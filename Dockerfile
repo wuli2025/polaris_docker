@@ -188,6 +188,16 @@ COPY --from=server /usr/local/bin/polaris-server /usr/local/bin/polaris-server
 COPY --from=web    /app/dist /srv/web
 COPY src-tauri/resources /app/resources
 
+# ── 预装飞书桥 SDK：构建期(Windows 有网)就把 @larksuiteoapi 装好 ──────────────
+#   飞书网关运行时实际跑在 /root/Polaris/feishu-bridge,但该路径是命名卷,
+#   运行时会被卷覆盖 → 这里先装进镜像内 /opt/feishu-bridge,由 entrypoint 在卷挂好后
+#   seed 进去。这样容器首启不再触发联网 npm install(NAS 容器出网受限会失败)。
+COPY src-tauri/assets/feishu_bridge.mjs          /opt/feishu-bridge/bridge.mjs
+COPY src-tauri/assets/feishu_bridge_package.json /opt/feishu-bridge/package.json
+RUN cd /opt/feishu-bridge \
+    && npm install --no-audit --no-fund --registry=https://registry.npmmirror.com \
+    && npm cache clean --force
+
 ENV HOME=/root \
     POLARIS_RESOURCE_DIR=/app/resources \
     POLARIS_WEB_DIR=/srv/web \

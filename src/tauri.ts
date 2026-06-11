@@ -40,7 +40,7 @@ function authToken(): string | null {
   }
 }
 
-function authHeaders(): Record<string, string> {
+export function authHeaders(): Record<string, string> {
   const t = authToken();
   return t ? { authorization: `Bearer ${t}` } : {};
 }

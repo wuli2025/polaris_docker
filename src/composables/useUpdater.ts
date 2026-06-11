@@ -15,7 +15,7 @@ import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { isTauri } from "../tauri";
+import { isTauri, authHeaders } from "../tauri";
 
 // 后端 updater.rs 的 UpdaterState（serde tag = "status"）。
 type UpdaterState =
@@ -186,7 +186,8 @@ export async function dockerCheck(): Promise<void> {
   try {
     const r = await fetch("/api/invoke", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // 设了 POLARIS_AUTH_TOKEN 时 /api/invoke 全量鉴权,裸 fetch 不带 token 必 401
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ cmd: "docker_status", args: {} }),
     });
     const j = (await r.json()) as DockerStatus & { error?: string };
@@ -209,7 +210,7 @@ export async function dockerApply(): Promise<void> {
   try {
     const r = await fetch("/api/invoke", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ cmd: "docker_update", args: { confirm: true } }),
     });
     const j = (await r.json()) as DockerUpdateResult;

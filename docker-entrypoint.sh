@@ -12,6 +12,19 @@ ensure_dirs() {
   for d in $DATA_DIRS; do mkdir -p "$d"; done
 }
 
+# 飞书桥 SDK seed：命名卷会盖掉镜像里 /root/Polaris 下的内容,故构建期把 SDK 预装在
+# /opt/feishu-bridge,这里在卷挂好后补进卷内。免去容器首启联网 npm install(NAS 容器出网受限常失败)。
+# 判据对齐 Rust 侧 ensure_bridge(查 @larksuiteoapi 而非裸 node_modules):
+# 早前容器内 npm install 失败可能留下残缺 node_modules,裸目录判据会永远跳过 seed。
+seed_feishu_bridge() {
+  BRIDGE=/root/Polaris/feishu-bridge
+  if [ -d /opt/feishu-bridge/node_modules ] && [ ! -d "$BRIDGE/node_modules/@larksuiteoapi" ]; then
+    mkdir -p "$BRIDGE"
+    cp -a /opt/feishu-bridge/. "$BRIDGE/"
+    echo "[entrypoint] 已 seed 飞书桥 SDK → $BRIDGE"
+  fi
+}
+
 if [ -n "$PUID" ] && [ -n "$PGID" ]; then
   # ── 非 root 模式（群晖推荐）──────────────────────────────────
   if ! getent group "$PGID" >/dev/null 2>&1; then
@@ -22,6 +35,7 @@ if [ -n "$PUID" ] && [ -n "$PGID" ]; then
       || adduser --uid "$PUID" --gid "$PGID" --home /root --disabled-password --gecos "" polaris 2>/dev/null || true
   fi
   ensure_dirs
+  seed_feishu_bridge
   # HOME(/root) 及数据目录归属运行用户，确保 claude 配置/缓存可写。
   chown "$PUID:$PGID" /root 2>/dev/null || true
   for d in $DATA_DIRS; do chown -R "$PUID:$PGID" "$d" 2>/dev/null || true; done
@@ -31,5 +45,6 @@ fi
 
 # ── 默认：root 模式（未设 PUID/PGID，与既有行为一致）─────────────
 ensure_dirs
+seed_feishu_bridge
 echo "[entrypoint] 以 root 运行（未设 PUID/PGID）"
 exec polaris-server "$@"
