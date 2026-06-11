@@ -4,7 +4,7 @@
 //! 全部元素是真文本框/真形状/真填充,用户在 PowerPoint/WPS/Keynote 里 100% 可编辑;
 //! **零截图、零浏览器**:Docker slim(无 chromium)也能出 PPT,纯文本模型即可驱动。
 //!
-//! spec v1(6 版式 × 原生原语):
+//! spec v1(9 版式 × 原生原语):
 //! ```json
 //! {
 //!   "version": 1,
@@ -15,6 +15,8 @@
 //!     {"layout":"bullets", "title":"…", "points":["…", {"text":"…","sub":["…"]}]},
 //!     {"layout":"two-col", "title":"…", "left":{"head":"…","points":["…"]}, "right":{…}},
 //!     {"layout":"compare", "title":"…", "items":[{"head":"…","body":"…"}, …]},  // 2–4 卡
+//!     {"layout":"stats",   "title":"…", "items":[{"value":"83%","label":"…","desc":"…"}, …]}, // 1–4 大数字
+//!     {"layout":"timeline","title":"…", "steps":[{"head":"…","body":"…"}, …]},  // 2–5 步
 //!     {"layout":"quote",   "text":"…", "by":"…"},
 //!     {"layout":"closing", "title":"…", "subtitle":"…"}
 //!   ]
@@ -178,6 +180,19 @@ fn round_card(id: u32, x: i64, y: i64, w: i64, h: i64, pal: &Palette) -> String 
     )
 }
 
+/// 强调色圆形 + 居中数字(timeline 步骤节点)。文字用 bg1 反衬强调色,深浅色板都可读。
+fn circle_num(id: u32, x: i64, y: i64, d: i64, label: &str, pal: &Palette) -> String {
+    let p = Para { align: "ctr", bold: true, ..Para::plain(label, 18, pal.bg1) };
+    format!(
+        "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"step{id}\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>\
+<p:spPr><a:xfrm><a:off x=\"{}\" y=\"{}\"/><a:ext cx=\"{}\" cy=\"{}\"/></a:xfrm>\
+<a:prstGeom prst=\"ellipse\"><a:avLst/></a:prstGeom>\
+<a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr>\
+<p:txBody><a:bodyPr anchor=\"ctr\" lIns=\"0\" tIns=\"0\" rIns=\"0\" bIns=\"0\"/>{}</p:txBody></p:sp>",
+        x * PX, y * PX, d * PX, d * PX, pal.accent, para_xml(&p, pal)
+    )
+}
+
 /// 页背景:上下渐变(p:bg,真填充,用户可在 PowerPoint 里整页换色)。
 fn slide_bg(pal: &Palette) -> String {
     format!(
@@ -206,6 +221,16 @@ fn header(title: &str, pal: &Palette, mut id: u32) -> (String, u32) {
 
 fn s_str<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// spec 由 LLM 产出,字段类型错(如 points 给了字符串)很现实——静默丢整页内容比
+/// 未知版式更隐蔽,必须与之同等待遇进 warnings。
+fn warn_bad_type(v: Option<&Value>, what: &str, page: usize, warnings: &mut Vec<String>) {
+    if let Some(x) = v {
+        if !x.is_array() && !x.is_null() {
+            warnings.push(format!("第 {page} 页 {what} 不是数组,内容已忽略"));
+        }
+    }
 }
 
 /// points 数组 → bullet 段落串(支持 string 或 {text, sub:[…]} 两级)。
@@ -293,6 +318,7 @@ fn slide_content(sl: &Value, pal: &Palette, warnings: &mut Vec<String>, page: us
                             pal,
                         ));
                     }
+                    warn_bad_type(col.get("points"), &format!("{key}.points"), page, warnings);
                     paras.push_str(&points_paras(col.get("points"), 15, pal));
                     if !paras.is_empty() {
                         s.push_str(&round_card(id, x, 168, 544, 470, pal));
@@ -307,6 +333,11 @@ fn slide_content(sl: &Value, pal: &Palette, warnings: &mut Vec<String>, page: us
             let (h, nid) = header(s_str(sl, "title"), pal, id);
             s.push_str(&h);
             id = nid;
+            warn_bad_type(sl.get("items"), "items", page, warnings);
+            let full = sl.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            if full > 4 {
+                warnings.push(format!("第 {page} 页 compare 仅渲染前 4 项,丢弃 {} 项", full - 4));
+            }
             let items: Vec<&Value> = sl
                 .get("items")
                 .and_then(|v| v.as_array())
@@ -341,6 +372,105 @@ fn slide_content(sl: &Value, pal: &Palette, warnings: &mut Vec<String>, page: us
                 id += 1;
             }
         }
+        "stats" => {
+            // 大数字指标页: 1–4 张卡,每卡 value(超大强调色) + label + 可选 desc。
+            let (h, nid) = header(s_str(sl, "title"), pal, id);
+            s.push_str(&h);
+            id = nid;
+            warn_bad_type(sl.get("items"), "items", page, warnings);
+            let full = sl.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            if full > 4 {
+                warnings.push(format!("第 {page} 页 stats 仅渲染前 4 项,丢弃 {} 项", full - 4));
+            }
+            let items: Vec<&Value> = sl
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().take(4).collect())
+                .unwrap_or_default();
+            let n = items.len().max(1) as i64;
+            let gap = 28i64;
+            let w = (1120 - gap * (n - 1)) / n;
+            for (i, it) in items.iter().enumerate() {
+                let x = 80 + (i as i64) * (w + gap);
+                s.push_str(&round_card(id, x, 220, w, 320, pal));
+                id += 1;
+                let mut paras = String::new();
+                let value = s_str(it, "value");
+                if !value.is_empty() {
+                    paras.push_str(&para_xml(
+                        &Para { align: "ctr", bold: true, space_after_pt: 10, ..Para::plain(value, 44, pal.accent) },
+                        pal,
+                    ));
+                }
+                let label = s_str(it, "label");
+                if !label.is_empty() {
+                    paras.push_str(&para_xml(
+                        &Para { align: "ctr", bold: true, space_after_pt: 6, ..Para::plain(label, 16, pal.ink) },
+                        pal,
+                    ));
+                }
+                let desc = s_str(it, "desc");
+                if !desc.is_empty() {
+                    paras.push_str(&para_xml(
+                        &Para { align: "ctr", ..Para::plain(desc, 12, pal.muted) },
+                        pal,
+                    ));
+                }
+                s.push_str(&text_box(id, x + 20, 244, w - 40, 320 - 48, "ctr", &paras));
+                id += 1;
+            }
+        }
+        "timeline" => {
+            // 流程/路线图页: 2–5 步,数字圆节点 + 连接线 + 每步 head/body。
+            let (h, nid) = header(s_str(sl, "title"), pal, id);
+            s.push_str(&h);
+            id = nid;
+            warn_bad_type(sl.get("steps"), "steps", page, warnings);
+            let full = sl.get("steps").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            if full > 5 {
+                warnings.push(format!("第 {page} 页 timeline 仅渲染前 5 步,丢弃 {} 步", full - 5));
+            }
+            let steps: Vec<&Value> = sl
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().take(5).collect())
+                .unwrap_or_default();
+            let n = steps.len().max(1) as i64;
+            let gap = 24i64;
+            let w = (1120 - gap * (n - 1)) / n;
+            // 连接线先画(在圆下层),从首步圆心到末步圆心。
+            if n > 1 {
+                let x0 = 80 + w / 2;
+                let span = (n - 1) * (w + gap);
+                s.push_str(&solid_rect(id, x0, 250, span, 3, pal.card_line));
+                id += 1;
+            }
+            for (i, st) in steps.iter().enumerate() {
+                let x = 80 + (i as i64) * (w + gap);
+                let num = (i + 1).to_string();
+                s.push_str(&circle_num(id, x + w / 2 - 22, 230, 44, &num, pal));
+                id += 1;
+                let mut paras = String::new();
+                let head = s_str(st, "head");
+                if !head.is_empty() {
+                    paras.push_str(&para_xml(
+                        &Para { align: "ctr", bold: true, space_after_pt: 6, ..Para::plain(head, 16, pal.ink) },
+                        pal,
+                    ));
+                }
+                let body = s_str(st, "body");
+                for line in body.split('\n').filter(|l| !l.trim().is_empty()) {
+                    paras.push_str(&para_xml(
+                        &Para { align: "ctr", space_after_pt: 4, ..Para::plain(line.trim(), 13, pal.muted) },
+                        pal,
+                    ));
+                }
+                if !paras.is_empty() {
+                    s.push_str(&text_box(id, x, 296, w, 320, "t", &paras));
+                    id += 1;
+                }
+            }
+        }
         "quote" => {
             let p = Para { bold: true, ..Para::plain("\u{201C}", 96, pal.accent) };
             s.push_str(&text_box(id, 100, 120, 200, 130, "t", &para_xml(&p, pal)));
@@ -356,10 +486,12 @@ fn slide_content(sl: &Value, pal: &Palette, warnings: &mut Vec<String>, page: us
             }
         }
         other => {
-            // bullets 或未知版式(宽容降级,尽量出东西)。
-            if other != "bullets" {
+            // bullets / 缺省 / 未知版式(宽容降级,尽量出东西)。缺 layout 与前端预览
+            // 同样按 bullets 处理,不算错不告警;真未知才提醒。
+            if other != "bullets" && !other.is_empty() {
                 warnings.push(format!("第 {page} 页未知版式 \"{other}\",按 bullets 渲染"));
             }
+            warn_bad_type(sl.get("points"), "points", page, warnings);
             let (h, nid) = header(s_str(sl, "title"), pal, id);
             s.push_str(&h);
             id = nid;
@@ -435,11 +567,16 @@ pub fn build_pptx_from_spec(spec_json: &str, out_path: &str) -> Result<Value, St
     if slides.len() > MAX_SLIDES {
         return Err(format!("页数 {} 超过上限 {MAX_SLIDES}", slides.len()));
     }
-    let (theme_name, pal) = palette(spec.get("theme").and_then(|v| v.as_str()).unwrap_or(""));
+    let requested_theme = spec.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+    let (theme_name, pal) = palette(requested_theme);
     let n = slides.len();
 
     // 每页内容 + 备注。
     let mut warnings: Vec<String> = Vec::new();
+    // 未知色板静默回退会让用户不知情(大小写写错都中招),与未知版式同等待遇。
+    if !requested_theme.is_empty() && theme_name != requested_theme {
+        warnings.push(format!("未知色板 \"{requested_theme}\",已回退 {theme_name}"));
+    }
     let mut slide_xmls: Vec<String> = Vec::with_capacity(n);
     let mut notes: Vec<Option<String>> = Vec::with_capacity(n);
     for (i, sl) in slides.iter().enumerate() {
@@ -455,8 +592,11 @@ pub fn build_pptx_from_spec(spec_json: &str, out_path: &str) -> Result<Value, St
             let _ = std::fs::create_dir_all(parent);
         }
     }
+    // 原子写:先写 .tmp 再 rename —— 半路失败不毁旧文件;目标被 PowerPoint 占用时给明确提示。
+    let tmp_path = format!("{out_path}.tmp");
+    let mut tmp_guard = crate::forge_pptx::TmpGuard(std::path::PathBuf::from(&tmp_path), true);
     let file =
-        std::fs::File::create(out_path).map_err(|e| format!("创建 {out_path} 失败: {e}"))?;
+        std::fs::File::create(&tmp_path).map_err(|e| format!("创建 {tmp_path} 失败: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
     let opt = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let put = |zip: &mut zip::ZipWriter<std::fs::File>, name: &str, data: &[u8]| -> Result<(), String> {
@@ -600,7 +740,12 @@ pub fn build_pptx_from_spec(spec_json: &str, out_path: &str) -> Result<Value, St
         }
     }
 
-    zip.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
+    let f = zip.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
+    drop(f); // Windows: rename 前先关句柄
+    std::fs::rename(&tmp_path, out_path).map_err(|e| {
+        format!("写入 {out_path} 失败(若该文件正在 PowerPoint/WPS 中打开,请先关闭再重试): {e}")
+    })?;
+    tmp_guard.1 = false;
     let notes_pages = notes.iter().filter(|x| x.is_some()).count();
     Ok(json!({
         "ok": true,
@@ -689,6 +834,50 @@ mod tests {
         let z = zip::ZipArchive::new(f).unwrap();
         let names: Vec<&str> = z.file_names().collect();
         assert!(!names.iter().any(|n| n.contains("notesMaster")), "无备注不应有 notesMaster");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_and_timeline_layouts_render_natively() {
+        let dir = std::env::temp_dir().join("polaris_native_pptx_rich");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("rich.pptx");
+        let spec = r#"{
+            "theme": "deep-space",
+            "slides": [
+                {"layout":"stats","title":"关键指标","items":[
+                    {"value":"83%","label":"覆盖率","desc":"含边缘场景"},
+                    {"value":"3.2x","label":"提速"}
+                ]},
+                {"layout":"timeline","title":"路线图","steps":[
+                    {"head":"调研","body":"两周"},
+                    {"head":"落地","body":"四周\n含验收"},
+                    {"head":"推广"}
+                ]}
+            ]
+        }"#;
+        let r = build_pptx_from_spec(spec, &out.to_string_lossy()).expect("应成功");
+        assert_eq!(r["slides"], 2);
+        assert_eq!(r["warnings"].as_array().unwrap().len(), 0);
+        let v = crate::forge_pptx::validate_pptx(&out.to_string_lossy()).unwrap();
+        assert!(v.ok, "校验失败: {:?}", v.errors);
+        // stats 页: 卡片 + 强调色大数字。
+        let s1 = read_part(&out, "ppt/slides/slide1.xml");
+        assert!(s1.contains("prst=\"roundRect\""));
+        assert!(s1.contains("83%"));
+        assert!(s1.contains("sz=\"4400\""), "value 应为 44pt 大字");
+        // timeline 页: 圆形节点 + 连接线 + 步骤序号。
+        let s2 = read_part(&out, "ppt/slides/slide2.xml");
+        assert!(s2.contains("prst=\"ellipse\""));
+        assert!(s2.contains("<a:t>1</a:t>"));
+        assert!(s2.contains("<a:t>3</a:t>"));
+        assert!(s2.contains("路线图"));
+        // 超限截断要进 warnings。
+        let spec_over = r#"{"slides":[{"layout":"timeline","steps":[
+            {"head":"a"},{"head":"b"},{"head":"c"},{"head":"d"},{"head":"e"},{"head":"f"}]}]}"#;
+        let r2 = build_pptx_from_spec(spec_over, &out.to_string_lossy()).unwrap();
+        let w = r2["warnings"].as_array().unwrap();
+        assert!(w.iter().any(|x| x.as_str().unwrap().contains("timeline")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

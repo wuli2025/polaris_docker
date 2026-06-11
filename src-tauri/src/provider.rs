@@ -1459,7 +1459,14 @@ fn codex_write_auth_json(
 
     let content = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("序列化 auth.json 失败: {e}"))?;
-    fs::write(&path, content).map_err(|e| format!("写入 ~/.codex/auth.json 失败: {e}"))?;
+    // auth.json 含 refresh/access/id token:① 原子写防写一半撕裂 → 外部 codex CLI 读到坏 JSON;
+    // ② Unix 下收紧到 0600,NAS/Docker 多用户主机上不让同机其他用户读走凭证。
+    atomic_write(&path, &content).map_err(|e| format!("写入 ~/.codex/auth.json 失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 

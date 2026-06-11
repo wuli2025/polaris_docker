@@ -766,6 +766,13 @@ def _find_editor(ctx_or_page):
 
 def _is_logged_in(ctx_or_page):
     pages = list(ctx_or_page.pages) if hasattr(ctx_or_page, "pages") else [ctx_or_page]
+    # 登录后后台 URL 必带 token——先零 DOM 扫描判掉，省下轮询里 *:has-text 的全页文本遍历
+    for pg in pages:
+        try:
+            if re.search(r"[?&]token=\d+", pg.url or ""):
+                return True
+        except Exception:
+            pass
     for pg in pages:
         el, _ = _first(pg, SELECTORS["logged_in_hint"])
         if el:
@@ -873,7 +880,18 @@ def _save_draft(editor_page):
             clicked = True
         except Exception:
             pass
-    confirmed = _wait_any(editor_page, SELECTORS["save_ok_hint"], 10) if clicked else False
+    # 等回执期间顺手点掉「确定/完成」类确认弹窗（未填封面/摘要等提示会挡住保存流程，
+    # 不点掉它保存就永远完不成——回执也就永远等不到）
+    confirmed = False
+    if clicked:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            el, _ = _first(editor_page, SELECTORS["save_ok_hint"])
+            if el:
+                confirmed = True
+                break
+            _confirm_upload_dialog(editor_page)
+            time.sleep(0.5)
     return clicked, confirmed
 
 
@@ -897,6 +915,12 @@ def _open_editor_direct(ctx):
     try:
         pg = ctx.new_page()
         pg.goto(url, wait_until="domcontentloaded")
+        # 等编辑器就绪即走（此前是盲睡 4s）——没等到也不算失败，外层 _wait_editor 轮询兜底
+        try:
+            pg.wait_for_selector("div.ProseMirror[contenteditable=true], #ueditor_0",
+                                 timeout=15000)
+        except Exception:
+            pass
         print("[壹伴] 已直开「写图文」编辑器（token 直达，绕过首页按钮）。", flush=True)
         return True
     except Exception:
@@ -924,8 +948,7 @@ def _wait_editor(ctx, timeout, auto_click_entry, hint):
         if auto_click_entry and logged_in and not tried_direct:
             tried_direct = True
             if _open_editor_direct(ctx):
-                time.sleep(4)
-                continue
+                continue  # 直开里已 wait_for_selector 等过编辑器，立刻进下一轮探测
         # 次选：登录后最多替用户点 2 次「写图文」（隔 45s 才重试，避免开出一堆标签）
         if auto_click_entry and logged_in and clicked_entry < 2:
             for p in list(ctx.pages):
@@ -1211,15 +1234,44 @@ def run_snapshot(body_html, theme, out_dir, base_name, raw_file=None, no_slice=F
         else:
             cuts = _plan_cuts(info["top"], info["bottom"], info["bottoms"], SLICE_MAX_CSS)
 
-        # ③ 逐段 clip 截图（clip 用页面 CSS 坐标，可超出视口）
+        # ③ 整页只成像一次 → 本地裁切。此前每张切片都 full_page=True+clip——Playwright 的语义是
+        # 「整页完整渲染再裁」，N 张切片 = N 次全页 @2x 成像（O(N×整页) 平方型开销，长文 30~60s 全耗在这）。
+        # 现在：截一张全页图 → Pillow 按切点 crop（毫秒级）。Pillow 缺席才退回逐段截图老路。
         slices = []
-        for i, (y0, y1) in enumerate(cuts, 1):
-            sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i))
-            # full_page=True + clip：先全页成像再按页面坐标裁切——只有这样才能裁到视口外
-            page.screenshot(path=sp_, full_page=True,
-                            clip={"x": 0, "y": y0, "width": SNAP_WIDTH, "height": y1 - y0})
-            slices.append(os.path.abspath(sp_))
-            print("[壹伴] 切片 %d/%d：%d~%dpx" % (i, len(cuts), y0, y1), flush=True)
+        cropped = False
+        if len(cuts) > 1:
+            try:
+                from PIL import Image  # type: ignore
+            except Exception:
+                Image = None
+                print("[壹伴] 未安装 Pillow——退回逐段整页截图（慢路）。pip install pillow 可提速数倍。",
+                      flush=True)
+            if Image is not None:
+                full_png = os.path.join(out_dir, base_name + "-full.png")
+                page.screenshot(path=full_png, full_page=True)
+                img = Image.open(full_png)
+                for i, (y0, y1) in enumerate(cuts, 1):
+                    sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i))
+                    # cuts 是页面 CSS 坐标，位图是 @SNAP_SCALE 设备像素——按比例换算再裁
+                    a = max(0, round(y0 * SNAP_SCALE))
+                    b = min(img.height, round(y1 * SNAP_SCALE))
+                    img.crop((0, a, img.width, b)).save(sp_)
+                    slices.append(os.path.abspath(sp_))
+                    print("[壹伴] 切片 %d/%d：%d~%dpx" % (i, len(cuts), y0, y1), flush=True)
+                img.close()
+                try:
+                    os.remove(full_png)
+                except Exception:
+                    pass
+                cropped = True
+        if not cropped:
+            for i, (y0, y1) in enumerate(cuts, 1):
+                sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i))
+                # full_page=True + clip：先全页成像再按页面坐标裁切——只有这样才能裁到视口外
+                page.screenshot(path=sp_, full_page=True,
+                                clip={"x": 0, "y": y0, "width": SNAP_WIDTH, "height": y1 - y0})
+                slices.append(os.path.abspath(sp_))
+                print("[壹伴] 切片 %d/%d：%d~%dpx" % (i, len(cuts), y0, y1), flush=True)
 
         manifest = {"slices": slices, "html": os.path.abspath(html_path),
                     "theme": theme, "width_css": SNAP_WIDTH, "scale": SNAP_SCALE}
@@ -1270,55 +1322,120 @@ JS_IMG_STATS = r"""
 """
 
 
+# 传图确认框：页内一次 JS 遍历找可见的「确定/插入/完成」按钮（精确文案匹配）并点掉。
+# 此前是 6 个 :has-text 选择器逐个全 DOM 扫 + 命中固定等 1s——挂在 _wait_img 轮询热路径上是隐性大头。
+JS_CONFIRM_DIALOG = r"""
+() => {
+  var texts = ["确定", "插入", "完成"];
+  var cands = document.querySelectorAll("button, a");
+  for (var i = 0; i < cands.length; i++) {
+    var el = cands[i];
+    if (texts.indexOf((el.textContent || "").trim()) < 0) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) { el.click(); return true; }
+  }
+  return false;
+}
+"""
+
+
 def _confirm_upload_dialog(page):
     """传图后可能弹素材/确认框：best-effort 点可见的「确定/插入/完成」。点不到就算了。"""
-    for txt in ("确定", "插入", "完成"):
-        for sel in ("button:has-text('%s')" % txt, "a:has-text('%s')" % txt):
-            try:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    el.click()
-                    page.wait_for_timeout(1000)
-                    return True
-            except Exception:
-                continue
+    try:
+        if page.evaluate(JS_CONFIRM_DIALOG):
+            page.wait_for_timeout(300)
+            return True
+    except Exception:
+        pass
     return False
 
 
+def _img_stats(frame, body_sel):
+    try:
+        return frame.eval_on_selector(body_sel, JS_IMG_STATS)
+    except Exception:
+        return None
+
+
 def _wait_img(frame, body_sel, want_n, seconds, page=None):
-    """等编辑器收图到第 want_n 张（顺手点掉弹出的确认框）。优先等到换成 http 外链。"""
+    """等编辑器**收下**第 want_n 张图——total 落位（通常亚秒级）即返回。
+    此前还要求「累计所有图都换成 http 外链」才提前退出：编辑器换 mmbiz 外链是并行异步的，
+    串行等它 = 每张烧满超时 × N 的级联放大，是全链路最大的时间黑洞。
+    换链确认统一挪到全部贴完后 _wait_uploaded 一次收尾（并行上传，等待≈最慢一张）。"""
     deadline = time.time() + seconds
-    landed = False
+    step = 0.4
+    rounds = 0
+    while time.time() < deadline:
+        # 确认框只会在刚传图时弹——只探测前几轮，别让全页遍历挂在整个轮询期
+        if page is not None and rounds < 3:
+            _confirm_upload_dialog(page)
+        st = _img_stats(frame, body_sel)
+        if st and st["total"] >= want_n:
+            return True
+        rounds += 1
+        time.sleep(step)
+        step = min(step * 1.5, 2.0)
+    return False
+
+
+def _wait_uploaded(frame, body_sel, want_n, seconds, page=None):
+    """收尾：统一等编辑器把 want_n 张图全部换成 mmbiz 外链。超时只降级为警告——
+    保存草稿同样会把素材落库，窗口也留给用户核对。"""
+    deadline = time.time() + seconds
+    last = -1
     while time.time() < deadline:
         if page is not None:
             _confirm_upload_dialog(page)
-        try:
-            st = frame.eval_on_selector(body_sel, JS_IMG_STATS)
-        except Exception:
-            st = None
-        if st and st["total"] >= want_n:
-            landed = True
+        st = _img_stats(frame, body_sel)
+        if st:
             if st["uploaded"] >= want_n:
-                break
-        time.sleep(1.5)
-    return landed
+                return True
+            if st["uploaded"] != last:
+                last = st["uploaded"]
+                print("[壹伴] 素材换链进度 %d/%d……" % (st["uploaded"], want_n), flush=True)
+        time.sleep(1.0)
+    return False
+
+
+# 探明的有效 file input 缓存（单次运行进程内）：此前每张图都重新遍历所有 input，
+# 且对喂错的 input（封面/素材等隐藏输入,不会在正文出图）各死等 35s——粘贴失效机器「特别慢」的元凶。
+_INPUT_CACHE = {"input": None}
 
 
 def _upload_via_input(editor_page, frame, body_sel, fp, want_n):
-    """图片走「文件输入」通道：①页面常驻的 input[type=file] 直喂；
-    ②工具栏「图片」按钮 + 文件选择器。合成粘贴对文件无效时的真通道。"""
+    """图片走「文件输入」通道：①上次探明的 input 直喂（缓存命中给足 25s）；
+    ②遍历各 frame 的 input[type=file]，accept 含 image 的优先，探测期每个只等 10s
+    （真有效的 input，图落位是秒级）；③工具栏「图片」按钮 + 文件选择器。"""
+    cached = _INPUT_CACHE.get("input")
+    if cached is not None:
+        try:
+            cached.set_input_files(fp)
+            if _wait_img(frame, body_sel, want_n, 25, page=editor_page):
+                return "file-input"
+        except Exception:
+            pass
+        _INPUT_CACHE["input"] = None  # 失效（页面导航等）→ 重新探测
     # ① 现成 file input（编辑器页常驻隐藏 input,set_input_files 直接触发其 change 上传逻辑）
     for fr in list(editor_page.frames):
         try:
             inputs = fr.query_selector_all("input[type=file]")
         except Exception:
             continue
-        for inp in inputs:
+
+        def _score(inp):
+            try:
+                acc = (inp.get_attribute("accept") or "").lower()
+            except Exception:
+                acc = ""
+            return 0 if "image" in acc else 1
+
+        for inp in sorted(inputs, key=_score):
             try:
                 inp.set_input_files(fp)
             except Exception:
                 continue
-            if _wait_img(frame, body_sel, want_n, 35, page=editor_page):
+            if _wait_img(frame, body_sel, want_n, 10, page=editor_page):
+                _INPUT_CACHE["input"] = inp
                 return "file-input"
     # ② 工具栏「图片」按钮 → 系统文件选择器（Playwright 拦截直喂）
     btn, _ = _first(editor_page, SELECTORS["img_button"])
@@ -1327,7 +1444,7 @@ def _upload_via_input(editor_page, frame, body_sel, fp, want_n):
             with editor_page.expect_file_chooser(timeout=5000) as fc:
                 btn.click()
             fc.value.set_files(fp)
-            if _wait_img(frame, body_sel, want_n, 60, page=editor_page):
+            if _wait_img(frame, body_sel, want_n, 30, page=editor_page):
                 return "file-chooser"
         except Exception:
             pass
@@ -1335,8 +1452,10 @@ def _upload_via_input(editor_page, frame, body_sel, fp, want_n):
 
 
 def run_publish_image(slices_dir, title, intro, timeout):
-    """长图入草稿：开编辑器 →（可选）先放一段真文字导语 → 切片按序粘贴 → 填标题 → 存草稿。
-    每张贴完都等编辑器真把图收下（img 出现/换成 mmbiz 外链）再贴下一张。绝不自动发布。"""
+    """长图入草稿：开编辑器 →（可选）导语 → 填标题+先存一次草稿（让条目立刻进草稿箱，
+    防进程中途被杀全盘丢失）→ 切片按序粘贴 → 统一等换链 → 再存草稿。
+    每张只等「图落位」（亚秒级）就贴下一张，换 mmbiz 外链的确认放到全部贴完后统一等一轮
+    （微信并行上传，统一等≈最慢一张）。绝不自动发布。"""
     import base64
 
     if not slices_dir or not os.path.isdir(slices_dir):
@@ -1388,12 +1507,28 @@ def run_publish_image(slices_dir, title, intro, timeout):
             print("[壹伴] 导语%s（通道 %s）。" % ("已写入" if ok_i else "写入失败,跳过", m_i),
                   flush=True)
 
+        # 先把草稿在服务端立住：填标题 → 点一次「保存为草稿」（创建草稿条目）。
+        # 此前是全部贴完图才第一次保存——贴图阶段一旦被上层超时/回合结束杀掉进程，
+        # 保存从未执行、草稿箱里什么都没有（用户实证）。先建条目后编辑器自动保存会持续跟进，
+        # 中途死掉也至少留下「标题+导语+已贴的图」。
+        title_filled = _fill_title(frame, editor_page, title)
+        if title_filled or intro:
+            ec, eok = _save_draft(editor_page)
+            print("[壹伴] 草稿条目已先建立%s，开始贴图。" % (
+                "（保存回执已确认）" if eok else
+                ("（已点保存，未见回执——编辑器自动保存会跟进）" if ec
+                 else "失败：没找到保存键——贴完图会再试")), flush=True)
+
         # 通道策略：先用首图实测「合成粘贴」灵不灵（文字粘贴灵≠文件粘贴灵——编辑器对
         # 文件 paste 校验更严）；不灵就全程切「文件输入」通道（input 直喂/文件选择器）。
+        # 落位判定用「贴前 total + 1」而非累计张数 i——某张失败时累计值永远凑不齐，
+        # 会让后面每一张都烧满超时（级联放大）。
         ok_count = 0
         use_paste = True
         for i, fp in enumerate(files, 1):
             print("[壹伴] 贴第 %d/%d 张：%s" % (i, len(files), os.path.basename(fp)), flush=True)
+            st0 = _img_stats(frame, body_sel)
+            want = (st0["total"] if st0 else (i - 1)) + 1
             landed_via = None
             if use_paste:
                 try:
@@ -1403,7 +1538,7 @@ def run_publish_image(slices_dir, title, intro, timeout):
                     frame.eval_on_selector(body_sel, JS_PASTE_IMAGE,
                                            {"dataUrl": "data:%s;base64,%s" % (mime, b64),
                                             "name": os.path.basename(fp)})
-                    if _wait_img(frame, body_sel, i, 25, page=editor_page):
+                    if _wait_img(frame, body_sel, want, 15, page=editor_page):
                         landed_via = "paste"
                 except Exception:
                     pass
@@ -1411,7 +1546,7 @@ def run_publish_image(slices_dir, title, intro, timeout):
                     use_paste = False
                     print("[壹伴] 粘贴通道对图片无效，切换「文件输入」通道。", flush=True)
             if not landed_via:
-                landed_via = _upload_via_input(editor_page, frame, body_sel, fp, i)
+                landed_via = _upload_via_input(editor_page, frame, body_sel, fp, want)
             if landed_via:
                 ok_count += 1
                 print("[壹伴] 第 %d 张已落位（通道 %s）。" % (i, landed_via), flush=True)
@@ -1419,11 +1554,26 @@ def run_publish_image(slices_dir, title, intro, timeout):
                 print("[壹伴] 第 %d 张三条通道都没成——请把 %s 手动拖进编辑器补上。" % (i, fp),
                       flush=True)
 
-        title_filled = _fill_title(frame, editor_page, title)
+        # 收尾：统一等编辑器把图换成 mmbiz 外链（微信并行上传，统一等≈最慢一张，
+        # 而不是此前的逐张串行等 × N）。超时不算失败——保存草稿同样会触发素材落库。
+        uploads_confirmed = True
+        if ok_count:
+            print("[壹伴] 全部贴完，统一等素材换链……", flush=True)
+            uploads_confirmed = _wait_uploaded(frame, body_sel, ok_count, 60, page=editor_page)
+            print("[壹伴] %s" % ("素材已全部换成 mmbiz 外链。" if uploads_confirmed
+                                 else "部分图未确认换链（保存草稿会继续落库，请在窗口里核对）。"),
+                  flush=True)
+
+        if not title_filled:
+            title_filled = _fill_title(frame, editor_page, title)  # 开头没填上的再补一次
         saved, confirmed = _save_draft(editor_page)
+        if not confirmed:
+            print("[壹伴] 最终保存未见明确回执——请在窗口里手动点一次「保存为草稿」核实入档。",
+                  flush=True)
         print(json.dumps({
             "ok": ok_count == len(files), "mode": "publish-image",
             "images_total": len(files), "images_ok": ok_count,
+            "uploads_confirmed": uploads_confirmed,
             "title_filled": title_filled, "save_clicked": saved, "save_confirmed": confirmed,
             "note": "长图已按序贴入（%d/%d 张确认落位）%s。窗口留着请核对图序与清晰度，确认后自行发布。绝不自动发布。"
                     % (ok_count, len(files),

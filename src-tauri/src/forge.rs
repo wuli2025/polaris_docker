@@ -138,6 +138,26 @@ fn bundled_exe(names: &[&str]) -> Option<String> {
     None
 }
 
+/// 本地路径 → 浏览器可加载的 file:// URL(截图/取词/视频取帧共用,三平台唯一出口)。
+///
+/// **Windows 关键坑**: `std::fs::canonicalize` 返回 `\\?\C:\...` 扩展长度前缀,直接拼
+/// URL 会变成 `file:////?/C:/...` —— 第一个 `?` 被浏览器当 query 分隔符 → 加载失败
+/// 回落新标签页 → 截图全是空白灰图却报成功(真机实测复现)。必须剥掉前缀。
+/// 路径里的 `% # ?` 也要编码,否则 `?export=1#/N` 锚点错位截错页。
+pub fn path_to_file_url(path: &str) -> Result<String, String> {
+    let abs = std::fs::canonicalize(path).map_err(|e| format!("找不到文件 {path}: {e}"))?;
+    let mut s = abs.to_string_lossy().replace('\\', "/");
+    // 剥 Windows 扩展前缀: //?/C:/... → C:/... ; UNC //?/UNC/server/share → //server/share
+    if let Some(rest) = s.strip_prefix("//?/UNC/") {
+        s = format!("//{rest}");
+    } else if let Some(rest) = s.strip_prefix("//?/") {
+        s = rest.to_string();
+    }
+    // 只编码会破坏 URL 结构的字符(% 必须最先,避免二次编码)。
+    let s = s.replace('%', "%25").replace('#', "%23").replace('?', "%3F");
+    Ok(format!("file:///{}", s.trim_start_matches('/')))
+}
+
 /// 找 chromium/chrome/edge 可执行: env → 应用自带(零安装打包)→ 平台候选名探测。
 pub fn find_chromium() -> Option<String> {
     if let Ok(p) = std::env::var("POLARIS_CHROMIUM") {
@@ -222,20 +242,23 @@ pub fn forge_preflight() -> Value {
             "degrades_to": "HTML 交付 + 提示浏览器打印(Ctrl/Cmd+P)",
             "blocker": if chromium.is_none() { Some("未发现 chromium：full 镜像才装(POLARIS_RENDER=1)") } else { None }
         }),
+        // 诚实申报:WebView2/WKWebView 截图后端尚未实现,实际只会调 Edge/Chrome/chromium
+        // headless CLI —— ready 必须以真探测为准,否则「preflight 绿灯、运行时报错」。
         "windows" => json!({
-            "primary": "WebView2",
-            "fallback": "Edge/Chrome CDP",
-            "ready": true,
+            "primary": "Edge/Chrome headless CLI",
+            "ready": chromium.is_some(),
             "cdp_available": chromium.is_some(),
             "path": chromium,
-            "degrades_to": "HTML 交付 + 打印"
+            "degrades_to": "HTML 交付 + 打印",
+            "blocker": if chromium.is_none() { Some("未发现 Edge/Chrome：请安装其一(Windows 一般自带 Edge)") } else { None }
         }),
         "macos" => json!({
-            "primary": "WKWebView takeSnapshot",
-            "ready": true,
+            "primary": "Chrome/Chromium headless CLI",
+            "ready": chromium.is_some(),
             "cdp_available": chromium.is_some(),
+            "path": chromium,
             "degrades_to": "HTML 交付 + 打印",
-            "note": "WKWebView 后端属 P4-mac，未落地前可用 Chrome CDP 兜底"
+            "blocker": if chromium.is_none() { Some("未发现 Chrome/Chromium：请安装 Google Chrome(mac 无预装兜底)") } else { None }
         }),
         _ => json!({ "ready": false }),
     };
@@ -297,7 +320,8 @@ pub fn forge_preflight() -> Value {
     // slim 镜像不再因缺 chromium 而 can_render_ppt:false。
     let can_render_deck_ppt = match plat {
         "docker" | "linux" => chromium.is_some() && cjk == Some(true),
-        _ => true,
+        // win/mac 同样依赖真实存在的浏览器(win 一般自带 Edge;mac 没装 Chrome 就是不能)。
+        _ => chromium.is_some(),
     };
     let can_render_ppt = true; // 原生路兜底(spec→OOXML,无浏览器也出真可编辑 PPT)
     let can_render_video = can_render_deck_ppt && (ffmpeg || plat == "windows" || plat == "macos");
@@ -375,12 +399,13 @@ pub async fn forge_deck_to_pptx(
 /// spec JSON → 原生可编辑 .pptx 的同步内核(路线 B「传统PPT」)。零截图零浏览器,
 /// Docker slim / mac / win 三平台恒可用。spec 既可传 JSON 字符串也可传 .json 文件路径。
 pub fn spec_to_pptx_sync(spec: String, out: String) -> Result<Value, String> {
-    let json = if spec.trim_start().starts_with('{') {
+    // BOM(U+FEFF)不算 whitespace,带 BOM 的 JSON 会被误判成文件路径 → 先剥掉再判。
+    let json = if spec.trim_start_matches('\u{feff}').trim_start().starts_with('{') {
         spec
     } else {
         std::fs::read_to_string(&spec).map_err(|e| format!("读 spec 文件 {spec} 失败: {e}"))?
     };
-    crate::forge_pptx_native::build_pptx_from_spec(&json, &out)
+    crate::forge_pptx_native::build_pptx_from_spec(json.trim_start_matches('\u{feff}'), &out)
 }
 
 /// spec JSON → 原生可编辑 .pptx。async + spawn_blocking 防大 spec 冻 UI(与 deck 导出同策略)。

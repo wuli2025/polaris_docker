@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import { usePolling } from "../composables/usePolling";
 import {
   Clapperboard,
@@ -29,7 +29,7 @@ import {
 } from "@lucide/vue";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
-import { artifacts as artifactsApi, chat as chatApi, type AttachedFile } from "../tauri";
+import { artifacts as artifactsApi, chat as chatApi, skills as skillsApi, type AttachedFile, type Skill } from "../tauri";
 import { useFileDrop } from "../composables/useFileDrop";
 import { DECK_THEMES_WITH_AUTO, findTheme, type DeckTheme } from "../lib/deckThemes";
 
@@ -61,7 +61,8 @@ const charCount = computed(() => scriptText.value.length);
 const uploads = ref<AttachedFile[]>([]);
 const uploading = ref(false);
 
-// 时长：可填写的秒数 + 快捷预设
+// 时长：默认 AI 按篇幅与重点自行决定；关掉后可填秒数 + 快捷预设
+const autoDuration = ref(true);
 const durationSec = ref(180);
 const durationPresets = [
   { label: "短", sec: 60 },
@@ -69,6 +70,7 @@ const durationPresets = [
   { label: "长", sec: 480 },
 ];
 const durationText = computed(() => {
+  if (autoDuration.value) return "AI 决定";
   const s = Math.max(15, durationSec.value || 0);
   const m = Math.floor(s / 60);
   const r = s % 60;
@@ -76,10 +78,41 @@ const durationText = computed(() => {
 });
 
 // PPT 风格：复用共享主题目录（与「演示工坊」一致，预览更精致；id 仅作 AI 设计提示）
-const selectedTheme = ref("tokyo-night");
+const selectedTheme = ref("auto"); // 默认 AI 自由发挥(视内容而定,走高级路线)
 const themes = DECK_THEMES_WITH_AUTO;
 const curTheme = computed<DeckTheme>(() => findTheme(selectedTheme.value));
 const themeName = computed(() => curTheme.value.name);
+
+// 可叠加的「增强技能」——与对话框同源:list_skills 全量技能库,点选后随对话一起注入。
+// polaris-video-studio 本体恒注入,不在列表里重复展示。
+const FALLBACK_SKILLS: Skill[] = [
+  { id: "deep-research", name: "深度搜索", description: "先联网研究、把内容补全/查证", source: "official" },
+  { id: "image-gen", name: "AI 配图", description: "为页面生成插图/配图", source: "official" },
+  { id: "pdf", name: "读 PDF", description: "解析上传的 PDF 素材", source: "official" },
+];
+const skillsList = ref<Skill[]>([]);
+const skillSearch = ref("");
+async function loadSkills() {
+  try {
+    skillsList.value = await skillsApi.list();
+  } catch {
+    skillsList.value = FALLBACK_SKILLS;
+  }
+}
+onMounted(loadSkills);
+function filteredSkills(): Skill[] {
+  const base = skillsList.value.filter((s) => s.id !== "polaris-video-studio");
+  const q = skillSearch.value.trim().toLowerCase();
+  if (!q) return base;
+  return base.filter((s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q));
+}
+const extraSkills = ref<string[]>([]);
+function toggleSkill(id: string) {
+  const i = extraSkills.value.indexOf(id);
+  if (i >= 0) extraSkills.value.splice(i, 1);
+  else extraSkills.value.push(id);
+}
+const skillIds = computed(() => ["polaris-video-studio", ...extraSkills.value]);
 
 // 配音：语速 + 音色
 const speed = ref(1.0);
@@ -269,11 +302,24 @@ async function pickBgm() {
 function configBlock(): string {
   const lines = [
     "## 制作配置",
-    `- 目标时长：约 ${durationSec.value} 秒（${durationText.value}）—— 口播节奏、章节数、每章信息量都要据此调配`,
-    `- PPT 风格：${selectedTheme.value === "auto" ? "由你根据内容自由设计最合适的视觉风格" : `${themeName.value}（主题 id=${selectedTheme.value}）`}`,
+    autoDuration.value
+      ? "- 目标时长：由你按内容篇幅与重点自行决定（内容多则长、少则短，重点处展开讲透，别硬凑也别硬砍）——口播节奏、章节数、每章信息量都据此调配"
+      : `- 目标时长：约 ${durationSec.value} 秒（${durationText.value}）—— 口播节奏、章节数、每章信息量都要据此调配`,
+    `- PPT 风格：${
+      selectedTheme.value === "auto"
+        ? "AI 自由发挥 —— 视觉方向由你根据内容气质与场景自行决定（可参考主题库，也可自行设计配色与版式），但观感**必须高级**：讲究的版式层级、克制的配色、超大标题与留白，一眼有设计感，拒绝平庸的默认观感"
+        : `${themeName.value}（主题 id=${selectedTheme.value}）`
+    }`,
     `- 配音音色：${VOICES.find((v) => v.id === voice.value)?.name}（voice_id=${voice.value}）`,
     `- 语速：${speed.value.toFixed(2)}（MiniMax voice_setting.speed，1.0=正常）`,
   ];
+  if (extraSkills.value.length) {
+    const names = skillsList.value
+      .filter((s) => extraSkills.value.includes(s.id))
+      .map((s) => s.name)
+      .join("、") || extraSkills.value.join("、");
+    lines.push(`- 已启用增强技能：${names}——制作时按需调用（如先研究补全内容、为页面配图、解析素材）。`);
+  }
   if (bgmPath.value) {
     lines.push(
       `- 背景音乐：${bgmPath.value}（相对人声音量约 ${Math.round(bgmVolume.value * 100)}%，用 ffmpeg 混入，循环铺底并对人声做 ducking）`
@@ -451,7 +497,7 @@ async function startPlan() {
       const display = `🎬 课件视频（全自动）·${durationText.value}：${preview()}`;
       await chat.send(id, autoPrompt(), display, undefined, {
         permissionMode: "auto_current",
-        skillIds: ["polaris-video-studio"],
+        skillIds: skillIds.value,
         goal: "把这段课件文案做成最终 MP4 视频并保存到产物目录",
       });
     } else {
@@ -459,7 +505,7 @@ async function startPlan() {
       const display = `🎬 课件视频·规划：${preview()}`;
       await chat.send(id, planPrompt(), display, undefined, {
         permissionMode: "auto_current",
-        skillIds: ["polaris-video-studio"],
+        skillIds: skillIds.value,
       });
     }
   } catch (e: any) {
@@ -483,7 +529,7 @@ async function confirmExecute() {
   try {
     await chat.send(convId.value, executePrompt(), "✅ 已确认规划，开始执行出片", undefined, {
       permissionMode: "auto_current",
-      skillIds: ["polaris-video-studio"],
+      skillIds: skillIds.value,
       goal: "按已确认的三份规划文件，制作出最终 MP4 视频并保存到产物目录",
     });
   } catch (e: any) {
@@ -507,7 +553,7 @@ async function retryPlanFile(f: PlanFile) {
       undefined,
       {
         permissionMode: "auto_current",
-        skillIds: ["polaris-video-studio"],
+        skillIds: skillIds.value,
       }
     );
   } catch (e: any) {
@@ -719,8 +765,11 @@ function fillDemo() {
 
           <!-- 时长 -->
           <div class="vc-field">
-            <label class="vc-field-label"><Clock :size="13" /> 视频时长</label>
-            <div class="vc-dur">
+            <div class="vc-field-row">
+              <label class="vc-field-label"><Clock :size="13" /> 视频时长 <b v-if="autoDuration">AI 决定</b></label>
+              <label class="vc-check"><input type="checkbox" v-model="autoDuration" /> AI 决定</label>
+            </div>
+            <div v-if="!autoDuration" class="vc-dur">
               <input type="number" min="15" max="3600" step="15" v-model.number="durationSec" class="vc-num" />
               <span class="vc-unit">秒</span>
               <span class="vc-dur-txt">≈ {{ durationText }}</span>
@@ -734,6 +783,7 @@ function fillDemo() {
                 >{{ p.label }}</button>
               </div>
             </div>
+            <span v-else class="vc-field-note">由 AI 按内容篇幅与重点决定时长，关掉可手动指定秒数</span>
           </div>
 
           <!-- 语速 -->
@@ -858,6 +908,30 @@ function fillDemo() {
               }}
             </span>
           </div>
+        </div>
+
+        <!-- 增强技能：整行 -->
+        <div class="vc-card vc-span2">
+          <h3 class="vc-card-title">
+            <Sparkles :size="15" :stroke-width="1.7" /><span>增强技能 · 可选</span>
+            <span class="vc-pill">{{ extraSkills.length ? extraSkills.length + " 项已选" : "与对话框同一个技能库" }}</span>
+          </h3>
+          <input v-model="skillSearch" class="vc-skill-search" type="text" placeholder="搜索技能…" />
+          <div class="vc-skill-list">
+            <button
+              v-for="s in filteredSkills()"
+              :key="s.id"
+              class="vc-skill-item"
+              :class="{ on: extraSkills.includes(s.id) }"
+              :title="s.description"
+              @click="toggleSkill(s.id)"
+            >
+              <span class="vc-skill-name">{{ s.name }}</span>
+              <span class="vc-skill-desc">{{ s.description }}</span>
+            </button>
+            <span v-if="!filteredSkills().length" class="vc-sub-hint">没有匹配的技能</span>
+          </div>
+          <span class="vc-sub-hint">点选叠加，AI 制作时会按需调用（如先联网补全内容、为页面配图、解析素材）。</span>
         </div>
 
         <!-- 操作 -->
@@ -1235,6 +1309,21 @@ function fillDemo() {
   cursor: pointer;
 }
 .vc-chip.active { border-color: var(--primary); background: var(--primary-soft); color: var(--primary-deep); }
+
+.vc-field-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.vc-check { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--muted); cursor: pointer; user-select: none; }
+.vc-check input { accent-color: var(--primary); }
+
+/* 增强技能（与对话框同源技能库） */
+.vc-skill-search { padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 12px; }
+.vc-skill-search:focus { outline: none; border-color: var(--primary); }
+.vc-skill-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px; max-height: 220px; overflow-y: auto; }
+.vc-skill-item { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); cursor: pointer; text-align: left; }
+.vc-skill-item:hover { border-color: var(--primary); }
+.vc-skill-item.on { border-color: var(--primary); background: var(--primary-soft); }
+.vc-skill-name { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.vc-skill-item.on .vc-skill-name { color: var(--primary-deep); }
+.vc-skill-desc { font-size: 10.5px; color: var(--muted); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 .vc-range { width: 100%; accent-color: var(--primary); }
 .vc-range.sm { flex: 1; }

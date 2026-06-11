@@ -188,13 +188,36 @@ watch(
       const dir = np.slice(0, np.lastIndexOf("/") + 1);
       const base = (np.split("/").pop() ?? "").replace(/\.pptx$/i, "");
       const list = await artifactsApi.list(app.currentConvId ?? undefined);
+      // 异步竞态守卫:list/read 期间用户可能已切到别的 pptx,过期回调若继续写
+      // pptxDeckHtml 会让「编辑/更新 PPT」指向上一个文件 → 覆盖错 deck。一律丢弃。
+      if (artifacts.current?.path !== p) return;
+      // 同目录有 polaris.slides.json = 原生 spec 导出的真可编辑 pptx ——
+      // 此时绝不能给 deck.html 重导出入口:任何 html 截图覆盖都会把真文本框毁成死图。
+      if (list.some((e) => norm(e.path) === `${dir}polaris.slides.json`)) return;
       const htmls = list.filter(
         (e) => /\.html?$/i.test(e.name) && norm(e.path).startsWith(dir)
       );
       if (!htmls.length) return;
       const exact = htmls.find((e) => e.name.replace(/\.html?$/i, "") === base);
-      pptxDeckHtml.value =
-        (exact ?? [...htmls].sort((a, b) => b.modified - a.modified)[0]).path;
+      if (exact) {
+        pptxDeckHtml.value = exact.path;
+        return;
+      }
+      // 非同名兜底:必须验明内容确实是 deck(含 .slide 结构/导出 runtime),
+      // 否则同目录随便一个网页都会被当伴生、「更新 PPT」用它覆盖毁掉原 pptx。
+      const recent = [...htmls].sort((a, b) => b.modified - a.modified).slice(0, 3);
+      for (const h of recent) {
+        try {
+          const c = await artifactsApi.read(h.path);
+          if (artifacts.current?.path !== p) return; // 同上:read 期间已切走则丢弃
+          if (c?.text && /class=["'][^"']*\bslide\b|__deck|data-notext-capable/.test(c.text)) {
+            pptxDeckHtml.value = h.path;
+            return;
+          }
+        } catch {
+          /* 读不动就看下一个候选 */
+        }
+      }
     } catch {
       /* 找不到就不显示编辑入口 */
     }

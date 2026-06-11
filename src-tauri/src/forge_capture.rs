@@ -154,9 +154,7 @@ async fn capture_cli_single_frame(
     let file_base = if is_http {
         deck_path.to_string_lossy().to_string()
     } else {
-        let abs = std::fs::canonicalize(deck_path)
-            .map_err(|e| format!("找不到 deck {deck_path:?}: {e}"))?;
-        format!("file://{}", abs.to_string_lossy().replace('\\', "/"))
+        crate::forge::path_to_file_url(&deck_path.to_string_lossy())?
     };
     let mut cmd = std::process::Command::new(&browser);
     cmd.args([

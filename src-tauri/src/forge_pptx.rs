@@ -57,6 +57,16 @@ pub fn build_pptx(image_paths: &[String], out_path: &str) -> Result<Value, Strin
     build_pptx_inner(image_paths, out_path, None)
 }
 
+/// 临时文件守卫:作用域内任何 `?` 早退都把半截 .tmp 清掉;rename 成功后置 `.1=false` 解除。
+pub(crate) struct TmpGuard(pub std::path::PathBuf, pub bool);
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
 pub fn build_pptx_inner(
     image_paths: &[String],
     out_path: &str,
@@ -78,7 +88,11 @@ pub fn build_pptx_inner(
         }
     }
     let cy: u64 = 6_858_000; // 7.5 inch
-    let ratio = first_ratio.unwrap_or(16.0 / 9.0);
+    // 比例钳制:sldSz 受 ST_SlideSizeCoordinate 限制(914400–51206400 EMU),畸形首图
+    // (超宽长图/损坏 IHDR)会写出 schema 非法值致 Office 修复/拒开。常规比例都在 [0.5,4]。
+    let ratio = first_ratio
+        .filter(|r| r.is_finite() && (0.5..=4.0).contains(r))
+        .unwrap_or(16.0 / 9.0);
     let cx: u64 = (cy as f64 * ratio).round() as u64;
     let n = image_paths.len();
 
@@ -88,7 +102,11 @@ pub fn build_pptx_inner(
             let _ = std::fs::create_dir_all(parent);
         }
     }
-    let file = std::fs::File::create(out_path).map_err(|e| format!("创建 {out_path} 失败: {e}"))?;
+    // 原子写:先写 .tmp 再 rename 落位 —— 半路失败不毁旧文件、不留半截产物;
+    // Windows 上目标被 PowerPoint 占用时,截图成果只损失落位一步,旧文件完好。
+    let tmp_path = format!("{out_path}.tmp");
+    let mut guard = TmpGuard(std::path::PathBuf::from(&tmp_path), true);
+    let file = std::fs::File::create(&tmp_path).map_err(|e| format!("创建 {tmp_path} 失败: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
     let opt = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
@@ -174,13 +192,15 @@ pub fn build_pptx_inner(
     //    工业级化(任务 c §A.4.1):每页字节读入→写 zip→立即 drop,峰值从 N 张降到 1 张
     for (idx, p) in image_paths.iter().enumerate() {
         let i = idx + 1;
-        let ext = Path::new(p)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("png")
-            .to_lowercase();
-        let media_ext = if ext == "jpg" || ext == "jpeg" { "jpeg" } else { "png" };
         let bytes = std::fs::read(p).map_err(|e| format!("读图失败 {p}: {e}"))?;
+        // 按魔数认格式(别信扩展名):字节与 Content-Type 声明不符时 Office 报图片损坏。
+        let media_ext = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            "png"
+        } else if bytes.starts_with(&[0xFF, 0xD8]) {
+            "jpeg"
+        } else {
+            return Err(format!("第 {i} 页图片不是 PNG/JPEG(按文件头判定): {p}"));
+        };
         put(&mut zip, &format!("ppt/media/image{i}.{media_ext}"), &bytes)?;
         drop(bytes); // ── 立即释放(任务 c §A.4.1 关键)──
         // 该页的文本框(若启用文本层且该页有 rects):editable=可见可编辑,否则 alpha=0 隐形。
@@ -203,7 +223,12 @@ pub fn build_pptx_inner(
         )?;
     }
 
-    zip.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
+    let f = zip.finish().map_err(|e| format!("zip 收尾失败: {e}"))?;
+    drop(f); // Windows: rename 前必须先关句柄
+    std::fs::rename(&tmp_path, out_path).map_err(|e| {
+        format!("写入 {out_path} 失败(若该文件正在 PowerPoint/WPS 中打开,请先关闭再重试): {e}")
+    })?;
+    guard.1 = false; // 已成功落位,守卫不再清理
     Ok(json!({
         "ok": true,
         "out": out_path,
@@ -225,11 +250,24 @@ fn slide_xml(cx: u64, cy: u64, text_boxes: &str) -> String {
     )
 }
 
+/// XML 转义 + 过滤 XML 1.0 非法字符。控制字符(\x00-\x08 \x0B \x0C \x0E-\x1F)和
+/// U+FFFE/U+FFFF **转义也救不了**(`&#x7;` 同样非法),必须丢弃 —— spec 是模型产出的
+/// JSON(`"ab"` 合法)、deck 文本来自 DOM,都现实可达,带入即 Office 拒开。
 pub(crate) fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' | '\n' | '\r' => out.push(c),
+            c if (c as u32) < 0x20 => {}
+            '\u{FFFE}' | '\u{FFFF}' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 把一页的文本 rects(窗口 px)生成文本框 OOXML。窗口 px → slide EMU 按比例;
@@ -255,13 +293,22 @@ fn text_boxes_xml(rects: &[Value], cx: u64, cy: u64, win_w: u32, win_h: u32, edi
         if text.is_empty() || pw <= 0.0 || ph <= 0.0 {
             continue;
         }
-        let ex = (getf("x") * cx as f64 / win_w as f64).round() as i64;
-        let ey = (getf("y") * cy as f64 / win_h as f64).round() as i64;
+        // 数值钳制:rect 来自页面 JS(不可信),越界值会写出 OOXML schema 非法数 →
+        // Office「需要修复」。坐标钳到画布 ±1 幅,字号钳 ST_TextFontSize(100..400000)。
+        let cl = |v: f64, lo: i64, hi: i64| -> i64 {
+            if !v.is_finite() {
+                return lo.max(0);
+            }
+            (v.round() as i64).clamp(lo, hi)
+        };
+        let (cxi, cyi) = (cx as i64, cy as i64);
+        let ex = cl(getf("x") * cx as f64 / win_w as f64, -cxi, cxi * 2);
+        let ey = cl(getf("y") * cy as f64 / win_h as f64, -cyi, cyi * 2);
         // 可编辑版宽度 +4%:浏览器断行点 ≠ PowerPoint 断行点,留余量防多折一行。
         let wbuf = if editable { 1.04 } else { 1.0 };
-        let ew = (pw * wbuf * cx as f64 / win_w as f64).round() as i64;
-        let eh = (ph * cy as f64 / win_h as f64).round() as i64;
-        let sz = (getf("size").max(8.0) * 75.0).round() as i64;
+        let ew = cl(pw * wbuf * cx as f64 / win_w as f64, 1, cxi * 2);
+        let eh = cl(ph * cy as f64 / win_h as f64, 1, cyi * 2);
+        let sz = cl(getf("size").max(8.0) * 75.0, 100, 400_000);
         let bold = if r.get("bold").and_then(|v| v.as_bool()).unwrap_or(false) { 1 } else { 0 };
         if editable {
             let italic = if r.get("italic").and_then(|v| v.as_bool()).unwrap_or(false) { 1 } else { 0 };
@@ -282,8 +329,9 @@ fn text_boxes_xml(rects: &[Value], cx: u64, cy: u64, win_w: u32, win_h: u32, edi
             // 安全字体链:中文 ea 必须写,否则 CJK 落到 latin 字体出豆腐块。
             let (latin, ea) = if serif { ("Georgia", "SimSun") } else { ("Calibri", "Microsoft YaHei") };
             let lh = getf("lh");
-            let lnspc = if lh > 0.0 {
-                format!("<a:lnSpc><a:spcPts val=\"{}\"/></a:lnSpc>", (lh * 75.0).round() as i64)
+            let lnspc = if lh > 0.0 && lh.is_finite() {
+                // spcPts 上限 158400(ST_TextSpacingPoint),越界同样触发修复。
+                format!("<a:lnSpc><a:spcPts val=\"{}\"/></a:lnSpc>", cl(lh * 75.0, 1, 158_400))
             } else {
                 String::new()
             };
@@ -375,9 +423,7 @@ pub fn screenshot(
     {
         url_or_file.to_string()
     } else {
-        let abs = std::fs::canonicalize(url_or_file)
-            .map_err(|e| format!("找不到文件 {url_or_file}: {e}"))?;
-        format!("file://{}", abs.to_string_lossy().replace('\\', "/"))
+        crate::forge::path_to_file_url(url_or_file)?
     };
     let mut args: Vec<String> = vec![
         "--headless=new".into(),
@@ -425,8 +471,7 @@ pub fn extract_text_rects(deck: &str, slide: usize, width: u32, height: u32) -> 
     {
         deck.to_string()
     } else {
-        let abs = std::fs::canonicalize(deck).map_err(|e| format!("找不到 deck {deck}: {e}"))?;
-        format!("file://{}", abs.to_string_lossy().replace('\\', "/"))
+        crate::forge::path_to_file_url(deck)?
     };
     let url = format!("{file_base}?export=1&extract=1#/{slide}");
     // --virtual-time-budget 让 chromium 跑完页面 JS(含 load/rAF)后退出,--dump-dom 输出最终 DOM。
@@ -545,8 +590,7 @@ fn resolve_deck_pages(deck: &str, slides_override: Option<usize>) -> Result<(Str
                 ));
             }
         }
-        let abs = std::fs::canonicalize(deck).map_err(|e| format!("找不到 deck {deck}: {e}"))?;
-        format!("file://{}", abs.to_string_lossy().replace('\\', "/"))
+        crate::forge::path_to_file_url(deck)?
     };
     let n = match slides_override {
         Some(n) if n > 0 => n,
@@ -698,16 +742,27 @@ pub fn validate_pptx(path: &str) -> Result<PptxValidation, String> {
 mod tests {
     use super::*;
 
+    /// 最小合法 PNG 头(签名 + IHDR 尺寸):打包器按魔数认格式,夹具必须是真 PNG 字节。
+    fn tiny_png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(&[0, 0, 0, 13]);
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 6, 0, 0, 0]);
+        v
+    }
+
     // 原生验证打包器(在 cargo test 所在 OS 上跑——Windows 宿主即验 win 路径):
-    // 喂任意字节当「图」(build_pptx 只为取尺寸才解析 PNG，非 PNG 退 16:9)，验产出是合法 zip 结构。
+    // 喂最小 PNG 头当「图」,验产出是合法 zip 结构。
     #[test]
     fn build_pptx_produces_valid_package() {
         let dir = std::env::temp_dir().join("polaris_forge_pptx_test");
         let _ = std::fs::create_dir_all(&dir);
         let img1 = dir.join("a.png");
         let img2 = dir.join("b.png");
-        std::fs::write(&img1, b"fake-image-bytes-1").unwrap();
-        std::fs::write(&img2, b"fake-image-bytes-2").unwrap();
+        std::fs::write(&img1, tiny_png(1280, 720)).unwrap();
+        std::fs::write(&img2, tiny_png(1280, 720)).unwrap();
         let out = dir.join("out.pptx");
         let r = build_pptx(
             &[img1.to_string_lossy().into(), img2.to_string_lossy().into()],
@@ -741,7 +796,7 @@ mod tests {
         let dir = std::env::temp_dir().join("polaris_forge_textlayer");
         let _ = std::fs::create_dir_all(&dir);
         let img = dir.join("a.png");
-        std::fs::write(&img, b"fake").unwrap();
+        std::fs::write(&img, tiny_png(1280, 720)).unwrap();
         let out = dir.join("out.pptx");
         let rects = vec![vec![serde_json::json!(
             {"text":"Hello<World>","x":50.0,"y":40.0,"w":200.0,"h":46.0,"size":40.0,"bold":true}
@@ -773,7 +828,7 @@ mod tests {
         let dir = std::env::temp_dir().join("polaris_forge_editlayer");
         let _ = std::fs::create_dir_all(&dir);
         let img = dir.join("a.png");
-        std::fs::write(&img, b"fake").unwrap();
+        std::fs::write(&img, tiny_png(1280, 720)).unwrap();
         let out = dir.join("out.pptx");
         let rects = vec![vec![serde_json::json!({
             "text":"• 真可编辑","x":50.0,"y":40.0,"w":200.0,"h":46.0,"size":40.0,
@@ -805,7 +860,7 @@ mod tests {
         let dir = std::env::temp_dir().join("polaris_forge_editlayer_bad");
         let _ = std::fs::create_dir_all(&dir);
         let img = dir.join("a.png");
-        std::fs::write(&img, b"fake").unwrap();
+        std::fs::write(&img, tiny_png(1280, 720)).unwrap();
         let out = dir.join("out.pptx");
         let rects = vec![vec![serde_json::json!({
             "text":"x","x":1.0,"y":1.0,"w":10.0,"h":10.0,"size":12.0,
@@ -835,7 +890,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let img = base.join("a.png");
         std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(&img, b"x").unwrap();
+        std::fs::write(&img, tiny_png(1280, 720)).unwrap();
         let out = base.join("deep/nested/dir/out.pptx"); // deep/nested/dir 不存在
         let r = build_pptx(&[img.to_string_lossy().into()], &out.to_string_lossy());
         assert!(r.is_ok(), "应自动建父目录并成功: {r:?}");

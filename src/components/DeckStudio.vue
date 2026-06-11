@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import { usePolling } from "../composables/usePolling";
 import {
   Presentation,
@@ -19,7 +19,7 @@ import {
 } from "@lucide/vue";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
-import { artifacts as artifactsApi, chat as chatApi, type AttachedFile } from "../tauri";
+import { artifacts as artifactsApi, chat as chatApi, skills as skillsApi, type AttachedFile, type Skill } from "../tauri";
 import { useFileDrop } from "../composables/useFileDrop";
 import { groupedThemes, findTheme, type DeckTheme } from "../lib/deckThemes";
 import { specPreviewHtml } from "../lib/slidesSpec";
@@ -49,16 +49,17 @@ const charCount = computed(() => contentText.value.length);
 const uploads = ref<AttachedFile[]>([]);
 const uploading = ref(false);
 
-const selectedTheme = ref("minimal-white");
+const selectedTheme = ref("auto"); // 默认 AI 自由发挥(视内容而定,走高级路线)
 const groups = groupedThemes(true);
 const curTheme = computed<DeckTheme>(() => findTheme(selectedTheme.value));
 
 const slideCount = ref(12);
-const autoSlides = ref(false); // AI 自己决定页数
+const autoSlides = ref(true); // 默认 AI 按篇幅与重点自己决定页数
 const aspect = ref<"16:9" | "4:3">("16:9");
-type Density = "low" | "med" | "high";
-const density = ref<Density>("med");
+type Density = "auto" | "low" | "med" | "high";
+const density = ref<Density>("auto");
 const DENSITIES: { id: Density; label: string; hint: string }[] = [
+  { id: "auto", label: "AI 决定", hint: "由 AI 按内容与重点自行把握，每页不必统一" },
   { id: "low", label: "极简", hint: "每页一句话 · 大字 · 演讲投影型" },
   { id: "med", label: "适中", hint: "标题 + 3-4 个要点 · 通用" },
   { id: "high", label: "信息密", hint: "图表/对比/多卡片 · 阅读型" },
@@ -67,12 +68,29 @@ const DENSITIES: { id: Density; label: string; hint: string }[] = [
 // 自定义风格：在所选主题基础上叠加用户的风格描述
 const customStyle = ref("");
 
-// 可叠加的「增强技能」——勾选后随对话一起注入，让 AI 制作时调用
-const ENHANCERS: { id: string; label: string; hint: string }[] = [
-  { id: "deep-research", label: "深度搜索", hint: "先联网研究、把内容补全/查证" },
-  { id: "image-gen", label: "AI 配图", hint: "为页面生成插图/配图" },
-  { id: "pdf", label: "读 PDF", hint: "解析上传的 PDF 素材" },
+// 可叠加的「增强技能」——与对话框同源:list_skills 全量技能库,点选后随对话一起注入。
+// polaris-deck-studio 本体恒注入,不在列表里重复展示。
+const FALLBACK_SKILLS: Skill[] = [
+  { id: "deep-research", name: "深度搜索", description: "先联网研究、把内容补全/查证", source: "official" },
+  { id: "image-gen", name: "AI 配图", description: "为页面生成插图/配图", source: "official" },
+  { id: "pdf", name: "读 PDF", description: "解析上传的 PDF 素材", source: "official" },
 ];
+const skillsList = ref<Skill[]>([]);
+const skillSearch = ref("");
+async function loadSkills() {
+  try {
+    skillsList.value = await skillsApi.list();
+  } catch {
+    skillsList.value = FALLBACK_SKILLS;
+  }
+}
+onMounted(loadSkills);
+function filteredSkills(): Skill[] {
+  const base = skillsList.value.filter((s) => s.id !== "polaris-deck-studio");
+  const q = skillSearch.value.trim().toLowerCase();
+  if (!q) return base;
+  return base.filter((s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q));
+}
 const extraSkills = ref<string[]>([]);
 function toggleSkill(id: string) {
   const i = extraSkills.value.indexOf(id);
@@ -129,11 +147,10 @@ function densityText(): string {
 function buildPrompt(): string {
   const themeLine =
     selectedTheme.value === "auto"
-      ? "AI 自由发挥 —— 默认走**高级感**路线：优先从深色/质感主题里按内容择一(" +
-        "`aurora`(极光渐变辉光) / `glassmorphism`(毛玻璃) / `pitch-deck-vc`(融资路演) / " +
-        "`vaporwave`(蒸汽波) / `cyberpunk-neon`(赛博霓虹) / `tokyo-night`(东京夜))，" +
-        "**不要用白底**，做出深底+渐变强调色+超大标题+克制留白、一眼高级、有感染力的观感；" +
-        "仅当内容明显属于学术/公文/财报等需要素白严肃的场景，才退回浅色主题。"
+      ? "AI 自由发挥 —— 视觉方向由你根据内容的气质与场景自行决定：从 skill 的 themes.css 全部 " +
+        "`data-theme` 主题里挑最贴合的一个，也可在所选主题之上自行调配色与版式。两条硬要求：" +
+        "①**必须基于 polaris-deck-studio(open-design) 的引擎与主题体系制作**，别脱离 skill 自起炉灶；" +
+        "②观感**必须高级**——讲究的版式层级、克制的配色、超大标题与留白，一眼有设计感，拒绝平庸的默认观感。"
       : `${curTheme.value.name}（data-theme id=${selectedTheme.value}）`;
   const lines = [
     "请使用 polaris-deck-studio skill 制作一份演示。",
@@ -145,16 +162,21 @@ function buildPrompt(): string {
     `- 主题：${themeLine}${isPpt.value ? "——传统 PPT 用 spec 内置 6 色板,从中选气质最接近所选主题的一个" : ""}`,
     `- 画幅比例：${aspect.value}`,
     autoSlides.value
-      ? "- 页数：由你按内容自动决定（内容多则多页、少则少页，别硬凑也别硬砍）"
+      ? "- 页数：由你按篇幅与重点自行决定（内容多则多页、少则少页，重点处展开讲透，别硬凑也别硬砍）"
       : `- 页数：约 ${slideCount.value} 页（含封面与结尾，按内容增减）`,
-    `- 信息密度：${density.value} —— ${densityText()}`,
+    density.value === "auto"
+      ? "- 信息密度：由你按内容与重点自行决定（重点页可密、过渡页可简，不必每页统一）"
+      : `- 信息密度：${density.value} —— ${densityText()}`,
   ];
   if (customStyle.value.trim()) {
     lines.push(`- 自定义风格补充：${customStyle.value.trim()}（在所选主题基础上按此调整，与主题冲突时以此为准）`);
   }
   if (extraSkills.value.length) {
-    const names = ENHANCERS.filter((e) => extraSkills.value.includes(e.id)).map((e) => e.label).join("、");
-    lines.push(`- 已启用增强技能：${names}——制作时按需调用（如先研究补全内容、为页面配图、解析 PDF）。`);
+    const names = skillsList.value
+      .filter((s) => extraSkills.value.includes(s.id))
+      .map((s) => s.name)
+      .join("、") || extraSkills.value.join("、");
+    lines.push(`- 已启用增强技能：${names}——制作时按需调用（如先研究补全内容、为页面配图、解析素材）。`);
   }
   if (uploads.value.length) {
     lines.push("", "## 素材文件（先 Read 它们作为内容来源）");
@@ -165,7 +187,7 @@ function buildPrompt(): string {
   lines.push("", "## 要求");
   if (isPpt.value) {
     lines.push(
-      "- 严格按 SKILL.md「传统 PPT(spec 路线)」：把内容编排成 polaris.slides.json（7 种版式，标题短、要点凝练，每页可带 notes 口播稿），存到产物目录。",
+      "- 严格按 SKILL.md「传统 PPT(spec 路线)」：把内容编排成 polaris.slides.json（9 种版式：title/section/bullets/two-col/compare/stats/timeline/quote/closing，按信息类型混排别通篇 bullets，标题短、要点凝练，每页可带 notes 口播稿），存到产物目录。",
       "- 然后用 Polaris 自带 CLI 转换：`polaris-forge spec-pptx --spec=<产物目录>/polaris.slides.json --out=<产物目录>/演示.pptx`（CLI 在 ~/Polaris/bin/，Windows 为 polaris-forge.exe）。",
       "- 若 CLI 不存在也不用慌：把 spec 按上述文件名存好即可，Polaris 会自动完成转换。",
     );
@@ -280,7 +302,7 @@ const lastToolHint = computed(() => {
   }
   return "";
 });
-const outputs = ref<{ path: string; name: string }[]>([]);
+const outputs = ref<{ path: string; name: string; modified: number }[]>([]);
 const hasResult = computed(() => outputs.value.length > 0);
 const previewHtml = ref<string>("");
 const previewPath = ref<string>("");
@@ -292,7 +314,9 @@ async function loadOutputs() {
   if (!convId.value) return;
   try {
     const list = await artifactsApi.list(convId.value);
-    const hits = list.filter((e) => outRe.value.test(e.name)).map((e) => ({ path: e.path, name: e.name }));
+    const hits = list
+      .filter((e) => outRe.value.test(e.name))
+      .map((e) => ({ path: e.path, name: e.name, modified: e.modified ?? 0 }));
     const want = isPpt.value ? ".pptx" : ".html";
     hits.sort((a, b) => Number(b.name.toLowerCase().endsWith(want)) - Number(a.name.toLowerCase().endsWith(want)));
     outputs.value = hits;
@@ -305,7 +329,10 @@ async function loadOutputs() {
 // 不能按「路径没变就跳过」短路:继续修改是覆盖写原文件(文件名不变),必须重读;
 // 但内容没变就不动 srcdoc,免得轮询期间 iframe 无谓重载、丢掉当前翻页。
 async function loadPreview() {
-  const htmlOut = outputs.value.find((o) => /\.html?$/i.test(o.name));
+  // 传统PPT模式下 spec 优先:导出引擎吃的是 spec,预览必须与导出同构(「预览即导出」)。
+  // 模型顺手写的 html 只在没有 spec 时才当预览用。
+  const specFirst = isPpt.value && outputs.value.some((o) => /polaris\.slides\.json$/i.test(o.name));
+  const htmlOut = specFirst ? undefined : outputs.value.find((o) => /\.html?$/i.test(o.name));
   if (htmlOut) {
     try {
       const p = await artifactsApi.read(htmlOut.path);
@@ -335,10 +362,14 @@ async function loadPreview() {
 }
 
 // 兜底转换:模型只写了 spec(CLI 不在/没跑成)→ 桌面端自己调原生引擎出 .pptx。
+// 「继续修改」只改 spec 不重转 pptx 是常态 → 按 mtime 判旧:pptx 比 spec 旧就重转,
+// 否则用户拿到的导出永远停在第一版。
 async function ensureSpecConverted() {
   if (!isPpt.value) return;
   const spec = outputs.value.find((o) => /polaris\.slides\.json$/i.test(o.name));
-  if (!spec || outputs.value.some((o) => /\.pptx$/i.test(o.name))) return;
+  if (!spec) return;
+  const pptx = outputs.value.find((o) => /\.pptx$/i.test(o.name));
+  if (pptx && pptx.modified >= spec.modified) return;
   try {
     const out = spec.path.replace(/polaris\.slides\.json$/i, "演示.pptx");
     await artifactsApi.specToPptx(spec.path, out);
@@ -455,18 +486,23 @@ function fillDemo() {
 
         <div class="dk-side-sec">
           <div class="dk-side-title">增强技能 · 可选</div>
-          <div class="dk-skills">
+          <input v-model="skillSearch" class="dk-skill-search" type="text" placeholder="搜索技能…" />
+          <div class="dk-skill-list">
             <button
-              v-for="e in ENHANCERS"
-              :key="e.id"
-              class="dk-skill"
-              :class="{ on: extraSkills.includes(e.id) }"
-              :title="e.hint"
-              @click="toggleSkill(e.id)"
-            >{{ e.label }}</button>
+              v-for="s in filteredSkills()"
+              :key="s.id"
+              class="dk-skill-item"
+              :class="{ on: extraSkills.includes(s.id) }"
+              :title="s.description"
+              @click="toggleSkill(s.id)"
+            >
+              <span class="dk-skill-name">{{ s.name }}</span>
+              <span class="dk-skill-desc">{{ s.description }}</span>
+            </button>
+            <span v-if="!filteredSkills().length" class="dk-note">没有匹配的技能</span>
           </div>
           <span class="dk-note">
-            勾选后 AI 制作时会调用这些技能（如先联网补全内容、为页面配图）。选「AI 自由发挥」风格时尤其好用。
+            与对话框同一个技能库。点选叠加，AI 制作时会按需调用（如先联网补全内容、为页面配图）。
           </span>
         </div>
 
@@ -606,9 +642,15 @@ function fillDemo() {
 .dk-check input { accent-color: var(--primary); }
 .dk-custom { resize: none; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 11.5px; line-height: 1.5; }
 .dk-custom:focus { outline: none; border-color: var(--primary); }
-.dk-skills { display: flex; flex-wrap: wrap; gap: 5px; }
-.dk-skill { padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-2); font-size: 11px; cursor: pointer; }
-.dk-skill.on { border-color: var(--primary); background: var(--primary-soft); color: var(--primary-deep); font-weight: 600; }
+.dk-skill-search { padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 11.5px; }
+.dk-skill-search:focus { outline: none; border-color: var(--primary); }
+.dk-skill-list { display: flex; flex-direction: column; gap: 5px; max-height: 220px; overflow-y: auto; }
+.dk-skill-item { display: flex; flex-direction: column; gap: 2px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); cursor: pointer; text-align: left; }
+.dk-skill-item:hover { border-color: var(--primary); }
+.dk-skill-item.on { border-color: var(--primary); background: var(--primary-soft); }
+.dk-skill-name { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+.dk-skill-item.on .dk-skill-name { color: var(--primary-deep); }
+.dk-skill-desc { font-size: 10px; color: var(--muted); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 .dk-out { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--primary); border-radius: 7px; background: var(--primary-soft); color: var(--primary-deep); font-size: 11.5px; font-weight: 600; cursor: pointer; }
 .dk-out span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

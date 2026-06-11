@@ -47,7 +47,7 @@ const PVS_WORKFLOW: &str =
 // 与 PVS 同套路：全部编译期内嵌、启动时确保落到 ~/Polaris/skills（靠 DECK_VERSION 比对覆盖）。
 const DECK_ID: &str = "polaris-deck-studio";
 // 改动任一内嵌资源后必须 +1，让已安装用户下次启动拿到更新。
-const DECK_VERSION: &str = "4";
+const DECK_VERSION: &str = "5";
 const DECK_SKILL_MD: &str = include_str!("templates/skills/polaris-deck-studio/SKILL.md");
 const DECK_LICENSE: &str = include_str!("templates/skills/polaris-deck-studio/LICENSE");
 const DECK_BASE_CSS: &str = include_str!("templates/skills/polaris-deck-studio/assets/base.css");
@@ -102,7 +102,12 @@ const WECHAT_TS_ID: &str = "wechat-md-typesetter";
 //     publish-image=切片转 dataURL→File→合成 paste 贴进编辑器(原生欢迎零清洗)→等 img 落位/
 //     换 mmbiz 外链→真文字导语(--intro)→填标题→存草稿。MediaOps 加「长图模式」开关(__longimg,
 //     隐式带上本技能)。snapshot 已本地实测(单/多切片+段落切点目检);publish-image 待真机。
-const WECHAT_TS_VERSION: &str = "8";
+// v9：耗时根治+保存前移——snapshot 整页只成像一次(Pillow 本地裁切,缺 Pillow 退回逐段截图);
+//     publish-image 贴图改「落位即贴下一张」,换 mmbiz 外链统一收尾等一轮(此前逐张串行死等
+//     +累计判定级联烧满超时,是「传半天」的根因);file-input 通道缓存有效 input;
+//     **填标题+首次保存挪到贴图之前**(草稿条目先进草稿箱——此前全贴完才保存,进程中途被
+//     上层超时杀掉→保存从未执行→草稿箱空,用户实证);保存等回执期间点掉挡路确认弹窗。
+const WECHAT_TS_VERSION: &str = "9";
 const WECHAT_TS_SKILL_MD: &str =
     include_str!("templates/skills/wechat-md-typesetter/SKILL.md");
 const WECHAT_TS_YIBAN_PY: &str =

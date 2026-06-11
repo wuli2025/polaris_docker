@@ -1,7 +1,7 @@
 /**
  * polaris.slides.json(传统PPT spec)→ 预览 HTML 的确定性渲染器。
  *
- * 与 Rust 端 forge_pptx_native.rs 同源同构:6 色板 / 7 版式一一对应,
+ * 与 Rust 端 forge_pptx_native.rs 同源同构:6 色板 / 9 版式一一对应,
  * 预览即导出(结构同源,不会预览一个样导出一个样)。纯函数,无副作用,
  * 产出完整 HTML 文档字符串喂 iframe srcdoc(sandbox=allow-scripts 下无脚本也可渲染)。
  */
@@ -19,7 +19,15 @@ export interface SlidePage {
   points?: (string | { text?: string; sub?: string[] })[];
   left?: SpecCol;
   right?: SpecCol;
-  items?: { head?: string; body?: string; points?: (string | { text?: string; sub?: string[] })[] }[];
+  items?: {
+    head?: string;
+    body?: string;
+    points?: (string | { text?: string; sub?: string[] })[];
+    value?: string;
+    label?: string;
+    desc?: string;
+  }[];
+  steps?: { head?: string; body?: string }[];
   text?: string;
   by?: string;
   notes?: string;
@@ -111,6 +119,35 @@ function slideHtml(sl: SlidePage, pal: Palette): string {
       inner = `${headerHtml(sl.title)}<div class="cmp" style="--n:${items.length || 1}">${cards}</div>`;
       break;
     }
+    case "stats": {
+      const items = Array.isArray(sl.items) ? sl.items.slice(0, 4) : [];
+      const cards = items
+        .map(
+          (it) => `<div class="card stat">
+            ${it.value ? `<div class="num">${esc(it.value)}</div>` : ""}
+            ${it.label ? `<div class="nlabel">${esc(it.label)}</div>` : ""}
+            ${it.desc ? `<div class="ndesc">${esc(it.desc)}</div>` : ""}
+          </div>`,
+        )
+        .join("");
+      inner = `${headerHtml(sl.title)}<div class="cmp stats" style="--n:${items.length || 1}">${cards}</div>`;
+      break;
+    }
+    case "timeline": {
+      const steps = Array.isArray(sl.steps) ? sl.steps.slice(0, 5) : [];
+      const cells = steps
+        .map(
+          (st, i) => `<div class="step"><div class="dot">${i + 1}</div>
+            ${st.head ? `<div class="shead">${esc(st.head)}</div>` : ""}
+            ${st.body
+              ? `<div class="sbody">${st.body.split("\n").filter((l) => l.trim()).map((l) => `<p>${esc(l.trim())}</p>`).join("")}</div>`
+              : ""}
+          </div>`,
+        )
+        .join("");
+      inner = `${headerHtml(sl.title)}<div class="tl" style="--n:${steps.length || 1}">${cells}</div>`;
+      break;
+    }
     case "quote":
       inner = `<div class="quote"><div class="qmark">“</div>
         <p class="qtext">${esc(sl.text ?? "")}</p>
@@ -161,6 +198,18 @@ export function specPreviewHtml(spec: SlideSpec | string): string | null {
   .card{background:${pal.card};border:1px solid ${pal.cardLine};border-radius:10px;padding:5.5% 5%;min-height:0}
   .chead{color:${pal.accent};font-weight:700;font-size:clamp(12px,1.8vw,17px);margin-bottom:.6em}
   .card p{font-size:clamp(11px,1.5vw,14px);margin-bottom:.45em}
+  .stats{margin-top:3%}
+  .stat{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:7% 4%}
+  .num{color:${pal.accent};font-weight:800;font-size:clamp(24px,4.6vw,46px);line-height:1.1}
+  .nlabel{font-weight:700;font-size:clamp(11px,1.7vw,16px);margin-top:.5em}
+  .ndesc{color:${pal.muted};font-size:clamp(10px,1.4vw,12px);margin-top:.4em}
+  .tl{display:grid;grid-template-columns:repeat(var(--n),1fr);gap:2.2%;position:relative;margin-top:4%}
+  .tl::before{content:"";position:absolute;left:10%;right:10%;top:21px;height:3px;background:${pal.cardLine}}
+  .step{display:flex;flex-direction:column;align-items:center;text-align:center;position:relative;z-index:1}
+  .dot{width:44px;height:44px;border-radius:50%;background:${pal.accent};color:${pal.bg1};font-weight:800;font-size:18px;display:flex;align-items:center;justify-content:center}
+  .shead{font-weight:700;font-size:clamp(11px,1.7vw,16px);margin-top:.7em}
+  .sbody{color:${pal.muted};font-size:clamp(10px,1.4vw,13px);margin-top:.4em}
+  .sbody p{margin-bottom:.3em}
   .quote{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 12%}
   .qmark{color:${pal.accent};font-size:clamp(48px,9vw,96px);font-weight:800;line-height:.6;align-self:flex-start;margin-left:-2%}
   .qtext{font-size:clamp(16px,2.6vw,26px);font-style:italic;margin-top:14px}
