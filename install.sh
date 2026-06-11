@@ -22,7 +22,9 @@ cat <<'EOF'
 
 [polaris] ✅ 安装包已就绪。下一步：
   1) 编辑 .env 填鉴权（ANTHROPIC_API_KEY 或 ANTHROPIC_BASE_URL+TOKEN；公网务必设 POLARIS_AUTH_TOKEN）
-  2) docker compose up -d         # 自动拉取 GHCR 预构建镜像并启动（无需本地构建）
-  3) 浏览器打开 http://localhost:8080
+  2) docker login ghcr.io -u wuli2025   # 镜像私有,首次需登录(密码=GitHub PAT,勾 read:packages)
+     #   没有访问权限？用 docker-compose.build.yml 从源码本地构建(见 DOCKER.md)
+  3) docker compose up -d               # 拉取 GHCR 预构建镜像并启动
+  4) 浏览器打开 http://localhost:8080
   以后远程更新： ./update.sh
 EOF

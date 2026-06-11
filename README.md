@@ -25,6 +25,10 @@ cp .env.example .env      # 编辑填鉴权
 docker compose up -d      # 自动拉 ghcr.io/wuli2025/polaris:latest
 ```
 
+> **镜像为私有**（仓库保持 private 的决策）：`docker compose up -d` 拉取前需先登录一次 GHCR：
+> `docker login ghcr.io -u wuli2025`（密码用 GitHub PAT，勾 `read:packages` 权限即可，登录一次永久有效）。
+> 不想登录的话用 `docker-compose.build.yml` 从源码本地构建（见第三节）。
+
 镜像口味（`POLARIS_TAG`）：
 
 | TAG | 内容 | 体积 |
