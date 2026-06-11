@@ -3,7 +3,7 @@
 把 Polaris（Tauri 桌面 AI 工作台）跑成**浏览器访问的容器服务**，与桌面版**共用同一份源码**。
 镜像由 GitHub Actions 构建并推送到 **GHCR**，用户侧一条 `./update.sh` 即可**远程更新**——不本地重建、不丢数据。
 
-当前版本：**v1.0.2**（含「传统 PPT 可编辑化 + spec 原生导出」）。
+当前版本：**v1.0.3**（含「传统 PPT 可编辑化 + spec 原生导出」）。
 
 ---
 
@@ -33,8 +33,8 @@ docker compose up -d      # 自动拉 ghcr.io/wuli2025/polaris:latest
 
 | TAG | 内容 | 体积 |
 | --- | --- | --- |
-| `latest` / `1.0.2`（默认 slim） | 聊天 / KB / 网站生成 + **传统 PPT 原生导出**（零浏览器） | 小 |
-| `full` / `1.0.2-full` | 上面 + chromium + ffmpeg + CJK 字体（deck 截图 PPT / 视频） | 大 |
+| `latest` / `1.0.3`（默认 slim） | 聊天 / KB / 网站生成 + **传统 PPT 原生导出**（零浏览器） | 小 |
+| `full` / `1.0.3-full` | 上面 + chromium + ffmpeg + CJK 字体（deck 截图 PPT / 视频） | 大 |
 
 ```bash
 # 要 full：
