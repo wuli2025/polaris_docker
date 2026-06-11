@@ -106,9 +106,12 @@ $askpass = Join-Path $env:TEMP "nas_askpass.cmd"
 if (-not (Test-Path $askpass)) {
     Write-Host "  需要 NAS $NasUser 的 SSH 密码来 docker load + restart。" -ForegroundColor Yellow
     $pwdSecure = Read-Host "  请输入 NAS $NasUser 密码" -AsSecureString
-    $pwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    $nasPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pwdSecure))
-    Set-Content -Path $askpass -Value "@echo $pwd" -Encoding ascii
+    Set-Content -Path $askpass -Value "@echo $nasPwd" -Encoding ascii
+} else {
+    # 从本机 askpass 文件取回密码给 sudo -S 用——密码只存在于本机临时文件，绝不写进仓库
+    $nasPwd = (Get-Content $askpass -First 1) -replace '^@echo ', ''
 }
 $env:SSH_ASKPASS = $askpass
 $env:SSH_ASKPASS_REQUIRE = "force"
@@ -119,11 +122,11 @@ $dockerNas = "/var/packages/ContainerManager/target/usr/bin/docker"
 $projDir   = "/volume1/tx/群晖/polaris-app"
 $restartCmd = @"
 echo '[1/3] docker load';
-echo 'ChaoGeek2026' | sudo -S $dockerNas load -i '$TarOnNas' 2>&1 | tail -3;
+echo '$nasPwd' | sudo -S $dockerNas load -i '$TarOnNas' 2>&1 | tail -3;
 echo '[2/3] docker tag image to polaris-web:latest so compose can find it';
-echo 'ChaoGeek2026' | sudo -S $dockerNas tag $Image polaris-web:latest 2>&1;
+echo '$nasPwd' | sudo -S $dockerNas tag $Image polaris-web:latest 2>&1;
 echo '[3/3] docker compose up -d (no-build)';
-cd '$projDir' && echo 'ChaoGeek2026' | sudo -S bash -c "cd '$projDir' && POLARIS_RENDER=0 POLARIS_TAG='$Tag' $dockerNas compose -f docker-compose.synology.yml up -d --no-build" 2>&1 | tail -10;
+cd '$projDir' && echo '$nasPwd' | sudo -S bash -c "cd '$projDir' && POLARIS_RENDER=0 POLARIS_TAG='$Tag' $dockerNas compose -f docker-compose.synology.yml up -d --no-build" 2>&1 | tail -10;
 "@
 ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no `
     -o ConnectTimeout=10 -o StrictHostKeyChecking=no `
