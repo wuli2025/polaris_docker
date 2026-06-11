@@ -698,8 +698,9 @@ fn do_docker_update(a: &Value) -> Result<Value, String> {
         }));
     }
 
-    // 3) 真正执行。update.sh 内部是 `docker compose pull && up -d`，会替换当前容器本身；
-    //    我们的进程会在 up -d 时被 SIGTERM 干掉，这是预期行为，浏览器随后会断连。
+    // 3) 真正执行。update.sh 在容器内不直接跑 pull/up -d（compose 客户端会随旧容器
+    //    一起被杀，新容器永远起不来）——它派出一个独立"替身"容器去做 pull + up -d，
+    //    自己几秒内就返回。替身完成拉取后才替换当前容器，届时本进程被 SIGTERM 是预期行为。
     use std::process::Command;
     let out = Command::new(script)
         .env("POLARIS_TAG", &tag)
@@ -714,7 +715,7 @@ fn do_docker_update(a: &Value) -> Result<Value, String> {
         "tag": tag,
         "stdout": stdout,
         "stderr": stderr,
-        "note": "返回此响应后 update.sh 已在重建容器。HTTP 连接会断开，等几秒刷新即可。",
+        "note": "替身更新容器已出发：拉取新镜像完成后会替换当前容器（约 1~3 分钟，取决于网速），届时连接断开，稍后刷新页面即可。",
     }))
 }
 

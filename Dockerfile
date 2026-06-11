@@ -167,14 +167,21 @@ RUN echo "${POLARIS_VERSION}" > /app/VERSION.bak \
     && if [ "$(cat /app/VERSION | tr -d '[:space:]')" = "dev" ] || [ -z "$(cat /app/VERSION)" ]; then \
          echo "${POLARIS_VERSION}" > /app/VERSION; \
        fi
-# update.sh 拷进镜像 → /usr/local/bin/update.sh;容器内能 spawn 它触发 pull+upd 重建。
-# 它内部会 `cd $(dirname $0)` 找 docker-compose.yml,所以配套把 compose 拷到 update-bundles/。
+# docker CLI + compose 插件:容器内一键更新(update.sh 替身模式)要真 CLI 操作宿主 daemon。
+# 纯客户端不装 daemon(docker-ce-cli ~50MB + compose-plugin ~60MB)。
+# 源用清华 TUNA 镜像:Windows 构建机(中国网络)和 GitHub Actions 都可达。
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian bookworm stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# update.sh 拷进镜像 → /usr/local/bin/update.sh;容器内 spawn 它派出替身容器完成 pull+重建。
+# (替身经容器自身的 compose 标签定位宿主 compose 项目目录,无需把 compose 文件打进镜像。)
 COPY update.sh /usr/local/bin/update.sh
-COPY docker-compose.yml /app/update-bundles/docker-compose.yml
-COPY docker-compose.synology.yml /app/update-bundles/docker-compose.synology.yml
 RUN sed -i 's/\r$//' /usr/local/bin/update.sh \
-    && chmod +x /usr/local/bin/update.sh \
-    && chmod +x /app/update-bundles/docker-compose.yml /app/update-bundles/docker-compose.synology.yml
+    && chmod +x /usr/local/bin/update.sh
 
 # 引擎二进制 + 前端静态 + 资源种子
 COPY --from=server /usr/local/bin/polaris-server /usr/local/bin/polaris-server

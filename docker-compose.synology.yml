@@ -25,7 +25,9 @@ services:
       args:
         # 要在群晖出 PPT/视频，设为 1 构建 full(+chromium+CJK字体+ffmpeg)；只用聊天/KB/网站保持 0。
         POLARIS_RENDER: "${POLARIS_RENDER:-0}"
-    image: polaris-web:latest
+    # 镜像名对齐 GHCR:一键更新/compose pull 拉的就是 CI 推的新镜像。
+    # Windows 构建→NAS load 流程里,load 后打同名 tag: docker tag polaris-web:latest ghcr.io/wuli2025/polaris:latest
+    image: ${POLARIS_IMAGE:-ghcr.io/wuli2025/polaris}:${POLARIS_TAG:-latest}
     container_name: polaris-web
     environment:
       # ── LLM 鉴权（任选其一）──
