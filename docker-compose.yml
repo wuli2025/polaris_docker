@@ -1,0 +1,99 @@
+# Polaris Docker 版 —— 拉起预构建镜像：docker compose up -d
+# 浏览器访问 http://localhost:8080 （若设了 POLARIS_AUTH_TOKEN，用 ?token=xxx）
+#
+# ── 远程更新（无需本地重建）─────────────────────────────────────────
+#   镜像由 GitHub Actions 构建并推送到 GHCR（ghcr.io/wuli2025/polaris）。
+#   更新只需： ./update.sh        （= docker compose pull && docker compose up -d）
+#   想自己从源码构建：用 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+#   POLARIS_TAG 选镜像口味：
+#     latest / 1.0.2        → slim（聊天/KB/网站生成 + 传统 PPT 原生导出，体积小）
+#     full   / 1.0.2-full   → +chromium+ffmpeg+CJK 字体（deck 截图 PPT / 视频）
+services:
+  polaris:
+    image: ghcr.io/wuli2025/polaris:${POLARIS_TAG:-latest}
+    container_name: polaris-web
+    # tini 已由镜像 ENTRYPOINT 自带（不再依赖此处 init），回收 claude 子进程僵尸。
+    ports:
+      - "8080:8080"
+    environment:
+      # ── 鉴权（任选其一接入 LLM）──
+      # 1) Claude 官方 / 第三方 Anthropic 兼容端点：API Key 模式
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+      ANTHROPIC_AUTH_TOKEN: "${ANTHROPIC_AUTH_TOKEN:-}"
+      # 2) 访问口令（不设则对所有可达网络开放，公网部署务必设置）
+      POLARIS_AUTH_TOKEN: "${POLARIS_AUTH_TOKEN:-}"
+      POLARIS_PORT: "8080"
+      # 3) 单轮对话看门狗：超时(秒)未结束则杀掉 claude 进程组，防个别请求无界挂死、
+      #    占住订阅并发槽拖垮后续。0=关闭，容器默认 180s。
+      POLARIS_CHAT_TIMEOUT_SECS: "${POLARIS_CHAT_TIMEOUT_SECS:-180}"
+      # 4) claude 全局配置目录 → 指向已持久化的 /root/.claude 卷。
+      #    默认 claude 把 .claude.json 写在 HOME 根(/root/.claude.json)，不在任何卷里，
+      #    容器重建即丢；且多个 headless claude 并发抢写易触发「配置文件找不到」竞态告警。
+      #    指向卷内后：.claude.json + backups 落入卷，与 .credentials/settings/projects 同处，
+      #    既持久又消除孤儿文件。凭证路径不变(本就在 /root/.claude/)。
+      CLAUDE_CONFIG_DIR: "/root/.claude"
+      # 5) 外部 GPU 推理节点(嵌入/重排/ASR)。群晖容器不开放 GPU 透传，A2 推理独立部署，
+      #    经此端点对接(见 DEPLOY-SYNOLOGY.md §6)。空=走本机 CPU 兜底。
+      POLARIS_INFER_ENDPOINT: "${POLARIS_INFER_ENDPOINT:-}"
+    volumes:
+      # 数据持久化（KB / 对话历史 / 项目 / 产物 / 技能）：容器重建不丢
+      - polaris-data:/root/Polaris
+      # claude 凭证 + settings（供应商切换、OAuth 登录态）
+      - polaris-claude:/root/.claude
+      # kb 设置等 XDG 配置
+      - polaris-config:/root/.config
+    restart: unless-stopped
+    # ── 工业级加固(Forge 工业级化阶段 0)─────────────────────────────
+    # 内存上限：防单容器泄漏拖垮宿主；超限 OOM kill 本容器，宿主与其它容器存活。
+    # （注：群晖内核缺 CFS 模块，CPU 硬限速 cpus= 不生效,full 模式建议改用 cpuset 绑核）
+    mem_limit: 4g            # full 默认 4g（chromium + ffmpeg + 2 并发渲染峰值 ~3GB）
+    mem_reservation: 2g      # soft 限制,确保空闲时不被挤压
+    # chromium 截大页默认 /dev/shm(64MB)易崩 → 调大(full 渲染必备; slim 无害)。
+    # 公众号链路(headless=False 走 Xvfb)并发标签多了 512MB 也吃紧 → 1g 更稳。
+    shm_size: "1g"
+    # ── 进程数上限:防 fork bomb(claude spawn + chromium 多进程树)─────
+    pids_limit: 512
+    # ── CPU 限制(非群晖):默认 2 核够 chromium+ffmpeg 并发渲染不串────
+    cpus: "2.0"
+    # ── ulimit nofile:chromium 一标签页 50+ socket,默认 1024 必爆 EMFILE
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # ── 五重安全加固(任务 d §1.3-1.4)──────────────────────────────
+    # cap-drop ALL + cap-add 最小集;不开放 SYS_ADMIN(防容器逃逸)
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN       # entrypoint gosu 降权所需
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    # seccomp + no-new-privileges + apparmor(任务 d §1.4)
+    # seccomp profile 拷入镜像:/etc/docker/seccomp/chromium.json
+    # (用 jfrazelle/dotfiles chrome.json 事实标准,任务 d 引文[16])
+    security_opt:
+      - "no-new-privileges:true"
+      # 本机/默认部署:用 Docker 默认 seccomp profile(已经够严)
+      # 群晖加固场景:把 chromium.json 放到宿主 /etc/docker/seccomp/ 再启用下一行
+      # - "seccomp=/etc/docker/seccomp/chromium.json"
+    # ── 日志轮转：防 stdout 无限增长写满系统分区。─────────────────
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # full 模式慢启动(SC 字体子集 + preflight 探测 + chromium 冷启动)→ 60s 起步窗口
+      start_period: 60s
+
+volumes:
+  polaris-data: {}
+  polaris-claude: {}
+  polaris-config: {}

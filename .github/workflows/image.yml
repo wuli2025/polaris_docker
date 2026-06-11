@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────
+# 构建 Polaris Docker 镜像并推送到 GHCR（GitHub Container Registry）
+#   触发：push 到 main / 打 v* 标签 / 手动 workflow_dispatch
+#   产物：ghcr.io/wuli2025/polaris
+#     · slim → :latest :<version> :slim :<version>-slim   （聊天/KB/网站 + 传统PPT 原生导出）
+#     · full → :full :<version>-full                       （+chromium+ffmpeg+CJK 字体，截图PPT/视频）
+#   远程更新：用户侧 `./update.sh`(= docker compose pull && up -d) 即拉到这里推的新镜像。
+# 需要的权限：packages: write（用仓库自带 GITHUB_TOKEN 登录 GHCR，无需额外 secret）。
+# ─────────────────────────────────────────────────────────────
+name: build-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/polaris
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: echo "v=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── slim：默认口味，:latest 指向它 ──────────────────────────
+      - name: Build & push slim
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            POLARIS_RENDER=0
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.v }}
+            ${{ env.IMAGE }}:slim
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.v }}-slim
+          cache-from: type=gha,scope=slim
+          cache-to: type=gha,scope=slim,mode=max
+
+      # ── full：+chromium/ffmpeg/CJK 字体，能 deck 截图出 PPT / 视频 ──
+      - name: Build & push full
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            POLARIS_RENDER=1
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:full
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.v }}-full
+          cache-from: type=gha,scope=full
+          cache-to: type=gha,scope=full,mode=max

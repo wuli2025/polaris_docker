@@ -1,0 +1,41 @@
+[package]
+name = "polaris-forge-codec"
+version = "0.1.0"
+edition = "2021"
+description = "Polaris Forge codec 板块:openh264-rs + 自写 BMFF muxer + ebur128 + cosmic-text + symphonia + audiopus,替 ffmpeg CLI;二进制增量 3.3-5MB"
+authors = ["winner3388"]
+license = "MIT"
+
+[dependencies]
+# ── 契约 ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"            # 统一 ForgeError 枚举(任务 c §D.1)
+async-trait = "0.1"        # FxFrameSink/Encoder 都是 async trait
+
+# ── H.264 编码(openh264-rs source feature 静态捆绑,绕开 Cisco BINARY_LICENSE 商用分发) ──
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
+
+# ── 自写最小 mp4 muxer 写盘 ──
+# 不引 mp4-rust(2.7 年未更新,任务 b §2),自写 ~500-800 行 BMFF(ISO/IEC 14496-12)
+# byteorder 占位:本期 stub 不写 muxer 实际字节,P1.5 落自写 BMFF 时启用
+# byteorder = "1"
+
+# ── EBU R128 响度归一化 ──
+ebur128 = "0.1"
+
+# ── 字幕渲染(cosmic-text + swash + HarfRust)──
+# 注:skrifa 0.40.0 + core_maths 0.1.1 有版本冲突(f32.hypot trait 未导入);
+# 字幕 stub 本期不真实现,注释掉 cosmic-text 避免阻塞编译,P1.5 写真实字幕时再启用
+# cosmic-text = { version = "0.19", default-features = false, features = ["shape-run-cache"] }
+
+# ── 音频解码 + 编码 ──
+symphonia = { version = "0.6", features = ["aac", "mp3", "flac", "vorbis", "alac", "wav", "pcm"] }
+audiopus = "0.2"           # Opus 编码(libopus 绑定;5 年停滞,spec 极稳,可接受)
+
+# ── tokio 异步桥(主 crate 已有,本 crate 显式开)──
+tokio = { version = "1", features = ["rt", "sync", "macros", "io-util", "fs"] }
+
+[dev-dependencies]
+# 单测 fixture + 兜底
+tempfile = "3"

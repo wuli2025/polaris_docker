@@ -1,0 +1,13 @@
+# 从源码本地构建覆盖层（不想用 GHCR 预构建镜像时）：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# 出 full（含 chromium/ffmpeg/CJK 字体，能 deck 截图出 PPT / 视频）：
+#   POLARIS_RENDER=1 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  polaris:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 0=slim(默认)  1=full(+chromium+fonts-noto-cjk+ffmpeg)
+        POLARIS_RENDER: "${POLARIS_RENDER:-0}"
+    image: ghcr.io/wuli2025/polaris:${POLARIS_TAG:-latest}
