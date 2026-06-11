@@ -149,15 +149,16 @@ STYLIZE_JS = r"""
   // —— 主题预设：palette + h2Mode(标题形态：bar竖条/underline下划线/pill胶囊/center居中/block色块/tag标签)
   //    + 可选 bg(整体底色)。底色**按块铺设**(每个块自带 background 内联)——不靠外包 section,
   //    编辑器剥不掉,这是 135editor 背景模板的真实做法。——
+  // 字号 / 行高整体调大、放疏：长图截出来不挤、手机上一眼能读（用户反馈「太紧凑、字小」）。
   var THEMES = {
-    "墨韵":   { accent:"#b08550", text:"#3a3a3a", quoteBg:"#f7f5f1", quoteBd:"#d9c7a8", quoteTx:"#8a8378", size:15.5, lh:1.85, hFont:"inherit", h2Mode:"bar" },
-    "极简":   { accent:"#191919", text:"#262626", quoteBg:"#f6f6f6", quoteBd:"#191919", quoteTx:"#737373", size:16,  lh:1.9,  hFont:"inherit", h2Mode:"underline" },
-    "科技蓝": { accent:"#2b6cff", text:"#2c3338", quoteBg:"#eef3ff", quoteBd:"#2b6cff", quoteTx:"#5a6b8c", size:15.5, lh:1.8,  hFont:"inherit", h2Mode:"pill" },
-    "杂志":   { accent:"#b3322c", text:"#2b2b2b", quoteBg:"#faf6f0", quoteBd:"#b3322c", quoteTx:"#8a7a6a", size:16,  lh:1.85, hFont:"Georgia,'Songti SC',serif", h2Mode:"center" },
-    "清新绿": { accent:"#1f7a4d", text:"#2f3a33", quoteBg:"#e9f5ee", quoteBd:"#1f7a4d", quoteTx:"#587a66", size:15.5, lh:1.8,  hFont:"inherit", h2Mode:"block" },
-    "活力橙": { accent:"#e8622c", text:"#33302c", quoteBg:"#fff3ec", quoteBd:"#ffb38a", quoteTx:"#9a7a66", size:15.5, lh:1.8,  hFont:"inherit", h2Mode:"tag" },
-    "米纸":   { accent:"#8a6d3b", text:"#4a4337", quoteBg:"#f1e8d2", quoteBd:"#c8b48a", quoteTx:"#8a7c63", size:15.5, lh:1.9,  hFont:"Georgia,'Songti SC',serif", h2Mode:"center", bg:"#faf5e9" },
-    "黛青":   { accent:"#34566b", text:"#2f3b42", quoteBg:"#e7eef2", quoteBd:"#34566b", quoteTx:"#5d7382", size:15.5, lh:1.85, hFont:"inherit", h2Mode:"underline", bg:"#f3f7f9" }
+    "墨韵":   { accent:"#b08550", text:"#3a3a3a", quoteBg:"#f7f5f1", quoteBd:"#d9c7a8", quoteTx:"#8a8378", size:17,   lh:2.0,  hFont:"inherit", h2Mode:"bar" },
+    "极简":   { accent:"#191919", text:"#262626", quoteBg:"#f6f6f6", quoteBd:"#191919", quoteTx:"#737373", size:17.5, lh:2.05, hFont:"inherit", h2Mode:"underline" },
+    "科技蓝": { accent:"#2b6cff", text:"#2c3338", quoteBg:"#eef3ff", quoteBd:"#2b6cff", quoteTx:"#5a6b8c", size:17,   lh:1.95, hFont:"inherit", h2Mode:"pill" },
+    "杂志":   { accent:"#b3322c", text:"#2b2b2b", quoteBg:"#faf6f0", quoteBd:"#b3322c", quoteTx:"#8a7a6a", size:17.5, lh:2.0,  hFont:"Georgia,'Songti SC',serif", h2Mode:"center" },
+    "清新绿": { accent:"#1f7a4d", text:"#2f3a33", quoteBg:"#e9f5ee", quoteBd:"#1f7a4d", quoteTx:"#587a66", size:17,   lh:1.95, hFont:"inherit", h2Mode:"block" },
+    "活力橙": { accent:"#e8622c", text:"#33302c", quoteBg:"#fff3ec", quoteBd:"#ffb38a", quoteTx:"#9a7a66", size:17,   lh:1.95, hFont:"inherit", h2Mode:"tag" },
+    "米纸":   { accent:"#8a6d3b", text:"#4a4337", quoteBg:"#f1e8d2", quoteBd:"#c8b48a", quoteTx:"#8a7c63", size:17,   lh:2.0,  hFont:"Georgia,'Songti SC',serif", h2Mode:"center", bg:"#faf5e9" },
+    "黛青":   { accent:"#34566b", text:"#2f3b42", quoteBg:"#e7eef2", quoteBd:"#34566b", quoteTx:"#5d7382", size:17,   lh:2.0,  hFont:"inherit", h2Mode:"underline", bg:"#f3f7f9" }
   };
   // themeName 可以是预设名，也可以是 AI 生成的主题对象（缺省字段从墨韵补齐）。
   var base = THEMES["墨韵"];
@@ -192,14 +193,14 @@ STYLIZE_JS = r"""
 
   // —— 一级标题：文章大标题，居中加粗 ——
   root.querySelectorAll("h1").forEach(function (el) {
-    set(el, "font-size:21px;font-weight:700;text-align:center;color:" + t.text + ";" +
-      sp(10, 24) + "line-height:1.4;font-family:" + t.hFont + ";");
+    set(el, "font-size:24px;font-weight:700;text-align:center;color:" + t.text + ";" +
+      sp(12, 30) + "line-height:1.45;font-family:" + t.hFont + ";");
   });
 
   // —— 二级标题：六种形态（主题的「长相」主要靠它）——
   var m2 = t.h2Mode || "bar";
   root.querySelectorAll("h2").forEach(function (el) {
-    var css = "font-size:17px;font-weight:700;line-height:1.5;font-family:" + t.hFont + ";" + sp(26, 12);
+    var css = "font-size:20px;font-weight:700;line-height:1.5;font-family:" + t.hFont + ";" + sp(40, 18);
     if (m2 === "underline")  css += "color:" + t.text + ";border-bottom:2px solid " + t.accent + ";padding-bottom:6px;";
     else if (m2 === "pill")  css += "color:#ffffff;background:" + t.accent + ";display:inline-block;padding:5px 16px;border-radius:6px;";
     else if (m2 === "center") css += "color:" + t.accent + ";text-align:center;letter-spacing:2px;";
@@ -211,7 +212,7 @@ STYLIZE_JS = r"""
 
   // —— 三级标题：主色加粗，略小 ——
   root.querySelectorAll("h3").forEach(function (el) {
-    set(el, "font-size:15.5px;font-weight:700;color:" + t.accent + ";" + sp(20, 8) +
+    set(el, "font-size:17px;font-weight:700;color:" + t.accent + ";" + sp(28, 12) +
       "line-height:1.5;font-family:" + t.hFont + ";");
   });
 
@@ -219,15 +220,15 @@ STYLIZE_JS = r"""
   root.querySelectorAll("p").forEach(function (el) {
     if (el.getAttribute("data-polaris-li")) return; // 列表段落在下面统一处理
     set(el, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text +
-      ";letter-spacing:.3px;" + sp(14, 14));
+      ";letter-spacing:.3px;" + sp(20, 20));
   });
 
-  // —— 引用块：浅底左竖条卡片 ——
+  // —— 引用块：浅底左竖条卡片（加大留白，做成更醒目的「配图卡」感）——
   root.querySelectorAll("blockquote").forEach(function (el) {
-    set(el, "background:" + t.quoteBg + ";border-left:3px solid " + t.quoteBd +
-      ";padding:12px 16px;color:" + t.quoteTx +
-      ";border-radius:0 8px 8px 0;font-size:" + (t.size - 0.5) + "px;line-height:1.75;" +
-      (t.bg ? "margin:0;" : "margin:18px 0;"));
+    set(el, "background:" + t.quoteBg + ";border-left:4px solid " + t.quoteBd +
+      ";padding:18px 22px;color:" + t.quoteTx +
+      ";border-radius:0 10px 10px 0;font-size:" + (t.size - 0.5) + "px;line-height:1.85;" +
+      (t.bg ? "margin:0;" : "margin:24px 0;"));
   });
 
   // —— 重点 / 强调：主色加粗 ——
@@ -263,7 +264,7 @@ STYLIZE_JS = r"""
         : ('<span data-polaris-mark="1" style="color:' + t.accent + ';font-weight:700;">· </span>');
       p.innerHTML = mark + li.innerHTML;
       p.setAttribute("data-polaris-li", "1");
-      set(p, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(8, 8));
+      set(p, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(12, 12));
       frag.appendChild(p);
     });
     list.replaceWith(frag);
@@ -277,7 +278,7 @@ STYLIZE_JS = r"""
     set(el, "color:" + t.accent + ";font-weight:700;");
   });
   root.querySelectorAll("[data-polaris-li]").forEach(function (el) {
-    set(el, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(8, 8));
+    set(el, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(12, 12));
   });
 
   // —— 链接：未认证号正文外链会被屏蔽，降级为主色文字（保留文案，去掉跳转误导）——
@@ -1157,7 +1158,9 @@ def run_restyle(theme, timeout):
 # 零清洗、零字数改写、零样式剥离）。
 SNAP_WIDTH = 720       # 视口 CSS 宽：对齐公众号 677px 显示宽，左右留白
 SNAP_SCALE = 2         # 2x 导出，手机端不糊
-SLICE_MAX_CSS = 2800   # 单张切片最大 CSS 像素高（@2x≈5600 设备像素）；超长单图客户端会压糊
+SLICE_MAX_CSS = 12000  # 单张切片最大 CSS 像素高（@2x≈24000 设备像素）。长图按宽适配、纵向滚动看,
+                       # 高一点不糊——故默认尽量「截一整张」(app 链路还会显式传 --no-slice),只有
+                       # 极端长文(>12000css)才不得不在段落空隙切开,避免触到客户端单图尺寸上限。
 
 # 量内容块边界（页面坐标），切点选在块与块之间 = 段落空隙
 JS_CUT_POINTS = r"""
@@ -1205,18 +1208,31 @@ def run_snapshot(body_html, theme, out_dir, base_name, raw_file=None, no_slice=F
         if raw_file:
             html_path = os.path.abspath(raw_file)
         else:
-            # ① 离屏套样式拿成品（同 render 管线）
+            # ① 离屏套样式，只取 STYLIZE 的「内容 HTML」——不要 render 那层 max-width:677 居中外壳：
+            #    它在 720 视口里两侧留白，正是用户嫌弃的「白边」。这里让内容**铺满整幅**，
+            #    画布底色跟着主题走（主题有 bg 用它；没 bg 给一层很浅的暖纸色），全图统一一种底，
+            #    边缘不再出现生硬的纯白条。内部留足 padding 让排版舒展、不挤。
             p0 = browser.new_page()
-            full = _styled_html(p0, body_html, theme)
+            p0.goto("about:blank")
+            res = p0.evaluate(
+                "(args) => { document.body.innerHTML = \"<div id='polaris-style-root'></div>\"; "
+                "var root = document.getElementById('polaris-style-root'); root.innerHTML = args.body; "
+                "var html = (" + STYLIZE_JS + ")(root, args.theme); "
+                "return { html: html, bg: (root.style.background || '') }; }",
+                {"body": body_html, "theme": theme},
+            )
             try:
                 p0.close()
             except Exception:
                 pass
-            # 包一层可定位的快照容器（body 去 margin，背景白，避免截出杂边）
-            inner = full.split(">", 2)[-1]  # 去掉 doctype+meta 前缀，保留内容 div
-            snap_html = ("<!doctype html><meta charset='utf-8'>"
-                         "<body style='margin:0;background:#ffffff;'>"
-                         "<div id='polaris-snap-root'>" + inner + "</div></body>")
+            canvas = res.get("bg") or "#f7f5ef"   # 无底色主题给暖纸色画布，杜绝白边
+            snap_html = (
+                "<!doctype html><meta charset='utf-8'>"
+                "<body style='margin:0;padding:0;background:" + canvas + ";'>"
+                "<div id='polaris-snap-root' style='width:" + str(SNAP_WIDTH) + "px;"
+                "box-sizing:border-box;padding:44px 38px;background:" + canvas + ";"
+                "-webkit-font-smoothing:antialiased;'>" + res["html"] + "</div></body>"
+            )
             html_path = os.path.join(out_dir, base_name + ".html")
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(snap_html)
