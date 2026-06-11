@@ -43,11 +43,19 @@ services:
       #    entrypoint 据此建同号用户、chown 数据目录、用 gosu 降权。
       PUID: "${PUID:-1026}"
       PGID: "${PGID:-100}"
+      # ── Docker 一键更新开关(默认关): 设 1 启用容器内 Web UI 一键更新 ──
+      #    启用前取消下方 volumes 里 docker.sock 挂载的注释。
+      #    安全提示:挂 sock = 容器对宿主 docker daemon 有 root 权限。
+      POLARIS_DOCKER_SOCKET: "${POLARIS_DOCKER_SOCKET:-0}"
+      # ── 拉取/运行的 tag (slim=latest;full=full;锁版本用 v1.0.3 等) ──
+      POLARIS_TAG: "${POLARIS_TAG:-latest}"
     volumes:
       # bind mount 到 /volume1：File Station 可见、可单独 Btrfs 快照复制备份。
       - /volume1/docker/polaris/data:/root/Polaris
       - /volume1/docker/polaris/claude:/root/.claude
       - /volume1/docker/polaris/config:/root/.config
+      # 可选:挂宿主 docker.sock 进容器,启用 Web UI 一键更新。
+      # - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8080:8080"           # 避开 DSM 占用的 443/5001，对外经反向代理统一 443+TLS
     restart: unless-stopped

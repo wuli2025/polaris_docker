@@ -10,10 +10,9 @@ created_at: 0
 # Polaris 演示工坊
 
 > 输入一段文案或一份文档 → 选一套主题 → 输出一份**好看**的演示。
-> 三种交付物：
+> 同一套 HTML 引擎，两种交付物：
 > - **网页幻灯片**：一个自包含 `.html`，可翻页、可全屏、可打印为 PDF、可直接分享。
-> - **传统 PPT（spec 路线，推荐）**：写一份 `polaris.slides.json` 结构化 spec → `polaris-forge spec-pptx` 确定性转换成**原生 100% 可编辑**的 `.pptx`（真文本框/真形状/真项目符号，零浏览器依赖）。
-> - **网页 deck 导出 PPT**：deck.html 逐页「无字背景截图 + 真文本框」分层导出，视觉像素级还原主题，文字仍可编辑。
+> - **PPT**：把网页 deck 逐页截图，做成像素级还原主题的 `.pptx`（视觉 = 网页，文字不可编辑）。
 
 技能资源目录（已随 App 落盘）：`~/Polaris/skills/polaris-deck-studio/`
 ```
@@ -85,50 +84,25 @@ cat ~/Polaris/skills/polaris-deck-studio/assets/runtime.js
 ### 4a. 模式 = html（网页幻灯片）
 到此就完成了。在回答末尾给出 `deck.html` 的绝对路径，并说明：双击用浏览器打开；`←/→/空格` 翻页、`F` 全屏、`O` 概览、`T` 换主题、`P`/`Ctrl+P` 导出 PDF。
 
-### 4b. 模式 = pptx · ★ 传统 PPT（spec 路线，首选）
-**不写 deck.html**。把内容编排成一份 `polaris.slides.json`（结构化 spec），存到产物目录，再用 Polaris 自带 CLI 一步转换成**原生 100% 可编辑**的 .pptx（真文本框/真形状/真项目符号，零浏览器、零 npm 依赖）：
+### 4b. 模式 = pptx（PPT）
+先装一次导出依赖（仅首次需要、幂等）：
 ```bash
-polaris-forge spec-pptx --spec="<产物目录>/polaris.slides.json" --out="<产物目录>/演示.pptx"
-# CLI 位于 ~/Polaris/bin/（Windows: %USERPROFILE%\Polaris\bin\polaris-forge.exe），Docker 镜像已内置在 PATH。
-# CLI 不存在时：把 spec 按上述文件名存好即可，Polaris 桌面端会自动完成转换。
+node ~/Polaris/skills/polaris-deck-studio/scripts/install-deps.mjs
 ```
-
-#### polaris.slides.json 格式（v1，严格遵守）
-```json
-{
-  "version": 1,
-  "theme": "minimal-white",
-  "slides": [
-    {"layout":"title",   "kicker":"眉题(可选)", "title":"主标题", "subtitle":"副题(可选)", "notes":"口播稿(可选,进PPT备注页)"},
-    {"layout":"section", "kicker":"PART 1", "title":"章节名"},
-    {"layout":"bullets", "title":"页标题", "points":["要点", {"text":"要点", "sub":["子点","子点"]}]},
-    {"layout":"two-col", "title":"对比页", "left":{"head":"栏头","points":["…"]}, "right":{"head":"栏头","points":["…"]}},
-    {"layout":"compare", "title":"多卡对比", "items":[{"head":"卡头","body":"卡内文,可\n多行"}, {"head":"…","body":"…"}]},
-    {"layout":"stats",   "title":"关键数据", "items":[{"value":"83%","label":"指标名","desc":"补充说明(可选)"}]},
-    {"layout":"timeline","title":"路线/流程", "steps":[{"head":"步骤名","body":"一句话说明(可选)"}]},
-    {"layout":"quote",   "text":"金句", "by":"出处(可选)"},
-    {"layout":"closing", "title":"结尾(默认:谢谢)", "subtitle":"…"}
-  ]
-}
-```
-- `theme` 六选一：`minimal-white`(近白暖米/默认) `ink-gold`(黑金) `deep-space`(深空蓝) `warm-paper`(暖纸) `forest`(森绿) `tech-blue`(科技蓝)。按用户所选主题的气质就近映射。
-- 写作要领：标题短、要点凝练（每点 ≤ 28 字）、一页一事；`compare` 卡片 2–4 个、`stats` 大数字 1–4 个、`timeline` 步骤 2–5 步；演讲内容写进每页 `notes`（用户在 PowerPoint 备注栏直接拿到口播稿）。
-- **★ 版式要混排，这是观感的关键**：整份 PPT **严禁通篇 bullets**——按信息类型选版式：开场 `title`、分章 `section`、数据冲击 `stats`、流程/路线 `timeline`、双方对照 `two-col`、多项并列 `compare`、点睛 `quote`、要点才用 `bullets`。一份 10 页的演示至少应出现 4 种不同版式。
-- 画幅固定 16:9。产出后回答末尾给出 `.pptx` 和 `polaris.slides.json` 的绝对路径。
-
-### 4c. 网页 deck → PPT（要像素级主题视觉时用）
-已写好自包含 deck.html 后（如用户先要了网页版又要 PPT）：
+再导出（用上一步那份自包含 deck.html）：
 ```bash
-polaris-forge pptx --deck="<产物目录>/演示-<主题>.html" --out="<产物目录>/演示-<主题>.pptx" --width=1920 --height=1080
+node ~/Polaris/skills/polaris-deck-studio/scripts/export-pptx.mjs \
+  --deck="<产物目录>/演示-<主题>.html" \
+  --out="<产物目录>/演示-<主题>.pptx" \
+  --width=1920 --height=1080
 ```
-分层导出：每页先提取文本框（坐标/字号/颜色），背景按「隐藏文字」重新截图 → 真文本框叠在无字背景上 = **视觉还原 + 文字可编辑**（挪开文字无重影）。需要环境里有 chromium/Chrome/Edge（CLI 自动探测；Docker 需 full 镜像）。
-CLI 不可用时的旧路（Node，最后手段）：先 `node ~/Polaris/skills/polaris-deck-studio/scripts/install-deps.mjs`，再跑 `scripts/export-pptx.mjs --deck=… --out=… --width=1920 --height=1080`（整版图嵌入，文字不可编辑）。
+脚本逐页截图（自动加 `?export=1` 关闭入场动画求干净静帧）→ 用 pptxgenjs 把每页整版图铺满一张 16:9 幻灯片 → 输出 `.pptx`。回答末尾给出 `.pptx`（和源 `.html`）的绝对路径。
 
 ---
 
 ## 兜底（依赖缺失也不能卡死）
-- 传统 PPT spec 路线**没有外部依赖**，写好 spec 就赢了一半：CLI 不在 → 存好 `polaris.slides.json`，Polaris 桌面端会自动转换。
-- deck 截图路缺 chromium / `npm` 装不上 → 改让用户用浏览器打开 deck.html 后 **`Ctrl+P` → 另存为 PDF**（`base.css` 已含 `@media print` 分页，每页一张）；或退传统 PPT spec 路线（牺牲主题精确视觉，换 100% 可编辑）。
+- `npm`/`playwright` 装不上 → 改让用户用浏览器打开 deck.html 后 **`Ctrl+P` → 另存为 PDF**（`base.css` 已含 `@media print` 分页，每页一张）。
+- 需要**可编辑文本**的 PPT（而非整版图）→ 改用 `pptx`（python-pptx）技能按内容重排为原生文本框，告知用户这会牺牲主题的精确视觉。
 - 始终给出已经成功产出的那份文件的绝对路径，别让用户两手空空。
 
 ## 画幅

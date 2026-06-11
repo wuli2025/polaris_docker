@@ -118,8 +118,7 @@ docker compose up -d --build
 | 文件上传 | ✅ 保留 | 拖拽 → `/api/upload` multipart |
 | 产物预览 / 成品编辑器 | ✅ 保留 | `artifact_read` 返回正文/dataUrl，iframe 预览 |
 | 飞书 / 企微网关 | ⚠ 可用 | 长连接服务端更合适；OAuth 回调 URL 需公网可达 |
-| 传统 PPT（spec→原生可编辑 .pptx） | ✅ 保留 | `polaris-forge spec-pptx` 零浏览器，**slim 镜像也能出** |
-| PPT / 网页 / 视频工坊 | ⚠ 多数保留 | deck 截图/视频需 full 镜像（chromium/ffmpeg） |
+| PPT / 网页 / 视频工坊 | ⚠ 多数保留 | 视频需镜像加 ffmpeg/playwright（按需扩镜像） |
 | 可运行项目（一键起前后端） | ⚠ 受限 | 容器内嵌套起服务受限，list/status 可用 |
 | Docker 沙箱板块 | ⛔ 降级 | Docker-in-Docker 风险高，返回 stub |
 | 环境医生（安装 claude/node） | ⛔ 简化 | 镜像已预装，安装类命令返回提示 |
@@ -127,7 +126,72 @@ docker compose up -d --build
 
 ---
 
-## 七、常用运维
+## 七、⭐ 更新
+
+**容器版的「更新」与桌面 Tauri 装包逻辑无关**——桌面 Tauri updater 走 GitHub Releases 装 `.exe` / `.app.tar.gz`，对容器无意义。容器版**永远走** `update.sh` 协议：拉 `ghcr.io/wuli2025/polaris` 的新层 → 重建容器。镜像由 GitHub Actions `image.yml` 在每次打 tag 时自动构建并推 GHCR。
+
+### 方式 A：Web UI 一键更新（推荐，体验最好）
+
+页面「更新」板块的「立即更新」按钮，**容器内 spawn `update.sh` 拉新镜像并自动重建**。
+
+**前置两步**（默认关，安全考虑）：
+
+```yaml
+# docker-compose.synology.yml（或 docker-compose.yml）
+services:
+  polaris:
+    environment:
+      # 取消下面这行注释 = 启用容器内一键更新
+      POLARIS_DOCKER_SOCKET: "1"
+    volumes:
+      # 取消下面这行注释 = 把宿主 docker.sock 挂进容器
+      # - /var/run/docker.sock:/var/run/docker.sock
+```
+
+`docker compose up -d --no-build` 重建一次容器后，回到 Web 页面「更新」板块，「立即更新」按钮变可点。
+
+**安全提示**：挂 `docker.sock` 进容器 = 容器对宿主 docker daemon 有 root 权限。务必配合 `POLARIS_AUTH_TOKEN`（访问口令）使用，避免未授权用户通过 Web 调用 `docker_update`。
+
+### 方式 B：终端跑 update.sh（最简，不需 docker.sock）
+
+```bash
+# 在仓库根目录（与 docker-compose.yml 同级）
+./update.sh                   # 默认拉 latest (slim)
+POLARIS_TAG=full ./update.sh  # 拉 full 口味（带 chromium+ffmpeg+PPT/视频）
+```
+
+脚本不本地重建，只 `docker compose pull && up -d`，数据卷保留。
+
+### 方式 C：Windows 桥接（NAS 国内网拉不动 GHCR 时）
+
+在 Windows 上把 GHCR 镜像 save → 落到 NAS SMB 挂载（Z:）→ NAS 上 `docker load`：
+
+```powershell
+# 在仓库根目录
+.\scripts\pull-ghcr-to-nas.ps1            # 拉 latest
+.\scripts\pull-ghcr-to-nas.ps1 -Tag full  # 拉 full
+.\scripts\pull-ghcr-to-nas.ps1 -Tag v1.0.3 -SkipRestart  # 锁版本,不自动重启
+```
+
+脚本会提示输入 NAS SSH 密码，自动化拉取 / save / 拷贝 / load / restart。
+
+### 镜像版本号
+
+- 仓库根 `VERSION` 文件（GitHub release tag 时同步更新）
+- 镜像构建时由 GitHub Actions 注入到容器内 `/app/VERSION`
+- Web UI 「更新」板块的「当前版本 vX.Y.Z」从 `GET /api/version` 读这个文件
+- API 自检：`curl http://localhost:8080/api/version` → `{"version":"1.0.4","flavor":"docker","updater_enabled":false,"socket_present":false}`
+
+### 一次更新到底下载多少？
+
+看 [GitHub Releases 描述](https://github.com/wuli2025/polaris_docker/releases)。粗略：
+
+- 纯代码/配置小改：几 MB ~ 几十 MB
+- 依赖 lockfile 变：100 MB ~ 几百 MB
+- 基础镜像 bump：500 MB ~ 1+ GB
+- 首次安装 slim 整镜像：~ 1–2 GB
+
+## 八、常用运维
 
 ```bash
 docker compose logs -f polaris      # 看日志
@@ -137,20 +201,7 @@ docker compose down -v              # 停并删数据卷（慎用）
 docker exec -it polaris-web bash    # 进容器排查（claude --version 等）
 ```
 
-### polaris-forge CLI（镜像内置，agent 与运维皆可用）
-
-容器里的 claude agent 可直接命令行出片（与桌面端同一份引擎）：
-
-```bash
-polaris-forge preflight                                    # 本容器能出什么(JSON)
-polaris-forge spec-pptx --spec=/path/polaris.slides.json --out=/path/演示.pptx
-                                                           # 原生可编辑 PPT,slim 即可
-polaris-forge pptx --deck=/path/deck.html --out=/path/x.pptx   # deck 分层导出(需 full)
-polaris-forge video --deck=/path/deck.html --out=/path/x.mp4   # 出视频(需 full)
-polaris-forge validate --pptx=/path/x.pptx                 # 校验包结构
-```
-
-## 八、稳健性：单轮对话看门狗
+## 九、稳健性：单轮对话看门狗
 
 容器内偶发：个别极简 prompt 会让 claude 触发子代理（`claude --print`，其 cwd 落在 `/`）
 对文件系统做无界扫描而长时间不返回，既拖死本轮、又占住 OAuth 订阅的并发槽拖垮后续消息。
@@ -162,7 +213,7 @@ stdout 关闭 → 正常 emit error+done，系统自愈、释放并发槽。设 
 > 实测：实质性问题（联网检索、生成 PPT/网页、写文件、KB 取证）均正常；
 > 仅「只回复两个字」这类极简多轮 prompt 偶发触发上述扫描，看门狗保证不会无限挂死。
 
-## 九、扩展为「全功能镜像」（媒体/视频）
+## 十、扩展为「全功能镜像」（媒体/视频）
 
 在 `Dockerfile` 阶段3 的 apt 安装里加 `ffmpeg`，并按需装 Playwright/Chromium
 （`npx playwright install --with-deps chromium`），compose 里加 `shm_size: 1gb`。

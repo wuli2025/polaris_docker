@@ -1,17 +1,14 @@
-# Polaris Docker 版 —— 拉起预构建镜像：docker compose up -d
+# Polaris Docker 版 —— 一键拉起：docker compose up -d --build
 # 浏览器访问 http://localhost:8080 （若设了 POLARIS_AUTH_TOKEN，用 ?token=xxx）
-#
-# ── 远程更新（无需本地重建）─────────────────────────────────────────
-#   镜像由 GitHub Actions 构建并推送到 GHCR（ghcr.io/wuli2025/polaris）。
-#   更新只需： ./update.sh        （= docker compose pull && docker compose up -d）
-#   想自己从源码构建：用 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-#
-#   POLARIS_TAG 选镜像口味：
-#     latest / 1.0.2        → slim（聊天/KB/网站生成 + 传统 PPT 原生导出，体积小）
-#     full   / 1.0.2-full   → +chromium+ffmpeg+CJK 字体（deck 截图 PPT / 视频）
 services:
   polaris:
-    image: ghcr.io/wuli2025/polaris:${POLARIS_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 0=slim(默认,无渲染栈)  1=full(+chromium+fonts-noto-cjk+ffmpeg,能出 PPT/视频)
+        POLARIS_RENDER: "${POLARIS_RENDER:-0}"
+    image: polaris-web:latest
     container_name: polaris-web
     # tini 已由镜像 ENTRYPOINT 自带（不再依赖此处 init），回收 claude 子进程僵尸。
     ports:
@@ -37,6 +34,13 @@ services:
       # 5) 外部 GPU 推理节点(嵌入/重排/ASR)。群晖容器不开放 GPU 透传，A2 推理独立部署，
       #    经此端点对接(见 DEPLOY-SYNOLOGY.md §6)。空=走本机 CPU 兜底。
       POLARIS_INFER_ENDPOINT: "${POLARIS_INFER_ENDPOINT:-}"
+      # 6) Docker 一键更新开关(默认关):
+      #    设为 1 后容器内能 spawn update.sh 拉新镜像并热替换容器。
+      #    启用前必须同时取消下方 volumes 里 docker.sock 挂载的注释。
+      #    风险:挂 docker.sock 进容器 = 容器 = 宿主 root,生产环境慎用。
+      POLARIS_DOCKER_SOCKET: "${POLARIS_DOCKER_SOCKET:-0}"
+      # 7) 拉取/运行的 tag(slim=latest;full=full;锁版本用 v1.0.3 等具体 tag)
+      POLARIS_TAG: "${POLARIS_TAG:-latest}"
     volumes:
       # 数据持久化（KB / 对话历史 / 项目 / 产物 / 技能）：容器重建不丢
       - polaris-data:/root/Polaris
@@ -44,6 +48,10 @@ services:
       - polaris-claude:/root/.claude
       # kb 设置等 XDG 配置
       - polaris-config:/root/.config
+      # 可选：把宿主 docker.sock 挂进容器,让容器内能调 update.sh 实现 Web UI 一键更新。
+      # 启用方法:取消下面这行注释 + 上方 environment 段把 POLARIS_DOCKER_SOCKET 设成 "1"。
+      # 安全:挂 sock 后容器进程对宿主 docker daemon 有 root 权限,务必配合 POLARIS_AUTH_TOKEN 使用。
+      # - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
     # ── 工业级加固(Forge 工业级化阶段 0)─────────────────────────────
     # 内存上限：防单容器泄漏拖垮宿主；超限 OOM kill 本容器，宿主与其它容器存活。

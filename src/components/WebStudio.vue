@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, watch } from "vue";
 import { usePolling } from "../composables/usePolling";
 import {
   Globe,
@@ -18,12 +18,9 @@ import {
 } from "@lucide/vue";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
-import { artifacts as artifactsApi, chat as chatApi, skills as skillsApi, type AttachedFile, type Skill } from "../tauri";
+import { artifacts as artifactsApi, chat as chatApi, type AttachedFile } from "../tauri";
 import { useFileDrop } from "../composables/useFileDrop";
 import { groupedThemes, findTheme, type DeckTheme } from "../lib/deckThemes";
-
-// KeepAlive 的 include 按组件 name 匹配 → 显式命名:切走再回来「继续修改」状态不丢
-defineOptions({ name: "WebStudio" });
 
 const app = useAppStore();
 const chat = useChatStore();
@@ -53,7 +50,7 @@ const charCount = computed(() => contentText.value.length);
 const uploads = ref<AttachedFile[]>([]);
 const uploading = ref(false);
 
-const selectedTheme = ref("auto"); // corporate-clean 等素白模板已从主题库下架,默认交给 AI 自由发挥
+const selectedTheme = ref("corporate-clean");
 const groups = groupedThemes(true);
 const curTheme = computed<DeckTheme>(() => findTheme(selectedTheme.value));
 
@@ -71,29 +68,12 @@ const siteTypeHint = computed(() => SITE_TYPES.find((s) => s.id === siteType.val
 // 自定义风格：在所选主题基础上叠加
 const customStyle = ref("");
 
-// 可叠加的「增强技能」——与对话框同源:list_skills 全量技能库,点选后随对话一起注入。
-// polaris-web-studio 本体恒注入,不在列表里重复展示。
-const FALLBACK_SKILLS: Skill[] = [
-  { id: "deep-research", name: "深度搜索", description: "先联网研究、把内容/文案补全", source: "official" },
-  { id: "image-gen", name: "AI 配图", description: "为网站生成插图/配图", source: "official" },
-  { id: "pdf", name: "读 PDF", description: "解析上传的 PDF 素材", source: "official" },
+// 可叠加的「增强技能」
+const ENHANCERS: { id: string; label: string; hint: string }[] = [
+  { id: "deep-research", label: "深度搜索", hint: "先联网研究、把内容/文案补全" },
+  { id: "image-gen", label: "AI 配图", hint: "为网站生成插图/配图" },
+  { id: "pdf", label: "读 PDF", hint: "解析上传的 PDF 素材" },
 ];
-const skillsList = ref<Skill[]>([]);
-const skillSearch = ref("");
-async function loadSkills() {
-  try {
-    skillsList.value = await skillsApi.list();
-  } catch {
-    skillsList.value = FALLBACK_SKILLS;
-  }
-}
-onMounted(loadSkills);
-function filteredSkills(): Skill[] {
-  const base = skillsList.value.filter((s) => s.id !== "polaris-web-studio");
-  const q = skillSearch.value.trim().toLowerCase();
-  if (!q) return base;
-  return base.filter((s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q));
-}
 const extraSkills = ref<string[]>([]);
 function toggleSkill(id: string) {
   const i = extraSkills.value.indexOf(id);
@@ -147,8 +127,7 @@ const { isOver: dropOver } = useFileDrop({
 function buildPrompt(): string {
   const themeLine =
     selectedTheme.value === "auto"
-      ? "AI 自由发挥 —— 由你根据内容气质自挑最贴合的主题（从 skill 的 data-theme 主题库里选，或在其上自行配色），" +
-        "必须基于 polaris-web-studio(open-design) 的主题体系制作，观感必须高级：讲究的版式层级、克制的配色、超大标题与留白，拒绝平庸的默认观感"
+      ? "由你根据内容自挑最合适的主题（17 套里选，或自行配色）"
       : `${curTheme.value.name}（data-theme id=${selectedTheme.value}）`;
   const st = SITE_TYPES.find((s) => s.id === siteType.value)!;
   const lines = [
@@ -163,11 +142,8 @@ function buildPrompt(): string {
     lines.push(`- 自定义风格补充：${customStyle.value.trim()}（在所选主题基础上按此调整，冲突时以此为准）`);
   }
   if (extraSkills.value.length) {
-    const names = skillsList.value
-      .filter((s) => extraSkills.value.includes(s.id))
-      .map((s) => s.name)
-      .join("、") || extraSkills.value.join("、");
-    lines.push(`- 已启用增强技能：${names}——制作时按需调用（如先研究补全内容、为网站配图、解析素材）。`);
+    const names = ENHANCERS.filter((e) => extraSkills.value.includes(e.id)).map((e) => e.label).join("、");
+    lines.push(`- 已启用增强技能：${names}——制作时按需调用（如先研究补全内容、为网站配图、解析 PDF）。`);
   }
   if (uploads.value.length) {
     lines.push("", "## 素材文件（先 Read 它们作为内容来源）");
@@ -300,13 +276,13 @@ async function loadOutputs() {
     /* ignore */
   }
 }
-// 修改是覆盖写原文件(文件名不变)→ 不能按路径短路,要重读内容、真变了才换 srcdoc
 async function loadPreview() {
   const htmlOut = outputs.value[0];
   if (!htmlOut) return;
+  if (htmlOut.path === previewPath.value && previewHtml.value) return;
   try {
     const p = await artifactsApi.read(htmlOut.path);
-    if (p?.text && (p.text !== previewHtml.value || htmlOut.path !== previewPath.value)) {
+    if (p?.text) {
       previewHtml.value = p.text;
       previewPath.value = htmlOut.path;
     }
@@ -402,22 +378,17 @@ function fillDemo() {
 
         <div class="wb-side-sec">
           <div class="wb-side-title">增强技能 · 可选</div>
-          <input v-model="skillSearch" class="wb-skill-search" type="text" placeholder="搜索技能…" />
-          <div class="wb-skill-list">
+          <div class="wb-skills">
             <button
-              v-for="s in filteredSkills()"
-              :key="s.id"
-              class="wb-skill-item"
-              :class="{ on: extraSkills.includes(s.id) }"
-              :title="s.description"
-              @click="toggleSkill(s.id)"
-            >
-              <span class="wb-skill-name">{{ s.name }}</span>
-              <span class="wb-skill-desc">{{ s.description }}</span>
-            </button>
-            <span v-if="!filteredSkills().length" class="wb-note">没有匹配的技能</span>
+              v-for="e in ENHANCERS"
+              :key="e.id"
+              class="wb-skill"
+              :class="{ on: extraSkills.includes(e.id) }"
+              :title="e.hint"
+              @click="toggleSkill(e.id)"
+            >{{ e.label }}</button>
           </div>
-          <span class="wb-note">与对话框同一个技能库。点选叠加，AI 制作时会按需调用（如先联网把内容补全、为网站配图）。</span>
+          <span class="wb-note">勾选后 AI 制作时会调用（如先联网把内容补全、为网站配图）。选「AI 自由发挥」风格时尤其好用。</span>
         </div>
 
         <div v-if="hasResult" class="wb-side-sec">
@@ -526,15 +497,9 @@ function fillDemo() {
 .wb-note { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
 .wb-custom { resize: none; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 11.5px; line-height: 1.5; }
 .wb-custom:focus { outline: none; border-color: var(--primary); }
-.wb-skill-search { padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 11.5px; }
-.wb-skill-search:focus { outline: none; border-color: var(--primary); }
-.wb-skill-list { display: flex; flex-direction: column; gap: 5px; max-height: 220px; overflow-y: auto; }
-.wb-skill-item { display: flex; flex-direction: column; gap: 2px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); cursor: pointer; text-align: left; }
-.wb-skill-item:hover { border-color: var(--primary); }
-.wb-skill-item.on { border-color: var(--primary); background: var(--primary-soft); }
-.wb-skill-name { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
-.wb-skill-item.on .wb-skill-name { color: var(--primary-deep); }
-.wb-skill-desc { font-size: 10px; color: var(--muted); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.wb-skills { display: flex; flex-wrap: wrap; gap: 5px; }
+.wb-skill { padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-2); font-size: 11px; cursor: pointer; }
+.wb-skill.on { border-color: var(--primary); background: var(--primary-soft); color: var(--primary-deep); font-weight: 600; }
 .wb-brand { display: flex; align-items: center; gap: 7px; color: var(--muted); }
 .wb-input { flex: 1; padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 12.5px; }
 .wb-input:focus { outline: none; border-color: var(--primary); }

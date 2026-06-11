@@ -589,12 +589,6 @@ export const artifacts = {
   /** 跨所有对话检索历史产物文件（文件名 + 正文） */
   search: (query: string) =>
     invoke<ArtifactSearchHit[]>("artifact_search", { query }),
-  /** deck.html → .pptx 重新导出（自研 forge 管线逐页截图 + 纯 Rust OOXML，覆盖写出） */
-  deckToPptx: (deck: string, out: string) =>
-    invoke<unknown>("forge_deck_to_pptx", { deck, out }),
-  /** polaris.slides.json(spec) → 原生可编辑 .pptx（路线 B 传统PPT，零浏览器）。spec 传文件路径或 JSON 字符串 */
-  specToPptx: (spec: string, out: string) =>
-    invoke<{ ok: boolean; slides: number; warnings: string[] }>("forge_spec_to_pptx", { spec, out }),
 };
 
 /** 跨对话产物搜索命中 */

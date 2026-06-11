@@ -1,7 +1,59 @@
-node_modules/
-dist/
-src-tauri/target/
-src-tauri/gen/
-.env
-*.log
+node_modules
+dist
+dist-ssr
+*.local
+.vscode/*
+!.vscode/extensions.json
+.idea
 .DS_Store
+src-tauri/target
+src-tauri/gen
+src-tauri/Cargo.lock
+
+# Runtime outputs / local logs
+.dev.log
+output/
+PolarisKB/output/
+# 对话产物（运行时生成，落在工作文件夹/KB 根下的 conversations/，不该进仓库）
+PolarisKB/conversations/
+conversations/
+
+# Claude workspace / temp files
+.claude/
+*.html
+!index.html
+!src-tauri/**/*.html
+
+# 本地开发产物 / 截图 / 日志（不进仓库）
+.shot-*.png
+.dev-screenshot-*.png
+.dev-server.log
+.dev-run.log
+/workspace/
+PolarisKB/.polaris_seeded
+
+# 本地工作/产物草稿目录（运行时生成，不进仓库）
+/career-map-work/
+/polaris-video-work/
+/polaris-video-work-kbwiki/
+
+# 生成的视频工作产物(大体积,勿提交)
+/polaris-video-work-longoutput/
+/polaris-video-work-zhiyuan/
+/polaris-video-work-kbwiki/
+
+# Docker 化本地产物（勿提交）
+.env
+bld.log
+*.tar
+.claude-seed/
+.docker-build.log
+.docker-monitor.log
+.docker-monitor-dry.log
+docker-compose.override.yml
+
+# UI 预览构建产物（并行会话生成,8GB+,勿提交）
+src-tauri/target-ui-preview/
+
+__pycache__/
+*.pyc

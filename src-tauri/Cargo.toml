@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "1.0.4"
+version = "1.0.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -111,15 +111,14 @@ server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
 
 # server 二进制：浏览器前端 + REST/WS 后端（替代 Tauri 外壳）。
 # 构建：cargo build --release --bin polaris-server --no-default-features --features server
-#
-# v1.0.1 实测:即便去掉 required-features 让 desktop 编出 stub,tauri bundler
-# 仍会按 [[bin]] 列表去 copy 二进制,而 stub 不带 main 链接(bin source 用
-# #[cfg(feature="server")] 门控,desktop 默认特性下 main 函数不存在),会
-# 报 does not exist。把整块 [[bin]] 注释掉 → bundler 完全看不到它,直接
-# 出包。Docker 真服务端等 v1.0.2 走 workspace 拆分再补(本版无 docker 镜像)。
-# [[bin]]
-# name = "polaris-server"
-# path = "src/bin/polaris-server.rs"
+# 注意:不能写 required-features = ["server"] —— tauri-cli 的 bundler 会把包里
+# 所有 [[bin]] 打进安装包且不看 required-features,desktop 构建因找不到
+# polaris-server 而 bundling 失败(v1.0.0 双平台 CI 实测)。去掉后 desktop
+# 按默认特性把它编成 cfg(not(server)) 的极小 stub,bundler 能找到文件;
+# Docker 仍用 --features server 出真服务端。
+[[bin]]
+name = "polaris-server"
+path = "src/bin/polaris-server.rs"
 
 # 桌面二进制保持默认（main.rs）。
 [[bin]]

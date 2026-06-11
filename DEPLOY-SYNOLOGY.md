@@ -133,7 +133,18 @@ full 镜像额外打包 **chromium（截图）+ fonts-noto-cjk（防中文豆腐
 
 ---
 
-## 7. 备份 / 恢复
+## 7. 更新镜像
+
+- 容器版**永远**用 `update.sh` 协议：拉 `ghcr.io/wuli2025/polaris` 的新层 → 重建容器。
+- 镜像由 GitHub Actions `image.yml` 在 release tag 时自动推 GHCR。
+- 三种更新路径（细节见 `DOCKER.md` §七）：
+  - **A. Web UI 一键更新**（推荐）：页面「更新」板块的「立即更新」按钮。需在 compose 取消 `POLARIS_DOCKER_SOCKET="1"` 与 `/var/run/docker.sock` 挂载的注释。
+  - **B. SSH 跑 `update.sh`**：在 `/volume1/tx/群晖/polaris-app` 下跑 `./update.sh`（仓库自带）。
+  - **C. Container Manager GUI 重建**：项目页点「重建」等价于 `docker compose up -d --build`，但**注意**：本仓库 NAS 端通常**没有源码 + 没法 build**，要先 `docker pull` 一次。
+- 国内网拉不动 GHCR：见 `DOCKER.md` §七「Windows 桥接」用 `scripts/pull-ghcr-to-nas.ps1`。
+- 看当前运行的版本：`curl http://<nas>:8080/api/version` → `{"version":"...","flavor":"docker",...}`。
+
+## 8. 备份 / 恢复
 
 - 用 **Snapshot Replication** 对 `/volume1/docker/polaris` 定时快照。
 - DB 写入中的快照非崩溃一致：备份前停容器，或在低写入时段做。

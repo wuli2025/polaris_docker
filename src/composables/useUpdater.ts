@@ -15,6 +15,7 @@ import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+import { isTauri } from "../tauri";
 
 // 后端 updater.rs 的 UpdaterState（serde tag = "status"）。
 type UpdaterState =
@@ -28,6 +29,31 @@ type UpdaterState =
   | { status: "installing"; version: string }
   | { status: "error"; message: string };
 
+// /api/version 响应（容器模式独享;桌面模式 fallback 用 getVersion()）。
+interface VersionInfo {
+  version: string;
+  flavor: "docker" | "desktop";
+  updater_enabled: boolean;
+  socket_present: boolean;
+}
+interface DockerStatus {
+  updater_enabled: boolean;
+  socket_present: boolean;
+  current_tag: string;
+  update_script: boolean;
+}
+interface DockerUpdateResult {
+  success?: boolean;
+  exit_code?: number | null;
+  tag?: string;
+  stdout?: string;
+  stderr?: string;
+  note?: string;
+  dryRun?: boolean;
+  wouldRun?: string;
+  error?: string;
+}
+
 // 后端状态机的当前态（唯一真相源）。
 const state = ref<UpdaterState>({ status: "idle" });
 
@@ -35,6 +61,12 @@ const state = ref<UpdaterState>({ status: "idle" });
 export const currentVersion = ref<string>(""); // 当前已安装版本（前端取）
 export const lastCheckedAt = ref<number | null>(null); // 上次检查时间戳(ms)
 export const dialogDismissed = ref(false); // 中央对话框「以后再说」—— 纯前端态
+// 容器模式额外位:
+export const isDockerMode = ref<boolean>(!isTauri); // 容器/浏览器预览 = true;桌面 Tauri = false
+export const dockerUpdaterEnabled = ref<boolean>(false); // POLARIS_DOCKER_SOCKET=1 && socket 已挂
+export const dockerStatus = ref<DockerStatus | null>(null); // 最近一次 docker_status 响应
+export const dockerLastApply = ref<DockerUpdateResult | null>(null); // 最近一次 docker_update 响应
+export const dockerApplying = ref<boolean>(false); // 更新中（按钮转圈 + 禁用）
 
 const versionOf = (s: UpdaterState): string | null =>
   "version" in s ? s.version : null;
@@ -63,12 +95,31 @@ export const checkFailed = computed(() => state.value.status === "error");
 let subscribed = false;
 let autoChecked = false;
 
+async function fetchDockerVersion(): Promise<VersionInfo | null> {
+  try {
+    const r = await fetch("/api/version", { cache: "no-store" });
+    if (!r.ok) return null;
+    return (await r.json()) as VersionInfo;
+  } catch {
+    return null;
+  }
+}
+
 async function ensureCurrentVersion(): Promise<void> {
   if (currentVersion.value) return;
-  try {
-    currentVersion.value = await getVersion();
-  } catch {
-    /* 非 Tauri 运行时（纯浏览器预览）拿不到，忽略 */
+  if (isDockerMode.value) {
+    // 容器模式：去 /api/version 拉真实版本（之前页面显示 v— 的根因）
+    const info = await fetchDockerVersion();
+    if (info) {
+      currentVersion.value = info.version;
+      dockerUpdaterEnabled.value = !!info.updater_enabled && !!info.socket_present;
+    }
+  } else {
+    try {
+      currentVersion.value = await getVersion();
+    } catch {
+      /* 浏览器预览态拿不到，忽略 */
+    }
   }
 }
 
@@ -123,6 +174,50 @@ export async function applyUpdate(): Promise<void> {
     // 正常路径里后端会自重启，不会走到这里。
   } catch (e) {
     console.warn("[updater] apply failed:", e);
+  }
+}
+
+// ── Docker 版独有动作 ───────────────────────────────────────────
+
+/** 容器模式：「检查更新」按钮——调 /api/invoke docker_status,返回 updater_enabled + socket_present。 */
+export async function dockerCheck(): Promise<void> {
+  await ensureCurrentVersion();
+  dialogDismissed.value = false;
+  try {
+    const r = await fetch("/api/invoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: "docker_status", args: {} }),
+    });
+    const j = (await r.json()) as DockerStatus & { error?: string };
+    if (j.error) throw new Error(j.error);
+    dockerStatus.value = j;
+    dockerUpdaterEnabled.value = !!j.updater_enabled && !!j.socket_present;
+    lastCheckedAt.value = Date.now();
+  } catch (e) {
+    console.warn("[updater] docker_check failed:", e);
+    // 状态里塞个 error 提示;UpdatePanel 兜底
+    dockerLastApply.value = { error: `检查失败：${(e as Error).message || e}` };
+  }
+}
+
+/** 容器模式：「立即更新」按钮——调 /api/invoke docker_update。后端 spawn update.sh。 */
+export async function dockerApply(): Promise<void> {
+  if (dockerApplying.value) return;
+  dockerApplying.value = true;
+  dockerLastApply.value = null;
+  try {
+    const r = await fetch("/api/invoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: "docker_update", args: { confirm: true } }),
+    });
+    const j = (await r.json()) as DockerUpdateResult;
+    dockerLastApply.value = j;
+  } catch (e) {
+    dockerLastApply.value = { error: `请求失败：${(e as Error).message || e}` };
+  } finally {
+    dockerApplying.value = false;
   }
 }
 

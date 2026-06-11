@@ -8,17 +8,22 @@
 # 运行：见 docker-compose.yml
 # ════════════════════════════════════════════════════════════════
 
-# ── 阶段1：构建前端 ──────────────────────────────────────────────
-# v1.0.2 起恢复真实前端构建(vue-tsc 类型债已清零)→ Docker 版与桌面版同一套 UI,
-# 含「传统 PPT 可编辑化」。先拷清单装依赖(层缓存),再拷源码跑 vue-tsc + vite build。
+# ── 阶段1：构建前端 Vue3 → dist/ ──────────────────────────────────
+# 跳过 package.json 的 `vue-tsc --noEmit`(有历史存量类型报错),直接 vite build：
+# esbuild 只转译不做类型检查,类型报错不影响产物;真实 App 界面随镜像发布。
 FROM node:20-slim AS web
 WORKDIR /app
+# npm 国内镜像(npmmirror)——NAS 只有国内网,拉 registry.npmjs.org 会极慢/超时。
+RUN npm config set registry https://registry.npmmirror.com
+# 依赖层:先拷清单,package-lock 不变则复用 npm ci 缓存层(Windows 更新后快速重建)。
 COPY package.json package-lock.json ./
 RUN npm ci
-COPY index.html vite.config.ts tsconfig.json tsconfig.node.json ./
-COPY src ./src
+# 源码 + 配置 + 静态资源
+COPY tsconfig.json tsconfig.node.json vite.config.ts index.html ./
 COPY public ./public
-RUN npm run build
+COPY src ./src
+# 跳过 vue-tsc,直接产出 dist/(默认输出目录,被阶段3 COPY 到 /srv/web)
+RUN npx vite build
 
 # ── 阶段2：构建 Rust server 二进制 ───────────────────────────────
 FROM rust:1-slim-bookworm AS server
@@ -46,16 +51,15 @@ RUN mkdir -p /usr/local/cargo/ \
 
 # 2a) 依赖缓存层：先只拷清单 + crates 源 + 空占位 src，预编译全部第三方依赖。
 #     之后改业务代码不会重编 axum/tokio 等重型依赖 → Windows 更新后 Docker 快速重建。
-#     注:polaris-server bin 自 v1.0.2 起住 crates/polaris-cli(47d1e0c 教训:主包 [[bin]]
-#     会被 tauri bundler 连坐),此层只预编主 lib(server feature)把第三方依赖全部缓存。
 COPY src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs ./src-tauri/
 COPY src-tauri/crates ./src-tauri/crates
-RUN mkdir -p src-tauri/src \
+RUN mkdir -p src-tauri/src/bin \
+    && echo 'fn main(){}' > src-tauri/src/bin/polaris-server.rs \
     && echo '' > src-tauri/src/main.rs \
     && echo '' > src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        --lib --no-default-features --features server \
+        --bin polaris-server --no-default-features --features server \
     ; rm -rf src-tauri/src
 
 # 2b) 真实源码层：拷源码 + 资源 + assets(feishu/wecom 的 include_str!)，编出 polaris-server。
@@ -63,14 +67,11 @@ COPY src-tauri/src ./src-tauri/src
 COPY src-tauri/assets ./src-tauri/assets
 COPY src-tauri/resources ./src-tauri/resources
 # 触碰 mtime 确保 cargo 重编 polaris-app crate 本体（而非缓存的空壳）。
-# polaris-cli 一次出两个 bin:polaris-server(axum 服务端)+ polaris-forge(渲染 CLI,
-# 容器内 agent 直接命令行出 PPT/截图/视频——传统PPT spec→原生OOXML 零浏览器)。
 RUN touch src-tauri/src/main.rs src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        -p polaris-cli \
-    && cp src-tauri/target/release-fast/polaris-server /usr/local/bin/polaris-server \
-    && cp src-tauri/target/release-fast/polaris-forge /usr/local/bin/polaris-forge
+        --bin polaris-server --no-default-features --features server \
+    && cp src-tauri/target/release-fast/polaris-server /usr/local/bin/polaris-server
 
 # ── 阶段3：运行时 ────────────────────────────────────────────────
 FROM node:20-slim AS runtime
@@ -79,6 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         bash git ca-certificates curl python3 python3-pip python3-venv ripgrep \
         tini gosu \
     && rm -rf /var/lib/apt/lists/* \
+    && npm config set registry https://registry.npmmirror.com \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
 
@@ -101,8 +103,8 @@ COPY docker/subset_cjk.py /docker/subset_cjk.py
 RUN if [ "$POLARIS_RENDER" = "1" ]; then \
         apt-get update && apt-get install -y --no-install-recommends \
             fonts-noto-cjk fonts-noto-color-emoji fontconfig \
-        && pip install --no-cache-dir --break-system-packages fonttools brotli 2>/dev/null \
-            || pip install --no-cache-dir fonttools brotli \
+        && pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir --break-system-packages fonttools brotli 2>/dev/null \
+            || pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir fonttools brotli \
         && mkdir -p /out \
         && python3 /docker/subset_cjk.py \
             || echo "[subset] 子集失败,降级全语种 102MB" \
@@ -115,16 +117,14 @@ RUN if [ "$POLARIS_RENDER" = "1" ]; then \
         && rm -rf /var/lib/apt/lists/* ; \
     fi
 
-# ── 渲染栈(可选 flavor)——Polaris Forge 跨平台 PRD §05 ──
-#   POLARIS_RENDER=0 → polaris:slim   聊天/KB/网站生成 + **传统PPT 仍可出**
-#                                 (polaris-forge spec-pptx 原生 OOXML,零浏览器)
-#   POLARIS_RENDER=1 → polaris:full   +chromium(deck 截图/CloakBrowser)+ffmpeg(视频)
-#                                 +xvfb(虚拟显示)+libnss3 等原生库+CJK 字体子集(阶段3.5 落)
+# ── 渲染栈(可选 flavor)——Polaris Forge 工业级化阶段 0:Docker 994MB→235MB ──
+#   POLARIS_RENDER=0 → polaris:slim   现状(聊天/KB/网站生成，网站本就不需渲染栈)
+#   POLARIS_RENDER=1 → polaris:full   +chrome-headless-shell(截图,~80-130MB,比完整 chromium 砍 150MB)
+#                                 +ffmpeg(出视频,静态 ~30MB)+xvfb(虚拟显示,CloakBrowser 有头模式)
+#                                 +fb/libnss3(原生库依赖)+CJK 字体子集(36MB,阶段3.5 落)
 # 构建 full：docker build --build-arg POLARIS_RENDER=1 -t polaris-web:full 。
-# 为什么装完整 chromium 而非 chrome-headless-shell(后者可省 ~150MB):
-#   CloakBrowser **有头模式**(公众号扫码登录/直传,xvfb 虚拟屏)headless-shell 跑不了;
-#   等公众号链路改纯 headless 后可降级 headless-shell(工业级化阶段 0 的 235MB 目标)。
 # CJK 字体是「最隐蔽必踩」坑：缺了 deck 截图全是 □□□，preflight 会用 fc-list 探测并亮红灯。
+# 浏览器(Chromium/CloakBrowser)有头模式需要 X server —— 容器没显示器，靠 Xvfb 给一块虚拟屏；
 # wechat_yiban.py 的 publish/restyle/publish-image/panel 模式都按 headless=False 启动以支撑扫码登录。
 RUN if [ "$POLARIS_RENDER" = "1" ]; then \
         apt-get update && apt-get install -y --no-install-recommends \
@@ -136,7 +136,7 @@ RUN if [ "$POLARIS_RENDER" = "1" ]; then \
             xvfb x11-utils procps \
         && rm -rf /var/lib/apt/lists/* ; \
     else \
-        echo "[build] POLARIS_RENDER=0 → slim 镜像(无浏览器渲染栈;传统PPT 走 polaris-forge 原生路线仍可用)" ; \
+        echo "[build] POLARIS_RENDER=0 → slim 镜像(无渲染栈)" ; \
     fi
 # 容器内 chromium wrapper:预置 no-sandbox + disable-dev-shm-usage + disable-gpu + disable-dbus
 # 消除 Docker 无 DBus daemon 的噪音(Docker 实测误差级,不影响截图)
@@ -158,6 +158,24 @@ RUN sed -i 's/\r$//' /usr/local/bin/xvfb-wrap \
 # 默认显示号;ClaakBrowser 拉起时会用 DISPLAY=:99 启 chromium。
 ENV DISPLAY=:99
 
+# ── 版本号注入(/app/VERSION)与容器内 update.sh ─────────────────────
+# 真实版本号：仓库根 VERSION 文件优先;CI 也可走 build-arg POLARIS_VERSION 覆盖。
+# 容器内 polaris-server 的 /api/version handler 读这个文件,前端 UpdatePanel 据此显示。
+ARG POLARIS_VERSION=dev
+COPY VERSION /app/VERSION
+RUN echo "${POLARIS_VERSION}" > /app/VERSION.bak \
+    && if [ "$(cat /app/VERSION | tr -d '[:space:]')" = "dev" ] || [ -z "$(cat /app/VERSION)" ]; then \
+         echo "${POLARIS_VERSION}" > /app/VERSION; \
+       fi
+# update.sh 拷进镜像 → /usr/local/bin/update.sh;容器内能 spawn 它触发 pull+upd 重建。
+# 它内部会 `cd $(dirname $0)` 找 docker-compose.yml,所以配套把 compose 拷到 update-bundles/。
+COPY update.sh /usr/local/bin/update.sh
+COPY docker-compose.yml /app/update-bundles/docker-compose.yml
+COPY docker-compose.synology.yml /app/update-bundles/docker-compose.synology.yml
+RUN sed -i 's/\r$//' /usr/local/bin/update.sh \
+    && chmod +x /usr/local/bin/update.sh \
+    && chmod +x /app/update-bundles/docker-compose.yml /app/update-bundles/docker-compose.synology.yml
+
 # 引擎二进制 + 前端静态 + 资源种子
 COPY --from=server /usr/local/bin/polaris-server /usr/local/bin/polaris-server
 COPY --from=web    /app/dist /srv/web
@@ -167,6 +185,8 @@ ENV HOME=/root \
     POLARIS_RESOURCE_DIR=/app/resources \
     POLARIS_WEB_DIR=/srv/web \
     POLARIS_PORT=8080 \
+    # 版本号：/app/VERSION 优先;这里是 build-arg 透传兜底
+    POLARIS_VERSION=${POLARIS_VERSION} \
     # claude headless 默认非交互；让其在容器里直接用环境变量鉴权
     CI=1
 

@@ -172,64 +172,6 @@ const canEdit = computed(() => {
   return k === "html" || k === "svg";
 });
 
-// ── .pptx 也能编辑：找它的网页版源稿 deck.html ──
-// .pptx 是逐页截图死图，真正可编辑的是同目录的 deck.html。预览 pptx 时
-// 找同目录的伴生 html（同名优先，否则取最新），「编辑」= 编辑 html + 保存后一键重导出。
-const isPptx = computed(() => /\.pptx$/i.test(artifacts.current?.name ?? ""));
-const pptxDeckHtml = ref<string | null>(null);
-watch(
-  () => artifacts.current?.path,
-  async (p) => {
-    pptxDeckHtml.value = null;
-    if (!p || !/\.pptx$/i.test(p)) return;
-    try {
-      const norm = (s: string) => s.replace(/\\/g, "/");
-      const np = norm(p);
-      const dir = np.slice(0, np.lastIndexOf("/") + 1);
-      const base = (np.split("/").pop() ?? "").replace(/\.pptx$/i, "");
-      const list = await artifactsApi.list(app.currentConvId ?? undefined);
-      // 异步竞态守卫:list/read 期间用户可能已切到别的 pptx,过期回调若继续写
-      // pptxDeckHtml 会让「编辑/更新 PPT」指向上一个文件 → 覆盖错 deck。一律丢弃。
-      if (artifacts.current?.path !== p) return;
-      // 同目录有 polaris.slides.json = 原生 spec 导出的真可编辑 pptx ——
-      // 此时绝不能给 deck.html 重导出入口:任何 html 截图覆盖都会把真文本框毁成死图。
-      if (list.some((e) => norm(e.path) === `${dir}polaris.slides.json`)) return;
-      const htmls = list.filter(
-        (e) => /\.html?$/i.test(e.name) && norm(e.path).startsWith(dir)
-      );
-      if (!htmls.length) return;
-      const exact = htmls.find((e) => e.name.replace(/\.html?$/i, "") === base);
-      if (exact) {
-        pptxDeckHtml.value = exact.path;
-        return;
-      }
-      // 非同名兜底:必须验明内容确实是 deck(含 .slide 结构/导出 runtime),
-      // 否则同目录随便一个网页都会被当伴生、「更新 PPT」用它覆盖毁掉原 pptx。
-      const recent = [...htmls].sort((a, b) => b.modified - a.modified).slice(0, 3);
-      for (const h of recent) {
-        try {
-          const c = await artifactsApi.read(h.path);
-          if (artifacts.current?.path !== p) return; // 同上:read 期间已切走则丢弃
-          if (c?.text && /class=["'][^"']*\bslide\b|__deck|data-notext-capable/.test(c.text)) {
-            pptxDeckHtml.value = h.path;
-            return;
-          }
-        } catch {
-          /* 读不动就看下一个候选 */
-        }
-      }
-    } catch {
-      /* 找不到就不显示编辑入口 */
-    }
-  },
-  { immediate: true }
-);
-function editPptx() {
-  if (pptxDeckHtml.value && artifacts.current) {
-    artifacts.enterEditDeck(pptxDeckHtml.value, artifacts.current.path);
-  }
-}
-
 const headIcon = computed(() => {
   const k = artifacts.payload?.kind;
   if (k === "html" || k === "svg") return FileCode;
@@ -366,14 +308,6 @@ function fmtSize(n: number): string {
             <PencilLine :size="15" :stroke-width="1.8" />
           </button>
           <button
-            v-else-if="isPptx && pptxDeckHtml"
-            class="pv-btn"
-            title="编辑此 PPT（实际编辑它的网页版源稿，保存后一键重新导出 .pptx）"
-            @click="editPptx()"
-          >
-            <PencilLine :size="15" :stroke-width="1.8" />
-          </button>
-          <button
             v-else
             class="pv-btn"
             :title="artifacts.expanded ? '收起' : '放大'"
@@ -446,17 +380,6 @@ function fmtSize(n: number): string {
           <div v-else class="pv-state">
             <FileIcon :size="26" :stroke-width="1.4" />
             <span>该文件类型暂不支持内嵌预览</span>
-            <button
-              v-if="isPptx && pptxDeckHtml"
-              class="pv-open-ext primary"
-              @click="editPptx()"
-            >
-              <PencilLine :size="14" :stroke-width="1.8" />
-              <span>在 App 里编辑此 PPT</span>
-            </button>
-            <span v-if="isPptx && pptxDeckHtml" class="pv-edit-hint">
-              编辑的是它的网页版源稿，保存后可一键重新导出 .pptx
-            </span>
             <button class="pv-open-ext" @click="artifacts.openExternal()">
               <ExternalLink :size="14" :stroke-width="1.8" />
               <span>用系统程序打开</span>
@@ -823,21 +746,6 @@ function fmtSize(n: number): string {
 .pv-open-ext:hover {
   border-color: var(--primary);
   color: var(--primary);
-}
-.pv-open-ext.primary {
-  border-color: var(--primary);
-  background: var(--primary);
-  color: #fff;
-  font-weight: 600;
-}
-.pv-open-ext.primary:hover {
-  filter: brightness(1.07);
-  color: #fff;
-}
-.pv-edit-hint {
-  font-size: 11px;
-  color: var(--dim);
-  margin-top: -6px;
 }
 .spin {
   animation: pv-spin 0.9s linear infinite;

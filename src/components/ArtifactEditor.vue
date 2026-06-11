@@ -10,7 +10,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
 import {
   Code2, Eye, ChevronLeft, ChevronRight, Plus, Copy, Trash2,
-  Save, X, Loader, Palette, ZoomIn, ZoomOut, Maximize, FileType2,
+  Save, X, Loader, Palette, ZoomIn, ZoomOut, Maximize,
   Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Minus, BringToFront,
   MousePointer2, RotateCw, Type, Square, Circle, Image as ImageIcon, SendToBack,
 } from "@lucide/vue";
@@ -651,26 +651,13 @@ function toVisual() {
 }
 
 // ───────── 保存 / 退出 ─────────
-async function save(): Promise<boolean> {
+async function save() {
   const out = mode.value === "visual" ? serialize() : html.value;
   html.value = out;
   const ok = await artifacts.saveContent(out);
   if (ok) {
     justSaved.value = true;
     setTimeout(() => (justSaved.value = false), 1800);
-  }
-  return ok;
-}
-
-// ── 伴生 .pptx：从「编辑此 PPT」进来时，保存后一键重导出覆盖 ──
-const justExported = ref(false);
-async function updatePptx() {
-  if (artifacts.exporting || artifacts.saving) return;
-  if (artifacts.dirty && !(await save())) return; // 先把改动落盘，导出读的是磁盘上的 html
-  const ok = await artifacts.exportPptx();
-  if (ok) {
-    justExported.value = true;
-    setTimeout(() => (justExported.value = false), 2600);
   }
 }
 function exit() {
@@ -757,24 +744,12 @@ watch(
       <div class="ed-spacer" />
 
       <span v-if="artifacts.saveError" class="ed-err" :title="artifacts.saveError">保存失败</span>
-      <span v-else-if="artifacts.exportError" class="ed-err" :title="artifacts.exportError">导出失败</span>
-      <span v-else-if="justExported" class="ed-ok">PPT 已更新 ✓</span>
       <span v-else-if="justSaved" class="ed-ok">已保存 ✓</span>
       <span v-else-if="dirty" class="ed-dirty">未保存</span>
 
       <button class="ed-save" :disabled="saving || (!dirty && !justSaved)" @click="save">
         <Loader v-if="saving" :size="14" class="spin" /><Save v-else :size="14" />
         {{ saving ? "保存中" : "保存" }}
-      </button>
-      <button
-        v-if="artifacts.companionPptx"
-        class="ed-save pptx"
-        :disabled="saving || artifacts.exporting"
-        title="保存当前修改，并把网页版重新导出覆盖 .pptx（逐页截图，可能要几十秒）"
-        @click="updatePptx"
-      >
-        <Loader v-if="artifacts.exporting" :size="14" class="spin" /><FileType2 v-else :size="14" />
-        {{ artifacts.exporting ? "导出中…" : "更新 PPT" }}
       </button>
       <button class="ed-exit" title="退出编辑" @click="exit"><X :size="15" /></button>
     </div>
@@ -971,8 +946,6 @@ watch(
 .ed-save { display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; border: none; border-radius: 8px; background: var(--primary); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
 .ed-save:hover:not(:disabled) { filter: brightness(1.07); }
 .ed-save:disabled { opacity: .5; cursor: default; }
-/* 「更新 PPT」：描边样式与实底「保存」区分主次 */
-.ed-save.pptx { background: var(--primary-soft); color: var(--primary-deep); border: 1px solid var(--primary); }
 .ed-exit { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--muted); cursor: pointer; }
 .ed-exit:hover { border-color: var(--vermilion); color: var(--vermilion); }
 

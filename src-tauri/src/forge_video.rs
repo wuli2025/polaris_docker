@@ -38,7 +38,8 @@ pub fn render_deck_fx_video(
     let file_base = if is_http {
         deck.to_string()
     } else {
-        crate::forge::path_to_file_url(deck)?
+        let abs = std::fs::canonicalize(deck).map_err(|e| format!("找不到 deck {deck}: {e}"))?;
+        format!("file://{}", abs.to_string_lossy().replace('\\', "/"))
     };
     let seq = FX_SEQ.fetch_add(1, Ordering::Relaxed);
     let frames = std::env::temp_dir().join(format!("forge_fx_{}_{}", std::process::id(), seq));

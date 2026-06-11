@@ -11,7 +11,6 @@ pub mod forge;
 pub mod forge_capture;   // 工业级化:持久 CDP + 5 档 fallback 链(替 forge_video 的 per-frame CLI)
 pub mod forge_fx_safe;   // 工业级化:动效错误隔离 + spring 闭式解(任务 c §C.2 §C.3)
 pub mod forge_pptx;
-pub mod forge_pptx_native; // 路线 B:spec JSON → 原生可编辑 .pptx(零浏览器,Docker slim 可用)
 pub mod forge_tts;
 pub mod forge_video;
 pub mod infer;
@@ -207,8 +206,6 @@ pub fn run() {
             forge::forge_build_pptx,
             forge::forge_screenshot,
             forge::forge_deck_to_pptx,
-            // 路线 B：spec JSON → 原生可编辑 .pptx（传统PPT模式，零浏览器）
-            forge::forge_spec_to_pptx,
             forge::forge_deck_to_video,
             forge::forge_deck_fx_video,
             forge::forge_tts,

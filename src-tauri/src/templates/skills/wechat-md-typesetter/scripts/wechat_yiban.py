@@ -149,16 +149,15 @@ STYLIZE_JS = r"""
   // —— 主题预设：palette + h2Mode(标题形态：bar竖条/underline下划线/pill胶囊/center居中/block色块/tag标签)
   //    + 可选 bg(整体底色)。底色**按块铺设**(每个块自带 background 内联)——不靠外包 section,
   //    编辑器剥不掉,这是 135editor 背景模板的真实做法。——
-  // 字号 / 行高整体调大、放疏：长图截出来不挤、手机上一眼能读（用户反馈「太紧凑、字小」）。
   var THEMES = {
-    "墨韵":   { accent:"#b08550", text:"#3a3a3a", quoteBg:"#f7f5f1", quoteBd:"#d9c7a8", quoteTx:"#8a8378", size:17,   lh:2.0,  hFont:"inherit", h2Mode:"bar" },
-    "极简":   { accent:"#191919", text:"#262626", quoteBg:"#f6f6f6", quoteBd:"#191919", quoteTx:"#737373", size:17.5, lh:2.05, hFont:"inherit", h2Mode:"underline" },
-    "科技蓝": { accent:"#2b6cff", text:"#2c3338", quoteBg:"#eef3ff", quoteBd:"#2b6cff", quoteTx:"#5a6b8c", size:17,   lh:1.95, hFont:"inherit", h2Mode:"pill" },
-    "杂志":   { accent:"#b3322c", text:"#2b2b2b", quoteBg:"#faf6f0", quoteBd:"#b3322c", quoteTx:"#8a7a6a", size:17.5, lh:2.0,  hFont:"Georgia,'Songti SC',serif", h2Mode:"center" },
-    "清新绿": { accent:"#1f7a4d", text:"#2f3a33", quoteBg:"#e9f5ee", quoteBd:"#1f7a4d", quoteTx:"#587a66", size:17,   lh:1.95, hFont:"inherit", h2Mode:"block" },
-    "活力橙": { accent:"#e8622c", text:"#33302c", quoteBg:"#fff3ec", quoteBd:"#ffb38a", quoteTx:"#9a7a66", size:17,   lh:1.95, hFont:"inherit", h2Mode:"tag" },
-    "米纸":   { accent:"#8a6d3b", text:"#4a4337", quoteBg:"#f1e8d2", quoteBd:"#c8b48a", quoteTx:"#8a7c63", size:17,   lh:2.0,  hFont:"Georgia,'Songti SC',serif", h2Mode:"center", bg:"#faf5e9" },
-    "黛青":   { accent:"#34566b", text:"#2f3b42", quoteBg:"#e7eef2", quoteBd:"#34566b", quoteTx:"#5d7382", size:17,   lh:2.0,  hFont:"inherit", h2Mode:"underline", bg:"#f3f7f9" }
+    "墨韵":   { accent:"#b08550", text:"#3a3a3a", quoteBg:"#f7f5f1", quoteBd:"#d9c7a8", quoteTx:"#8a8378", size:15.5, lh:1.85, hFont:"inherit", h2Mode:"bar" },
+    "极简":   { accent:"#191919", text:"#262626", quoteBg:"#f6f6f6", quoteBd:"#191919", quoteTx:"#737373", size:16,  lh:1.9,  hFont:"inherit", h2Mode:"underline" },
+    "科技蓝": { accent:"#2b6cff", text:"#2c3338", quoteBg:"#eef3ff", quoteBd:"#2b6cff", quoteTx:"#5a6b8c", size:15.5, lh:1.8,  hFont:"inherit", h2Mode:"pill" },
+    "杂志":   { accent:"#b3322c", text:"#2b2b2b", quoteBg:"#faf6f0", quoteBd:"#b3322c", quoteTx:"#8a7a6a", size:16,  lh:1.85, hFont:"Georgia,'Songti SC',serif", h2Mode:"center" },
+    "清新绿": { accent:"#1f7a4d", text:"#2f3a33", quoteBg:"#e9f5ee", quoteBd:"#1f7a4d", quoteTx:"#587a66", size:15.5, lh:1.8,  hFont:"inherit", h2Mode:"block" },
+    "活力橙": { accent:"#e8622c", text:"#33302c", quoteBg:"#fff3ec", quoteBd:"#ffb38a", quoteTx:"#9a7a66", size:15.5, lh:1.8,  hFont:"inherit", h2Mode:"tag" },
+    "米纸":   { accent:"#8a6d3b", text:"#4a4337", quoteBg:"#f1e8d2", quoteBd:"#c8b48a", quoteTx:"#8a7c63", size:15.5, lh:1.9,  hFont:"Georgia,'Songti SC',serif", h2Mode:"center", bg:"#faf5e9" },
+    "黛青":   { accent:"#34566b", text:"#2f3b42", quoteBg:"#e7eef2", quoteBd:"#34566b", quoteTx:"#5d7382", size:15.5, lh:1.85, hFont:"inherit", h2Mode:"underline", bg:"#f3f7f9" }
   };
   // themeName 可以是预设名，也可以是 AI 生成的主题对象（缺省字段从墨韵补齐）。
   var base = THEMES["墨韵"];
@@ -193,14 +192,14 @@ STYLIZE_JS = r"""
 
   // —— 一级标题：文章大标题，居中加粗 ——
   root.querySelectorAll("h1").forEach(function (el) {
-    set(el, "font-size:24px;font-weight:700;text-align:center;color:" + t.text + ";" +
-      sp(12, 30) + "line-height:1.45;font-family:" + t.hFont + ";");
+    set(el, "font-size:21px;font-weight:700;text-align:center;color:" + t.text + ";" +
+      sp(10, 24) + "line-height:1.4;font-family:" + t.hFont + ";");
   });
 
   // —— 二级标题：六种形态（主题的「长相」主要靠它）——
   var m2 = t.h2Mode || "bar";
   root.querySelectorAll("h2").forEach(function (el) {
-    var css = "font-size:20px;font-weight:700;line-height:1.5;font-family:" + t.hFont + ";" + sp(40, 18);
+    var css = "font-size:17px;font-weight:700;line-height:1.5;font-family:" + t.hFont + ";" + sp(26, 12);
     if (m2 === "underline")  css += "color:" + t.text + ";border-bottom:2px solid " + t.accent + ";padding-bottom:6px;";
     else if (m2 === "pill")  css += "color:#ffffff;background:" + t.accent + ";display:inline-block;padding:5px 16px;border-radius:6px;";
     else if (m2 === "center") css += "color:" + t.accent + ";text-align:center;letter-spacing:2px;";
@@ -212,7 +211,7 @@ STYLIZE_JS = r"""
 
   // —— 三级标题：主色加粗，略小 ——
   root.querySelectorAll("h3").forEach(function (el) {
-    set(el, "font-size:17px;font-weight:700;color:" + t.accent + ";" + sp(28, 12) +
+    set(el, "font-size:15.5px;font-weight:700;color:" + t.accent + ";" + sp(20, 8) +
       "line-height:1.5;font-family:" + t.hFont + ";");
   });
 
@@ -220,15 +219,15 @@ STYLIZE_JS = r"""
   root.querySelectorAll("p").forEach(function (el) {
     if (el.getAttribute("data-polaris-li")) return; // 列表段落在下面统一处理
     set(el, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text +
-      ";letter-spacing:.3px;" + sp(20, 20));
+      ";letter-spacing:.3px;" + sp(14, 14));
   });
 
-  // —— 引用块：浅底左竖条卡片（加大留白，做成更醒目的「配图卡」感）——
+  // —— 引用块：浅底左竖条卡片 ——
   root.querySelectorAll("blockquote").forEach(function (el) {
-    set(el, "background:" + t.quoteBg + ";border-left:4px solid " + t.quoteBd +
-      ";padding:18px 22px;color:" + t.quoteTx +
-      ";border-radius:0 10px 10px 0;font-size:" + (t.size - 0.5) + "px;line-height:1.85;" +
-      (t.bg ? "margin:0;" : "margin:24px 0;"));
+    set(el, "background:" + t.quoteBg + ";border-left:3px solid " + t.quoteBd +
+      ";padding:12px 16px;color:" + t.quoteTx +
+      ";border-radius:0 8px 8px 0;font-size:" + (t.size - 0.5) + "px;line-height:1.75;" +
+      (t.bg ? "margin:0;" : "margin:18px 0;"));
   });
 
   // —— 重点 / 强调：主色加粗 ——
@@ -264,7 +263,7 @@ STYLIZE_JS = r"""
         : ('<span data-polaris-mark="1" style="color:' + t.accent + ';font-weight:700;">· </span>');
       p.innerHTML = mark + li.innerHTML;
       p.setAttribute("data-polaris-li", "1");
-      set(p, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(12, 12));
+      set(p, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(8, 8));
       frag.appendChild(p);
     });
     list.replaceWith(frag);
@@ -278,7 +277,7 @@ STYLIZE_JS = r"""
     set(el, "color:" + t.accent + ";font-weight:700;");
   });
   root.querySelectorAll("[data-polaris-li]").forEach(function (el) {
-    set(el, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(12, 12));
+    set(el, "font-size:" + t.size + "px;line-height:" + t.lh + ";color:" + t.text + ";" + sp(8, 8));
   });
 
   // —— 链接：未认证号正文外链会被屏蔽，降级为主色文字（保留文案，去掉跳转误导）——
@@ -767,13 +766,6 @@ def _find_editor(ctx_or_page):
 
 def _is_logged_in(ctx_or_page):
     pages = list(ctx_or_page.pages) if hasattr(ctx_or_page, "pages") else [ctx_or_page]
-    # 登录后后台 URL 必带 token——先零 DOM 扫描判掉，省下轮询里 *:has-text 的全页文本遍历
-    for pg in pages:
-        try:
-            if re.search(r"[?&]token=\d+", pg.url or ""):
-                return True
-        except Exception:
-            pass
     for pg in pages:
         el, _ = _first(pg, SELECTORS["logged_in_hint"])
         if el:
@@ -881,18 +873,7 @@ def _save_draft(editor_page):
             clicked = True
         except Exception:
             pass
-    # 等回执期间顺手点掉「确定/完成」类确认弹窗（未填封面/摘要等提示会挡住保存流程，
-    # 不点掉它保存就永远完不成——回执也就永远等不到）
-    confirmed = False
-    if clicked:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            el, _ = _first(editor_page, SELECTORS["save_ok_hint"])
-            if el:
-                confirmed = True
-                break
-            _confirm_upload_dialog(editor_page)
-            time.sleep(0.5)
+    confirmed = _wait_any(editor_page, SELECTORS["save_ok_hint"], 10) if clicked else False
     return clicked, confirmed
 
 
@@ -916,12 +897,6 @@ def _open_editor_direct(ctx):
     try:
         pg = ctx.new_page()
         pg.goto(url, wait_until="domcontentloaded")
-        # 等编辑器就绪即走（此前是盲睡 4s）——没等到也不算失败，外层 _wait_editor 轮询兜底
-        try:
-            pg.wait_for_selector("div.ProseMirror[contenteditable=true], #ueditor_0",
-                                 timeout=15000)
-        except Exception:
-            pass
         print("[壹伴] 已直开「写图文」编辑器（token 直达，绕过首页按钮）。", flush=True)
         return True
     except Exception:
@@ -949,7 +924,8 @@ def _wait_editor(ctx, timeout, auto_click_entry, hint):
         if auto_click_entry and logged_in and not tried_direct:
             tried_direct = True
             if _open_editor_direct(ctx):
-                continue  # 直开里已 wait_for_selector 等过编辑器，立刻进下一轮探测
+                time.sleep(4)
+                continue
         # 次选：登录后最多替用户点 2 次「写图文」（隔 45s 才重试，避免开出一堆标签）
         if auto_click_entry and logged_in and clicked_entry < 2:
             for p in list(ctx.pages):
@@ -1158,9 +1134,7 @@ def run_restyle(theme, timeout):
 # 零清洗、零字数改写、零样式剥离）。
 SNAP_WIDTH = 720       # 视口 CSS 宽：对齐公众号 677px 显示宽，左右留白
 SNAP_SCALE = 2         # 2x 导出，手机端不糊
-SLICE_MAX_CSS = 12000  # 单张切片最大 CSS 像素高（@2x≈24000 设备像素）。长图按宽适配、纵向滚动看,
-                       # 高一点不糊——故默认尽量「截一整张」(app 链路还会显式传 --no-slice),只有
-                       # 极端长文(>12000css)才不得不在段落空隙切开,避免触到客户端单图尺寸上限。
+SLICE_MAX_CSS = 2800   # 单张切片最大 CSS 像素高（@2x≈5600 设备像素）；超长单图客户端会压糊
 
 # 量内容块边界（页面坐标），切点选在块与块之间 = 段落空隙
 JS_CUT_POINTS = r"""
@@ -1208,31 +1182,18 @@ def run_snapshot(body_html, theme, out_dir, base_name, raw_file=None, no_slice=F
         if raw_file:
             html_path = os.path.abspath(raw_file)
         else:
-            # ① 离屏套样式，只取 STYLIZE 的「内容 HTML」——不要 render 那层 max-width:677 居中外壳：
-            #    它在 720 视口里两侧留白，正是用户嫌弃的「白边」。这里让内容**铺满整幅**，
-            #    画布底色跟着主题走（主题有 bg 用它；没 bg 给一层很浅的暖纸色），全图统一一种底，
-            #    边缘不再出现生硬的纯白条。内部留足 padding 让排版舒展、不挤。
+            # ① 离屏套样式拿成品（同 render 管线）
             p0 = browser.new_page()
-            p0.goto("about:blank")
-            res = p0.evaluate(
-                "(args) => { document.body.innerHTML = \"<div id='polaris-style-root'></div>\"; "
-                "var root = document.getElementById('polaris-style-root'); root.innerHTML = args.body; "
-                "var html = (" + STYLIZE_JS + ")(root, args.theme); "
-                "return { html: html, bg: (root.style.background || '') }; }",
-                {"body": body_html, "theme": theme},
-            )
+            full = _styled_html(p0, body_html, theme)
             try:
                 p0.close()
             except Exception:
                 pass
-            canvas = res.get("bg") or "#f7f5ef"   # 无底色主题给暖纸色画布，杜绝白边
-            snap_html = (
-                "<!doctype html><meta charset='utf-8'>"
-                "<body style='margin:0;padding:0;background:" + canvas + ";'>"
-                "<div id='polaris-snap-root' style='width:" + str(SNAP_WIDTH) + "px;"
-                "box-sizing:border-box;padding:44px 38px;background:" + canvas + ";"
-                "-webkit-font-smoothing:antialiased;'>" + res["html"] + "</div></body>"
-            )
+            # 包一层可定位的快照容器（body 去 margin，背景白，避免截出杂边）
+            inner = full.split(">", 2)[-1]  # 去掉 doctype+meta 前缀，保留内容 div
+            snap_html = ("<!doctype html><meta charset='utf-8'>"
+                         "<body style='margin:0;background:#ffffff;'>"
+                         "<div id='polaris-snap-root'>" + inner + "</div></body>")
             html_path = os.path.join(out_dir, base_name + ".html")
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(snap_html)
@@ -1250,44 +1211,15 @@ def run_snapshot(body_html, theme, out_dir, base_name, raw_file=None, no_slice=F
         else:
             cuts = _plan_cuts(info["top"], info["bottom"], info["bottoms"], SLICE_MAX_CSS)
 
-        # ③ 整页只成像一次 → 本地裁切。此前每张切片都 full_page=True+clip——Playwright 的语义是
-        # 「整页完整渲染再裁」，N 张切片 = N 次全页 @2x 成像（O(N×整页) 平方型开销，长文 30~60s 全耗在这）。
-        # 现在：截一张全页图 → Pillow 按切点 crop（毫秒级）。Pillow 缺席才退回逐段截图老路。
+        # ③ 逐段 clip 截图（clip 用页面 CSS 坐标，可超出视口）
         slices = []
-        cropped = False
-        if len(cuts) > 1:
-            try:
-                from PIL import Image  # type: ignore
-            except Exception:
-                Image = None
-                print("[壹伴] 未安装 Pillow——退回逐段整页截图（慢路）。pip install pillow 可提速数倍。",
-                      flush=True)
-            if Image is not None:
-                full_png = os.path.join(out_dir, base_name + "-full.png")
-                page.screenshot(path=full_png, full_page=True)
-                img = Image.open(full_png)
-                for i, (y0, y1) in enumerate(cuts, 1):
-                    sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i))
-                    # cuts 是页面 CSS 坐标，位图是 @SNAP_SCALE 设备像素——按比例换算再裁
-                    a = max(0, round(y0 * SNAP_SCALE))
-                    b = min(img.height, round(y1 * SNAP_SCALE))
-                    img.crop((0, a, img.width, b)).save(sp_)
-                    slices.append(os.path.abspath(sp_))
-                    print("[壹伴] 切片 %d/%d：%d~%dpx" % (i, len(cuts), y0, y1), flush=True)
-                img.close()
-                try:
-                    os.remove(full_png)
-                except Exception:
-                    pass
-                cropped = True
-        if not cropped:
-            for i, (y0, y1) in enumerate(cuts, 1):
-                sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i))
-                # full_page=True + clip：先全页成像再按页面坐标裁切——只有这样才能裁到视口外
-                page.screenshot(path=sp_, full_page=True,
-                                clip={"x": 0, "y": y0, "width": SNAP_WIDTH, "height": y1 - y0})
-                slices.append(os.path.abspath(sp_))
-                print("[壹伴] 切片 %d/%d：%d~%dpx" % (i, len(cuts), y0, y1), flush=True)
+        for i, (y0, y1) in enumerate(cuts, 1):
+            sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i))
+            # full_page=True + clip：先全页成像再按页面坐标裁切——只有这样才能裁到视口外
+            page.screenshot(path=sp_, full_page=True,
+                            clip={"x": 0, "y": y0, "width": SNAP_WIDTH, "height": y1 - y0})
+            slices.append(os.path.abspath(sp_))
+            print("[壹伴] 切片 %d/%d：%d~%dpx" % (i, len(cuts), y0, y1), flush=True)
 
         manifest = {"slices": slices, "html": os.path.abspath(html_path),
                     "theme": theme, "width_css": SNAP_WIDTH, "scale": SNAP_SCALE}
@@ -1338,120 +1270,55 @@ JS_IMG_STATS = r"""
 """
 
 
-# 传图确认框：页内一次 JS 遍历找可见的「确定/插入/完成」按钮（精确文案匹配）并点掉。
-# 此前是 6 个 :has-text 选择器逐个全 DOM 扫 + 命中固定等 1s——挂在 _wait_img 轮询热路径上是隐性大头。
-JS_CONFIRM_DIALOG = r"""
-() => {
-  var texts = ["确定", "插入", "完成"];
-  var cands = document.querySelectorAll("button, a");
-  for (var i = 0; i < cands.length; i++) {
-    var el = cands[i];
-    if (texts.indexOf((el.textContent || "").trim()) < 0) continue;
-    var r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) { el.click(); return true; }
-  }
-  return false;
-}
-"""
-
-
 def _confirm_upload_dialog(page):
     """传图后可能弹素材/确认框：best-effort 点可见的「确定/插入/完成」。点不到就算了。"""
-    try:
-        if page.evaluate(JS_CONFIRM_DIALOG):
-            page.wait_for_timeout(300)
-            return True
-    except Exception:
-        pass
+    for txt in ("确定", "插入", "完成"):
+        for sel in ("button:has-text('%s')" % txt, "a:has-text('%s')" % txt):
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    el.click()
+                    page.wait_for_timeout(1000)
+                    return True
+            except Exception:
+                continue
     return False
-
-
-def _img_stats(frame, body_sel):
-    try:
-        return frame.eval_on_selector(body_sel, JS_IMG_STATS)
-    except Exception:
-        return None
 
 
 def _wait_img(frame, body_sel, want_n, seconds, page=None):
-    """等编辑器**收下**第 want_n 张图——total 落位（通常亚秒级）即返回。
-    此前还要求「累计所有图都换成 http 外链」才提前退出：编辑器换 mmbiz 外链是并行异步的，
-    串行等它 = 每张烧满超时 × N 的级联放大，是全链路最大的时间黑洞。
-    换链确认统一挪到全部贴完后 _wait_uploaded 一次收尾（并行上传，等待≈最慢一张）。"""
+    """等编辑器收图到第 want_n 张（顺手点掉弹出的确认框）。优先等到换成 http 外链。"""
     deadline = time.time() + seconds
-    step = 0.4
-    rounds = 0
-    while time.time() < deadline:
-        # 确认框只会在刚传图时弹——只探测前几轮，别让全页遍历挂在整个轮询期
-        if page is not None and rounds < 3:
-            _confirm_upload_dialog(page)
-        st = _img_stats(frame, body_sel)
-        if st and st["total"] >= want_n:
-            return True
-        rounds += 1
-        time.sleep(step)
-        step = min(step * 1.5, 2.0)
-    return False
-
-
-def _wait_uploaded(frame, body_sel, want_n, seconds, page=None):
-    """收尾：统一等编辑器把 want_n 张图全部换成 mmbiz 外链。超时只降级为警告——
-    保存草稿同样会把素材落库，窗口也留给用户核对。"""
-    deadline = time.time() + seconds
-    last = -1
+    landed = False
     while time.time() < deadline:
         if page is not None:
             _confirm_upload_dialog(page)
-        st = _img_stats(frame, body_sel)
-        if st:
+        try:
+            st = frame.eval_on_selector(body_sel, JS_IMG_STATS)
+        except Exception:
+            st = None
+        if st and st["total"] >= want_n:
+            landed = True
             if st["uploaded"] >= want_n:
-                return True
-            if st["uploaded"] != last:
-                last = st["uploaded"]
-                print("[壹伴] 素材换链进度 %d/%d……" % (st["uploaded"], want_n), flush=True)
-        time.sleep(1.0)
-    return False
-
-
-# 探明的有效 file input 缓存（单次运行进程内）：此前每张图都重新遍历所有 input，
-# 且对喂错的 input（封面/素材等隐藏输入,不会在正文出图）各死等 35s——粘贴失效机器「特别慢」的元凶。
-_INPUT_CACHE = {"input": None}
+                break
+        time.sleep(1.5)
+    return landed
 
 
 def _upload_via_input(editor_page, frame, body_sel, fp, want_n):
-    """图片走「文件输入」通道：①上次探明的 input 直喂（缓存命中给足 25s）；
-    ②遍历各 frame 的 input[type=file]，accept 含 image 的优先，探测期每个只等 10s
-    （真有效的 input，图落位是秒级）；③工具栏「图片」按钮 + 文件选择器。"""
-    cached = _INPUT_CACHE.get("input")
-    if cached is not None:
-        try:
-            cached.set_input_files(fp)
-            if _wait_img(frame, body_sel, want_n, 25, page=editor_page):
-                return "file-input"
-        except Exception:
-            pass
-        _INPUT_CACHE["input"] = None  # 失效（页面导航等）→ 重新探测
+    """图片走「文件输入」通道：①页面常驻的 input[type=file] 直喂；
+    ②工具栏「图片」按钮 + 文件选择器。合成粘贴对文件无效时的真通道。"""
     # ① 现成 file input（编辑器页常驻隐藏 input,set_input_files 直接触发其 change 上传逻辑）
     for fr in list(editor_page.frames):
         try:
             inputs = fr.query_selector_all("input[type=file]")
         except Exception:
             continue
-
-        def _score(inp):
-            try:
-                acc = (inp.get_attribute("accept") or "").lower()
-            except Exception:
-                acc = ""
-            return 0 if "image" in acc else 1
-
-        for inp in sorted(inputs, key=_score):
+        for inp in inputs:
             try:
                 inp.set_input_files(fp)
             except Exception:
                 continue
-            if _wait_img(frame, body_sel, want_n, 10, page=editor_page):
-                _INPUT_CACHE["input"] = inp
+            if _wait_img(frame, body_sel, want_n, 35, page=editor_page):
                 return "file-input"
     # ② 工具栏「图片」按钮 → 系统文件选择器（Playwright 拦截直喂）
     btn, _ = _first(editor_page, SELECTORS["img_button"])
@@ -1460,7 +1327,7 @@ def _upload_via_input(editor_page, frame, body_sel, fp, want_n):
             with editor_page.expect_file_chooser(timeout=5000) as fc:
                 btn.click()
             fc.value.set_files(fp)
-            if _wait_img(frame, body_sel, want_n, 30, page=editor_page):
+            if _wait_img(frame, body_sel, want_n, 60, page=editor_page):
                 return "file-chooser"
         except Exception:
             pass
@@ -1468,10 +1335,8 @@ def _upload_via_input(editor_page, frame, body_sel, fp, want_n):
 
 
 def run_publish_image(slices_dir, title, intro, timeout):
-    """长图入草稿：开编辑器 →（可选）导语 → 填标题+先存一次草稿（让条目立刻进草稿箱，
-    防进程中途被杀全盘丢失）→ 切片按序粘贴 → 统一等换链 → 再存草稿。
-    每张只等「图落位」（亚秒级）就贴下一张，换 mmbiz 外链的确认放到全部贴完后统一等一轮
-    （微信并行上传，统一等≈最慢一张）。绝不自动发布。"""
+    """长图入草稿：开编辑器 →（可选）先放一段真文字导语 → 切片按序粘贴 → 填标题 → 存草稿。
+    每张贴完都等编辑器真把图收下（img 出现/换成 mmbiz 外链）再贴下一张。绝不自动发布。"""
     import base64
 
     if not slices_dir or not os.path.isdir(slices_dir):
@@ -1523,28 +1388,12 @@ def run_publish_image(slices_dir, title, intro, timeout):
             print("[壹伴] 导语%s（通道 %s）。" % ("已写入" if ok_i else "写入失败,跳过", m_i),
                   flush=True)
 
-        # 先把草稿在服务端立住：填标题 → 点一次「保存为草稿」（创建草稿条目）。
-        # 此前是全部贴完图才第一次保存——贴图阶段一旦被上层超时/回合结束杀掉进程，
-        # 保存从未执行、草稿箱里什么都没有（用户实证）。先建条目后编辑器自动保存会持续跟进，
-        # 中途死掉也至少留下「标题+导语+已贴的图」。
-        title_filled = _fill_title(frame, editor_page, title)
-        if title_filled or intro:
-            ec, eok = _save_draft(editor_page)
-            print("[壹伴] 草稿条目已先建立%s，开始贴图。" % (
-                "（保存回执已确认）" if eok else
-                ("（已点保存，未见回执——编辑器自动保存会跟进）" if ec
-                 else "失败：没找到保存键——贴完图会再试")), flush=True)
-
         # 通道策略：先用首图实测「合成粘贴」灵不灵（文字粘贴灵≠文件粘贴灵——编辑器对
         # 文件 paste 校验更严）；不灵就全程切「文件输入」通道（input 直喂/文件选择器）。
-        # 落位判定用「贴前 total + 1」而非累计张数 i——某张失败时累计值永远凑不齐，
-        # 会让后面每一张都烧满超时（级联放大）。
         ok_count = 0
         use_paste = True
         for i, fp in enumerate(files, 1):
             print("[壹伴] 贴第 %d/%d 张：%s" % (i, len(files), os.path.basename(fp)), flush=True)
-            st0 = _img_stats(frame, body_sel)
-            want = (st0["total"] if st0 else (i - 1)) + 1
             landed_via = None
             if use_paste:
                 try:
@@ -1554,7 +1403,7 @@ def run_publish_image(slices_dir, title, intro, timeout):
                     frame.eval_on_selector(body_sel, JS_PASTE_IMAGE,
                                            {"dataUrl": "data:%s;base64,%s" % (mime, b64),
                                             "name": os.path.basename(fp)})
-                    if _wait_img(frame, body_sel, want, 15, page=editor_page):
+                    if _wait_img(frame, body_sel, i, 25, page=editor_page):
                         landed_via = "paste"
                 except Exception:
                     pass
@@ -1562,7 +1411,7 @@ def run_publish_image(slices_dir, title, intro, timeout):
                     use_paste = False
                     print("[壹伴] 粘贴通道对图片无效，切换「文件输入」通道。", flush=True)
             if not landed_via:
-                landed_via = _upload_via_input(editor_page, frame, body_sel, fp, want)
+                landed_via = _upload_via_input(editor_page, frame, body_sel, fp, i)
             if landed_via:
                 ok_count += 1
                 print("[壹伴] 第 %d 张已落位（通道 %s）。" % (i, landed_via), flush=True)
@@ -1570,26 +1419,11 @@ def run_publish_image(slices_dir, title, intro, timeout):
                 print("[壹伴] 第 %d 张三条通道都没成——请把 %s 手动拖进编辑器补上。" % (i, fp),
                       flush=True)
 
-        # 收尾：统一等编辑器把图换成 mmbiz 外链（微信并行上传，统一等≈最慢一张，
-        # 而不是此前的逐张串行等 × N）。超时不算失败——保存草稿同样会触发素材落库。
-        uploads_confirmed = True
-        if ok_count:
-            print("[壹伴] 全部贴完，统一等素材换链……", flush=True)
-            uploads_confirmed = _wait_uploaded(frame, body_sel, ok_count, 60, page=editor_page)
-            print("[壹伴] %s" % ("素材已全部换成 mmbiz 外链。" if uploads_confirmed
-                                 else "部分图未确认换链（保存草稿会继续落库，请在窗口里核对）。"),
-                  flush=True)
-
-        if not title_filled:
-            title_filled = _fill_title(frame, editor_page, title)  # 开头没填上的再补一次
+        title_filled = _fill_title(frame, editor_page, title)
         saved, confirmed = _save_draft(editor_page)
-        if not confirmed:
-            print("[壹伴] 最终保存未见明确回执——请在窗口里手动点一次「保存为草稿」核实入档。",
-                  flush=True)
         print(json.dumps({
             "ok": ok_count == len(files), "mode": "publish-image",
             "images_total": len(files), "images_ok": ok_count,
-            "uploads_confirmed": uploads_confirmed,
             "title_filled": title_filled, "save_clicked": saved, "save_confirmed": confirmed,
             "note": "长图已按序贴入（%d/%d 张确认落位）%s。窗口留着请核对图序与清晰度，确认后自行发布。绝不自动发布。"
                     % (ok_count, len(files),

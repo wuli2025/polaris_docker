@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-app"
-version = "1.0.4"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3285,15 +3285,6 @@ dependencies = [
  "walkdir",
  "windows-sys 0.59.0",
  "zip 8.6.0",
-]
-
-[[package]]
-name = "polaris-cli"
-version = "1.0.4"
-dependencies = [
- "polaris-app",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

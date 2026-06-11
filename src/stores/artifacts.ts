@@ -21,19 +21,13 @@ export const useArtifactsStore = defineStore("artifacts", () => {
   const dirty = ref(false);
   const saveError = ref<string | null>(null);
   const savedAt = ref(0); // 最近保存时间戳(ms)，用于「已保存」提示
-  // ── PPT 伴生导出：编辑的是 deck.html，保存后可一键重导出覆盖同源 .pptx ──
-  const companionPptx = ref<string | null>(null);
-  const exporting = ref(false);
-  const exportError = ref<string | null>(null);
 
   async function open(path: string) {
-    const name = path.split(/[\\/]/).pop() || path;
+    const name = path.split("/").pop() || path;
     current.value = { path, name };
     loading.value = true;
     error.value = null;
     payload.value = null;
-    companionPptx.value = null; // 换文件即斩断旧伴生关系，防把别的 html 导出去覆盖 pptx
-    exportError.value = null;
     try {
       payload.value = await api.read(path);
     } catch (e: any) {
@@ -55,8 +49,6 @@ export const useArtifactsStore = defineStore("artifacts", () => {
     editing.value = false;
     dirty.value = false;
     saveError.value = null;
-    companionPptx.value = null;
-    exportError.value = null;
   }
 
   function toggleExpand() {
@@ -68,36 +60,6 @@ export const useArtifactsStore = defineStore("artifacts", () => {
     editing.value = true;
     expanded.value = true;
     saveError.value = null;
-  }
-
-  /**
-   * 「编辑 PPT」入口：.pptx 是逐页截图死图改不了，真正可编辑的是它的网页版源稿
-   * deck.html —— 打开 html 进编辑器，并记住伴生 .pptx，保存后可一键重导出覆盖。
-   */
-  async function enterEditDeck(htmlPath: string, pptxPath: string): Promise<boolean> {
-    await open(htmlPath); // open 会清 companionPptx，故先 open 再认亲
-    if (error.value || !payload.value?.text) return false;
-    enterEdit();
-    companionPptx.value = pptxPath;
-    return true;
-  }
-
-  /** 把当前编辑的 deck.html 重新导出覆盖伴生 .pptx（自研 forge 管线，可能要几十秒） */
-  async function exportPptx(): Promise<boolean> {
-    const deck = current.value?.path;
-    const out = companionPptx.value;
-    if (!deck || !out || exporting.value) return false;
-    exporting.value = true;
-    exportError.value = null;
-    try {
-      await api.deckToPptx(deck, out);
-      return true;
-    } catch (e: any) {
-      exportError.value = e?.message ?? String(e);
-      return false;
-    } finally {
-      exporting.value = false;
-    }
   }
   /** 退出编辑器（回到只读预览，仍保持放大状态由调用方决定） */
   function exitEdit() {
@@ -175,16 +137,11 @@ export const useArtifactsStore = defineStore("artifacts", () => {
     dirty,
     saveError,
     savedAt,
-    companionPptx,
-    exporting,
-    exportError,
     open,
     refresh,
     close,
     toggleExpand,
     enterEdit,
-    enterEditDeck,
-    exportPptx,
     exitEdit,
     markDirty,
     saveContent,

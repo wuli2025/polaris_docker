@@ -55,8 +55,6 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
-    // Polaris 联动写全局时盖的戳, 见 apply_settings_config —— 隔离模式净化的最强证据
-    "POLARIS_LINKED",
 ];
 
 /// 模型钉选的四档键 —— 第三方单模型供应商把这四档全设成同一个 model id,
@@ -423,11 +421,21 @@ pub fn init(_app: &AppHandle) -> Result<()> {
             }
         } else {
             // 隔离(默认):
-            // ① 净化 —— 联动时代(或旧版本)写进全局 settings.json 的受管键还躺在那里
-            //    污染外部 CLI。旧规则只认「全局 base_url == 当前供应商」, 用户切回官方后
-            //    current 的 base 变空, 残留永远匹配不上、永远清不掉(实测就是「切一次
-            //    MiniMax 就再也切不回来」)。证据判定改走 global_env_is_ours 四级证据。
-            purge_global_residue(&views, &store);
+            // ① 一次性净化 —— 联动时代(或旧版本)写进全局 settings.json 的受管键还躺在
+            //    那里污染外部 CLI。仅当全局 base_url 恰等于「Polaris 当前供应商」的
+            //    base_url(强证据是我们写的)才清, 用户自己在终端配的第三方不动。
+            let live_base = read_live_env()
+                .get("ANTHROPIC_BASE_URL")
+                .and_then(|v| v.as_str())
+                .map(normalize_url)
+                .unwrap_or_default();
+            if !live_base.is_empty() {
+                if let Some(cur) = views.iter().find(|v| v.id == store.current_id) {
+                    if normalize_url(&cur.base_url) == live_base {
+                        let _ = apply_settings_config(&json!({ "env": {} }));
+                    }
+                }
+            }
             // ② 重启后进程 env 是空的, 把当前供应商重新作用上去, 否则 Polaris 内的
             //    选择一重启就回落官方。配置不全(如 key 被删)就静默跳过 = 官方。
             if let Some(v) = views.iter().find(|v| v.id == store.current_id) {
@@ -690,60 +698,6 @@ fn read_live_env() -> Map<String, Value> {
     v.get("env").and_then(|e| e.as_object()).cloned().unwrap_or_default()
 }
 
-/// 隔离模式下判定「全局 settings.json 的受管 env 是不是我们(联动时代/旧版本)写的」。
-/// 证据从强到弱:
-/// ① POLARIS_LINKED 戳(新版联动写全局时盖的);
-/// ② base_url 命中当前供应商(旧规则, 保留兼容);
-/// ③ base_url 命中任一已知供应商 **且** token 与我们存的该家 key 一致 —— 用户已切回
-///    官方、残留还指着上一家时, ①②全失效, 残留永远清不掉(实测踩坑「切一次就切不
-///    回来」), 全靠这条兜底; key 不同则视为用户自己在终端配的, 不动。
-/// ④ base 已清但模型钉选残留(等于我们某家钉的模型) —— 官方端点带着 MiniMax-M3
-///    这种钉选必然 4xx, 属我们的残留, 清。
-fn global_env_is_ours(live: &Map<String, Value>, views: &[ProviderView], store: &Store) -> bool {
-    if live.contains_key("POLARIS_LINKED") {
-        return true;
-    }
-    let live_str = |k: &str| {
-        live.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
-    let live_base = normalize_url(&live_str("ANTHROPIC_BASE_URL"));
-    if !live_base.is_empty() {
-        if let Some(cur) = views.iter().find(|v| v.id == store.current_id) {
-            if normalize_url(&cur.base_url) == live_base {
-                return true;
-            }
-        }
-        return views.iter().any(|v| {
-            !v.auth_token.trim().is_empty()
-                && !v.base_url.is_empty()
-                && normalize_url(&v.base_url) == live_base
-                && [DEFAULT_TOKEN_FIELD, API_KEY_FIELD]
-                    .iter()
-                    .any(|f| live_str(f) == v.auth_token.trim())
-        });
-    }
-    MODEL_ENV_KEYS.iter().any(|k| {
-        let m = live_str(k);
-        !m.is_empty()
-            && views
-                .iter()
-                .any(|v| cfg_env_str(&v.settings_config, k).trim() == m)
-    })
-}
-
-/// 隔离模式的残留体检: 全局 settings.json 里若还躺着我们写的受管键, 清回官方。
-/// init 启动时和每次切换都跑一遍 —— 无证据时只读不写, 幂等且零成本。
-fn purge_global_residue(views: &[ProviderView], store: &Store) {
-    let live = read_live_env();
-    if !live.is_empty() && global_env_is_ours(&live, views, store) {
-        let _ = apply_settings_config(&json!({ "env": {} }));
-    }
-}
-
 /// 把供应商 settings_config 合并写进 live settings.json：
 /// 先从 live 清掉受管 env/top 键，再套用 cfg 的 env 与顶层键，其余 live 键原样保留。
 fn apply_settings_config(cfg: &Value) -> Result<(), String> {
@@ -797,16 +751,6 @@ fn apply_settings_config(cfg: &Value) -> Result<(), String> {
         for (k, v) in src_env {
             env.insert(k.clone(), v.clone());
         }
-    }
-    // 真正路由了全局(env 带 base_url)就盖 POLARIS_LINKED 戳: 日后隔离模式的净化
-    // 凭这个戳就能确认残留是我们写的, 不再依赖「当前供应商恰好没换」这种弱证据。
-    let routed = env
-        .get("ANTHROPIC_BASE_URL")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if routed {
-        env.insert("POLARIS_LINKED".into(), Value::String("1".into()));
     }
     // 顶层键 (除 env) 套用
     if let Some(src) = cfg.as_object() {
@@ -1039,13 +983,9 @@ pub fn provider_switch(id: String) -> Result<String, String> {
         .ok_or_else(|| format!("供应商不存在: {id}"))?;
 
     let cfg = cfg_for_view(v)?;
-    // 联动才碰全局 settings.json; 隔离只走进程 env, 外部 CLI 原封不动 ——
-    // 但顺手做一次残留体检: 全局若还躺着我们(旧版/联动时代)写的受管键, 先清掉,
-    // 用户不用重启 Polaris 外部 CLI 就立即恢复干净。
+    // 联动才碰全局 settings.json; 隔离只走进程 env, 外部 CLI 原封不动。
     if store.link_global {
         apply_settings_config(&cfg)?;
-    } else {
-        purge_global_residue(&views, &store);
     }
     apply_process_env(&cfg);
 
@@ -1459,14 +1399,7 @@ fn codex_write_auth_json(
 
     let content = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("序列化 auth.json 失败: {e}"))?;
-    // auth.json 含 refresh/access/id token:① 原子写防写一半撕裂 → 外部 codex CLI 读到坏 JSON;
-    // ② Unix 下收紧到 0600,NAS/Docker 多用户主机上不让同机其他用户读走凭证。
-    atomic_write(&path, &content).map_err(|e| format!("写入 ~/.codex/auth.json 失败: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
+    fs::write(&path, content).map_err(|e| format!("写入 ~/.codex/auth.json 失败: {e}"))?;
     Ok(())
 }
 
