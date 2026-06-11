@@ -10,7 +10,7 @@
 # ═══════════════════════════════════════════════════════════════
 [package]
 name = "polaris-cli"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "polaris-forge — Polaris Forge 渲染引擎 CLI"
 publish = false
@@ -19,8 +19,16 @@ publish = false
 name = "polaris-forge"
 path = "src/main.rs"
 
+# Docker 服务端入口。曾是主包 [[bin]],47d1e0c 因 tauri bundler 连坐被迫删除;
+# 落户本 crate = bundler 不可见 + server feature 经依赖恒开,desktop 打包零影响。
+[[bin]]
+name = "polaris-server"
+path = "src/bin/polaris-server.rs"
+
 [dependencies]
 # 复用主 lib 的全部引擎(forge 五件套 + convert)。server feature 是 Docker 侧
 # 验证过的无-tauri 已知良好组合;CLI 不起 HTTP,只是借这条特性线拿引擎。
 polaris-app = { path = "../..", default-features = false, features = ["server"] }
 serde_json = "1"
+# polaris-server bin 跑 async serve() 用;与主 lib 的 tokio 同版本统一,零额外编译。
+tokio = { version = "1", features = ["rt-multi-thread"] }

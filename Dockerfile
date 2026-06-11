@@ -46,15 +46,16 @@ RUN mkdir -p /usr/local/cargo/ \
 
 # 2a) 依赖缓存层：先只拷清单 + crates 源 + 空占位 src，预编译全部第三方依赖。
 #     之后改业务代码不会重编 axum/tokio 等重型依赖 → Windows 更新后 Docker 快速重建。
+#     注:polaris-server bin 自 v1.0.2 起住 crates/polaris-cli(47d1e0c 教训:主包 [[bin]]
+#     会被 tauri bundler 连坐),此层只预编主 lib(server feature)把第三方依赖全部缓存。
 COPY src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs ./src-tauri/
 COPY src-tauri/crates ./src-tauri/crates
-RUN mkdir -p src-tauri/src/bin \
-    && echo 'fn main(){}' > src-tauri/src/bin/polaris-server.rs \
+RUN mkdir -p src-tauri/src \
     && echo '' > src-tauri/src/main.rs \
     && echo '' > src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --no-default-features --features server \
+        --lib --no-default-features --features server \
     ; rm -rf src-tauri/src
 
 # 2b) 真实源码层：拷源码 + 资源 + assets(feishu/wecom 的 include_str!)，编出 polaris-server。
@@ -62,12 +63,9 @@ COPY src-tauri/src ./src-tauri/src
 COPY src-tauri/assets ./src-tauri/assets
 COPY src-tauri/resources ./src-tauri/resources
 # 触碰 mtime 确保 cargo 重编 polaris-app crate 本体（而非缓存的空壳）。
-# 顺手编 polaris-forge CLI(crates/polaris-cli):容器内 agent 直接命令行出
-# PPT/截图/视频——传统PPT(spec→原生OOXML)零浏览器,slim 镜像也能出片。
+# polaris-cli 一次出两个 bin:polaris-server(axum 服务端)+ polaris-forge(渲染 CLI,
+# 容器内 agent 直接命令行出 PPT/截图/视频——传统PPT spec→原生OOXML 零浏览器)。
 RUN touch src-tauri/src/main.rs src-tauri/src/lib.rs \
-    && cargo build --profile release-fast \
-        --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --no-default-features --features server \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
         -p polaris-cli \

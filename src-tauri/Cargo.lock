@@ -3289,10 +3289,11 @@ dependencies = [
 
 [[package]]
 name = "polaris-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "polaris-app",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
