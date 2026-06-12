@@ -204,6 +204,17 @@ fn minimax_key_present() -> bool {
         .any(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
 }
 
+/// 结构化 spec(JSON 字符串或文件路径)→ 原生可编辑 .pptx(零浏览器,Docker slim 可用)。
+pub fn spec_to_pptx_sync(spec: String, out: String) -> Result<Value, String> {
+    // BOM(U+FEFF)不算 whitespace,带 BOM 的 JSON 会被误判成文件路径 → 先剥掉再判。
+    let json = if spec.trim_start_matches('\u{feff}').trim_start().starts_with('{') {
+        spec
+    } else {
+        std::fs::read_to_string(&spec).map_err(|e| format!("读 spec 文件 {spec} 失败: {e}"))?
+    };
+    crate::forge_pptx_native::build_pptx_from_spec(json.trim_start_matches('\u{feff}'), &out)
+}
+
 /// 渲染能力 preflight 总入口。返回平台 + 各能力的「就绪/将走哪条路/缺啥降到哪」。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn forge_preflight() -> Value {

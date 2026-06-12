@@ -201,6 +201,24 @@ docker compose down -v              # 停并删数据卷（慎用）
 docker exec -it polaris-web bash    # 进容器排查（claude --version 等）
 ```
 
+### polaris-forge CLI（镜像内置，agent 与运维皆可用）
+
+镜像内置 `polaris-forge`（与桌面端同一份渲染引擎），容器里的 claude agent 可直接命令行出片：
+
+```bash
+polaris-forge preflight                                       # 本容器能出什么(JSON:chromium/ffmpeg/字体/TTS)
+polaris-forge spec-pptx --spec=/path/polaris.slides.json --out=/path/演示.pptx
+                                                              # 结构化 spec → 原生可编辑 .pptx,**slim 镜像也能出**(零浏览器)
+polaris-forge pptx  --deck=/path/deck.html --out=/path/x.pptx # deck 分层导出(无字背景截图+可编辑文本框,需 full)
+polaris-forge shot  --url=/path/page.html  --out=/path/x.png  # 网页/HTML 截图(需 full)
+polaris-forge video --deck=/path/deck.html --out=/path/x.mp4  # deck → 视频(需 full)
+polaris-forge tts   --text="你好" --out=/path/x.mp3           # 文本配音(MiniMax 主力)
+polaris-forge validate --pptx=/path/x.pptx                    # 校验 .pptx 包结构
+```
+
+> 约定：成功 → JSON 到 stdout、退出码 0；失败 → `{"ok":false,"error":…}` 到 stderr、退出码 1。
+> slim 镜像无 chromium/ffmpeg：`spec-pptx`/`tts`/`validate` 可用，`pptx`/`shot`/`video` 需 full。
+
 ## 九、稳健性：单轮对话看门狗
 
 容器内偶发：个别极简 prompt 会让 claude 触发子代理（`claude --print`，其 cwd 落在 `/`）

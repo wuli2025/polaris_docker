@@ -120,6 +120,14 @@ server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
 name = "polaris-server"
 path = "src/bin/polaris-server.rs"
 
+# polaris-forge —— Forge 渲染引擎 CLI（preflight/spec-pptx/pptx/shot/pack/video/tts/validate）。
+# 容器内 agent 直接命令行出片;slim 镜像也能跑 spec-pptx(原生 OOXML,零浏览器)。
+# 同样不写 required-features(理由见上 polaris-server)：default 特性下 forge 函数恒在,
+# 编成可运行 CLI;Docker 用 --features server 显式 --bin polaris-forge 构建。
+[[bin]]
+name = "polaris-forge"
+path = "src/bin/polaris-forge.rs"
+
 # 桌面二进制保持默认（main.rs）。
 [[bin]]
 name = "polaris-app"

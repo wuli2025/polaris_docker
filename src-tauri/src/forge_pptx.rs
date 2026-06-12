@@ -17,11 +17,11 @@ use zip::write::SimpleFileOptions;
 /// 进程内单调计数器:给每次 capture_slides 唯一临时目录,防多线程并发渲染互相覆盖帧。
 static CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-const NS_CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
-const NS_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
-const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
-const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-const NS_P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+pub(crate) const NS_CT: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
+pub(crate) const NS_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+pub(crate) const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+pub(crate) const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub(crate) const NS_P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
 
 /// 从 PNG 头(IHDR)读宽高(px)。非 PNG / 损坏 → None。纯 std,不引 image crate。
 fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -38,7 +38,7 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
-fn xml_decl() -> &'static str {
+pub(crate) fn xml_decl() -> &'static str {
     "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n"
 }
 
@@ -46,6 +46,16 @@ fn xml_decl() -> &'static str {
 /// text_layer=Some((每页文本rects, 窗口宽, 窗口高)) 时叠 alpha=0 隐形文本框(可搜索/读屏);None=纯图。
 pub fn build_pptx(image_paths: &[String], out_path: &str) -> Result<Value, String> {
     build_pptx_inner(image_paths, out_path, None)
+}
+
+/// 临时文件守卫:作用域内任何 `?` 早退都把半截 .tmp 清掉;rename 成功后置 `.1=false` 解除。
+pub(crate) struct TmpGuard(pub std::path::PathBuf, pub bool);
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 }
 
 pub fn build_pptx_inner(
@@ -213,7 +223,7 @@ fn slide_xml(cx: u64, cy: u64, text_boxes: &str) -> String {
     )
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -261,7 +271,7 @@ fn text_boxes_xml(rects: &[Value], cx: u64, cy: u64, win_w: u32, win_h: u32) -> 
     out
 }
 
-fn slide_layout_xml(_cx: u64, _cy: u64) -> String {
+pub(crate) fn slide_layout_xml(_cx: u64, _cy: u64) -> String {
     format!(
         "{decl}<p:sldLayout xmlns:a=\"{a}\" xmlns:r=\"{r}\" xmlns:p=\"{p}\" type=\"blank\" preserve=\"1\"><p:cSld name=\"Blank\"><p:spTree>\
 <p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\
@@ -271,7 +281,7 @@ fn slide_layout_xml(_cx: u64, _cy: u64) -> String {
     )
 }
 
-fn slide_master_xml(cx: u64, cy: u64) -> String {
+pub(crate) fn slide_master_xml(cx: u64, cy: u64) -> String {
     format!(
         "{decl}<p:sldMaster xmlns:a=\"{a}\" xmlns:r=\"{r}\" xmlns:p=\"{p}\"><p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val=\"FFFFFF\"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree>\
 <p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\
@@ -285,7 +295,7 @@ fn slide_master_xml(cx: u64, cy: u64) -> String {
 }
 
 /// 最小但合法的 Office 主题(clrScheme/fontScheme/fmtScheme 三件齐全, PowerPoint 才认)。
-fn theme_xml() -> String {
+pub(crate) fn theme_xml() -> String {
     format!("{decl}<a:theme xmlns:a=\"{a}\" name=\"Polaris\"><a:themeElements>\
 <a:clrScheme name=\"Polaris\"><a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1><a:lt1><a:sysClr val=\"window\" lastClr=\"FFFFFF\"/></a:lt1>\
 <a:dk2><a:srgbClr val=\"1F2230\"/></a:dk2><a:lt2><a:srgbClr val=\"EEF1F8\"/></a:lt2>\

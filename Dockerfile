@@ -55,6 +55,7 @@ COPY src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs ./src-tauri/
 COPY src-tauri/crates ./src-tauri/crates
 RUN mkdir -p src-tauri/src/bin \
     && echo 'fn main(){}' > src-tauri/src/bin/polaris-server.rs \
+    && echo 'fn main(){}' > src-tauri/src/bin/polaris-forge.rs \
     && echo '' > src-tauri/src/main.rs \
     && echo '' > src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
@@ -70,8 +71,9 @@ COPY src-tauri/resources ./src-tauri/resources
 RUN touch src-tauri/src/main.rs src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --no-default-features --features server \
-    && cp src-tauri/target/release-fast/polaris-server /usr/local/bin/polaris-server
+        --bin polaris-server --bin polaris-forge --no-default-features --features server \
+    && cp src-tauri/target/release-fast/polaris-server /usr/local/bin/polaris-server \
+    && cp src-tauri/target/release-fast/polaris-forge /usr/local/bin/polaris-forge
 
 # ── 阶段3：运行时 ────────────────────────────────────────────────
 FROM node:20-slim AS runtime
@@ -185,6 +187,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/update.sh \
 
 # 引擎二进制 + 前端静态 + 资源种子
 COPY --from=server /usr/local/bin/polaris-server /usr/local/bin/polaris-server
+COPY --from=server /usr/local/bin/polaris-forge  /usr/local/bin/polaris-forge
 COPY --from=web    /app/dist /srv/web
 COPY src-tauri/resources /app/resources
 
