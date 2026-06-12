@@ -29,6 +29,7 @@ import path from 'path';
 import os from 'os';
 import { promises as fs } from 'fs';
 import { existsSync, readFileSync } from 'fs';
+import { findLocalBrowser, describeBrowser } from '../find-browser.mjs';
 
 // ───────── 参数 ─────────
 function resolveHome(p) {
@@ -296,7 +297,9 @@ async function main() {
 
   // 2. 逐步截图（每段对应一次 ArrowRight 推进）
   console.log('▶ 截图每一步...');
-  const browser = await chromium.launch({ headless: true });
+  const browserOpt = findLocalBrowser();
+  console.log('  · 浏览器: ' + describeBrowser(browserOpt) + '（不自动下载）');
+  const browser = await chromium.launch({ headless: true, ...browserOpt });
   let shotsDir, clipsDir, concatFile, concatTmp, burnSrtFile;
   try {
     const context = await browser.newContext({ viewport: { width: 1920, height: 1080 } });

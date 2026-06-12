@@ -30,7 +30,7 @@ const WVP_BOOTSTRAP: &str = include_str!("templates/skills/web-video-presentatio
 // 以便：① 全新安装即可用；② 改了脚本后随 App 更新下发（靠 PVS_VERSION 比对覆盖）。
 const PVS_ID: &str = "polaris-video-studio";
 // 改动内嵌脚本/SKILL.md 后必须 +1，让已安装用户在下次启动时拿到更新。
-const PVS_VERSION: &str = "3";
+const PVS_VERSION: &str = "4";
 const PVS_SKILL_MD: &str = include_str!("templates/skills/polaris-video-studio/SKILL.md");
 const PVS_MANIFEST: &str = include_str!("templates/skills/polaris-video-studio/manifest.json");
 const PVS_INSTALL_DEPS: &str =
@@ -38,6 +38,8 @@ const PVS_INSTALL_DEPS: &str =
 const PVS_RUN: &str = include_str!("templates/skills/polaris-video-studio/scripts/run.mjs");
 const PVS_RECORD: &str =
     include_str!("templates/skills/polaris-video-studio/scripts/pipeline/03-record.mjs");
+const PVS_FIND_BROWSER: &str =
+    include_str!("templates/skills/polaris-video-studio/scripts/find-browser.mjs");
 const PVS_WORKFLOW: &str =
     include_str!("templates/skills/polaris-video-studio/references/WORKFLOW.md");
 
@@ -47,7 +49,7 @@ const PVS_WORKFLOW: &str =
 // 与 PVS 同套路：全部编译期内嵌、启动时确保落到 ~/Polaris/skills（靠 DECK_VERSION 比对覆盖）。
 const DECK_ID: &str = "polaris-deck-studio";
 // 改动任一内嵌资源后必须 +1，让已安装用户下次启动拿到更新。
-const DECK_VERSION: &str = "3";
+const DECK_VERSION: &str = "6";
 const DECK_SKILL_MD: &str = include_str!("templates/skills/polaris-deck-studio/SKILL.md");
 const DECK_LICENSE: &str = include_str!("templates/skills/polaris-deck-studio/LICENSE");
 const DECK_BASE_CSS: &str = include_str!("templates/skills/polaris-deck-studio/assets/base.css");
@@ -61,6 +63,8 @@ const DECK_INSTALL_DEPS: &str =
     include_str!("templates/skills/polaris-deck-studio/scripts/install-deps.mjs");
 const DECK_EXPORT_PPTX: &str =
     include_str!("templates/skills/polaris-deck-studio/scripts/export-pptx.mjs");
+const DECK_FIND_BROWSER: &str =
+    include_str!("templates/skills/polaris-deck-studio/scripts/find-browser.mjs");
 
 // ───────── 「网站生成」技能（落地页/单页站点，Polaris 自研，编译期内嵌，启动落盘）─────────
 // 支撑「网站生成」UI 入口。复用 deck-studio 的 17 套主题（DECK_THEMES_CSS，不重复源文件），
@@ -928,6 +932,7 @@ fn write_deck_studio_files(dest: &Path) -> Result<(), String> {
     fs::write(templates.join("deck.html"), DECK_TEMPLATE).map_err(|e| e.to_string())?;
     fs::write(scripts.join("install-deps.mjs"), DECK_INSTALL_DEPS).map_err(|e| e.to_string())?;
     fs::write(scripts.join("export-pptx.mjs"), DECK_EXPORT_PPTX).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("find-browser.mjs"), DECK_FIND_BROWSER).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -975,6 +980,7 @@ fn write_video_studio_files(dest: &Path) -> Result<(), String> {
     fs::write(dest.join("skill.md"), PVS_SKILL_MD).map_err(|e| e.to_string())?;
     fs::write(dest.join("manifest.json"), PVS_MANIFEST).map_err(|e| e.to_string())?;
     fs::write(scripts.join("install-deps.mjs"), PVS_INSTALL_DEPS).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("find-browser.mjs"), PVS_FIND_BROWSER).map_err(|e| e.to_string())?;
     fs::write(scripts.join("run.mjs"), PVS_RUN).map_err(|e| e.to_string())?;
     fs::write(pipeline.join("03-record.mjs"), PVS_RECORD).map_err(|e| e.to_string())?;
     fs::write(refs.join("WORKFLOW.md"), PVS_WORKFLOW).map_err(|e| e.to_string())?;

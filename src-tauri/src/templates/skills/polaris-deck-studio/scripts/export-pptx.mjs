@@ -17,6 +17,7 @@
 import { pathToFileURL } from "node:url";
 import { dirname, resolve, isAbsolute } from "node:path";
 import { existsSync } from "node:fs";
+import { findLocalBrowser, describeBrowser } from "./find-browser.mjs";
 
 function arg(name, def) {
   const hit = process.argv.find((a) => a.startsWith("--" + name + "="));
@@ -50,8 +51,17 @@ try {
 const fileUrl = pathToFileURL(isAbsolute(deckPath) ? deckPath : resolve(process.cwd(), deckPath)).href;
 const outAbs = isAbsolute(outPath) ? outPath : resolve(process.cwd(), outPath);
 
-console.log("→ 启动 chromium…");
-const browser = await chromium.launch();
+const browserOpt = findLocalBrowser();
+console.log("→ 启动浏览器（" + describeBrowser(browserOpt) + "，不自动下载）…");
+let browser;
+try {
+  browser = await chromium.launch(browserOpt);
+} catch (e) {
+  console.error("✗ 启动本机浏览器失败：" + e.message);
+  console.error("  本工具不会自动下载 chromium。请确保装了 Edge/Chrome，或让 app 通过 POLARIS_CHROMIUM 指定浏览器；");
+  console.error("  也可兜底：在浏览器打开 deck.html → Ctrl+P → 另存为 PDF。");
+  process.exit(3);
+}
 const page = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: 1 });
 
 console.log("→ 载入 deck: " + fileUrl);

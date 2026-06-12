@@ -8,6 +8,7 @@ import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { findLocalBrowser, describeBrowser } from "./find-browser.mjs";
 
 const MIN_NODE = 18;
 const MIN_NPM = 9;
@@ -56,6 +57,14 @@ async function checkPlaywright() {
   return { ok: true, msg: `Playwright ${v}` };
 }
 
+// 浏览器：不自动下载，探测本机/自带（与 Rust find_chromium 同链）。
+async function checkBrowser() {
+  const b = findLocalBrowser();
+  if (b.executablePath) return { ok: true, msg: describeBrowser(b) };
+  // 只剩 channel 兜底 → 算"可用但不确定"，提示装 Edge/Chrome
+  return { ok: true, msg: `将用${describeBrowser(b)}（建议装 Edge/Chrome；不会自动下载）` };
+}
+
 async function checkMiniMaxKey() {
   const key = process.env.MINIMAX_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
   if (!key) return { ok: false, msg: "MINIMAX_API_KEY 未设置（Polaris 供应商坞可自动提供）" };
@@ -70,6 +79,7 @@ async function main() {
     { name: "npm", check: checkNpm },
     { name: "ffmpeg", check: checkFfmpeg },
     { name: "Playwright", check: checkPlaywright },
+    { name: "浏览器", check: checkBrowser },
     { name: "MiniMax Key", check: checkMiniMaxKey },
   ];
 
@@ -108,12 +118,16 @@ async function main() {
     console.log("");
   }
 
-  // Playwright 安装指引
+  // Playwright 安装指引（只装 JS 库，禁用浏览器自动下载——浏览器用本机已装的）
   const pwOk = (await checkPlaywright()).ok;
   if (!pwOk) {
-    console.log("【Playwright】");
-    console.log("  npm install -g playwright");
-    console.log("  npx playwright install chromium");
+    console.log("【Playwright】（只装库，不下载浏览器）");
+    if (platform === "win32") {
+      console.log("  $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD='1'; npm install -g playwright");
+    } else {
+      console.log("  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install -g playwright");
+    }
+    console.log("  浏览器：装 Edge/Chrome 即可（脚本会自动找），或让 app 经 POLARIS_CHROMIUM 指定；不要 npx playwright install。");
     console.log("");
   }
 
