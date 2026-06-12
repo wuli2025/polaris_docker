@@ -23,7 +23,7 @@ import { installMarkdownDelegation } from "./lib/markdown";
 import { openUrl, onWsStatus, isTauri } from "./tauri";
 // ── 重 / 非首屏视图：懒加载，切到对应视图时才拉各自 chunk ──
 // 把 cytoscape(图谱) + 4 套工坊 + 各面板/弹层(合计上万行)从启动主包挪走 → 开窗快、首屏不卡。
-// KnowledgeGraph / SandboxStatus 都有 defineOptions({name})，懒加载后 KeepAlive 仍按 name 缓存；
+// KnowledgeGraph / SandboxStatus / 四工坊都有 defineOptions({name})，懒加载后 KeepAlive 仍按 name 缓存；
 // 其首次挂载本就被 ViewLoader 加载条盖住，chunk 拉取(本地 ms 级)一并被遮。
 const KnowledgeGraph = defineAsyncComponent(() => import("./components/KnowledgeGraph.vue"));
 const SandboxStatus = defineAsyncComponent(() => import("./features/sandbox/components/SandboxStatus.vue"));
@@ -32,6 +32,7 @@ const Automation = defineAsyncComponent(() => import("./components/Automation.vu
 const AutomationModal = defineAsyncComponent(() => import("./components/AutomationModal.vue"));
 const ClaudeMdPanel = defineAsyncComponent(() => import("./components/ClaudeMdPanel.vue"));
 const Settings = defineAsyncComponent(() => import("./components/Settings.vue"));
+const SenseApi = defineAsyncComponent(() => import("./components/SenseApi.vue"));
 const SkillCenter = defineAsyncComponent(() => import("./components/SkillCenter.vue"));
 const AddProviderModal = defineAsyncComponent(() => import("./components/AddProviderModal.vue"));
 const McpConfigModal = defineAsyncComponent(() => import("./components/McpConfigModal.vue"));
@@ -179,8 +180,10 @@ function startSbDrag(e: MouseEvent) {
       ></div>
       <!-- 重视图(图谱/沙箱)用 KeepAlive 缓存：第一次进算一次，之后切走再回来瞬开，
            且离开时其动画/自转随 DOM 脱离自动暂停，不在后台空耗。其余视图照常按需挂载。
+           四个工坊也缓存：生成/修改是多轮流程(phase/convId/产物预览都在组件态里)，
+           切去对话看进度再切回来必须还能「继续修改」，销毁重建=流程报废。
            mountedView 让重视图冷启时滞后两帧挂载，先把加载条画出来再扛卡顿。 -->
-      <KeepAlive :include="['KnowledgeGraph', 'SandboxStatus']">
+      <KeepAlive :include="['KnowledgeGraph', 'SandboxStatus', 'DeckStudio', 'WebStudio', 'MediaOps', 'VideoCourseStudio']">
         <ChatPanel v-if="mountedView === 'chat'" />
         <WikiBrowse v-else-if="mountedView === 'wiki'" />
         <Automation v-else-if="mountedView === 'automation'" />
@@ -199,6 +202,7 @@ function startSbDrag(e: MouseEvent) {
         <FeishuSettings v-else-if="mountedView === 'feishu'" />
         <McpConfigModal v-else-if="mountedView === 'mcp'" inline @close="app.setView('chat')" />
         <Settings v-else-if="mountedView === 'settings'" />
+        <SenseApi v-else-if="mountedView === 'sense_api'" />
         <VideoCourseStudio v-else-if="mountedView === 'video_course'" />
         <MediaOps v-else-if="mountedView === 'media_ops'" />
         <DeckStudio v-else-if="mountedView === 'deck'" />

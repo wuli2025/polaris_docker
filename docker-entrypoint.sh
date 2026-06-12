@@ -39,8 +39,30 @@ if [ -n "$PUID" ] && [ -n "$PGID" ]; then
   # HOME(/root) 及数据目录归属运行用户，确保 claude 配置/缓存可写。
   chown "$PUID:$PGID" /root 2>/dev/null || true
   for d in $DATA_DIRS; do chown -R "$PUID:$PGID" "$d" 2>/dev/null || true; done
+
+  # ── docker.sock 自更新支持（Web UI「一键更新」所需）─────────────────
+  # 群晖非 root 跑时，宿主 sock 属主是 root:<某GID>(DSM 默认 root:root)，降权后的
+  # polaris 用户不在该组 → 调 sock 报 permission denied。挂了 sock 就探测其 GID，
+  # 建同号组并把 polaris 加进去；再用「只给 UID」的 gosu 带上附属组。
+  # 仅在显式挂了 sock 时生效——没挂 sock 的部署完全不受影响，零额外授权。
+  if [ -S /var/run/docker.sock ]; then
+    SOCK_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo '')"
+    if [ -n "$SOCK_GID" ] && [ "$SOCK_GID" != "$PGID" ]; then
+      if ! getent group "$SOCK_GID" >/dev/null 2>&1; then
+        groupadd -g "$SOCK_GID" dockersock 2>/dev/null \
+          || addgroup --gid "$SOCK_GID" dockersock 2>/dev/null || true
+      fi
+      SOCK_GRP="$(getent group "$SOCK_GID" | cut -d: -f1)"
+      usermod -aG "$SOCK_GID" polaris 2>/dev/null \
+        || adduser polaris "${SOCK_GRP:-$SOCK_GID}" 2>/dev/null || true
+      echo "[entrypoint] 已把 polaris 加入 docker.sock 组 (GID=$SOCK_GID '${SOCK_GRP:-?}')，容器内一键更新可用"
+    fi
+  fi
+
   echo "[entrypoint] 以非 root 运行 UID=$PUID GID=$PGID"
-  exec gosu "$PUID:$PGID" polaris-server "$@"
+  # 用「仅 UID」形式 → gosu 会带上 polaris 的全部附属组(含上面加的 sock 组)；
+  # 若写成 "$PUID:$PGID" 则 gosu 只设这一个 gid、丢掉附属组，sock 又会 permission denied。
+  exec gosu "$PUID" polaris-server "$@"
 fi
 
 # ── 默认：root 模式（未设 PUID/PGID，与既有行为一致）─────────────

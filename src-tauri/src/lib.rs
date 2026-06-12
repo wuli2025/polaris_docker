@@ -17,8 +17,12 @@ pub mod forge_video;
 pub mod infer;
 pub mod kb;
 pub mod persona;
+// 寓言计划三件套:回声层(对话沉淀) / 检索枢纽(盘点+混检) / 感官坞(API 管理)
+pub mod echo;
+pub mod fable;
 pub mod project;
 pub mod provider;
+pub mod sense;
 pub mod skills;
 pub mod wecom;
 // 自动更新依赖 Tauri updater/restart/package_info → 桌面专属（Docker 用 docker pull 更新）。

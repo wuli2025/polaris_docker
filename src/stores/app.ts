@@ -21,6 +21,7 @@ export type ViewKey =
   | "update"
   | "feishu"
   | "settings"
+  | "sense_api"
   | "video_course"
   | "media_ops"
   | "deck"

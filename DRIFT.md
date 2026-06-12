@@ -7,7 +7,21 @@
 > 顺手并，因为它们牵一发动全身，必须开一个**单独的、跑完整 `cargo build` 验证过**的 catch-up pass。
 > 在那之前，`.docker-owned` 把相关文件标成 OWNED，让守卫脚本拦住盲覆盖。
 
-更新于：2026-06-12（v1.0.5 同步时盘点）
+更新于：2026-06-12（v1.0.5 同步时盘点；同日并入寓言计划三件套,见 D0）
+
+---
+
+## D0. 寓言计划三件套已并入（2026-06-12,主仓尚未 commit 的前瞻同步）✅
+
+**内容**：`sense.rs`(感官 API 坞) + `echo.rs`(回声层做梦) + `fable/`(检索枢纽:盘点 L1a /
+向量索引 / grep∥RAG 塌平混检) + 前端 `SenseApi.vue` 整页 + `Settings.vue`/`App.vue`/`app.ts`
+增量 + `conv.rs`/`kb.rs`/`claude_md.rs` 增量(均为主仓正向增量,非 OWNED,整拷) + `docker/sense-models.sh`。
+手并的 OWNED 文件：`Cargo.toml`(+chrono+rusqlite bundled)、`lib.rs`(+3 个 `pub mod`)、
+`server.rs`(+opt_bool/opt_f64/opt_u8 助手 + sense/echo/fable dispatch + init 三行)、
+`src/bin/polaris-forge.rs`(+`fable` 子命令组,容器内 agent 的全盘检索工具)。
+**验证**：`cargo check --lib/--bins --no-default-features --features server` 绿 + `vue-tsc` 绿(Windows)。
+**注意**：主仓该批改动同步时尚未 commit——主仓 commit 后做常规同步,这批共享文件 hash 应当
+已一致(对得上就跳过)。镜像未重建;下次 CI 因 rusqlite(bundled) 编 C 会略变慢属正常。
 
 ---
 

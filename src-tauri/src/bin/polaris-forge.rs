@@ -41,6 +41,18 @@ const HELP: &str = r#"polaris-forge — Polaris Forge 渲染引擎 CLI
   polaris-forge validate --pptx=<file.pptx>
       校验 .pptx 包结构(自写最小 OOXML 校验器)。
 
+  polaris-forge fable status
+      检索枢纽(寓言计划)状态:盘点文件数/向量 chunk 数/嵌入服务商。
+
+  polaris-forge fable inventory --root=<目录>
+      多核并行全盘盘点 → ~/Polaris/data/fable.db(L1a,首小时全盘可搜)。
+
+  polaris-forge fable index [--max-chunks=4000]
+      构建(或继续)向量索引:文本 chunk → 嵌入(感官坞服务商)→ 落库;幂等续跑。
+
+  polaris-forge fable search --q=<查询> [--top=12] [--mode=hybrid|grep|vector]
+      塌平混检:grep 多核车道 ∥ RAG 向量车道并行 → RRF 融合 → 重排,JSON 命中。
+
 约定:成功 → JSON 到 stdout,退出码 0;失败 → {"ok":false,"error":…} 到 stderr,退出码 1。
 "#;
 
@@ -129,6 +141,40 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
         "validate" => {
             let v = app::forge_pptx::validate_pptx(&req(args, "pptx")?)?;
             serde_json::to_value(&v).map_err(|e| e.to_string())
+        }
+        // 寓言计划 · 检索枢纽:agent 的全盘检索 shell 工具(grep ∥ RAG 混检)
+        "fable" => {
+            // 嵌入/重排要读感官坞配置(~/Polaris/data/sense.json)
+            app::sense::init();
+            let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+            let rest = if args.is_empty() { args } else { &args[1..] };
+            match sub {
+                "status" => serde_json::to_value(app::fable::status()?).map_err(|e| e.to_string()),
+                "inventory" => {
+                    let root = req(rest, "root")?;
+                    let summary = app::fable::inventory::scan_root(&root, &|files, bytes| {
+                        eprintln!("[fable] 已盘点 {files} 个文件 / {:.1} GB", bytes as f64 / 1e9);
+                    })?;
+                    serde_json::to_value(summary).map_err(|e| e.to_string())
+                }
+                "index" => {
+                    let budget = flag(rest, "max-chunks")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(4000usize);
+                    let summary = app::fable::index::build_index(budget, &|files, chunks, cur| {
+                        eprintln!("[fable] 文件 {files} / chunk {chunks} — {cur}");
+                    })?;
+                    serde_json::to_value(summary).map_err(|e| e.to_string())
+                }
+                "search" => {
+                    let q = req(rest, "q")?;
+                    let top = flag(rest, "top").and_then(|v| v.parse().ok()).unwrap_or(12);
+                    let mode = flag(rest, "mode").unwrap_or_else(|| "hybrid".into());
+                    serde_json::to_value(app::fable::retrieve::search(&q, top, &mode)?)
+                        .map_err(|e| e.to_string())
+                }
+                other => Err(format!("未知 fable 子命令 {other}(--help 看用法)")),
+            }
         }
         other => Err(format!("未知子命令 {other}(--help 看用法)")),
     }

@@ -107,6 +107,17 @@ function useDefault() {
     </section>
 
     <section class="block">
+      <div class="b-title">寓言计划 · 感官 API</div>
+      <div class="b-desc">
+        听(转写)/ 看(视觉)/ 嵌入 / 重排 / 读(扫描件)的服务商管理:本地模型按需下载,
+        云服务商填 key 即用;含「回声 · 每日做梦」(定时收录对话沉淀为记忆)。
+      </div>
+      <div class="row">
+        <button class="btn primary" @click="app.setView('sense_api')">打开管理页</button>
+      </div>
+    </section>
+
+    <section class="block">
       <div class="b-title">知识库根目录(KB 根)</div>
       <div class="b-desc">
         Polaris 在此目录下维护

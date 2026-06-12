@@ -74,6 +74,12 @@ ureq = { version = "2", features = ["json"] }
 # 「聊天机器人」板块「扫码创建机器人」: 把飞书开放平台建应用 URL 编码成二维码 (SVG)。
 # default-features=false → 不拉重型 image crate, 只保留纯 Rust 的 svg 渲染。
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+# 回声层「每日做梦」调度需要本地时区的钟点(std 拿不到 local hour)。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 寓言计划 · 检索枢纽(fable/):盘点/chunk/向量统一落 SQLite(PRD v5 P0「SQLite 落盘」)。
+# bundled = 静态编译 sqlite3,镜像内零系统依赖。
+rusqlite = { version = "0.32", features = ["bundled"] }
 # ── Forge 工业级化阶段 1:chromiumoxide 持久 CDP 替「每帧起 chromium CLI 进程」 ──
 #   提速 6-10×(单页 350-900ms → 50-120ms);双选型 chromiumoxide 主路 + headless_chrome 兜底
 #   pin minor 版本:0.9.x API 仍在动(issue 标 "Regression from 0.8 to 0.9")

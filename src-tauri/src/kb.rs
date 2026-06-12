@@ -264,9 +264,10 @@ fn save_settings(s: &AppSettings) -> Result<()> {
     Ok(())
 }
 
-/// 三层目录铁律 (PRD §8.3)
+/// 三层目录铁律 (PRD §8.3) + 回声层第四车道 memory/(寓言计划 v5 §6:
+/// 对话沉淀落这里,享受图谱可视化但注入只给地图,不进 wiki/ 全文区防臃肿)。
 fn ensure_skeleton(root: &Path) -> Result<()> {
-    for sub in ["raw", "output", "wiki"] {
+    for sub in ["raw", "output", "wiki", "memory"] {
         fs::create_dir_all(root.join(sub))?;
     }
     let claude_md = root.join("CLAUDE.md");
@@ -768,7 +769,7 @@ pub fn kb_compile(app: AppHandle) -> Result<String, String> {
 
 /// 起一个只读 headless claude, 把 prompt 经 stdin 喂进去, 收集其全部 assistant 文本块返回。
 /// `on_event(kind, text)`: kind ∈ {tool, delta} 用于向前端透传进度。阻塞直到进程退出。
-fn run_claude_readonly<F: FnMut(&str, &str)>(
+pub(crate) fn run_claude_readonly<F: FnMut(&str, &str)>(
     root: &Path,
     prompt: &str,
     mut on_event: F,
@@ -867,7 +868,7 @@ fn run_claude_readonly<F: FnMut(&str, &str)>(
 
 /// 从一段文本里抽出第一个**平衡**的 JSON (对象 `{...}` 或数组 `[...]`), 容忍前后包裹的
 /// markdown 代码围栏与说明文字 (借鉴 llm_wiki 对 LLM 输出格式宽松解析)。
-fn extract_balanced_json(s: &str) -> Option<String> {
+pub(crate) fn extract_balanced_json(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let start = s.find(['{', '['])?;
     let open = bytes[start];

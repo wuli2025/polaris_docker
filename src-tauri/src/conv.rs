@@ -40,6 +40,10 @@ pub struct Conversation {
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 回声层(寓言计划 v5 §6):归档 = 移出主列表的纯状态位,可逆;蒸馏取材时跳过。
+    /// 老 state.json 没有此字段 → serde 默认 false,向后兼容。
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,10 +473,71 @@ pub fn conv_create_conversation(project_id: String) -> Result<Conversation, Stri
         title: "新对话".into(),
         created_at: now,
         updated_at: now,
+        archived: false,
     };
     STATE.write().conversations.push(c.clone());
     persist();
     Ok(c)
+}
+
+/// 归档/取消归档一个对话(回声层动作一:纯状态位,可逆)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn conv_archive_conversation(id: String, archived: bool) -> Result<(), String> {
+    {
+        let mut state = STATE.write();
+        let c = state
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| format!("没有对话 '{id}'"))?;
+        c.archived = archived;
+    }
+    persist();
+    Ok(())
+}
+
+/// 回声层(echo.rs)蒸馏取材:since_ms 之后有更新、未归档的对话 → (标题, 文字稿)。
+/// 文字稿只含 user/assistant 轮次;超长截尾保留最新内容。
+pub(crate) fn transcripts_since(
+    since_ms: i64,
+    max_convs: usize,
+    per_conv_chars: usize,
+) -> Vec<(String, String)> {
+    let state = STATE.read();
+    let mut convs: Vec<&Conversation> = state
+        .conversations
+        .iter()
+        .filter(|c| c.updated_at > since_ms && !c.archived)
+        .collect();
+    convs.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+    convs.truncate(max_convs);
+    convs
+        .iter()
+        .map(|c| {
+            let mut buf = String::new();
+            for msg in state.messages.iter().filter(|m| m.conversation_id == c.id) {
+                let who = match msg.role.as_str() {
+                    "user" => "用户",
+                    "assistant" => "助手",
+                    _ => continue,
+                };
+                buf.push_str(who);
+                buf.push_str(": ");
+                buf.push_str(msg.content.trim());
+                buf.push('\n');
+            }
+            let s = if buf.chars().count() > per_conv_chars {
+                let tail: String = {
+                    let chars: Vec<char> = buf.chars().collect();
+                    chars[chars.len() - per_conv_chars..].iter().collect()
+                };
+                format!("…(前文截断)\n{tail}")
+            } else {
+                buf
+            };
+            (c.title.clone(), s)
+        })
+        .collect()
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]

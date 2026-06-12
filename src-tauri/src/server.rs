@@ -73,6 +73,10 @@ pub async fn serve() -> anyhow::Result<()> {
     crate::skills::migrate_consult_mao_for_seeded_kb();
     // 飞书网关「开机自动启动」（若用户开了 auto_start 且凭证齐全）。
     crate::feishu::auto_start_if_enabled(&app);
+    // 寓言计划:感官 API 坞 + 回声层「每日做梦」调度 + 检索枢纽(与桌面 setup 等价)。
+    crate::sense::init();
+    crate::echo::start_scheduler(app.clone());
+    crate::fable::init();
 
     let auth_token = std::env::var("POLARIS_AUTH_TOKEN")
         .ok()
@@ -397,6 +401,15 @@ fn opt_str(a: &Value, k: &str) -> Option<String> {
 fn opt_usize(a: &Value, k: &str) -> Option<usize> {
     a.get(k).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
+fn opt_bool(a: &Value, k: &str) -> Option<bool> {
+    a.get(k).and_then(|v| v.as_bool())
+}
+fn opt_f64(a: &Value, k: &str) -> Option<f64> {
+    a.get(k).and_then(|v| v.as_f64())
+}
+fn opt_u8(a: &Value, k: &str) -> Option<u8> {
+    a.get(k).and_then(|v| v.as_u64()).map(|n| n.min(255) as u8)
+}
 fn bool_def(a: &Value, k: &str, d: bool) -> bool {
     a.get(k).and_then(|v| v.as_bool()).unwrap_or(d)
 }
@@ -435,6 +448,49 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "kb_pack_list" => ok(kb::kb_pack_list()),
         "kb_pack_install" => ok(kb::kb_pack_install(app, req_str(a, "id")?)?),
         "kb_pack_remove" => ok(kb::kb_pack_remove(req_str(a, "id")?)?),
+
+        // ── 寓言计划 · 感官 API 坞 ──
+        "sense_list" => ok(sense::sense_list()),
+        "sense_set" => ok(sense::sense_set(
+            req_str(a, "id")?,
+            opt_str(a, "apiKey"),
+            opt_str(a, "baseUrl"),
+            opt_bool(a, "enabled"),
+            opt_str(a, "defaultModel"),
+        )?),
+        "sense_switches_set" => ok(sense::sense_switches_set(
+            opt_bool(a, "cloudEnabled"),
+            opt_bool(a, "audioEgress"),
+            opt_bool(a, "imageEgress"),
+            opt_f64(a, "budgetMonthlyCny"),
+        )?),
+        "sense_test" => ok(sense::sense_test(req_str(a, "id")?)?),
+        "sense_pack_install" => ok(sense::sense_pack_install(app, req_str(a, "id")?)?),
+        "sense_pack_remove" => ok(sense::sense_pack_remove(req_str(a, "id")?)?),
+
+        // ── 寓言计划 · 回声层(对话沉淀/做梦)──
+        "conv_archive_conversation" => ok(conv::conv_archive_conversation(
+            req_str(a, "id")?,
+            bool_def(a, "archived", true),
+        )?),
+        "echo_status" => ok(echo::echo_status()),
+        "echo_set" => ok(echo::echo_set(opt_bool(a, "enabled"), opt_u8(a, "hour"))),
+        "echo_dream_now" => ok(echo::echo_dream_now(app)?),
+
+        // ── 寓言计划 · 检索枢纽(盘点 L1a + 向量索引 + 塌平混检)──
+        "fable_status" => ok(fable::fable_status()?),
+        "fable_cancel" => ok(fable::fable_cancel()),
+        "fable_inventory_start" => {
+            ok(fable::inventory::fable_inventory_start(app, opt_str(a, "root"))?)
+        }
+        "fable_index_start" => {
+            ok(fable::index::fable_index_start(app, opt_usize(a, "maxChunks"))?)
+        }
+        "fable_search" => ok(fable::retrieve::fable_search(
+            req_str(a, "query")?,
+            opt_usize(a, "topK"),
+            opt_str(a, "mode"),
+        )?),
 
         // ── Conv ──
         "conv_list_projects" => ok(conv::conv_list_projects()),
