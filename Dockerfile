@@ -102,21 +102,28 @@ COPY docker/subset_cjk.py /docker/subset_cjk.py
 # ── 阶段3.6:SC 字体子集(全语种 102MB → 3 weight × ~12MB = ~36MB)────────
 #   字符集 docker/font-subset-chars.txt(ASCII + 6763 高频中文 + 实用 emoji)
 #   软降级:pyftsubset 失败不 fail build,fallback 装全语种(任务 d §6.3)
+# ⚠ 这里曾出过「空字体层」事故：apt-get 失败被后面的 || pip 链接住，整层 exit 0，
+#   GHA 缓存把这个零字体层缓存住 → GHCR :full 长期缺中文字体(真机 fc-list :lang=zh = 0)。
+#   故改三段式：① apt 必须成功(set -e 硬失败) ② 子集化纯 best-effort ③ 出层前 fc-list 硬闸。
 RUN if [ "$POLARIS_RENDER" = "1" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends \
-            fonts-noto-cjk fonts-noto-color-emoji fontconfig \
-        && pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir --break-system-packages fonttools brotli 2>/dev/null \
+        set -e; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            fonts-noto-cjk fonts-noto-color-emoji fontconfig; \
+        { pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir --break-system-packages fonttools brotli 2>/dev/null \
             || pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir fonttools brotli \
-        && mkdir -p /out \
-        && python3 /docker/subset_cjk.py \
-            || echo "[subset] 子集失败,降级全语种 102MB" \
-        && if [ -d /out ] && [ -n "$(ls -A /out 2>/dev/null)" ]; then \
-               mkdir -p /usr/share/fonts/truetype/noto-cjk-subset \
-               && cp /out/*.woff2 /usr/share/fonts/truetype/noto-cjk-subset/ \
-               && fc-cache -fv > /dev/null 2>&1 \
-               && echo "[subset] SC 字体子集已落 /usr/share/fonts/truetype/noto-cjk-subset/"; \
-           fi \
-        && rm -rf /var/lib/apt/lists/* ; \
+            || echo "[subset] fonttools 装不上,跳过子集(保留全语种)"; }; \
+        mkdir -p /out; \
+        python3 /docker/subset_cjk.py || echo "[subset] 子集失败,降级全语种 102MB"; \
+        if [ -n "$(ls -A /out 2>/dev/null)" ]; then \
+            mkdir -p /usr/share/fonts/truetype/noto-cjk-subset; \
+            cp /out/*.woff2 /usr/share/fonts/truetype/noto-cjk-subset/; \
+            echo "[subset] SC 字体子集已落 /usr/share/fonts/truetype/noto-cjk-subset/"; \
+        fi; \
+        fc-cache -f > /dev/null 2>&1 || true; \
+        fc-list :lang=zh | grep -q . \
+            || { echo "FATAL: full 镜像 fc-list :lang=zh 为空 — 中文字体没装上,拒出镜像(否则截图全豆腐块)"; exit 1; }; \
+        rm -rf /var/lib/apt/lists/*; \
     fi
 
 # ── 渲染栈(可选 flavor)——Polaris Forge 工业级化阶段 0:Docker 994MB→235MB ──
