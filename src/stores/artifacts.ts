@@ -1,6 +1,21 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
-import { artifacts as api, type ArtifactPayload } from "../tauri";
+import {
+  artifacts as api,
+  isTauri,
+  backendFileUrl,
+  type ArtifactPayload,
+} from "../tauri";
+
+/** 网页版：触发浏览器下载（后端 download=1 已带 Content-Disposition: attachment）。 */
+function triggerDownload(url: string) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
 /**
  * 右侧抽屉的「成品预览」状态。
@@ -105,24 +120,34 @@ export const useArtifactsStore = defineStore("artifacts", () => {
     }
   }
 
+  /** 桌面版：用系统默认程序打开；网页版：在新标签页打开后端文件 URL（HTML 直接渲染，pptx 等走下载）。 */
   async function openExternal() {
-    if (current.value) {
+    if (!current.value) return;
+    if (isTauri) {
       try {
         await api.openExternal(current.value.path);
       } catch (_) {
         /* 忽略：打开失败不影响预览 */
       }
+    } else {
+      window.open(backendFileUrl(current.value.path), "_blank", "noopener");
     }
   }
 
-  /** 在系统文件管理器中定位并选中当前预览的文件 */
+  /**
+   * 桌面版：在系统文件管理器中定位并选中该文件。
+   * 网页版：「文件夹」在浏览器里无对应概念 —— 改为下载该文件（用户点这个键的真实意图就是「拿到文件」）。
+   */
   async function revealInFolder() {
-    if (current.value) {
+    if (!current.value) return;
+    if (isTauri) {
       try {
         await api.reveal(current.value.path);
       } catch (_) {
         /* 忽略：打开失败不影响预览 */
       }
+    } else {
+      triggerDownload(backendFileUrl(current.value.path, { download: true }));
     }
   }
 

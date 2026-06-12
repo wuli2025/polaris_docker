@@ -45,6 +45,22 @@ export function authHeaders(): Record<string, string> {
   return t ? { authorization: `Bearer ${t}` } : {};
 }
 
+/**
+ * 后端受限文件 URL（/api/file）。window.open/<a download> 等导航请求带不了
+ * Authorization 头，故 token 走 query（与 /ws 同理）。download=true 让后端加
+ * Content-Disposition: attachment 强制下载。
+ */
+export function backendFileUrl(
+  path: string,
+  opts?: { download?: boolean }
+): string {
+  const qs = new URLSearchParams({ path });
+  const t = authToken();
+  if (t) qs.set("token", t);
+  if (opts?.download) qs.set("download", "1");
+  return `/api/file?${qs.toString()}`;
+}
+
 async function ensureBackend(): Promise<void> {
   if (backendMode) return;
   if (!probePromise) {

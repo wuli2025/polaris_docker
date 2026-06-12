@@ -1,0 +1,88 @@
+# ════════════════════════════════════════════════════════════════
+# .docker-owned — Docker 专属修改空间「保护清单」
+#
+# 这份清单是 polaris_docker 仓相对主仓 (polaris-app) 分叉出来的、**Docker 独有**
+# 的文件 / 文件区。它存在的唯一目的：**从主仓同步新代码时，这些文件绝不能被整文件覆盖**，
+# 否则会悄悄抹掉 Docker 侧的改动（自更新、替身容器、鉴权头、docker.sock、国内镜像源…）。
+#
+# 谁来读它：scripts/sync-guard.ps1。同步主仓改动时跑守卫脚本——
+#   命中本清单的文件 → 拒绝 Copy-Item，强制逐 hunk 手并；
+#   未命中的共享文件 → 才允许整文件覆盖（那份本来就是主仓快照）。
+#
+# 怎么维护：每次给 Docker 加新的分叉点（在某个共享文件里写 Docker-only 逻辑），
+#   就把该文件加进下面对应分区。`sync-guard.ps1 -Audit` 会用 git 反查实际分叉、
+#   提醒清单漏了哪些。over-list 是安全的（顶多多审一遍），under-list 才危险（静默丢改动）。
+#
+# 语法：每行一个路径或 glob（相对仓库根，用 /）。# 开头是注释，空行忽略。
+# ════════════════════════════════════════════════════════════════
+
+# ── A. 纯 Docker 基础设施（永远不该从主仓来，主仓压根没有）────────────────
+Dockerfile
+.gitattributes
+.gitignore
+.dockerignore
+docker-compose.yml
+docker-compose.build.yml
+docker-compose.synology.yml
+docker-entrypoint.sh
+docker-xvfb-wrap.sh
+DEPLOY-SYNOLOGY.md
+DOCKER.md
+.env.example
+VERSION
+.github/workflows/image.yml
+docker/**
+
+# ── B. Docker 分发壳：安装 / 更新 / 文档 / 网页外壳（与桌面版不同源）────────
+install.sh
+install.ps1
+update.sh
+update.ps1
+README.md
+index.html
+package.json
+package-lock.json
+tsconfig.json
+tsconfig.node.json
+vite.config.ts
+scripts/**
+
+# ── C. 分叉过的共享【后端】源码——藏着 Docker-only 逻辑，最容易被误覆盖 ──────
+#   server.rs：axum 服务端本体 + 口令鉴权 + /api/version + 容器自更新(do_docker_update)
+#              + serve_file 的 ?token=/?download= 兜底。主仓那份没有服务端骨架。
+src-tauri/src/server.rs
+#   polaris-server bin 入口：_pdocker 住主包 src/bin（主仓已迁 crates/polaris-cli，架构不同）。
+src-tauri/src/bin/polaris-server.rs
+#   Cargo 清单：workspace members / [[bin]] 与主仓分叉（主仓多一个 polaris-cli crate）。
+src-tauri/Cargo.toml
+#   Cargo.lock：主仓 .gitignore 了它，Docker 可复现构建必须留一份。
+src-tauri/Cargo.lock
+#   tauri.conf.json：bundler / 标识配置按 Docker 调过。
+src-tauri/tauri.conf.json
+
+# ── C2. drift-divergent 后端：Docker 落后主仓，**盲覆盖会炸构建**（见 DRIFT.md）──────
+#   这些不是「Docker 有主仓没有」，而是「Docker 比主仓旧」：主仓的对应文件引用了
+#   Docker 侧还没有的符号（如 forge_pptx_native、longtask/creative/script_convention），
+#   单独整覆盖任一文件 → 编译期找不到符号。catch-up 必须整簇一起做并跑完整 cargo 构建，
+#   所以平时同步一律当 OWNED 跳过，留到专门的、构建验证过的 catch-up pass。
+src-tauri/src/lib.rs
+src-tauri/src/chat.rs
+src-tauri/src/provider.rs
+src-tauri/src/forge.rs
+src-tauri/src/forge_pptx.rs
+src-tauri/src/forge_capture.rs
+src-tauri/src/forge_video.rs
+src-tauri/src/forge_tts.rs
+src-tauri/src/forge_fx_safe.rs
+
+# ── D. 分叉过的共享【前端】源码——Docker/Web 适配层 + 容器自更新 UI ──────────
+#   tauri.ts：整个「Docker/Web 后端适配层」(HTTP /api/invoke + WS /ws + 口令 + backendFileUrl)，
+#             主仓那份是纯 Tauri IPC。**整文件覆盖必炸**。
+src/tauri.ts
+#   RightDrawer.vue：预览抽屉，含 isTauri 分支的 web 预览/下载按钮（已并入主仓 958ac49）。
+src/components/RightDrawer.vue
+#   artifacts.ts：openExternal/revealInFolder 的 web 分支（backendFileUrl + triggerDownload）。
+src/stores/artifacts.ts
+#   UpdatePanel.vue + useUpdater.ts：容器自更新面板（替身容器模式触发 /api 更新）。
+src/components/UpdatePanel.vue
+src/composables/useUpdater.ts

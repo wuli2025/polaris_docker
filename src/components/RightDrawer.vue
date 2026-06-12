@@ -6,6 +6,7 @@ import {
   X,
   RefreshCw,
   FolderOpen,
+  Download,
   ExternalLink,
   Globe,
   Maximize2,
@@ -38,6 +39,7 @@ import { useProjectsStore } from "../stores/projects";
 import { useChatStore } from "../stores/chat";
 import {
   artifacts as artifactsApi,
+  isTauri,
   type ArtifactEntry,
   type ProjectInfo,
 } from "../tauri";
@@ -294,10 +296,14 @@ function fmtSize(n: number): string {
         <div class="pv-actions">
           <button
             class="pv-btn"
-            title="打开原文件夹位置"
+            :title="isTauri ? '打开原文件夹位置' : '下载文件'"
             @click="artifacts.revealInFolder()"
           >
-            <FolderOpen :size="15" :stroke-width="1.8" />
+            <component
+              :is="isTauri ? FolderOpen : Download"
+              :size="15"
+              :stroke-width="1.8"
+            />
           </button>
           <button
             v-if="canEdit"
@@ -321,7 +327,7 @@ function fmtSize(n: number): string {
           </button>
           <button
             class="pv-btn"
-            title="用默认浏览器打开"
+            :title="isTauri ? '用默认浏览器打开' : '在新标签页打开'"
             @click="artifacts.openExternal()"
           >
             <Globe :size="15" :stroke-width="1.8" />
@@ -341,7 +347,7 @@ function fmtSize(n: number): string {
           <span>{{ artifacts.error }}</span>
           <button class="pv-open-ext" @click="artifacts.openExternal()">
             <ExternalLink :size="14" :stroke-width="1.8" />
-            <span>用系统程序打开</span>
+            <span>{{ isTauri ? "用系统程序打开" : "在浏览器打开 / 下载" }}</span>
           </button>
         </div>
 
@@ -382,7 +388,7 @@ function fmtSize(n: number): string {
             <span>该文件类型暂不支持内嵌预览</span>
             <button class="pv-open-ext" @click="artifacts.openExternal()">
               <ExternalLink :size="14" :stroke-width="1.8" />
-              <span>用系统程序打开</span>
+              <span>{{ isTauri ? "用系统程序打开" : "在浏览器打开 / 下载" }}</span>
             </button>
           </div>
         </template>

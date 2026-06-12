@@ -841,6 +841,12 @@ fn unique_path(base: &Path, fname: &str) -> PathBuf {
 #[derive(serde::Deserialize)]
 struct FileQuery {
     path: String,
+    /// 鉴权 token：window.open/<a download> 等导航请求带不了 Authorization 头，故走 query（与 /ws 同理）。
+    #[serde(default)]
+    token: Option<String>,
+    /// download=1 → 加 Content-Disposition: attachment 强制下载（网页版「下载文件」按钮用）。
+    #[serde(default)]
+    download: Option<String>,
 }
 
 async fn serve_file(
@@ -848,7 +854,12 @@ async fn serve_file(
     headers: HeaderMap,
     Query(q): Query<FileQuery>,
 ) -> Response {
-    if !check_auth(&state, &headers) {
+    // 鉴权：header（Authorization/x-polaris-token）或 query ?token=（导航请求兜底）。
+    let authed = match state.auth_token.as_ref() {
+        None => true,
+        Some(exp) => q.token.as_deref() == Some(exp.as_str()) || check_auth(&state, &headers),
+    };
+    if !authed {
         return (StatusCode::UNAUTHORIZED, "未授权").into_response();
     }
     let path = PathBuf::from(&q.path);
@@ -864,10 +875,36 @@ async fn serve_file(
     match tokio::fs::read(&canon).await {
         Ok(bytes) => {
             let ct = mime_for(&canon);
-            ([(header::CONTENT_TYPE, ct)], bytes).into_response()
+            let mut resp = ([(header::CONTENT_TYPE, ct)], bytes).into_response();
+            if q.download.as_deref() == Some("1") {
+                let fname = canon
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("download");
+                // RFC 5987：filename* 用 UTF-8 百分号编码，兼容中文名。
+                let cd = format!("attachment; filename*=UTF-8''{}", pct_encode(fname));
+                if let Ok(v) = header::HeaderValue::from_str(&cd) {
+                    resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+                }
+            }
+            resp
         }
         Err(_) => (StatusCode::NOT_FOUND, "读取失败").into_response(),
     }
+}
+
+/// RFC 5987 百分号编码：unreserved 原样，其余按 UTF-8 字节转 %XX。
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
 }
 
 fn allowed_roots() -> Vec<PathBuf> {
