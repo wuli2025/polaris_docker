@@ -641,8 +641,66 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// 词法归类的哈希特征维度(稀疏 token → 固定维,余弦可比)。
+const LEX_DIM: usize = 128;
+
+fn hash_token(s: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// 文件的词法特征向量:文件夹段(权重 1.5)+ 文件名分词(1.0)+ 扩展名(0.8)哈希进 LEX_DIM 维。
+/// 共享同一目录/相近命名/同类型的文件在余弦下自然靠拢。
+fn lexical_vec(relpath: &str, name: &str, ext: &str) -> Vec<f32> {
+    let mut v = vec![0f32; LEX_DIM];
+    let segs: Vec<&str> = relpath.split('/').collect();
+    for seg in segs.iter().take(segs.len().saturating_sub(1)) {
+        let low = seg.trim().to_lowercase();
+        if low.is_empty() || GENERIC_DIRS.contains(&low.as_str()) {
+            continue;
+        }
+        v[(hash_token(&low) % LEX_DIM as u64) as usize] += 1.5;
+    }
+    for tok in tokenize(name) {
+        v[(hash_token(&tok) % LEX_DIM as u64) as usize] += 1.0;
+    }
+    if !ext.is_empty() {
+        v[(hash_token(&ext.to_lowercase()) % LEX_DIM as u64) as usize] += 0.8;
+    }
+    v
+}
+
+/// 词法兜底:加载范围内全部文件(上限 6000,mtime 倒序)→ 归一化词法向量。
+fn load_lexical_files(conn: &rusqlite::Connection, filter: &str) -> Result<Vec<FileVec>, String> {
+    let sql = format!(
+        "SELECT f.id, f.root_id, f.relpath, f.name, f.ext FROM files f
+         WHERE 1=1{filter} ORDER BY f.mtime DESC LIMIT 6000"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for (id, root_id, relpath, name, ext) in rows.flatten() {
+        let mut v = lexical_vec(&relpath, &name, &ext);
+        normalize(&mut v);
+        out.push(FileVec { file_id: id, root_id, relpath, name, vec: v });
+    }
+    Ok(out)
+}
+
 /// 单根/全库重建语义聚类:每文件 = 其 chunk 向量均值池化 → 球面 k-means(余弦) →
 /// 写回 files.cluster_id + clusters 表。纯数学,不调嵌入 API。
+/// 无嵌入向量时自动退化为词法归类(见 [`load_lexical_files`]),保证永远可用。
 pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String> {
     let started = std::time::Instant::now();
     let conn = open_db()?;
@@ -695,13 +753,22 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
         })
         .collect();
 
+    let mut mode = "semantic";
     if files.len() < 2 {
-        return Ok(ClusterBuildSummary {
-            clusters: 0,
-            files: files.len(),
-            seconds: started.elapsed().as_secs_f64(),
-            note: "已嵌入文本不足(<2),先在「设置 › 检索枢纽」构建向量索引再聚类".into(),
-        });
+        // 没有(足够的)嵌入向量 → 退化为「结构/词法」归类:对全部文件用
+        // 文件夹 + 文件名分词 + 扩展名的哈希特征向量,跑同一套球面 k-means。
+        // 无需任何 key、离线即可用 —— 保证「智能归类」永远点得动、永远能把相似文件放一起;
+        // 配了硅基 key 并建好向量索引后,本函数自动走上面的语义路(更准)。
+        mode = "lexical";
+        files = load_lexical_files(&conn, &filter)?;
+        if files.len() < 2 {
+            return Ok(ClusterBuildSummary {
+                clusters: 0,
+                files: files.len(),
+                seconds: started.elapsed().as_secs_f64(),
+                note: "可归类的文件不足(<2),先点「盘点」扫描磁盘文件再归类".into(),
+            });
+        }
     }
     // 稳定顺序(file_id 升序),让确定性初始化可复现
     files.sort_by_key(|f| f.file_id);
@@ -826,7 +893,13 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
         clusters: new_clusters,
         files: n,
         seconds: started.elapsed().as_secs_f64(),
-        note: format!("已把 {n} 个已嵌入文本归成 {new_clusters} 簇"),
+        note: if mode == "semantic" {
+            format!("已按语义把 {n} 个已嵌入文本归成 {new_clusters} 簇")
+        } else {
+            format!(
+                "已按文件夹/名称把 {n} 个文件归成 {new_clusters} 簇 · 配硅基 key 并建向量索引后可升级为语义归类"
+            )
+        },
     })
 }
 

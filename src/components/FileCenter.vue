@@ -19,6 +19,8 @@ import {
   FolderOpen,
   X,
   Wand2,
+  Zap,
+  KeyRound,
   LoaderCircle,
   ArrowDownWideNarrow,
 } from "@lucide/vue";
@@ -30,6 +32,9 @@ import {
   type FileCard,
   type FcCluster,
 } from "../tauri";
+import { useAppStore } from "../stores/app";
+
+const app = useAppStore();
 
 // ───────────────────────── 状态 ─────────────────────────
 type ViewKind = "gallery" | "clusters" | "list";
@@ -50,6 +55,9 @@ const scanning = ref(false);
 const scanMsg = ref("");
 const clustering = ref(false);
 const clusterMsg = ref("");
+const building = ref(false);
+const buildMsg = ref("");
+let unlistenIndex: (() => void) | null = null;
 
 // 语义检索结果(独立于网格的一条结果带)
 interface SemHit {
@@ -249,7 +257,10 @@ async function doScan() {
 async function doCluster() {
   if (clustering.value) return;
   clustering.value = true;
-  clusterMsg.value = "正在按语义归类(复用已有向量,零新增嵌入)…";
+  const semantic = (overview.value?.embeddedFiles ?? 0) > 0;
+  clusterMsg.value = semantic
+    ? "正在按语义归类(复用已有向量,零新增嵌入)…"
+    : "正在按文件夹/名称把相似文件归类(离线,无需 key)…";
   try {
     const r = await fc.clusterBuild(null);
     clusterMsg.value = r.note;
@@ -260,6 +271,43 @@ async function doCluster() {
     clusterMsg.value = `归类失败:${e?.message ?? e}`;
   } finally {
     clustering.value = false;
+  }
+}
+
+// 构建向量索引(文本 → 硅基 BGE-M3 嵌入),让「智能归类」从词法升级到语义。
+async function buildIndex() {
+  if (building.value) return;
+  if (!overview.value?.hasEmbedProvider) {
+    app.setView("sense_api"); // 没配嵌入 key → 跳设置页配硅基(免费)
+    return;
+  }
+  building.value = true;
+  buildMsg.value = "正在构建向量索引(硅基 BGE-M3 滴灌嵌入)…";
+  try {
+    if (!unlistenIndex) {
+      unlistenIndex = await listen<{
+        kind: string;
+        files?: number;
+        chunks?: number;
+        stopped?: string;
+        message?: string;
+      }>("fable:index", (p) => {
+        if (p.kind === "progress") {
+          buildMsg.value = `已嵌入 ${p.files ?? 0} 文件 · ${p.chunks ?? 0} chunk…`;
+        } else if (p.kind === "done") {
+          buildMsg.value = `索引完成 · 本轮 ${p.files ?? 0} 文件 · ${p.stopped ?? ""}`;
+          building.value = false;
+          loadOverview();
+        } else if (p.kind === "error") {
+          buildMsg.value = `索引失败:${p.message ?? ""}`;
+          building.value = false;
+        }
+      });
+    }
+    await fc.indexStart();
+  } catch (e: any) {
+    buildMsg.value = `索引失败:${e?.message ?? e}`;
+    building.value = false;
   }
 }
 
@@ -458,6 +506,7 @@ onBeforeUnmount(() => {
   thumbObs?.disconnect();
   moreObs?.disconnect();
   if (unlistenScan) unlistenScan();
+  if (unlistenIndex) unlistenIndex();
 });
 </script>
 
@@ -525,12 +574,49 @@ onBeforeUnmount(() => {
           <FolderSearch v-else :size="14" :stroke-width="1.8" />
           <span>{{ scanning ? "盘点中" : "盘点" }}</span>
         </button>
-        <button class="tool-btn accent" :disabled="clustering || !overview?.embeddedFiles" title="按语义把相似文件归类(复用已有向量)" @click="doCluster">
+        <button
+          class="tool-btn accent"
+          :disabled="clustering || !overview?.totalFiles"
+          :title="(overview?.embeddedFiles ?? 0) > 0 ? '按语义把相似文件归类(复用已有向量)' : '按文件夹/名称把相似文件归类(离线;配硅基 key 建索引后升级为语义)'"
+          @click="doCluster"
+        >
           <LoaderCircle v-if="clustering" :size="14" class="spin" />
           <Wand2 v-else :size="14" :stroke-width="1.8" />
           <span>{{ clustering ? "归类中" : "智能归类" }}</span>
         </button>
       </div>
+    </div>
+
+    <!-- 语义就绪度:解释「智能归类」当前能力 + 一键升级到语义 -->
+    <div v-if="hasFiles" class="fc-semantic">
+      <template v-if="!overview?.hasEmbedProvider">
+        <Zap :size="14" :stroke-width="1.8" class="sem-ic warn" />
+        <span class="sem-text">
+          语义增强未启用 —— 智能归类当前按<b>文件夹 / 名称</b>把相似文件归一起。
+          配置硅基流动 key(<b>免费</b>)并构建索引后,自动升级为<b>语义归类</b>与语义检索。
+        </span>
+        <button class="link-btn" @click="app.setView('sense_api')">
+          <KeyRound :size="13" :stroke-width="1.8" /> 去配置 key
+        </button>
+      </template>
+      <template v-else>
+        <Radar :size="14" :stroke-width="1.8" class="sem-ic ok" />
+        <span class="sem-text">
+          向量索引:<b>{{ overview.embeddedFiles }}</b> / {{ overview.textFiles }} 个文本已嵌入
+          <span v-if="overview.embeddedFiles > 0" class="sem-ok">· 语义归类与检索已就绪</span>
+        </span>
+        <button
+          v-if="overview.textFiles > overview.embeddedFiles"
+          class="link-btn"
+          :disabled="building"
+          @click="buildIndex"
+        >
+          <LoaderCircle v-if="building" :size="13" class="spin" />
+          <Radar v-else :size="13" :stroke-width="1.8" />
+          {{ building ? "构建中…" : (overview.embeddedFiles > 0 ? "续建索引" : "构建向量索引") }}
+        </button>
+      </template>
+      <span v-if="buildMsg" class="build-msg">{{ buildMsg }}</span>
     </div>
 
     <div v-if="scanMsg || clusterMsg" class="fc-note">{{ clusterMsg || scanMsg }}</div>
@@ -647,10 +733,14 @@ onBeforeUnmount(() => {
       <div v-show="view === 'clusters'" class="starmap glass">
         <div v-if="!overview?.clusters.length" class="star-empty">
           <Sparkles :size="26" :stroke-width="1.4" />
-          <div>还没有语义簇</div>
-          <div class="star-hint">点工具条「智能归类」,把已嵌入的文本按相似度归成一张星图(复用已有向量,不花新钱)。</div>
-          <button class="empty-cta" :disabled="clustering || !overview?.embeddedFiles" @click="doCluster">
-            <Wand2 :size="15" :stroke-width="1.8" /><span>智能归类</span>
+          <div>还没有归类</div>
+          <div class="star-hint">
+            点「智能归类」把相似文件归成一张星图 —— 有向量索引走<b>语义</b>,没有就按<b>文件夹 / 名称</b>归类,
+            <b>两种都能用、都能点</b>。点球可筛选出该簇的文件。
+          </div>
+          <button class="empty-cta" :disabled="clustering || !overview?.totalFiles" @click="doCluster">
+            <LoaderCircle v-if="clustering" :size="15" class="spin" />
+            <Wand2 v-else :size="15" :stroke-width="1.8" /><span>{{ clustering ? "归类中…" : "智能归类" }}</span>
           </button>
         </div>
         <div v-else class="star-field">
@@ -953,6 +1043,70 @@ onBeforeUnmount(() => {
   color: var(--muted);
   padding: 0 8px;
   margin-top: -4px;
+}
+
+/* ── 语义就绪度条 ── */
+.fc-semantic {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 14px;
+  margin: 0 2px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--primary) 5%, var(--panel));
+  border: 1px solid var(--border-soft);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.sem-ic {
+  flex: none;
+}
+.sem-ic.warn {
+  color: var(--gold);
+}
+.sem-ic.ok {
+  color: var(--primary);
+}
+.sem-text {
+  flex: 1;
+  min-width: 220px;
+  line-height: 1.65;
+}
+.sem-text b {
+  color: var(--text);
+}
+.sem-ok {
+  color: var(--ok);
+}
+.fc-semantic .link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+  border-radius: 9px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: none;
+  transition: all 0.16s;
+}
+.fc-semantic .link-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.fc-semantic .link-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.build-msg {
+  flex-basis: 100%;
+  font-size: 11.5px;
+  color: var(--muted);
 }
 
 /* ── 过滤胶囊 ── */

@@ -547,6 +547,9 @@ export const files = {
   /** 开始盘点磁盘根(缺省=知识库根),进度走 fable:inventory 事件 */
   inventoryStart: (root?: string | null) =>
     invoke<void>("fable_inventory_start", { root: root ?? null }),
+  /** 构建/续建向量索引(文本 chunk → 硅基 BGE-M3 嵌入),进度走 fable:index 事件 */
+  indexStart: (maxChunks?: number) =>
+    invoke<void>("fable_index_start", { maxChunks: maxChunks ?? null }),
   /** 检索枢纽混合检索(grep ∥ 向量 RRF) */
   search: (query: string, topK = 24, mode: "hybrid" | "grep" | "vector" = "hybrid") =>
     invoke<FableSearchResult>("fable_search", { query, topK, mode }),
