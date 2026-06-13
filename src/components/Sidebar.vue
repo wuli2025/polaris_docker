@@ -3,6 +3,7 @@ import { onMounted, ref, computed } from "vue";
 import {
   MessagesSquare,
   Library,
+  Database,
   Waypoints,
   Clock,
   Puzzle,
@@ -38,6 +39,8 @@ type NavItem = { key: typeof app.view; label: string; icon: any };
 const primaryNav: NavItem[] = [
   { key: "chat", label: "对话", icon: MessagesSquare },
   { key: "wiki", label: "知识库", icon: Library },
+  // 文件中心:把整台电脑当成数据库 —— 可视化文件库 + 智能归类 + 语义检索
+  { key: "file_center", label: "文件中心", icon: Database },
   { key: "graph", label: "图谱", icon: Waypoints },
   { key: "automation", label: "自动化", icon: Clock },
   // 沙箱入口已隐藏：进入沙箱视图首挂载较重、点击有卡顿，且当前非核心路径。

@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "1.0.0"
+version = "1.1.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -77,6 +77,19 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # 回声层「每日做梦」调度需要本地时区的钟点(std 拿不到 local hour)。
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 语音输入 · 防污染秒达档(voice.rs §7):个人词表拼音对齐纠同音错。
+# 纯 Rust 内嵌音节表,零系统依赖;只用 ToPinyin 取无调音节做编辑距离匹配。
+pinyin = "0.10"
+# 语音识别运行时(voice-asr feature):sherpa-onnx 的 Rust 绑定,本地跑 SenseVoice。
+# download-binaries = 构建时下载预编译 sherpa-onnx 库(免 cmake 从源码编译,本机最稳)。
+# optional + 专属 feature → 默认 build 不拉它,保护现有绿色编译;实测/发版时显式开 voice-asr。
+# 运行时需把 target 下的 sherpa-onnx 动态库放进 PATH(BUILDING.md)。
+sherpa-rs = { version = "0.6", optional = true, features = ["download-binaries"] }
+# 语音输入实时链路(voice-asr):麦克风采集 / 全局热键 / 文本注入。
+# 都 optional + 归 voice-asr feature,默认 build 不拉,保护现有绿色编译。
+cpal = { version = "0.15", optional = true }   # 跨平台音频采集(按住录音)
+rdev = { version = "0.5", optional = true }    # 全局热键(右 Alt 按住/松手边沿)
+enigo = { version = "0.3", optional = true }   # 把终稿「敲」进当前焦点应用
 # 寓言计划 · 检索枢纽(fable/):盘点/chunk/向量统一落 SQLite(PRD v5 P0「SQLite 落盘」)。
 # bundled = 静态编译 sqlite3,镜像内零系统依赖。
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -116,6 +129,9 @@ desktop = [
 custom-protocol = ["tauri?/custom-protocol"]
 # Docker/Web 构建：axum HTTP/WS 外壳，复用全部 Rust 引擎，不含 Tauri。
 server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
+# 语音识别 + 实时输入运行时:本地 SenseVoice + 录音 + 全局热键 + 注入。
+# 默认不开(保护 build),实测/发版显式开 `--features voice-asr`。
+voice-asr = ["dep:sherpa-rs", "dep:cpal", "dep:rdev", "dep:enigo"]
 
 # server 二进制：浏览器前端 + REST/WS 后端（替代 Tauri 外壳）。
 # 构建：cargo build --release --bin polaris-server --no-default-features --features server

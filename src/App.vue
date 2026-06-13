@@ -17,6 +17,7 @@ import Onboarding from "./components/Onboarding.vue";
 import EnvDoctor from "./components/EnvDoctor.vue"; // 既是视图也是启动 env 网关，留静态
 import UpdateBanner from "./components/UpdateBanner.vue";
 import ToastHost from "./components/ToastHost.vue";
+import VoiceOverlay from "./components/VoiceOverlay.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import { useHotkeys } from "./composables/useHotkeys";
 import { installMarkdownDelegation } from "./lib/markdown";
@@ -28,11 +29,13 @@ import { openUrl, onWsStatus, isTauri } from "./tauri";
 const KnowledgeGraph = defineAsyncComponent(() => import("./components/KnowledgeGraph.vue"));
 const SandboxStatus = defineAsyncComponent(() => import("./features/sandbox/components/SandboxStatus.vue"));
 const WikiBrowse = defineAsyncComponent(() => import("./components/WikiBrowse.vue"));
+const FileCenter = defineAsyncComponent(() => import("./components/FileCenter.vue"));
 const Automation = defineAsyncComponent(() => import("./components/Automation.vue"));
 const AutomationModal = defineAsyncComponent(() => import("./components/AutomationModal.vue"));
 const ClaudeMdPanel = defineAsyncComponent(() => import("./components/ClaudeMdPanel.vue"));
 const Settings = defineAsyncComponent(() => import("./components/Settings.vue"));
 const SenseApi = defineAsyncComponent(() => import("./components/SenseApi.vue"));
+const VoiceSettings = defineAsyncComponent(() => import("./components/VoiceSettings.vue"));
 const SkillCenter = defineAsyncComponent(() => import("./components/SkillCenter.vue"));
 const AddProviderModal = defineAsyncComponent(() => import("./components/AddProviderModal.vue"));
 const McpConfigModal = defineAsyncComponent(() => import("./components/McpConfigModal.vue"));
@@ -156,9 +159,22 @@ function startSbDrag(e: MouseEvent) {
   sbDragging.value = true;
   const startX = e.clientX;
   const startW = app.sidebarWidth;
-  const move = (ev: MouseEvent) => app.setSidebarWidth(startW + ev.clientX - startX);
+  // 用 rAF 合帧：mousemove 可能一帧来好几个,只在每帧画前应用最后一次宽度,
+  // 把 grid 重排+侧栏 backdrop-filter 重算压到每帧一次；拖拽中不落盘(persist=false)。
+  let pending = startW;
+  let rafId = 0;
+  const flush = () => {
+    rafId = 0;
+    app.setSidebarWidth(pending, false);
+  };
+  const move = (ev: MouseEvent) => {
+    pending = startW + ev.clientX - startX;
+    if (!rafId) rafId = requestAnimationFrame(flush);
+  };
   const up = () => {
     sbDragging.value = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    app.setSidebarWidth(pending, true); // 松手落一次盘
     window.removeEventListener("mousemove", move);
     window.removeEventListener("mouseup", up);
   };
@@ -169,6 +185,14 @@ function startSbDrag(e: MouseEvent) {
 
 <template>
   <div class="shell" :class="{ 'sb-drag': sbDragging }" :style="{ gridTemplateColumns: layoutCols }">
+    <!-- 极光琉璃画框主题：虚幻极光 + 颗粒背景层（fixed，居于全部内容之下，
+         内容面板不透明遮住中央 → 极光只在画框带透出；浅/深两版共用） -->
+    <template v-if="app.theme === 'aurora-light' || app.theme === 'aurora-dark'">
+      <div class="aurora" aria-hidden="true">
+        <span class="a1"></span><span class="a2"></span><span class="a3"></span><span class="a4"></span><span class="a5"></span>
+      </div>
+      <div class="grain" aria-hidden="true"></div>
+    </template>
     <Sidebar />
     <main class="main">
       <!-- 侧栏宽度拖拽分隔条 -->
@@ -186,6 +210,7 @@ function startSbDrag(e: MouseEvent) {
       <KeepAlive :include="['KnowledgeGraph', 'SandboxStatus', 'DeckStudio', 'WebStudio', 'MediaOps', 'VideoCourseStudio']">
         <ChatPanel v-if="mountedView === 'chat'" />
         <WikiBrowse v-else-if="mountedView === 'wiki'" />
+        <FileCenter v-else-if="mountedView === 'file_center'" />
         <Automation v-else-if="mountedView === 'automation'" />
         <KnowledgeGraph
           v-else-if="mountedView === 'graph'"
@@ -203,6 +228,7 @@ function startSbDrag(e: MouseEvent) {
         <McpConfigModal v-else-if="mountedView === 'mcp'" inline @close="app.setView('chat')" />
         <Settings v-else-if="mountedView === 'settings'" />
         <SenseApi v-else-if="mountedView === 'sense_api'" />
+        <VoiceSettings v-else-if="mountedView === 'voice_input'" />
         <VideoCourseStudio v-else-if="mountedView === 'video_course'" />
         <MediaOps v-else-if="mountedView === 'media_ops'" />
         <DeckStudio v-else-if="mountedView === 'deck'" />
@@ -225,6 +251,7 @@ function startSbDrag(e: MouseEvent) {
 
     <!-- 全局 toast(统一通知出口) + Ctrl+K 命令面板 -->
     <ToastHost />
+    <VoiceOverlay />
     <CommandPalette />
 
     <!-- Docker/Web 模式断线提示条 -->
@@ -258,6 +285,9 @@ function startSbDrag(e: MouseEvent) {
   height: 100vh;
   display: grid;
   background: var(--bg-side);
+  /* 外圈四角倒圆：消除左上角（内容与标题栏交汇处）的正方形棱角，整窗只剩圆角 */
+  border-radius: 12px;
+  overflow: hidden;
   transition: grid-template-columns 180ms ease;
 }
 /* 拖宽时关过渡,否则跟手延迟 */

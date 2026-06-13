@@ -36,12 +36,15 @@ import {
   Layers,
   Hand,
   RotateCcw,
+  Mic,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import {
   chat,
   convApi,
   skills as skillsApi,
+  invoke,
+  listen,
   type PermissionMode,
   type Skill,
   type AttachedFile,
@@ -322,6 +325,74 @@ function autoGrow() {
 // 内容变化（手输 / 程序填入 / 发送清空）都重算高度
 watch(input, () => nextTick(autoGrow));
 onMounted(() => nextTick(autoGrow));
+
+// ─────────── 语音听写（输入框麦克风 · 仿豆包/Codex）───────────
+// 点麦克风 / 按右 Alt 开始说话，说话时文字流式长进输入框，再点 / 再按右 Alt 结束。
+// 后端 voice_dictate_start/stop 录音转写 + 防污染，文字经 voice:dictation 事件回填。
+const dictating = ref(false);
+let dictateBase = ""; // 听写开始时输入框已有内容，新转写续在其后
+const voiceUnlisteners: Array<() => void> = [];
+
+async function toggleDictate() {
+  try {
+    if (!dictating.value) {
+      dictateBase = input.value ? input.value.replace(/\s+$/, "") + " " : "";
+      await invoke("voice_dictate_start");
+      dictating.value = true;
+    } else {
+      dictating.value = false;
+      await invoke("voice_dictate_stop");
+    }
+  } catch (e) {
+    dictating.value = false;
+    toast.error(`语音输入：${humanizeError(e)}`);
+  }
+}
+
+function onGlobalKeydown(e: KeyboardEvent) {
+  // 右 Alt 快捷开关听写（仅本窗口获焦时）。AltGr 在 Win 也以 AltRight 触发。
+  if (e.code === "AltRight") {
+    e.preventDefault();
+    if (!e.repeat) void toggleDictate();
+  }
+}
+
+onMounted(async () => {
+  window.addEventListener("keydown", onGlobalKeydown);
+  // 流式：说话中把当前转写实时续到输入框（从听写起点之后替换）
+  voiceUnlisteners.push(
+    await listen<{ text?: string }>("voice:partial", (p) => {
+      if (dictating.value && p && typeof p.text === "string") {
+        input.value = dictateBase + p.text;
+        nextTick(autoGrow);
+      }
+    })
+  );
+  // 结束：终稿（防污染后）落定到输入框
+  voiceUnlisteners.push(
+    await listen<{ text?: string; error?: string; cancelled?: boolean }>("voice:dictation", (f) => {
+      dictating.value = false;
+      if (f?.error) {
+        toast.error(`语音输入：${f.error}`);
+        return;
+      }
+      if (f?.cancelled) return;
+      if (typeof f?.text === "string" && f.text) {
+        input.value = dictateBase + f.text;
+        nextTick(() => {
+          autoGrow();
+          inputEl.value?.focus();
+        });
+      }
+    })
+  );
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onGlobalKeydown);
+  for (const u of voiceUnlisteners) u();
+  if (dictating.value) void invoke("voice_dictate_stop").catch(() => {});
+});
 
 function toggleGoal() {
   goalMode.value = !goalMode.value;
@@ -1348,6 +1419,19 @@ async function deleteCurrentConv() {
             </button>
           </div>
           <div class="toolbar-right">
+            <button
+              class="mic-btn"
+              :class="{ live: dictating }"
+              :title="dictating ? '正在听写 · 点击 / 右 Alt 结束' : '语音输入 · 点击 / 按右 Alt 开始，再按一下结束'"
+              @click="toggleDictate"
+            >
+              <Mic :size="15" :stroke-width="1.9" />
+              <span v-if="dictating" class="mic-ping"></span>
+              <div class="mic-tip">
+                语音输入 · 按 <b>右 Alt</b> 快捷开关
+                <div class="mic-tip-sub">说话时文字实时长进输入框，再按一下结束</div>
+              </div>
+            </button>
             <button
               v-if="sending"
               class="send-btn stop"
@@ -2505,14 +2589,15 @@ textarea {
 
 /* ───── 黑夜模式（深空玻璃）下的覆盖：暖白玻璃 → 深空玻璃，暖金 → 流光金 ───── */
 html[data-theme="dark"] .input-card {
-  /* 仿 Codex 深色：略亮于主区的石墨卡面（半透玻璃），中性细边 */
+  /* 黑炭风格：实底近纯黑（≈ #0e0e0e，明显比主区 #181818 更黑），扁平不浮，
+     读起来就是一块黑炭面 */
   background: linear-gradient(
     180deg,
-    rgba(43, 43, 41, 0.88),
-    rgba(36, 36, 34, 0.72)
+    rgba(17, 17, 17, 1),
+    rgba(10, 10, 10, 1)
   );
-  border-color: rgba(255, 255, 255, 0.12);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06),
+  border-color: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04),
     inset 0 -1px 0 rgba(255, 255, 255, 0.02), 0 8px 32px rgba(0, 0, 0, 0.4);
 }
 html[data-theme="dark"] .input-card:hover {
@@ -2576,6 +2661,77 @@ html[data-theme="dark"] .btn-tooltip-inner {
   background: var(--vermilion);
 }
 
+/* ─────────── 语音听写麦克风（发送键左侧 · 仿豆包/Codex）─────────── */
+.mic-btn {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  color: var(--text-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.mic-btn:hover {
+  color: var(--ink);
+  border-color: var(--border);
+  background: var(--hover-soft, rgba(0, 0, 0, 0.04));
+}
+.mic-btn.live {
+  background: var(--vermilion);
+  border-color: var(--vermilion);
+  color: #fff;
+}
+/* 录音中：外扩呼吸光环 */
+.mic-ping {
+  position: absolute;
+  inset: -1px;
+  border-radius: 50%;
+  border: 2px solid var(--vermilion);
+  animation: mic-ping 1.3s cubic-bezier(0, 0, 0.2, 1) infinite;
+  pointer-events: none;
+}
+@keyframes mic-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+.mic-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  z-index: 25;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+  background: var(--ink);
+  color: #fafaf7;
+  padding: 7px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  line-height: 1.5;
+}
+.mic-tip b {
+  color: var(--gold, #d4b06a);
+}
+.mic-tip-sub {
+  font-size: 11px;
+  color: var(--dim);
+}
+.mic-btn:hover .mic-tip {
+  opacity: 1;
+}
+
 /* ─────────── 底部授权栏 ─────────── */
 .auth-bar {
   width: 100%;
@@ -2606,9 +2762,10 @@ html[data-theme="dark"] .btn-tooltip-inner {
   color: var(--vermilion);
   border-color: rgba(192, 57, 43, 0.2);
 }
+/* 授权手图标：跟随按钮文字色（浅色=近黑墨色，深色=浅灰），不再用金黄 */
 .auth-hand {
-  color: var(--gold);
-  opacity: 0.85;
+  color: currentColor;
+  opacity: 0.9;
   flex-shrink: 0;
 }
 .auth-deny {

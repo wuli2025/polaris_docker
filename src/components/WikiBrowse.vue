@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch, defineAsyncComponent } from "vue";
+import { ref, onMounted, computed, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { marked } from "marked";
 import { sanitizeHtml } from "../lib/sanitize";
@@ -17,8 +17,11 @@ import {
 } from "@lucide/vue";
 import {
   kb,
+  scan,
   type KbHit,
   type KbPack,
+  type ScanRoot,
+  type ScanRow,
   artifacts as artifactsApi,
   type ArtifactSearchHit,
 } from "../tauri";
@@ -27,15 +30,11 @@ import { useArtifactsStore } from "../stores/artifacts";
 import { useKbStore } from "../stores/kb";
 import { useFileDrop } from "../composables/useFileDrop";
 
-// 文件中心:可视化文件库(琉璃质感三视图 + 语义聚类 + 缩略图)。
-// 按需懒加载,只有点开「文件中心」tab 才拉取其代码与 image 处理逻辑。
-const FileCenter = defineAsyncComponent(() => import("./FileCenter.vue"));
-
 const app = useAppStore();
 const artifactsStore = useArtifactsStore();
 const kbStore = useKbStore();
 
-type Tab = "overview" | "packs" | "browse" | "files" | "manage";
+type Tab = "overview" | "packs" | "browse" | "manage";
 const tab = ref<Tab>("browse");
 const files = ref<string[]>([]);
 const selected = ref<string | null>(null);
@@ -333,6 +332,195 @@ const { isOver: dropOver } = useFileDrop({
   active: () => app.view === "wiki",
   onDrop: onDropFiles,
 });
+
+// ═══════════════ 全盘资源归集（概览 tab） ═══════════════
+// 扫描 C/D 盘/桌面 → 多维表格 → 归档到资源库(raw/) / 摄入核心层(构建知识网)。
+// 归档复用 kb.uploadFiles;摄入核心层 = 归档后跑 kbStore.startBuildAll()。
+interface ScanRowVM extends ScanRow {
+  checked: boolean;
+}
+const scanRoots = ref<ScanRoot[]>([]);
+const rootsLoaded = ref(false);
+const resScanning = ref(false);
+const rows = ref<ScanRowVM[]>([]);
+const scanMeta = ref<{ totalSeen: number; hit: number; skipped: number; truncated: boolean } | null>(null);
+const archiving = ref(false);
+const archiveMsg = ref("");
+
+async function loadScanRoots() {
+  try {
+    scanRoots.value = await scan.roots();
+  } catch {
+    scanRoots.value = [];
+  }
+  rootsLoaded.value = true;
+}
+
+// 进入概览首次拉取扫描根
+watch(
+  tab,
+  (t) => {
+    if (t === "overview" && !rootsLoaded.value) loadScanRoots();
+  },
+  { immediate: true },
+);
+
+function toggleRoot(r: ScanRoot) {
+  r.defaultOn = !r.defaultOn;
+}
+
+async function doResourceScan() {
+  const roots = scanRoots.value.filter((r) => r.defaultOn).map((r) => r.path);
+  if (!roots.length) {
+    archiveMsg.value = "请先勾选要扫描的范围";
+    return;
+  }
+  resScanning.value = true;
+  archiveMsg.value = "";
+  rows.value = [];
+  scanMeta.value = null;
+  try {
+    const rep = await scan.resources(roots);
+    rows.value = rep.rows.map((r) => ({
+      ...r,
+      checked: r.suggest !== "skip",
+    }));
+    scanMeta.value = {
+      totalSeen: rep.totalSeen,
+      hit: rep.hit,
+      skipped: rep.skipped,
+      truncated: rep.truncated,
+    };
+  } catch (e: any) {
+    archiveMsg.value = `扫描失败:${e?.message ?? e}`;
+  } finally {
+    resScanning.value = false;
+  }
+}
+
+// 只渲染价值最高的前 N 项(后端已按价值降序);其余仍在 rows 里,「全选」会一并勾选。
+// 用纯列表渲染而非虚拟滚动:简单稳妥,避免 recycled 行 + v-model 双向绑定的边角崩溃。
+const DISPLAY_CAP = 600;
+const shownRows = computed(() => rows.value.slice(0, DISPLAY_CAP));
+const checkedCount = computed(() => rows.value.filter((r) => r.checked).length);
+const checkedBytes = computed(() =>
+  rows.value.filter((r) => r.checked).reduce((s, r) => s + r.size, 0),
+);
+function humanBytes(b: number): string {
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let v = b,
+    i = 0;
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return i === 0 ? `${b} B` : `${v.toFixed(1)} ${u[i]}`;
+}
+
+function selectAll(on: boolean) {
+  rows.value.forEach((r) => (r.checked = on));
+}
+const kindLabel: Record<string, string> = {
+  doc: "文档",
+  text: "文本",
+  sheet: "表格",
+  slide: "演示",
+  data: "数据",
+  image: "图片",
+  audio: "音频",
+  video: "视频",
+  archive: "压缩包",
+  code: "代码",
+  other: "其它",
+};
+
+// 归入核心层(数据库):把勾选文件复制入 raw/ 并索引,再跑构建知识网(LLM 编译)。
+// 暂时把整台电脑都当成数据库 —— 扫到的有用文件统一归入核心层这一个去向。
+async function archiveToCore() {
+  const paths = rows.value.filter((r) => r.checked).map((r) => r.path);
+  if (!paths.length || archiving.value) return;
+  archiving.value = true;
+  archiveMsg.value = `正在把 ${paths.length} 个文件归入核心层(数据库)…`;
+  try {
+    await kb.uploadFiles(paths);
+    await refreshList();
+    await kbStore.startBuildAll(); // 构建知识网(进度走 kb:compile 事件,见「管理」tab)
+    archiveMsg.value = `${paths.length} 个文件已归档,核心层编译已启动(见「管理」tab 进度) ✓`;
+  } catch (e: any) {
+    archiveMsg.value = `归入失败:${e?.message ?? e}`;
+  } finally {
+    archiving.value = false;
+  }
+}
+
+// ── 表格对话框(自然语言指挥多维表格) ──
+// 现阶段为本地规则解析,覆盖常用指令;LLM 语义理解后续接入(见 PRD P3)。
+interface ChatTurn {
+  role: "u" | "a";
+  text: string;
+}
+const chatLog = ref<ChatTurn[]>([]);
+const chatInput = ref("");
+function applyTableCmd(raw: string): string {
+  const t = raw.toLowerCase();
+  const now = Date.now() / 1000;
+  const has = (...ks: string[]) => ks.some((k) => raw.includes(k) || t.includes(k));
+  // 执行类
+  if (has("归档全部", "全部归档", "全部归入", "都归入")) {
+    selectAll(true);
+    archiveToCore();
+    return `已勾选全部并开始把 ${rows.value.length} 项归入核心层(数据库)。`;
+  }
+  if (has("摄入", "归入", "核心层", "数据库", "维基")) {
+    archiveToCore();
+    return `开始把勾选的 ${checkedCount.value} 项归入核心层(数据库)。`;
+  }
+  // 选择类
+  if (has("全选", "都选上", "选全部")) {
+    selectAll(true);
+    return `已全选 ${rows.value.length} 项。`;
+  }
+  if (has("全不选", "取消全部", "都不选", "清空选择")) {
+    selectAll(false);
+    return "已取消全部勾选。";
+  }
+  let changed = 0;
+  if (has("图片")) {
+    rows.value.forEach((r) => r.kind === "image" && r.checked && ((r.checked = false), changed++));
+    return `已取消勾选 ${changed} 个图片。`;
+  }
+  if (has("视频")) {
+    rows.value.forEach((r) => r.kind === "video" && r.checked && ((r.checked = false), changed++));
+    return `已取消勾选 ${changed} 个视频。`;
+  }
+  if (has("压缩包", "压缩")) {
+    rows.value.forEach((r) => r.kind === "archive" && r.checked && ((r.checked = false), changed++));
+    return `已取消勾选 ${changed} 个压缩包。`;
+  }
+  if (has("两年", "2年", "很久", "旧的", "没动")) {
+    const cut = now - 60 * 60 * 24 * 365 * 2;
+    rows.value.forEach((r) => r.mtime < cut && r.checked && ((r.checked = false), changed++));
+    return `已取消勾选 ${changed} 个两年以上未修改的文件。`;
+  }
+  if (has("低价值", "没用的", "噪音", "评分低")) {
+    rows.value.forEach((r) => r.score <= 2 && r.checked && ((r.checked = false), changed++));
+    return `已取消勾选 ${changed} 个低价值项。`;
+  }
+  if (has("近一年", "最近", "一年内", "近期")) {
+    const cut = now - 60 * 60 * 24 * 365;
+    rows.value.forEach((r) => (r.checked = r.mtime >= cut));
+    return `已只保留近一年的 ${checkedCount.value} 项。`;
+  }
+  return "暂未理解(现支持:全选/全不选/取消图片|视频|压缩包/取消两年没动的/取消低价值/只留近一年/全部归入核心层)。LLM 语义理解将在后续接入。";
+}
+function sendTableCmd() {
+  const v = chatInput.value.trim();
+  if (!v) return;
+  chatLog.value.push({ role: "u", text: v });
+  const reply = applyTableCmd(v);
+  chatLog.value.push({ role: "a", text: reply });
+  chatInput.value = "";
+}
 </script>
 
 <template>
@@ -373,7 +561,6 @@ const { isOver: dropOver } = useFileDrop({
             { k: 'overview', l: '概览' },
             { k: 'packs', l: '名人资料包' },
             { k: 'browse', l: '浏览' },
-            { k: 'files', l: '文件中心' },
             { k: 'manage', l: '管理' },
           ]"
           :key="t.k"
@@ -390,32 +577,111 @@ const { isOver: dropOver } = useFileDrop({
       </div>
     </div>
 
-    <div v-if="tab === 'overview'" class="body overview">
-      <div class="cards">
-        <div class="card">
-          <div class="card-title">三层目录铁律</div>
-          <div class="card-body">
-            <code>raw/</code> 只读原始 · <code>output/</code> 撰文 + Lint ·
-            <code>wiki/</code> 知识层
-          </div>
+    <div v-if="tab === 'overview'" class="body overview rg">
+      <!-- 扫描入口 -->
+      <div class="rg-hero glass">
+        <div class="rg-hero-title">把电脑炼成你的数据库</div>
+        <div class="rg-hero-sub">
+          扫描盘里散落的有用文件 → 逐文件看清内容 → 一键<b class="b-core">归入核心层</b>(大模型把资料编译成可检索的知识灵魂)。暂时把整台电脑都当成你的数据库。
         </div>
-        <div class="card">
-          <div class="card-title">KB-first 召回</div>
-          <div class="card-body">
-            每次发消息前自动 <code>kb_search</code>,关键词加权评分,Top-N
-            注入 system prompt
-          </div>
+        <div class="rg-roots">
+          <button
+            v-for="r in scanRoots"
+            :key="r.id"
+            class="rg-rootchip"
+            :class="{ on: r.defaultOn }"
+            @click="toggleRoot(r)"
+          >
+            <span class="dot"></span>{{ r.label }}
+          </button>
+          <span v-if="rootsLoaded && !scanRoots.length" class="muted">未发现可扫描的盘/目录</span>
         </div>
-        <div class="card">
-          <div class="card-title">6 模式</div>
-          <div class="card-body">
-            查询(严/普)· 拆解课件 · Ingest · 撰文 · Lint;
-            v0.1 仅启用「普通查询 + ingest」
-          </div>
+        <div class="rg-scanrow">
+          <button class="rg-primary" :disabled="resScanning" @click="doResourceScan">
+            <LoaderCircle v-if="resScanning" :size="15" :stroke-width="1.8" class="spin" />
+            <span>{{ resScanning ? "扫描中…" : "开始扫描" }}</span>
+          </button>
+          <span v-if="scanMeta" class="rg-meta">
+            命中 <b>{{ scanMeta.hit }}</b> · 跳过系统/缓存 {{ scanMeta.skipped }}
+            <template v-if="scanMeta.truncated"> · 已达上限截断</template>
+          </span>
         </div>
       </div>
-      <button class="primary-btn" @click="doScan()">扫描索引</button>
-      <span v-if="scanned !== null" class="muted">扫描完成,共 {{ scanned }} 个文件</span>
+
+      <!-- 多维表格 -->
+      <div v-if="rows.length" class="rg-table glass">
+        <div class="rg-ttop">
+          <span class="rg-ttitle">扫描结果 · 已按价值预选</span>
+          <span class="rg-tmeta">
+            勾选 <b class="b-core">{{ checkedCount }}</b> · {{ humanBytes(checkedBytes) }}
+          </span>
+          <span class="rg-spacer"></span>
+          <button class="rg-chip" @click="selectAll(true)">全选</button>
+          <button class="rg-chip" @click="selectAll(false)">全不选</button>
+          <button class="rg-chip gold" :disabled="archiving || !checkedCount" @click="archiveToCore">
+            归入核心层 {{ checkedCount }}
+          </button>
+        </div>
+        <div class="rg-row rg-hd">
+          <span class="c-cb"></span>
+          <span class="c-name">文件名</span>
+          <span class="c-ty">类型</span>
+          <span class="c-prev">大概内容</span>
+          <span class="c-size">大小</span>
+          <span class="c-score">价值</span>
+        </div>
+        <div class="rg-list">
+          <div
+            v-for="item in shownRows"
+            :key="item.id"
+            class="rg-row"
+            :class="{ dim: !item.checked }"
+            @click="item.checked = !item.checked"
+          >
+            <span class="c-cb">
+              <input type="checkbox" v-model="item.checked" @click.stop />
+            </span>
+            <span class="c-name" :title="item.path">{{ item.name }}</span>
+            <span class="c-ty"><span class="ty" :class="'ty-' + item.kind">{{ kindLabel[item.kind] || item.kind }}</span></span>
+            <span class="c-prev" :title="item.preview">{{ item.preview }}</span>
+            <span class="c-size">{{ item.sizeH }}</span>
+            <span class="c-score">{{ "★".repeat(item.score) }}</span>
+          </div>
+          <div v-if="rows.length > DISPLAY_CAP" class="rg-more-note">
+            仅显示价值最高的 {{ DISPLAY_CAP }} 项(共 {{ rows.length }} 项,已按价值排序)。点「全选」会勾选全部并一并归入。
+          </div>
+        </div>
+        <div v-if="archiveMsg" class="rg-archmsg">{{ archiveMsg }}</div>
+      </div>
+      <div v-else-if="scanMeta && !resScanning" class="rg-empty muted">
+        没扫到可归档的资源(命中 0)。换个扫描范围试试。
+      </div>
+      <div v-else-if="!resScanning" class="rg-empty muted">
+        勾选上方范围,点「开始扫描」—— 扫到的有用文件会铺成一张多维表格。
+      </div>
+
+      <!-- 表格对话框 -->
+      <div v-if="rows.length" class="rg-chat glass">
+        <div class="rg-chat-head">✦ 和这张表说话</div>
+        <div v-if="chatLog.length" class="rg-chat-body">
+          <div
+            v-for="(m, i) in chatLog"
+            :key="i"
+            class="rg-bubble"
+            :class="m.role"
+          >
+            {{ m.text }}
+          </div>
+        </div>
+        <div class="rg-chat-input">
+          <input
+            v-model="chatInput"
+            placeholder="例:把图片都取消 / 取消两年没动的 / 只留近一年 / 全部归入核心层"
+            @keydown.enter="sendTableCmd"
+          />
+          <button class="rg-primary sm" @click="sendTableCmd">发送</button>
+        </div>
+      </div>
     </div>
 
     <div v-if="tab === 'packs'" class="body packs">
@@ -542,10 +808,6 @@ const { isOver: dropOver } = useFileDrop({
         </div>
         <div v-else class="md" v-html="rendered"></div>
       </div>
-    </div>
-
-    <div v-if="tab === 'files'" class="body files-body">
-      <FileCenter />
     </div>
 
     <div v-if="tab === 'manage'" class="body manage">
@@ -1385,5 +1647,352 @@ const { isOver: dropOver } = useFileDrop({
 /* 黑夜模式：拖拽覆盖层的浅蓝雾在深空底上隐形，换成主色蓝雾 */
 html[data-theme="dark"] .kb-drop-overlay {
   background: rgba(91, 140, 255, 0.12);
+}
+
+/* ═══════════ 全盘资源归集 · 琉璃牛轧糖(v4) ═══════════ */
+.body.overview.rg {
+  gap: 16px;
+  overflow-y: auto;
+  --rg-gold: #d4b06a;
+  --rg-gold-soft: #f0dcae;
+  --rg-blue: #7fa8d9;
+  --rg-stroke: rgba(150, 140, 120, 0.18);
+}
+.rg .glass {
+  position: relative;
+  border-radius: 18px;
+  border: 1px solid var(--rg-stroke);
+  background: linear-gradient(
+    155deg,
+    rgba(246, 229, 198, 0.1),
+    rgba(255, 250, 243, 0.04)
+  );
+  backdrop-filter: blur(22px) saturate(140%);
+  -webkit-backdrop-filter: blur(22px) saturate(140%);
+  box-shadow: 0 14px 40px -22px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+html[data-theme="dark"] .rg .glass {
+  background: linear-gradient(
+    155deg,
+    rgba(231, 201, 138, 0.08),
+    rgba(255, 250, 243, 0.03)
+  );
+}
+
+/* hero */
+.rg-hero {
+  padding: 22px 24px;
+}
+.rg-hero-title {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.5px;
+}
+.rg-hero-sub {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.7;
+}
+.b-res {
+  color: var(--rg-blue);
+}
+.b-core {
+  color: var(--rg-gold);
+}
+.rg-roots {
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.rg-rootchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--rg-stroke);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 0.18s;
+}
+.rg-rootchip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: all 0.18s;
+}
+.rg-rootchip.on {
+  border-color: var(--rg-gold);
+  background: rgba(212, 176, 106, 0.14);
+  color: var(--text);
+}
+.rg-rootchip.on .dot {
+  background: var(--rg-gold);
+  box-shadow: 0 0 8px rgba(212, 176, 106, 0.8);
+}
+.rg-scanrow {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.rg-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+.rg-meta b {
+  color: var(--rg-gold);
+}
+.rg-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 22px;
+  border: none;
+  border-radius: 12px;
+  background: linear-gradient(160deg, var(--rg-gold-soft), var(--rg-gold));
+  color: #2a2410;
+  font-weight: 700;
+  font-size: 13.5px;
+  cursor: pointer;
+  box-shadow: 0 8px 20px -9px rgba(212, 176, 106, 0.85);
+}
+.rg-primary.sm {
+  padding: 8px 16px;
+  font-size: 13px;
+}
+.rg-primary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 表格 */
+.rg-table {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 280px;
+}
+.rg-ttop {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rg-stroke);
+  flex-wrap: wrap;
+}
+.rg-ttitle {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 13.5px;
+}
+.rg-tmeta {
+  font-size: 12px;
+  color: var(--muted);
+}
+.rg-spacer {
+  flex: 1;
+}
+.rg-chip {
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--rg-stroke);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.rg-chip.blue {
+  background: rgba(127, 168, 217, 0.16);
+  color: var(--rg-blue);
+  border-color: rgba(127, 168, 217, 0.34);
+  font-weight: 700;
+}
+.rg-chip.gold {
+  background: linear-gradient(160deg, var(--rg-gold-soft), var(--rg-gold));
+  color: #2a2410;
+  border-color: transparent;
+  font-weight: 700;
+}
+.rg-chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.rg-row {
+  display: grid;
+  grid-template-columns: 34px minmax(120px, 1.4fr) 56px minmax(160px, 2.2fr) 76px 70px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  height: 46px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--hairline);
+}
+.rg-row.rg-hd {
+  height: 38px;
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--rg-stroke);
+}
+.rg-row.dim {
+  opacity: 0.5;
+}
+.rg-list {
+  flex: 1;
+  max-height: calc(100vh - 470px);
+  min-height: 180px;
+  overflow-y: auto;
+}
+.rg-list .rg-row {
+  cursor: pointer;
+}
+.rg-list .rg-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.rg-more-note {
+  padding: 12px 16px;
+  font-size: 11.5px;
+  color: var(--muted);
+  text-align: center;
+}
+.rg-row .c-name {
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rg-row .c-prev {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rg-row .c-score {
+  color: var(--rg-gold);
+  letter-spacing: -1px;
+  white-space: nowrap;
+}
+.rg-row .c-dest {
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.c-dest .d-res {
+  color: var(--rg-blue);
+}
+.c-dest .d-core {
+  color: var(--rg-gold);
+  margin-left: 3px;
+}
+.c-dest .d-x {
+  color: var(--muted);
+}
+.ty {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 5px;
+}
+.ty-doc,
+.ty-text {
+  background: rgba(127, 168, 217, 0.16);
+  color: var(--rg-blue);
+}
+.ty-sheet,
+.ty-data {
+  background: rgba(123, 191, 138, 0.16);
+  color: #6bbf86;
+}
+.ty-slide {
+  background: rgba(212, 176, 106, 0.16);
+  color: var(--rg-gold);
+}
+.ty-image,
+.ty-video,
+.ty-audio {
+  background: rgba(177, 150, 214, 0.16);
+  color: #b196d6;
+}
+.ty-archive,
+.ty-code,
+.ty-other {
+  background: rgba(150, 140, 120, 0.16);
+  color: var(--text-2);
+}
+.rg-archmsg {
+  padding: 10px 16px;
+  font-size: 12.5px;
+  color: var(--rg-gold);
+  border-top: 1px solid var(--rg-stroke);
+}
+.rg-empty {
+  padding: 28px;
+  text-align: center;
+  font-size: 13px;
+}
+
+/* 对话框 */
+.rg-chat {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.rg-chat-head {
+  padding: 11px 16px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--rg-gold);
+  border-bottom: 1px solid var(--rg-stroke);
+}
+.rg-chat-body {
+  padding: 12px 16px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.rg-bubble {
+  margin: 7px 0;
+  padding: 8px 13px;
+  border-radius: 12px;
+  max-width: 86%;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.rg-bubble.u {
+  margin-left: auto;
+  background: linear-gradient(160deg, rgba(212, 176, 106, 0.22), rgba(212, 176, 106, 0.1));
+  color: var(--text);
+  border: 1px solid rgba(212, 176, 106, 0.22);
+}
+.rg-bubble.a {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-2);
+  border: 1px solid var(--rg-stroke);
+}
+.rg-chat-input {
+  display: flex;
+  gap: 9px;
+  padding: 11px 16px;
+  border-top: 1px solid var(--rg-stroke);
+}
+.rg-chat-input input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.14);
+  border: 1px solid var(--rg-stroke);
+  border-radius: 11px;
+  padding: 9px 14px;
+  color: var(--text);
+  font-size: 13px;
+}
+.rg-chat-input input::placeholder {
+  color: var(--muted);
 }
 </style>

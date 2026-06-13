@@ -77,8 +77,9 @@ function useDefault() {
     <section class="block">
       <div class="b-title">外观</div>
       <div class="b-desc">
-        浅色为默认的暖白水墨主题；黑夜模式为石墨炭黑主题(中性深色 +
-        石墨卡面 + 暖金点缀)，切换立即生效并记住选择。
+        浅色=暖白水墨；黑夜=石墨炭黑；「极光琉璃」两套=内容保持干净、只把
+        画框做成琉璃质感:软白画框(浅底+彩虹极光边)、墨黑灰框(深底+中性灰边、不突兀)。
+        切换立即生效并记住选择。
       </div>
       <div class="theme-row">
         <button
@@ -103,6 +104,41 @@ function useDefault() {
           </span>
           <span class="theme-name">黑夜 · 石墨炭黑</span>
         </button>
+        <button
+          class="theme-card"
+          :class="{ active: app.theme === 'aurora-light' }"
+          @click="app.setTheme('aurora-light')"
+        >
+          <span class="theme-swatch aurora-light-sw">
+            <span class="sw-aurora"></span>
+            <span class="sw-side"></span>
+            <span class="sw-main"><span class="sw-card"></span></span>
+          </span>
+          <span class="theme-name">极光琉璃 · 软白画框</span>
+        </button>
+        <button
+          class="theme-card"
+          :class="{ active: app.theme === 'aurora-dark' }"
+          @click="app.setTheme('aurora-dark')"
+        >
+          <span class="theme-swatch aurora-dark-sw">
+            <span class="sw-aurora"></span>
+            <span class="sw-side"></span>
+            <span class="sw-main"><span class="sw-card"></span></span>
+          </span>
+          <span class="theme-name">极光琉璃 · 墨黑灰框</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="block">
+      <div class="b-title">语音输入「极速说」</div>
+      <div class="b-desc">
+        按住右 Alt 说话、字随声出、松手上屏(采集/注入运行时为下一阶段)。本页可配:识别引擎 / 激活方式 /
+        防污染档位(秒达·重型)/ 个人词表(热词·同音纠错)/ 词表自学。默认本地 SenseVoice + 秒达防污染,纯本地零出域。
+      </div>
+      <div class="row">
+        <button class="btn primary" @click="app.setView('voice_input')">打开语音设置</button>
       </div>
     </section>
 
@@ -326,6 +362,7 @@ function useDefault() {
 /* 主题切换卡：左侧栏+主区的微缩示意图，所见即所得 */
 .theme-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 14px;
 }
 .theme-card {
@@ -388,6 +425,69 @@ function useDefault() {
 .dark-sw .sw-card {
   background: rgba(43, 43, 41, 0.95);
   border: 1px solid rgba(255, 255, 255, 0.14);
+}
+/* 极光琉璃·软白画框：内容干净软白，画框(侧栏/四周)透出彩虹极光 */
+.aurora-light-sw {
+  position: relative;
+  background: #f6f8fd;
+  border-color: rgba(160, 140, 220, 0.45);
+  box-shadow: 0 0 0 1.5px rgba(180, 160, 245, 0.35);
+}
+.aurora-light-sw .sw-aurora {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  filter: blur(11px) saturate(150%);
+  background: radial-gradient(44% 60% at 8% 16%, #ff8fc8dd, transparent 66%),
+    radial-gradient(40% 52% at 4% 92%, #9d8bffdd, transparent 66%),
+    radial-gradient(38% 46% at 0% 50%, #74d4ffcc, transparent 70%),
+    radial-gradient(30% 40% at 100% 88%, #ffd27abb, transparent 70%);
+}
+.aurora-light-sw .sw-side {
+  position: relative;
+  z-index: 1;
+  background: rgba(255, 255, 255, 0.32);
+}
+.aurora-light-sw .sw-main {
+  position: relative;
+  z-index: 1;
+  background: #fdfdfb; /* 内容干净软白 */
+  margin: 4px;
+  border-radius: 6px;
+}
+.aurora-light-sw .sw-card {
+  background: #ffffff;
+  border: 1px solid rgba(180, 160, 240, 0.5);
+}
+/* 极光琉璃·墨黑灰框：内容干净墨黑，画框中性灰、收敛不突兀 */
+.aurora-dark-sw {
+  position: relative;
+  background: #161616;
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.aurora-dark-sw .sw-aurora {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  filter: blur(11px) saturate(35%) brightness(0.7);
+  background: radial-gradient(46% 60% at 6% 18%, #9aa6c0aa, transparent 68%),
+    radial-gradient(40% 50% at 2% 90%, #7e8aa088, transparent 70%);
+}
+.aurora-dark-sw .sw-side {
+  position: relative;
+  z-index: 1;
+  background: rgba(120, 124, 134, 0.28);
+}
+.aurora-dark-sw .sw-main {
+  position: relative;
+  z-index: 1;
+  background: #181818; /* 内容干净墨黑 */
+  margin: 4px;
+  border-radius: 6px;
+}
+.aurora-dark-sw .sw-card {
+  background: #232322;
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 .theme-name {
   font-size: 12px;

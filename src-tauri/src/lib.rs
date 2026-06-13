@@ -22,8 +22,18 @@ pub mod echo;
 pub mod fable;
 pub mod project;
 pub mod provider;
+// 全盘资源归集(扫描 → 多维表格 → 归入核心层);跨平台,server 亦编译。
+pub mod scan;
 pub mod sense;
 pub mod skills;
+// 语音输入「极速说」防污染秒达档(纯 pinyin,零系统依赖;server 亦编译)。
+pub mod voice;
+// 语音识别运行时(本地 SenseVoice via sherpa-rs);默认不编译,保护现有 build。
+#[cfg(feature = "voice-asr")]
+pub mod voice_asr;
+// 实时语音输入(录音+全局热键+注入);桌面专属,默认不编译。
+#[cfg(all(feature = "voice-asr", feature = "desktop"))]
+pub mod voice_live;
 pub mod wecom;
 // 自动更新依赖 Tauri updater/restart/package_info → 桌面专属（Docker 用 docker pull 更新）。
 #[cfg(feature = "desktop")]

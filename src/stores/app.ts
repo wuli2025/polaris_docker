@@ -11,6 +11,7 @@ import {
 export type ViewKey =
   | "chat"
   | "wiki"
+  | "file_center"
   | "graph"
   | "automation"
   | "sandbox"
@@ -22,6 +23,7 @@ export type ViewKey =
   | "feishu"
   | "settings"
   | "sense_api"
+  | "voice_input"
   | "video_course"
   | "media_ops"
   | "deck"
@@ -66,28 +68,41 @@ export const useAppStore = defineStore("app", () => {
   // 主题：浅色（默认·暖白水墨）/ 黑夜（深空玻璃，抄自智能选股版）。
   // 挂到 <html data-theme="dark"> 上由 style.css 的 token 覆盖块全局换肤。
   const THEME_KEY = "polaris.theme.v1";
-  type Theme = "light" | "dark";
+  // light=软白水墨 / dark=墨黑 / aurora-light=软白+极光画框 / aurora-dark=墨黑+灰画框
+  type Theme = "light" | "dark" | "aurora-light" | "aurora-dark";
   function loadTheme(): Theme {
     try {
-      return localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
+      const t = localStorage.getItem(THEME_KEY);
+      if (
+        t === "light" ||
+        t === "dark" ||
+        t === "aurora-light" ||
+        t === "aurora-dark"
+      )
+        return t;
+      if (t === "nougat") return "aurora-light"; // 旧键迁移
+      return "aurora-light"; // 未选择过 → 默认极光琉璃画框(软白)
     } catch {
-      return "light";
+      return "aurora-light";
     }
   }
   const theme = ref<Theme>(loadTheme());
   function applyTheme() {
-    if (theme.value === "dark") {
-      document.documentElement.setAttribute("data-theme", "dark");
-    } else {
+    // light = 默认（无属性）；其余挂 data-theme 由 style.css token 块换肤
+    if (theme.value === "light") {
       document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.setAttribute("data-theme", theme.value);
     }
-    // 原生标题栏跟随主题染成框面色（仅桌面端；Win11 生效，Win10 静默跳过）
+    // 原生标题栏跟随主题染成画框色（仅桌面端；Win11 生效，Win10 静默跳过）
     if (isTauri) {
-      const c =
-        theme.value === "dark"
-          ? { caption: "#1f1f1f", text: "#ececea" }
-          : { caption: "#f3f2eb", text: "#1a1a1c" }; // 浅色=框面暖米同色，与侧栏无色差
-      invoke("set_titlebar_color", c).catch(() => {});
+      const titlebar: Record<Theme, { caption: string; text: string }> = {
+        light: { caption: "#f3f2eb", text: "#1a1a1c" }, // 暖米框面，与侧栏无色差
+        dark: { caption: "#1f1f1f", text: "#ececea" }, // 石墨框面
+        "aurora-light": { caption: "#eef1fa", text: "#232436" }, // 珠光浅画框
+        "aurora-dark": { caption: "#1c1d20", text: "#ececea" }, // 墨黑+灰画框
+      };
+      invoke("set_titlebar_color", titlebar[theme.value]).catch(() => {});
     }
   }
   function setTheme(t: Theme) {
@@ -138,8 +153,11 @@ export const useAppStore = defineStore("app", () => {
   const sidebarUserWidth = ref(
     Math.min(420, Math.max(200, parseInt(localStorage.getItem(SIDEBAR_W_KEY) || "260") || 260))
   );
-  function setSidebarWidth(w: number) {
+  // persist=false：拖拽中每帧调用,只更新内存值(避免 60fps 同步写盘卡顿);
+  // 松手时再 persist=true 落一次盘。
+  function setSidebarWidth(w: number, persist = true) {
     sidebarUserWidth.value = Math.min(420, Math.max(200, Math.round(w)));
+    if (!persist) return;
     try {
       localStorage.setItem(SIDEBAR_W_KEY, String(sidebarUserWidth.value));
     } catch {

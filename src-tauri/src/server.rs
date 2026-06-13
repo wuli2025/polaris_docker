@@ -75,6 +75,7 @@ pub async fn serve() -> anyhow::Result<()> {
     crate::feishu::auto_start_if_enabled(&app);
     // 寓言计划:感官 API 坞 + 回声层「每日做梦」调度 + 检索枢纽(与桌面 setup 等价)。
     crate::sense::init();
+    crate::voice::init();
     crate::echo::start_scheduler(app.clone());
     crate::fable::init();
 
@@ -449,6 +450,10 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "kb_pack_install" => ok(kb::kb_pack_install(app, req_str(a, "id")?)?),
         "kb_pack_remove" => ok(kb::kb_pack_remove(req_str(a, "id")?)?),
 
+        // ── 全盘资源归集 ──
+        "scan_roots" => ok(scan::scan_roots()),
+        "scan_resources" => ok(scan::scan_resources(vec_str(a, "roots"), opt_usize(a, "max"))?),
+
         // ── 寓言计划 · 感官 API 坞 ──
         "sense_list" => ok(sense::sense_list()),
         "sense_set" => ok(sense::sense_set(
@@ -467,6 +472,38 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "sense_test" => ok(sense::sense_test(req_str(a, "id")?)?),
         "sense_pack_install" => ok(sense::sense_pack_install(app, req_str(a, "id")?)?),
         "sense_pack_remove" => ok(sense::sense_pack_remove(req_str(a, "id")?)?),
+
+        // ── 语音输入「极速说」· 防污染 + 配置 + 个人词表 ──
+        "voice_config_get" => ok(voice::voice_config_get()),
+        "voice_config_set" => ok(voice::voice_config_set(
+            opt_str(a, "activation"),
+            opt_str(a, "hotkey"),
+            opt_str(a, "engine"),
+            opt_bool(a, "fluentMode"),
+            opt_bool(a, "polish"),
+            opt_str(a, "antipollute"),
+            a.get("pinyinThreshold").and_then(|v| v.as_u64()).map(|n| n as u32),
+            opt_str(a, "overlayPos"),
+        )?),
+        "voice_lexicon_get" => ok(voice::voice_lexicon_get()),
+        "voice_hotword_add" => ok(voice::voice_hotword_add(req_str(a, "word")?)?),
+        "voice_hotword_remove" => ok(voice::voice_hotword_remove(req_str(a, "word")?)?),
+        "voice_correction_add" => {
+            ok(voice::voice_correction_add(req_str(a, "wrong")?, req_str(a, "right")?)?)
+        }
+        "voice_correction_remove" => ok(voice::voice_correction_remove(req_str(a, "wrong")?)?),
+        "voice_anti_pollute" => ok(voice::voice_anti_pollute(req_str(a, "text")?)),
+        "voice_transcribe_file" => ok(voice::voice_transcribe_file(req_str(a, "path")?)?),
+        "voice_listen_start" => ok(voice::voice_listen_start(app)?),
+        "voice_listen_stop" => ok(voice::voice_listen_stop()?),
+        "voice_dictate_start" => ok(voice::voice_dictate_start(app)?),
+        "voice_dictate_stop" => ok(voice::voice_dictate_stop()?),
+        "voice_learn_correction" => {
+            ok(voice::voice_learn_correction(req_str(a, "wrong")?, req_str(a, "right")?)?)
+        }
+        "voice_lexicon_learn" => {
+            ok(voice::voice_lexicon_learn(req_str(a, "text")?, opt_usize(a, "top"))?)
+        }
 
         // ── 寓言计划 · 回声层(对话沉淀/做梦)──
         "conv_archive_conversation" => ok(conv::conv_archive_conversation(

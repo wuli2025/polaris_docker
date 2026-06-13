@@ -112,6 +112,19 @@ const WECHAT_TS_SKILL_MD: &str =
 const WECHAT_TS_YIBAN_PY: &str =
     include_str!("templates/skills/wechat-md-typesetter/scripts/wechat_yiban.py");
 
+// ───────── 「极速下载」多文件技能（aria2c 多连接下载器，编译期内嵌，启动落盘）─────────
+// 跨平台大文件下载器：SKILL.md + scripts/fast_download.py（纯 stdlib，自动装 aria2 + 优雅回退）
+// + references/aria2_flags.md（L3 参数速查）。和 deck/video studio 同套路：编译期内嵌、启动确保
+// 落到 ~/Polaris/skills，让 spawn 的 claude agent 能直接 `uv run …/fast_download.py` 执行。
+const TURBO_ID: &str = "turbo-download";
+// 改动 SKILL.md / fast_download.py / 参数表后必须 +1，让已安装用户下次启动拿到更新。
+const TURBO_VERSION: &str = "1";
+const TURBO_SKILL_MD: &str = include_str!("templates/skills/turbo-download/SKILL.md");
+const TURBO_FAST_DL: &str =
+    include_str!("templates/skills/turbo-download/scripts/fast_download.py");
+const TURBO_FLAGS_MD: &str =
+    include_str!("templates/skills/turbo-download/references/aria2_flags.md");
+
 // ═══════════════════════════════════════════════════════════════
 // 统一目录 Catalog（编译期，只读）
 // ═══════════════════════════════════════════════════════════════
@@ -137,6 +150,15 @@ fn catalog() -> Vec<CatalogSkill> {
             source: "third-party",
             preinstalled: true,
             system_prompt: include_str!("templates/skills/deep-research.md"),
+        },
+        // ── 极速下载（预装、默认开启）：大文件 aria2c 多连接分段下载，意图命中即自动激活 ──
+        CatalogSkill {
+            id: TURBO_ID,
+            name: "极速下载 TurboDownload",
+            description: "下载大文件(>200MB)用自带跨平台 Python 脚本调 aria2c 多连接分段并行替代单线 wget，实测批量快 6.7 倍；自动按平台装 aria2、探测大小、优雅回退单线/curl，跨 Windows/Mac/Linux/群晖。拉模型/数据集/镜像/依赖包默认走它",
+            source: "official",
+            preinstalled: true,
+            system_prompt: TURBO_SKILL_MD,
         },
         // ── 名人资料包配套技能（随知识库「名人资料包」一起装/卸，不单独预装） ──
         CatalogSkill {
@@ -618,6 +640,22 @@ pub fn detect_image_intent(prompt: &str) -> bool {
     triggers.iter().any(|t| lower.contains(t))
 }
 
+/// 检测是否是「下载大文件」的任务。命中即自动激活 turbo-download 技能，
+/// 把 aria2c 多连接分段下载的完整跨平台配方注入本轮——配合 always-on 的
+/// 大文件下载公约(见 chat.rs download_convention)，让拉模型/数据集/镜像默认提速。
+pub fn detect_download_intent(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let triggers = [
+        // 英文
+        "download", "wget", "curl ", "aria2", "fetch the", ".tar.gz", ".tar.bz2",
+        ".zip", ".iso", ".bin", ".gguf", ".safetensors", "torrent",
+        // 中文
+        "下载", "下个", "拉取", "拉一下", "拉个", "获取文件", "大文件", "压缩包",
+        "镜像包", "数据集", "模型权重", "安装包", "离线包",
+    ];
+    triggers.iter().any(|t| lower.contains(t))
+}
+
 /// 检测是否是「请教毛主席」的任务（原对话框开关，现改为技能 + 意图自动激活：
 /// 消息里写「请教毛主席」等说法即注入毛选式分析指令，无需任何按钮）。
 pub fn detect_mao_consult_intent(prompt: &str) -> bool {
@@ -668,6 +706,11 @@ pub fn auto_skills_for_intent(prompt: &str) -> Vec<(SkillMeta, String)> {
     }
     if detect_image_intent(prompt) {
         if let Some(s) = find("image-gen") {
+            out.push(s);
+        }
+    }
+    if detect_download_intent(prompt) {
+        if let Some(s) = find("turbo-download") {
             out.push(s);
         }
     }
@@ -965,6 +1008,37 @@ fn write_web_studio_files(dest: &Path) -> Result<(), String> {
     fs::write(assets.join("themes.css"), DECK_THEMES_CSS).map_err(|e| e.to_string())?;
     fs::write(assets.join("runtime.js"), WEB_RUNTIME_JS).map_err(|e| e.to_string())?;
     fs::write(templates.join("site.html"), WEB_TEMPLATE).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 启动时确保「极速下载」技能在 ~/Polaris/skills 落盘（含可执行 Python 脚本）。
+/// 策略同上（版本号比对覆盖）。best-effort：失败只让该技能脚本暂不可用，不阻断启动。
+pub fn seed_turbo_download_skill() {
+    let Some(root) = skills_dir() else {
+        return;
+    };
+    let dest = root.join(TURBO_ID);
+    let ver_file = dest.join(".polaris_version");
+    let stored = fs::read_to_string(&ver_file).unwrap_or_default();
+    let present = dest.join("skill.md").exists();
+    if present && stored.trim() == TURBO_VERSION {
+        return;
+    }
+    if write_turbo_download_files(&dest).is_ok() {
+        let _ = fs::write(&ver_file, TURBO_VERSION);
+    }
+}
+
+/// 把内嵌的「极速下载」全部文件写到目标目录（含 scripts/ 与 references/ 子树）。
+/// 技能正文写成小写 `skill.md`，与 `scan_user_skills` 约定一致。
+fn write_turbo_download_files(dest: &Path) -> Result<(), String> {
+    let scripts = dest.join("scripts");
+    let references = dest.join("references");
+    fs::create_dir_all(&scripts).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&references).map_err(|e| e.to_string())?;
+    fs::write(dest.join("skill.md"), TURBO_SKILL_MD).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("fast_download.py"), TURBO_FAST_DL).map_err(|e| e.to_string())?;
+    fs::write(references.join("aria2_flags.md"), TURBO_FLAGS_MD).map_err(|e| e.to_string())?;
     Ok(())
 }
 

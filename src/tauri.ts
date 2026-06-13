@@ -447,6 +447,50 @@ export const kb = {
 };
 
 // ──────────────────────────────────────────────────────────────
+// 全盘资源归集 (Scan) — 扫描 C/D 盘/桌面 → 多维表格 → 归档资源库 / 摄入核心层
+// 归档复用 kb.uploadFiles;摄入核心层 = uploadFiles 后接 kb.compile。
+// ──────────────────────────────────────────────────────────────
+export interface ScanRoot {
+  id: string;
+  label: string;
+  path: string;
+  /** desktop | drive | home | volume | mounted */
+  kind: string;
+  defaultOn: boolean;
+}
+export interface ScanRow {
+  id: string;
+  path: string;
+  name: string;
+  ext: string;
+  /** doc | sheet | slide | data | image | audio | video | archive | code | text | other */
+  kind: string;
+  /** 大概内容(启发式) */
+  preview: string;
+  size: number;
+  sizeH: string;
+  mtime: number;
+  /** 价值 1-5 */
+  score: number;
+  /** 建议去向: resource | resource+core | skip */
+  suggest: string;
+}
+export interface ScanReport {
+  rows: ScanRow[];
+  totalSeen: number;
+  hit: number;
+  skipped: number;
+  truncated: boolean;
+}
+export const scan = {
+  /** 平台自适应的扫描根(Win 盘符 / mac 家目录+卷 / Docker 挂载卷) */
+  roots: () => invoke<ScanRoot[]>("scan_roots"),
+  /** 扫描给定根下的有用资源,返回多维表格行。只读。 */
+  resources: (roots: string[], max?: number) =>
+    invoke<ScanReport>("scan_resources", { roots, max }),
+};
+
+// ──────────────────────────────────────────────────────────────
 // 文件中心 (File Center) — 可视化文件库:类型/语义聚类/缩略图/速览
 // 复用检索枢纽 fable.db(盘点表 + 已存向量),不另起数据源。
 // ──────────────────────────────────────────────────────────────

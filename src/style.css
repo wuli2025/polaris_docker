@@ -117,7 +117,8 @@ a:hover {
    设置 → 外观 切换；挂在 <html data-theme="dark"> 上覆盖全部 token，
    浅色（默认）不受影响。中性炭黑无蓝调无辉光，框面略亮于主区。
    ============================================================ */
-:root[data-theme="dark"] {
+:root[data-theme="dark"],
+:root[data-theme="aurora-dark"] {
   --bg: #181818;
   --bg-soft: #1f1f1f;
   --panel: #232322;
@@ -177,13 +178,205 @@ a:hover {
   );
 }
 
+/* 窗底取与侧栏/染色标题栏同色（#1f1f1f）：外壳四角倒圆后，圆角外的那一圈
+   窗底与标题栏融为一体，左上角圆角干净，不再露出更暗的方形缺口 */
 html[data-theme="dark"] body,
 html[data-theme="dark"] #app {
-  background-color: #181818;
+  background-color: #1f1f1f;
 }
-html[data-theme="dark"] ::selection {
+html[data-theme="aurora-dark"] body,
+html[data-theme="aurora-dark"] #app {
+  background-color: #141414;
+}
+html[data-theme="dark"] ::selection,
+html[data-theme="aurora-dark"] ::selection {
   background: var(--selection-bg);
   color: #fff;
+}
+
+/* ============================================================
+   极光琉璃 · 画框版 —— 两套可选（aurora-light / aurora-dark）
+   不再铺满全屏：内容面板保持干净底，只把「画框」(侧栏 + 主面板四周
+   的框带 + 面板描边) 做成琉璃质感。
+     · aurora-light = 内容仿「软白水墨」浅色 + 画框=彩虹极光玻璃
+     · aurora-dark  = 内容仿「墨黑」深色   + 画框=中性灰玻璃(不突兀)
+   内容 token 分别继承 浅色 :root / 深色块；这里只覆盖框相关 token。
+   极光/颗粒 DOM 层在 App.vue 按主题渲染。
+   ============================================================ */
+
+/* 白色版：内容沿用浅色默认，仅把框带换成白磨砂玻璃让极光透上来，
+   主面板描一圈彩虹琉璃边（--liuli-edge）。 */
+:root[data-theme="aurora-light"] {
+  --bg-side: rgba(255, 255, 255, 0.4);
+  --bg-side-mid: rgba(255, 255, 255, 0.56);
+  --hairline: rgba(255, 255, 255, 0.78);
+  --border-strong: rgba(150, 130, 210, 0.34);
+  --liuli-edge: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.95) 0%,
+    rgba(150, 200, 255, 0.7) 30%,
+    rgba(200, 150, 255, 0.7) 58%,
+    rgba(255, 180, 220, 0.6) 80%,
+    rgba(255, 210, 150, 0.6) 100%
+  );
+}
+
+/* 黑色版：内容沿用墨黑（继承 dark 块），框带换成中性灰玻璃，描边低调灰白 */
+:root[data-theme="aurora-dark"] {
+  --bg-side: rgba(78, 80, 88, 0.34);
+  --bg-side-mid: rgba(98, 100, 110, 0.4);
+  --hairline: rgba(255, 255, 255, 0.12);
+  --liuli-edge: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.2),
+    rgba(170, 178, 200, 0.16) 50%,
+    rgba(255, 255, 255, 0.08) 100%
+  );
+}
+
+/* ── 两套共用：#app 透明 + shell 框面透明 → 框带直接坐在极光上 ── */
+html[data-theme="aurora-light"] #app,
+html[data-theme="aurora-dark"] #app {
+  background-color: transparent;
+}
+html[data-theme="aurora-light"] .shell,
+html[data-theme="aurora-dark"] .shell {
+  background: transparent;
+}
+/* 侧栏=画框主体：磨砂玻璃透出极光（浅色高彩度、深色低彩度更收敛） */
+html[data-theme="aurora-light"] .sb {
+  backdrop-filter: blur(28px) saturate(185%);
+  -webkit-backdrop-filter: blur(28px) saturate(185%);
+}
+html[data-theme="aurora-dark"] .sb {
+  backdrop-filter: blur(28px) saturate(120%);
+  -webkit-backdrop-filter: blur(28px) saturate(120%);
+}
+/* 框带多留一点缝，让画框更明显 */
+html[data-theme="aurora-light"] .main,
+html[data-theme="aurora-dark"] .main {
+  margin: 12px;
+}
+/* 主内容面板：底保持不透明干净（软白 / 墨黑），只在外缘做「琉璃画框」——
+   用 mask 渐变描边法画一圈跟随圆角的彩虹边 + 柔光 */
+html[data-theme="aurora-light"] .main {
+  box-shadow: 0 20px 52px -26px rgba(120, 100, 200, 0.42),
+    0 0 0 1px rgba(255, 255, 255, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.75);
+}
+html[data-theme="aurora-dark"] .main {
+  box-shadow: 0 20px 52px -26px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+/* 跟随圆角的渐变描边（border-image 不认 radius，改用 mask 双层异或挖空法） */
+html[data-theme="aurora-light"] .main::after,
+html[data-theme="aurora-dark"] .main::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  border-radius: inherit;
+  padding: 1.5px;
+  pointer-events: none;
+  background: var(--liuli-edge);
+  -webkit-mask: linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+
+/* ── 虚幻极光背景（仿 PRD .aurora）：固定铺满，重度模糊，居于内容之下；
+      内容面板不透明，遮住中央 → 极光只在画框带(侧栏/四周缝)透出 ── */
+.aurora {
+  position: fixed;
+  inset: -25% -12% -12% -12%;
+  z-index: -2;
+  pointer-events: none;
+  filter: blur(78px) saturate(135%);
+}
+/* 黑色版：极光去彩、压暗 → 画框只剩一抹中性冷灰流动，不跟墨黑环境冲突 */
+html[data-theme="aurora-dark"] .aurora {
+  filter: blur(78px) saturate(28%) brightness(0.6);
+}
+html[data-theme="aurora-dark"] .aurora span {
+  opacity: 0.3;
+}
+/* 浅色底用 normal 混合（screen 在白底会洗成白，彩色出不来）；
+   高彩度的虹彩光斑漂移 → 白磨砂玻璃后透出超级琉璃感 */
+.aurora span {
+  position: absolute;
+  border-radius: 50%;
+  opacity: 0.62;
+  mix-blend-mode: normal;
+  animation: aurora-drift 26s ease-in-out infinite;
+  /* 提升为独立合成层：漂移只在 GPU 合成,不触发 78px 模糊背景整层重绘 */
+  will-change: transform;
+}
+.aurora .a1 {
+  width: 50vw;
+  height: 50vw;
+  left: -8vw;
+  top: -10vw;
+  background: radial-gradient(circle, #ff8fc8, transparent 64%);
+}
+.aurora .a2 {
+  width: 46vw;
+  height: 46vw;
+  right: -10vw;
+  top: 2vw;
+  background: radial-gradient(circle, #9d8bff, transparent 64%);
+  animation-delay: -7s;
+}
+.aurora .a3 {
+  width: 52vw;
+  height: 52vw;
+  left: 16vw;
+  bottom: -20vw;
+  background: radial-gradient(circle, #74d4ff, transparent 64%);
+  animation-delay: -13s;
+}
+.aurora .a4 {
+  width: 40vw;
+  height: 40vw;
+  right: 8vw;
+  bottom: -8vw;
+  background: radial-gradient(circle, #8af0c4, transparent 66%);
+  animation-delay: -19s;
+}
+/* 第五枚暖金光斑：补一点金辉，让彩谱不偏冷 */
+.aurora .a5 {
+  width: 34vw;
+  height: 34vw;
+  left: 40vw;
+  top: 24vw;
+  background: radial-gradient(circle, #ffd27a, transparent 66%);
+  animation-delay: -23s;
+}
+@keyframes aurora-drift {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+  33% {
+    transform: translate(4vw, 3vh) scale(1.08);
+  }
+  66% {
+    transform: translate(-3vw, -2vh) scale(0.95);
+  }
+}
+.grain {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+/* 降低动态偏好时停掉极光漂移 */
+@media (prefers-reduced-motion: reduce) {
+  .aurora span {
+    animation: none;
+  }
 }
 
 /* 全局滚动条 (细) */

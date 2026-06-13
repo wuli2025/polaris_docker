@@ -48,6 +48,7 @@ bld.log
 *.tar
 .claude-seed/
 .docker-build.log
+.docker-build2.log
 .docker-monitor.log
 .docker-monitor-dry.log
 docker-compose.override.yml
