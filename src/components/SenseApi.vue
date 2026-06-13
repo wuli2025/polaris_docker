@@ -147,6 +147,57 @@ async function refresh() {
   } catch (e) {
     loadErr.value = String(e);
   }
+  loadClusterModel();
+}
+
+// ── AI 归类模型(可选,独立于对话供应商;不配=用主对话 API)──
+interface ClusterModelView {
+  enabled: boolean;
+  baseUrl: string;
+  model: string;
+  keySet: boolean;
+}
+const cm = ref<ClusterModelView | null>(null);
+const cmForm = ref({ enabled: false, baseUrl: "", model: "", apiKey: "" });
+const cmSaving = ref(false);
+const cmMsg = ref("");
+async function loadClusterModel() {
+  try {
+    const c = await invoke<ClusterModelView>("file_cluster_model_get");
+    cm.value = c;
+    cmForm.value = {
+      enabled: c.enabled,
+      baseUrl: c.baseUrl || "https://api.siliconflow.cn",
+      model: c.model || "Qwen/Qwen2.5-7B-Instruct",
+      apiKey: "",
+    };
+  } catch {
+    /* 浏览器/降级模式忽略 */
+  }
+}
+async function saveClusterModel() {
+  if (cmSaving.value) return;
+  cmSaving.value = true;
+  cmMsg.value = "";
+  try {
+    const c = await invoke<ClusterModelView>("file_cluster_model_set", {
+      enabled: cmForm.value.enabled,
+      baseUrl: cmForm.value.baseUrl,
+      model: cmForm.value.model,
+      apiKey: cmForm.value.apiKey,
+    });
+    cm.value = c;
+    cmForm.value.apiKey = "";
+    cmMsg.value = c.enabled
+      ? c.keySet
+        ? `已启用独立归类模型:${c.model}`
+        : "已开启,但还没填 key —— 填上才会生效"
+      : "已关闭,AI 归类沿用你的主对话 API";
+  } catch (e: any) {
+    cmMsg.value = `保存失败:${e?.message ?? e}`;
+  } finally {
+    cmSaving.value = false;
+  }
 }
 
 // ── 检索枢纽(神经层)──
@@ -624,6 +675,51 @@ function statusDot(p: SenseProviderView): string {
             <div class="fb-snippet">{{ h.snippet }}</div>
           </div>
           <div v-if="!searchRes.hits.length" class="muted-txt">没有命中(向量索引未建时只有 grep 车道)</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 归类 · AI 归类模型(文件中心「AI 归类」用) -->
+    <section class="group">
+      <div class="g-head">
+        <h2>归类 · AI 归类模型</h2>
+        <span class="g-desc">
+          文件中心「AI 归类」用哪个模型。<b>默认用你的主对话 API</b>(开箱即用);也可在此另配一个便宜/免费模型(如硅基免费对话模型),归类就不烧对话 API 的钱
+        </span>
+      </div>
+      <div class="echo-card">
+        <label class="sw">
+          <input v-model="cmForm.enabled" type="checkbox" />
+          启用独立归类模型(不勾 = 默认用主对话 API)
+        </label>
+        <div class="cm-grid" :class="{ dim: !cmForm.enabled }">
+          <label class="cm-field">
+            <span>接口地址(OpenAI 兼容 /v1/chat/completions)</span>
+            <input v-model="cmForm.baseUrl" :disabled="!cmForm.enabled" class="fable-in" placeholder="https://api.siliconflow.cn" />
+          </label>
+          <label class="cm-field">
+            <span>模型名</span>
+            <input v-model="cmForm.model" :disabled="!cmForm.enabled" class="fable-in" placeholder="Qwen/Qwen2.5-7B-Instruct" />
+          </label>
+          <label class="cm-field">
+            <span>API Key {{ cm?.keySet ? "(已配置,留空不改)" : "" }}</span>
+            <input
+              v-model="cmForm.apiKey"
+              :disabled="!cmForm.enabled"
+              class="fable-in"
+              type="password"
+              :placeholder="cm?.keySet ? '●●●●●● 已保存' : 'sk-...'"
+            />
+          </label>
+        </div>
+        <div class="echo-row" style="margin-top: 10px">
+          <button class="btn sm primary" :disabled="cmSaving" @click="saveClusterModel">
+            {{ cmSaving ? "保存中…" : "保存" }}
+          </button>
+          <span v-if="cmMsg" class="muted-txt">{{ cmMsg }}</span>
+        </div>
+        <div class="muted-txt" style="margin-top: 8px">
+          提示:硅基流动的 key 跟上面 BGE-M3 是<b>同一个</b>;填它的免费对话模型(如 Qwen2.5-7B),归类几乎零成本。
         </div>
       </div>
     </section>
@@ -1116,6 +1212,35 @@ function statusDot(p: SenseProviderView): string {
 .fable-in:focus {
   outline: none;
   border-color: var(--primary);
+}
+.cm-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1.3fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+.cm-grid.dim {
+  opacity: 0.5;
+}
+@media (max-width: 760px) {
+  .cm-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.cm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.cm-field > span {
+  font-size: 11px;
+  color: var(--muted);
+}
+.cm-field .fable-in {
+  flex: none;
+  min-width: 0;
+  width: 100%;
 }
 .fable-results {
   margin-top: 10px;
