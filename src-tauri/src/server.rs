@@ -514,6 +514,13 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
         )?),
         "file_cluster_llm" => ok(fable::files::file_cluster_llm(app, opt_str(a, "root"))?),
+        "file_cluster_model_get" => ok(fable::files::file_cluster_model_get()),
+        "file_cluster_model_set" => ok(fable::files::file_cluster_model_set(
+            opt_bool(a, "enabled"),
+            opt_str(a, "baseUrl"),
+            opt_str(a, "model"),
+            opt_str(a, "apiKey"),
+        )?),
 
         // ── Conv ──
         "conv_list_projects" => ok(conv::conv_list_projects()),

@@ -23,6 +23,7 @@ import {
   KeyRound,
   Brain,
   FileText,
+  Settings2,
   LoaderCircle,
   ArrowDownWideNarrow,
 } from "@lucide/vue";
@@ -33,6 +34,7 @@ import {
   type FileOverview,
   type FileCard,
   type FcCluster,
+  type ClusterModelView,
 } from "../tauri";
 import { useAppStore } from "../stores/app";
 
@@ -65,6 +67,12 @@ const llmClustering = ref(false);
 const llmMsg = ref("");
 const reportPath = ref("");
 let unlistenLlm: (() => void) | null = null;
+// 归类专用模型(独立于对话供应商,省钱)
+const modelPanelOpen = ref(false);
+const modelCfg = ref<ClusterModelView | null>(null);
+const mForm = ref({ enabled: false, baseUrl: "", model: "", apiKey: "" });
+const modelSaving = ref(false);
+const modelMsg = ref("");
 
 // 语义检索结果(独立于网格的一条结果带)
 interface SemHit {
@@ -359,6 +367,47 @@ function openReport() {
   if (reportPath.value) openPath(reportPath.value);
 }
 
+// 归类专用模型配置
+async function loadModelCfg() {
+  try {
+    const c = await fc.clusterModelGet();
+    modelCfg.value = c;
+    mForm.value = {
+      enabled: c.enabled,
+      baseUrl: c.baseUrl || "https://api.siliconflow.cn",
+      model: c.model || "Qwen/Qwen2.5-7B-Instruct",
+      apiKey: "",
+    };
+  } catch {
+    /* 浏览器/降级模式忽略 */
+  }
+}
+async function saveModelCfg() {
+  if (modelSaving.value) return;
+  modelSaving.value = true;
+  modelMsg.value = "";
+  try {
+    const c = await fc.clusterModelSet({
+      enabled: mForm.value.enabled,
+      baseUrl: mForm.value.baseUrl,
+      model: mForm.value.model,
+      apiKey: mForm.value.apiKey, // 空=保留旧 key
+    });
+    modelCfg.value = c;
+    mForm.value.apiKey = "";
+    modelMsg.value = c.enabled
+      ? c.keySet
+        ? `已启用独立归类模型:${c.model}`
+        : "已开启,但还没填 key —— 填上 key 才会生效"
+      : "已关闭,AI 归类将沿用对话大模型";
+  } catch (e: any) {
+    modelMsg.value = `保存失败:${e?.message ?? e}`;
+  } finally {
+    modelSaving.value = false;
+  }
+}
+const modelActive = computed(() => !!modelCfg.value?.enabled && !!modelCfg.value?.keySet);
+
 // ───────────────────────── 语义检索 ─────────────────────────
 async function runSemantic() {
   const q = searchText.value.trim();
@@ -545,6 +594,7 @@ const headerStats = computed(() => {
 
 onMounted(async () => {
   setupObservers();
+  loadModelCfg();
   await loadOverview();
   await loadGrid(true);
   await nextTick();
@@ -643,6 +693,49 @@ onBeforeUnmount(() => {
           <Brain v-else :size="14" :stroke-width="1.8" />
           <span>{{ llmClustering ? "AI 归类中" : "AI 归类" }}</span>
         </button>
+        <button
+          class="tool-btn gear"
+          :class="{ on: modelActive }"
+          title="配置 AI 归类专用模型(可指便宜/免费模型,省钱)"
+          @click="modelPanelOpen = !modelPanelOpen"
+        >
+          <Settings2 :size="14" :stroke-width="1.8" />
+        </button>
+      </div>
+    </div>
+
+    <!-- 归类专用模型配置 -->
+    <div v-if="modelPanelOpen" class="model-panel glass">
+      <div class="mp-head">
+        <Brain :size="14" :stroke-width="1.8" />
+        <span>AI 归类专用模型</span>
+        <span class="mp-tip">不配=用你聊天那个大模型 · 配了=用这个(指便宜/免费模型省钱,如硅基免费对话模型)</span>
+        <label class="mp-switch">
+          <input v-model="mForm.enabled" type="checkbox" />
+          <span>启用独立模型</span>
+        </label>
+      </div>
+      <div class="mp-grid" :class="{ dim: !mForm.enabled }">
+        <label class="mp-field">
+          <span>接口地址</span>
+          <input v-model="mForm.baseUrl" :disabled="!mForm.enabled" placeholder="https://api.siliconflow.cn" />
+        </label>
+        <label class="mp-field">
+          <span>模型名</span>
+          <input v-model="mForm.model" :disabled="!mForm.enabled" placeholder="Qwen/Qwen2.5-7B-Instruct" />
+        </label>
+        <label class="mp-field">
+          <span>API Key {{ modelCfg?.keySet ? "(已配置,留空不改)" : "" }}</span>
+          <input v-model="mForm.apiKey" :disabled="!mForm.enabled" type="password" :placeholder="modelCfg?.keySet ? '●●●●●● 已保存' : 'sk-...'" />
+        </label>
+      </div>
+      <div class="mp-foot">
+        <button class="mp-save" :disabled="modelSaving" @click="saveModelCfg">
+          <LoaderCircle v-if="modelSaving" :size="13" class="spin" />
+          <span>{{ modelSaving ? "保存中…" : "保存" }}</span>
+        </button>
+        <span v-if="modelMsg" class="mp-msg">{{ modelMsg }}</span>
+        <span class="mp-hint">兼容 OpenAI <code>/v1/chat/completions</code> 的端点都行;硅基的 key 跟你那把 BGE-M3 是同一个。</span>
       </div>
     </div>
 
@@ -1112,7 +1205,81 @@ onBeforeUnmount(() => {
 .tool-btn.ai:hover:not(:disabled) {
   background: color-mix(in srgb, #8b6cff 16%, transparent);
 }
+.tool-btn.gear { padding: 0 9px; }
+.tool-btn.gear.on {
+  border-color: color-mix(in srgb, #8b6cff 55%, transparent);
+  color: #8b6cff;
+  background: color-mix(in srgb, #8b6cff 12%, transparent);
+}
 .tool-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 归类专用模型配置面板 */
+.model-panel {
+  margin: 0 2px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, #8b6cff 22%, transparent);
+}
+.mp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  flex-wrap: wrap;
+}
+.mp-head > span:first-of-type { font-weight: 600; }
+.mp-tip { color: var(--muted); font-size: 11.5px; font-weight: 400; }
+.mp-switch {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.mp-switch input { accent-color: #8b6cff; }
+.mp-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1.3fr 1fr;
+  gap: 10px;
+  margin: 12px 0 10px;
+}
+.mp-grid.dim { opacity: 0.5; }
+@media (max-width: 760px) { .mp-grid { grid-template-columns: 1fr; } }
+.mp-field { display: flex; flex-direction: column; gap: 4px; }
+.mp-field > span { font-size: 11px; color: var(--muted); }
+.mp-field input {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--bg) 60%, transparent);
+  color: var(--text);
+  border-radius: 9px;
+  font-size: 12.5px;
+  outline: none;
+  font-family: var(--mono);
+}
+.mp-field input:focus { border-color: color-mix(in srgb, #8b6cff 50%, transparent); }
+.mp-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.mp-save {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 18px;
+  border: none;
+  border-radius: 9px;
+  background: #8b6cff;
+  color: #fff;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.mp-save:disabled { opacity: 0.6; cursor: default; }
+.mp-msg { font-size: 12px; color: var(--text-2); }
+.mp-hint { font-size: 11px; color: var(--dim); margin-left: auto; }
+.mp-hint code { font-family: var(--mono); background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 
 /* AI 归类进度 / 报告条 */
 .fc-llm {

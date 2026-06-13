@@ -18,6 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
@@ -1024,6 +1025,104 @@ pub fn warm_thumbs(paths: Vec<String>, max: u32) -> usize {
 // 文件清单、按主题归类,Rust 写回 cluster_id + clusters 表,并在桌面生成 HTML 报告。
 // 复用回声层「做梦」同一套:run_claude_readonly(无头跑已连接模型)+ extract_balanced_json。
 
+// ── 归类专用模型(可选):独立于「对话供应商」,可指向便宜/免费的 OpenAI 兼容端点 ──
+// 不配 → AI 归类沿用你聊天那个大模型;配了 → 走这个(例:硅基流动免费对话模型,省钱)。
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ClusterModelCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    model: String,
+}
+
+fn cluster_model_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("cluster_model.json"))
+}
+fn load_cluster_model() -> ClusterModelCfg {
+    cluster_model_path()
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+fn save_cluster_model(cfg: &ClusterModelCfg) -> Result<(), String> {
+    let path = cluster_model_path().ok_or("无法定位数据目录")?;
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let txt = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, txt).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+/// 生效的归类模型:enabled + key + base_url + model 四件齐才算。
+fn active_cluster_model() -> Option<ClusterModelCfg> {
+    let c = load_cluster_model();
+    let ok = c.enabled
+        && !c.api_key.trim().is_empty()
+        && !c.base_url.trim().is_empty()
+        && !c.model.trim().is_empty();
+    ok.then_some(c)
+}
+/// OpenAI 兼容 chat completion(硅基流动 / 任意兼容端点)。
+fn chat_complete(cfg: &ClusterModelCfg, prompt: &str) -> Result<String, String> {
+    let url = format!("{}/v1/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(180))
+        .build();
+    let resp = http
+        .post(&url)
+        .set("authorization", &format!("Bearer {}", cfg.api_key.trim()))
+        .send_json(json!({
+            "model": cfg.model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "temperature": 0.2,
+            "stream": false,
+        }));
+    match resp {
+        Ok(r) => {
+            let v: Value = r.into_json().map_err(|e| format!("归类模型响应解析失败: {e}"))?;
+            v.get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| "归类模型响应里没有 content".to_string())
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            let brief: String = body.chars().take(220).collect();
+            Err(format!("归类模型 HTTP {code}: {brief}"))
+        }
+        Err(e) => Err(format!("归类模型网络错误: {e}")),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterModelView {
+    pub enabled: bool,
+    pub base_url: String,
+    pub model: String,
+    pub key_set: bool,
+}
+fn cluster_model_view(c: &ClusterModelCfg) -> ClusterModelView {
+    ClusterModelView {
+        enabled: c.enabled,
+        base_url: c.base_url.clone(),
+        model: c.model.clone(),
+        key_set: !c.api_key.trim().is_empty(),
+    }
+}
+
 static LLM_CLUSTERING: AtomicBool = AtomicBool::new(false);
 
 /// 喂给大模型的文件清单上限(控上下文;超出按 mtime 倒序取最近的)。
@@ -1131,18 +1230,26 @@ fn cluster_llm_run(app: &AppHandle, root: Option<String>) -> Result<(usize, usiz
     }
 
     let prompt = llm_cluster_directive(&files);
-    emit_llm(
-        app,
-        json!({ "kind": "phase", "text": format!("交给已连接的大模型归类({} 个文件)…", files.len()) }),
-    );
-    let kb_root = PathBuf::from(crate::kb::kb_root());
-    let cwd = if kb_root.exists() { kb_root } else { std::env::temp_dir() };
-    let collected = crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _text| {
-        if kind == "delta" {
-            // 进度心跳(不外泄正文)
-            emit_llm(app, json!({ "kind": "tick" }));
-        }
-    })?;
+    // 配了独立归类模型 → 直连它(省钱);否则用聊天那个大模型(run_claude_readonly)。
+    let collected = if let Some(cfg) = active_cluster_model() {
+        emit_llm(
+            app,
+            json!({ "kind": "phase", "text": format!("用独立归类模型「{}」给 {} 个文件归类…", cfg.model, files.len()) }),
+        );
+        chat_complete(&cfg, &prompt)?
+    } else {
+        emit_llm(
+            app,
+            json!({ "kind": "phase", "text": format!("用已连接的对话大模型给 {} 个文件归类…", files.len()) }),
+        );
+        let kb_root = PathBuf::from(crate::kb::kb_root());
+        let cwd = if kb_root.exists() { kb_root } else { std::env::temp_dir() };
+        crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _text| {
+            if kind == "delta" {
+                emit_llm(app, json!({ "kind": "tick" })); // 心跳,不外泄正文
+            }
+        })?
+    };
     let raw = crate::kb::extract_balanced_json(&collected)
         .ok_or("大模型没有返回可解析的 JSON(可换更强的模型,或稍后重试)")?;
     let groups: Vec<LlmGroup> =
@@ -1373,6 +1480,46 @@ pub fn file_cluster_llm(app: AppHandle, root: Option<String>) -> Result<(), Stri
         }
     });
     Ok(())
+}
+
+/// 读「归类专用模型」配置(key 只回 key_set,不回明文)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_cluster_model_get() -> ClusterModelView {
+    cluster_model_view(&load_cluster_model())
+}
+
+/// 存「归类专用模型」配置。api_key 传空字符串=保留旧 key(方便只改模型不重填 key)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_cluster_model_set(
+    enabled: Option<bool>,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<ClusterModelView, String> {
+    let mut c = load_cluster_model();
+    if let Some(e) = enabled {
+        c.enabled = e;
+    }
+    if let Some(b) = base_url {
+        if !b.trim().is_empty() {
+            c.base_url = b.trim().to_string();
+        }
+    }
+    if let Some(m) = model {
+        if !m.trim().is_empty() {
+            c.model = m.trim().to_string();
+        }
+    }
+    if let Some(k) = api_key {
+        if !k.trim().is_empty() {
+            c.api_key = k.trim().to_string(); // 空=保留旧 key
+        }
+    }
+    if c.base_url.trim().is_empty() {
+        c.base_url = "https://api.siliconflow.cn".into();
+    }
+    save_cluster_model(&c)?;
+    Ok(cluster_model_view(&c))
 }
 
 #[cfg(test)]

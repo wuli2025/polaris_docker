@@ -507,6 +507,12 @@ export interface ClusterBuildSummary {
   seconds: number;
   note: string;
 }
+export interface ClusterModelView {
+  enabled: boolean;
+  baseUrl: string;
+  model: string;
+  keySet: boolean;
+}
 export interface FileGridParams {
   root?: string | null;
   clusterId?: number | null;
@@ -544,6 +550,15 @@ export const files = {
   /** 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告;进度走 file:cluster_llm 事件 */
   clusterLlm: (root?: string | null) =>
     invoke<void>("file_cluster_llm", { root: root ?? null }),
+  /** 读「归类专用模型」配置(独立于对话供应商,可指便宜模型;key 只回是否已配) */
+  clusterModelGet: () => invoke<ClusterModelView>("file_cluster_model_get"),
+  /** 存「归类专用模型」配置(apiKey 传空=保留旧 key) */
+  clusterModelSet: (p: {
+    enabled?: boolean;
+    baseUrl?: string;
+    model?: string;
+    apiKey?: string;
+  }) => invoke<ClusterModelView>("file_cluster_model_set", p),
   /** 批量预热缩略图缓存(进入网格时后台调,滚动更顺);返回成功数 */
   warmThumbs: (paths: string[], max = 360) =>
     invoke<number>("file_warm_thumbs", { paths, max }),
