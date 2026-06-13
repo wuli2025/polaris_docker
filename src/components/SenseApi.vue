@@ -4,7 +4,7 @@
 // 点卡片开配置弹窗(启用开关 / API Key + 获取链接 / 模型列表设默认 / 一键探活)。
 // 页尾:回声层「每日做梦」(定时收录对话蒸馏成记忆)。
 import { onMounted, onUnmounted, ref, computed } from "vue";
-import { invoke, listen } from "../tauri";
+import { invoke, listen, openUrl } from "../tauri";
 import { useAppStore } from "../stores/app";
 
 defineOptions({ name: "SenseApi" });
@@ -450,14 +450,8 @@ function packOf(p: SenseProviderView): SensePackView | null {
   return overview.value?.packs.find((k) => k.id === p.pack_id) ?? null;
 }
 
-async function openUrl(url: string) {
-  if (!url) return;
-  try {
-    await invoke("open_url", { url });
-  } catch {
-    window.open(url, "_blank");
-  }
-}
+// 用统一的 openUrl(../tauri):桌面走系统浏览器,Docker/Web 走 window.open(在用户浏览器开),
+// 不再自己 invoke("open_url") —— 那在 Docker 里是让无头容器去开链接,用户这边什么都不会发生。
 
 async function setSwitch(key: "cloudEnabled" | "audioEgress" | "imageEgress", v: boolean) {
   try {
