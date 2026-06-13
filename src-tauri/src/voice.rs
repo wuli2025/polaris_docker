@@ -548,21 +548,21 @@ pub fn voice_transcribe_file(path: String) -> Result<TranscribeResult, String> {
 /// 命令恒注册;真运行需 `voice-asr` + 桌面 + 已下载 SenseVoice 模型。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn voice_listen_start(app: AppHandle) -> Result<(), String> {
-    #[cfg(all(feature = "voice-asr", feature = "desktop"))]
+    #[cfg(feature = "voice-live")]
     {
         crate::voice_live::start(app)
     }
-    #[cfg(not(all(feature = "voice-asr", feature = "desktop")))]
+    #[cfg(not(feature = "voice-live"))]
     {
         let _ = app;
-        Err("实时语音输入未编译:需以 `--features voice-asr` 构建桌面版".into())
+        Err("实时语音输入未编译:需以 `--features voice-live` 构建桌面版(Docker/浏览器走「上传音频识别」,见 voice_transcribe_file)".into())
     }
 }
 
 /// 停用实时语音输入(全局热键事件被忽略)。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn voice_listen_stop() -> Result<(), String> {
-    #[cfg(all(feature = "voice-asr", feature = "desktop"))]
+    #[cfg(feature = "voice-live")]
     {
         crate::voice_live::stop();
     }
@@ -572,21 +572,21 @@ pub fn voice_listen_stop() -> Result<(), String> {
 /// 开始听写(输入框麦克风/右Alt 触发):录音转写,文字经 `voice:dictation` 事件回前端输入框。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn voice_dictate_start(app: AppHandle) -> Result<(), String> {
-    #[cfg(all(feature = "voice-asr", feature = "desktop"))]
+    #[cfg(feature = "voice-live")]
     {
         crate::voice_live::dictate_start(app)
     }
-    #[cfg(not(all(feature = "voice-asr", feature = "desktop")))]
+    #[cfg(not(feature = "voice-live"))]
     {
         let _ = app;
-        Err("语音听写未编译:需以 `--features voice-asr` 构建桌面版".into())
+        Err("本机麦克风听写未编译(桌面 `--features voice-live`)。浏览器/Docker 请走上传音频识别:voice_transcribe_file".into())
     }
 }
 
 /// 停止听写 → 整段识别 + 防污染 → emit `voice:dictation { text }`。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn voice_dictate_stop() -> Result<(), String> {
-    #[cfg(all(feature = "voice-asr", feature = "desktop"))]
+    #[cfg(feature = "voice-live")]
     {
         crate::voice_live::dictate_stop();
     }

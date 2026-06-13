@@ -267,7 +267,23 @@ html[data-theme="aurora-dark"] .main {
   box-shadow: 0 20px 52px -26px rgba(0, 0, 0, 0.6),
     0 0 0 1px rgba(255, 255, 255, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
-/* 跟随圆角的渐变描边（border-image 不认 radius，改用 mask 双层异或挖空法） */
+/* 跟随圆角的渐变描边（border-image 不认 radius，改用 mask 双层异或挖空法）。
+   极光版在常驻彩虹底上叠一道「跟随鼠标游走」的高光彗尾：App.vue 实时把
+   鼠标相对主面板中心的方位角写进 --edge-angle，conic 亮带锚在那个方位 →
+   鼠标移到哪，边框那一段就亮起来；鼠标离开窗口时回落成普通彩虹边。 */
+@property --edge-angle {
+  syntax: "<angle>";
+  inherits: true;
+  initial-value: 0deg;
+}
+html[data-theme="aurora-light"] .main {
+  --edge-comet: rgba(255, 255, 255, 0.95);
+  --edge-halo: rgba(255, 255, 255, 0.42);
+}
+html[data-theme="aurora-dark"] .main {
+  --edge-comet: rgba(206, 218, 255, 0.7);
+  --edge-halo: rgba(178, 194, 255, 0.28);
+}
 html[data-theme="aurora-light"] .main::after,
 html[data-theme="aurora-dark"] .main::after {
   content: "";
@@ -275,9 +291,24 @@ html[data-theme="aurora-dark"] .main::after {
   inset: 0;
   z-index: 5;
   border-radius: inherit;
-  padding: 1.5px;
+  padding: 2px;
   pointer-events: none;
-  background: var(--liuli-edge);
+  /* 三层叠放：窄亮核 + 宽柔晕(都锚在 --edge-angle 处，故偏移 from 让峰值落在该方位) + 常驻彩虹底 */
+  background: conic-gradient(
+      from calc(var(--edge-angle, 0deg) - 26deg) at 50% 50%,
+      transparent 0deg,
+      var(--edge-comet) 26deg,
+      transparent 52deg,
+      transparent 360deg
+    ),
+    conic-gradient(
+      from calc(var(--edge-angle, 0deg) - 62deg) at 50% 50%,
+      transparent 0deg,
+      var(--edge-halo) 62deg,
+      transparent 124deg,
+      transparent 360deg
+    ),
+    var(--liuli-edge);
   -webkit-mask: linear-gradient(#000 0 0) content-box,
     linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;

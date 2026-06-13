@@ -45,11 +45,14 @@ import {
   skills as skillsApi,
   invoke,
   listen,
+  isTauri,
+  uploadToBackend,
   type PermissionMode,
   type Skill,
   type AttachedFile,
   type Message,
 } from "../tauri";
+import { WebVoiceRecorder } from "../lib/webVoice";
 import { renderMarkdown, mdVersion } from "../lib/markdown";
 import { toast } from "../composables/useToast";
 import { humanizeError } from "../lib/humanizeError";
@@ -330,10 +333,15 @@ onMounted(() => nextTick(autoGrow));
 // 点麦克风 / 按右 Alt 开始说话，说话时文字流式长进输入框，再点 / 再按右 Alt 结束。
 // 后端 voice_dictate_start/stop 录音转写 + 防污染，文字经 voice:dictation 事件回填。
 const dictating = ref(false);
+const voiceBusy = ref(false); // 浏览器路径:停录后上传+识别的 ~1s,期间禁重复点击
 let dictateBase = ""; // 听写开始时输入框已有内容，新转写续在其后
 const voiceUnlisteners: Array<() => void> = [];
+let webRec: WebVoiceRecorder | null = null;
 
 async function toggleDictate() {
+  // 浏览器/Docker:后端无麦克风,采集在客户端做,停录后上传 WAV 走 voice_transcribe_file。
+  if (!isTauri) return toggleDictateWeb();
+  // 桌面:后端 cpal 录音 + 防污染,文字经 voice:partial/voice:dictation 事件回填。
   try {
     if (!dictating.value) {
       dictateBase = input.value ? input.value.replace(/\s+$/, "") + " " : "";
@@ -346,6 +354,49 @@ async function toggleDictate() {
   } catch (e) {
     dictating.value = false;
     toast.error(`语音输入：${humanizeError(e)}`);
+  }
+}
+
+// 浏览器整段批处理:点开始 getUserMedia 录音 → 再点停止 → 16k WAV 上传 → 识别回填。
+async function toggleDictateWeb() {
+  if (voiceBusy.value) return; // 识别中,忽略点击
+  if (!dictating.value) {
+    try {
+      dictateBase = input.value ? input.value.replace(/\s+$/, "") + " " : "";
+      webRec = new WebVoiceRecorder();
+      await webRec.start();
+      dictating.value = true;
+    } catch (e) {
+      dictating.value = false;
+      webRec = null;
+      toast.error(`语音输入：${humanizeError(e)}`);
+    }
+    return;
+  }
+  // 停录 → 上传 → 识别
+  dictating.value = false;
+  const rec = webRec;
+  webRec = null;
+  voiceBusy.value = true;
+  try {
+    const wav = await rec?.stop();
+    if (!wav) return; // 太短/误触
+    const [up] = await uploadToBackend([wav]);
+    if (!up?.path) throw new Error("音频上传失败");
+    const r = await invoke<{ text?: string; error?: string }>("voice_transcribe_file", {
+      path: up.path,
+    });
+    if (r?.text) {
+      input.value = dictateBase + r.text;
+      nextTick(() => {
+        autoGrow();
+        inputEl.value?.focus();
+      });
+    }
+  } catch (e) {
+    toast.error(`语音输入：${humanizeError(e)}`);
+  } finally {
+    voiceBusy.value = false;
   }
 }
 
@@ -391,7 +442,12 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
   for (const u of voiceUnlisteners) u();
-  if (dictating.value) void invoke("voice_dictate_stop").catch(() => {});
+  if (webRec) {
+    webRec.cancel();
+    webRec = null;
+  } else if (dictating.value) {
+    void invoke("voice_dictate_stop").catch(() => {});
+  }
 });
 
 function toggleGoal() {
@@ -1421,12 +1477,13 @@ async function deleteCurrentConv() {
           <div class="toolbar-right">
             <button
               class="mic-btn"
-              :class="{ live: dictating }"
-              :title="dictating ? '正在听写 · 点击 / 右 Alt 结束' : '语音输入 · 点击 / 按右 Alt 开始，再按一下结束'"
+              :class="{ live: dictating, busy: voiceBusy }"
+              :disabled="voiceBusy"
+              :title="voiceBusy ? '识别中…' : dictating ? '正在听写 · 点击 / 右 Alt 结束' : '语音输入 · 点击 / 按右 Alt 开始，再按一下结束'"
               @click="toggleDictate"
             >
               <Mic :size="15" :stroke-width="1.9" />
-              <span v-if="dictating" class="mic-ping"></span>
+              <span v-if="dictating || voiceBusy" class="mic-ping"></span>
               <div class="mic-tip">
                 语音输入 · 按 <b>右 Alt</b> 快捷开关
                 <div class="mic-tip-sub">说话时文字实时长进输入框，再按一下结束</div>
@@ -2685,6 +2742,15 @@ html[data-theme="dark"] .btn-tooltip-inner {
   background: var(--vermilion);
   border-color: var(--vermilion);
   color: #fff;
+}
+/* 浏览器路径：停录后上传+识别中，金色脉冲提示「在干活」 */
+.mic-btn.busy {
+  color: var(--gold, #d4b06a);
+  border-color: var(--gold, #d4b06a);
+  cursor: progress;
+}
+.mic-btn.busy .mic-ping {
+  border-color: var(--gold, #d4b06a);
 }
 /* 录音中：外扩呼吸光环 */
 .mic-ping {

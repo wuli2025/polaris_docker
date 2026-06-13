@@ -1,6 +1,7 @@
 //! 语音输入实时链路 —— 按住热键说话 → 流式上字 → 松手识别注入。
 //!
-//! 仅在 `voice-asr` + `desktop` 下编译(麦克风/全局热键/注入是桌面专属)。
+//! 仅在 `voice-live` feature 下编译(麦克风 cpal/全局热键 rdev/注入 enigo 是桌面专属;
+//! 该 feature 自动带上 `voice-asr` 识别核)。Docker/浏览器不编译本模块,走「上传音频→识别」。
 //! 链路:rdev 全局热键(右 Alt 按住/松手) → cpal 采集 → 滑窗模拟流式(每 ~350ms
 //! 重识别一次 emit `voice:partial`) → 松手整段识别 + 防污染 → enigo 注入焦点应用 +
 //! emit `voice:final`。前端 VoiceOverlay 听这些事件画浮窗。

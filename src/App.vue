@@ -116,7 +116,52 @@ onBeforeUnmount(() => {
   unMdDelegate?.();
   unWsStatus?.();
   clearTimeout(loaderSafety);
+  window.removeEventListener("mousemove", onAuroraPointer);
+  if (edgeRaf) cancelAnimationFrame(edgeRaf);
 });
+
+// ─────────── 极光主题：彩虹边框高光跟随鼠标方位游走 ───────────
+// mousemove 用 rAF 合帧(一帧最多算一次)，把鼠标相对主面板中心的方位角写进
+// CSS 变量 --edge-angle，style.css 里的 conic 亮带就锚在该方位 → 边框上那一段亮起。
+// 仅极光两套主题挂监听；切走主题即摘掉，零常驻开销。
+let mainEl: HTMLElement | null = null;
+let edgeRaf = 0;
+let edgePx = 0;
+let edgePy = 0;
+function flushEdge() {
+  edgeRaf = 0;
+  mainEl ||= document.querySelector(".main");
+  if (!mainEl) return;
+  const r = mainEl.getBoundingClientRect();
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  // conic 0deg 指向正上、顺时针递增；atan2 0 指向右(屏幕 y 向下) → +90° 对齐
+  const deg = (Math.atan2(edgePy - cy, edgePx - cx) * 180) / Math.PI + 90;
+  mainEl.style.setProperty("--edge-angle", `${deg.toFixed(1)}deg`);
+}
+function onAuroraPointer(e: MouseEvent) {
+  edgePx = e.clientX;
+  edgePy = e.clientY;
+  if (!edgeRaf) edgeRaf = requestAnimationFrame(flushEdge);
+}
+const isAurora = computed(
+  () => app.theme === "aurora-light" || app.theme === "aurora-dark"
+);
+watch(
+  isAurora,
+  (on) => {
+    if (on) {
+      window.addEventListener("mousemove", onAuroraPointer, { passive: true });
+    } else {
+      window.removeEventListener("mousemove", onAuroraPointer);
+      if (edgeRaf) {
+        cancelAnimationFrame(edgeRaf);
+        edgeRaf = 0;
+      }
+    }
+  },
+  { immediate: true }
+);
 
 // 全局快捷键:Ctrl+N 新对话 / Ctrl+K 命令面板 / Ctrl+B 收侧栏
 useHotkeys();

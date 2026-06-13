@@ -62,6 +62,11 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 fn skip_dir(name: &str) -> bool {
+    // 群晖/NAS 系统目录一律以 `@` 或 `#` 打头(@eaDir 缩略图、@docker 层、@database、
+    // @appstore、#recycle、#snapshot…),用户数据从不放这里 → 整盘盘点时跳过,免噪音免爆量。
+    if name.starts_with('@') || name.starts_with('#') {
+        return true;
+    }
     SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(name))
 }
 
@@ -285,35 +290,108 @@ fn emit(app: &AppHandle, payload: Value) {
     let _ = app.emit("fable:inventory", payload);
 }
 
-/// 开始盘点(root 缺省 = 知识库根)。立即返回,进度走 `fable:inventory` 事件。
+/// 解析「盘点哪些根」。
+/// - 显式传 root → 只盘这一个;
+/// - 否则:`POLARIS_INVENTORY_ROOTS`(PATH 分隔:Win 用 `;`、Unix 用 `:`)+ 约定挂载点
+///   `<KB父目录>/nas`(群晖 Docker 把各 NAS 共享 bind 到这里)+ 知识库根。
+///
+/// 桌面版没有 nas 挂载点、也不设环境变量 → 退化成单根 = 知识库根(行为不变)。
+/// 容器版能据此把 `/root/Polaris/nas/<share>` 整个挂载点一并盘点,文件中心遂能看到全 NAS。
+fn inventory_roots(explicit: Option<String>) -> Vec<String> {
+    if let Some(r) = explicit
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+    {
+        return vec![r];
+    }
+    let mut roots: Vec<String> = Vec::new();
+    if let Ok(v) = std::env::var("POLARIS_INVENTORY_ROOTS") {
+        for p in std::env::split_paths(&v) {
+            let s = p.to_string_lossy().trim().to_string();
+            if !s.is_empty() {
+                roots.push(s);
+            }
+        }
+    }
+    let kb = crate::kb::kb_root();
+    // 约定:NAS 各共享 bind-mount 到 <KB父目录>/nas/<share>(见 docker-compose.synology)。
+    if let Some(parent) = std::path::Path::new(&kb).parent() {
+        let nas = parent.join("nas");
+        if nas.is_dir() {
+            roots.push(nas.to_string_lossy().to_string());
+        }
+    }
+    // 始终把知识库根纳入盘点。
+    if !kb.trim().is_empty() {
+        roots.push(kb);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// 开始盘点(root 缺省 = 知识库根 + 约定的 NAS 挂载点)。立即返回,进度走 `fable:inventory` 事件。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn fable_inventory_start(app: AppHandle, root: Option<String>) -> Result<(), String> {
-    let root = root
-        .filter(|r| !r.trim().is_empty())
-        .unwrap_or_else(crate::kb::kb_root);
-    if root.trim().is_empty() {
-        return Err("没有可盘点的根目录(知识库未初始化,也未指定 root)".into());
+    let roots: Vec<String> = inventory_roots(root)
+        .into_iter()
+        .filter(|r| std::path::Path::new(r).is_dir())
+        .collect();
+    if roots.is_empty() {
+        return Err("没有可盘点的根目录(知识库未初始化,也无可访问的挂载点)".into());
     }
     if SCANNING.swap(true, Ordering::SeqCst) {
         return Err("盘点已在进行中".into());
     }
     CANCEL.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
-        let app2 = app.clone();
-        let result = scan_root(&root, &move |files, bytes| {
-            emit(&app2, json!({ "kind": "progress", "files": files, "bytes": bytes }));
-        });
+        // 多根串行盘点;进度按「已盘过的根」累加,前端看到的是全量计数。
+        let mut acc_files = 0u64;
+        let mut acc_bytes = 0u64;
+        let mut acc_removed = 0u64;
+        let mut acc_secs = 0.0f64;
+        let mut workers = 0usize;
+        let mut last_err: Option<String> = None;
+        for r in &roots {
+            if cancelled() {
+                break;
+            }
+            let app_p = app.clone();
+            let base_f = acc_files;
+            let base_b = acc_bytes;
+            match scan_root(r, &move |files, bytes| {
+                emit(
+                    &app_p,
+                    json!({ "kind": "progress", "files": base_f + files, "bytes": base_b + bytes }),
+                );
+            }) {
+                Ok(s) => {
+                    acc_files += s.files;
+                    acc_bytes += s.bytes;
+                    acc_removed += s.removed;
+                    acc_secs += s.seconds;
+                    workers = s.workers;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
         SCANNING.store(false, Ordering::SeqCst);
-        match result {
-            Ok(s) => emit(
+        if cancelled() {
+            emit(&app, json!({ "kind": "error", "message": "已取消" }));
+        } else if acc_files == 0 {
+            emit(
+                &app,
+                json!({ "kind": "error", "message": last_err.unwrap_or_else(|| "未扫描到任何文件".into()) }),
+            );
+        } else {
+            emit(
                 &app,
                 json!({
-                    "kind": "done", "files": s.files, "bytes": s.bytes,
-                    "removed": s.removed, "seconds": s.seconds, "workers": s.workers,
-                    "root": s.root,
+                    "kind": "done", "files": acc_files, "bytes": acc_bytes,
+                    "removed": acc_removed, "seconds": acc_secs, "workers": workers,
+                    "roots": roots.len(),
                 }),
-            ),
-            Err(e) => emit(&app, json!({ "kind": "error", "message": e })),
+            );
         }
     });
     Ok(())

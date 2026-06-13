@@ -260,8 +260,8 @@ async function runLearn() {
           <span v-if="listenErr" class="err-line" style="margin: 0">{{ listenErr }}</span>
         </div>
         <div class="tierhint">
-          需以 <code>--features voice-asr</code> 构建桌面版 + 已下载 SenseVoice 模型方可真用;
-          运行中的默认版会提示「未编译」。
+          Windows / macOS 桌面版已内置本地语音识别;首次使用前请在「设置 → 感官 API」
+          下载「SenseVoice-Small」感官包(约 230&nbsp;MB)。Docker / Web 版暂不支持本地听写。
         </div>
       </section>
 
