@@ -86,6 +86,7 @@ fn human_size(bytes: u64) -> String {
 // ───────────────────────── 总览 ─────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KindCount {
     pub kind: String,
     pub count: u64,
@@ -93,6 +94,7 @@ pub struct KindCount {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClusterView {
     pub id: i64,
     pub label: String,
@@ -102,6 +104,7 @@ pub struct ClusterView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RootView {
     pub id: i64,
     pub path: String,
@@ -109,6 +112,7 @@ pub struct RootView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileOverview {
     pub roots: Vec<RootView>,
     pub active_root: Option<String>,
@@ -263,6 +267,7 @@ pub fn overview(root: Option<String>) -> Result<FileOverview, String> {
 // ───────────────────────── 网格(分页) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileCard {
     pub id: i64,
     pub path: String,
@@ -278,6 +283,7 @@ pub struct FileCard {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileGridPage {
     pub items: Vec<FileCard>,
     pub total: u64,
@@ -606,6 +612,7 @@ fn kind_label(ext: &str) -> &'static str {
 // ───────────────────────── 语义聚类(复用已存向量) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClusterBuildSummary {
     pub clusters: usize,
     pub files: usize,
