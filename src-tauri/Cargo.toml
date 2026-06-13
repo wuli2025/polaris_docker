@@ -80,6 +80,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 寓言计划 · 检索枢纽(fable/):盘点/chunk/向量统一落 SQLite(PRD v5 P0「SQLite 落盘」)。
 # bundled = 静态编译 sqlite3,镜像内零系统依赖。
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 文件中心 · 缩略图/首帧:纯 Rust 解码+缩放(jpg/png/gif/webp/bmp),容器内无系统依赖。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 # ── Forge 工业级化阶段 1:chromiumoxide 持久 CDP 替「每帧起 chromium CLI 进程」 ──
 #   提速 6-10×(单页 350-900ms → 50-120ms);双选型 chromiumoxide 主路 + headless_chrome 兜底
 #   pin minor 版本:0.9.x API 仍在动(issue 标 "Regression from 0.8 to 0.9")

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from "vue";
+import { ref, onMounted, computed, watch, defineAsyncComponent } from "vue";
 import { storeToRefs } from "pinia";
 import { marked } from "marked";
 import { sanitizeHtml } from "../lib/sanitize";
@@ -27,11 +27,15 @@ import { useArtifactsStore } from "../stores/artifacts";
 import { useKbStore } from "../stores/kb";
 import { useFileDrop } from "../composables/useFileDrop";
 
+// 文件中心:可视化文件库(琉璃质感三视图 + 语义聚类 + 缩略图)。
+// 按需懒加载,只有点开「文件中心」tab 才拉取其代码与 image 处理逻辑。
+const FileCenter = defineAsyncComponent(() => import("./FileCenter.vue"));
+
 const app = useAppStore();
 const artifactsStore = useArtifactsStore();
 const kbStore = useKbStore();
 
-type Tab = "overview" | "packs" | "browse" | "manage";
+type Tab = "overview" | "packs" | "browse" | "files" | "manage";
 const tab = ref<Tab>("browse");
 const files = ref<string[]>([]);
 const selected = ref<string | null>(null);
@@ -369,6 +373,7 @@ const { isOver: dropOver } = useFileDrop({
             { k: 'overview', l: '概览' },
             { k: 'packs', l: '名人资料包' },
             { k: 'browse', l: '浏览' },
+            { k: 'files', l: '文件中心' },
             { k: 'manage', l: '管理' },
           ]"
           :key="t.k"
@@ -537,6 +542,10 @@ const { isOver: dropOver } = useFileDrop({
         </div>
         <div v-else class="md" v-html="rendered"></div>
       </div>
+    </div>
+
+    <div v-if="tab === 'files'" class="body files-body">
+      <FileCenter />
     </div>
 
     <div v-if="tab === 'manage'" class="body manage">
@@ -775,6 +784,12 @@ const { isOver: dropOver } = useFileDrop({
   display: flex;
   flex-direction: column;
   gap: 18px;
+}
+/* 文件中心:让琉璃文件库铺满,内部自管滚动 */
+.body.files-body {
+  padding: 12px 18px 8px;
+  height: calc(100vh - 130px);
+  overflow: hidden;
 }
 .body.packs {
   display: flex;

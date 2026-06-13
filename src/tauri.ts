@@ -447,6 +447,131 @@ export const kb = {
 };
 
 // ──────────────────────────────────────────────────────────────
+// 文件中心 (File Center) — 可视化文件库:类型/语义聚类/缩略图/速览
+// 复用检索枢纽 fable.db(盘点表 + 已存向量),不另起数据源。
+// ──────────────────────────────────────────────────────────────
+export interface FcRoot {
+  id: number;
+  path: string;
+  files: number;
+}
+export interface FcKindCount {
+  kind: string;
+  count: number;
+  bytes: number;
+}
+export interface FcCluster {
+  id: number;
+  label: string;
+  color: string;
+  keywords: string;
+  size: number;
+}
+export interface FileOverview {
+  roots: FcRoot[];
+  activeRoot: string | null;
+  totalFiles: number;
+  totalBytes: number;
+  byKind: FcKindCount[];
+  clusters: FcCluster[];
+  textFiles: number;
+  embeddedFiles: number;
+  hasEmbedProvider: boolean;
+  clustered: boolean;
+  scanning: boolean;
+  indexing: boolean;
+}
+export interface FileCard {
+  id: number;
+  path: string;
+  abspath: string;
+  name: string;
+  ext: string;
+  /** text | doc | image | audio | video | archive | other */
+  kind: string;
+  size: number;
+  sizeH: string;
+  mtime: number;
+  clusterId: number;
+  thumbable: boolean;
+}
+export interface FileGridPage {
+  items: FileCard[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+export interface ClusterBuildSummary {
+  clusters: number;
+  files: number;
+  seconds: number;
+  note: string;
+}
+export interface FileGridParams {
+  root?: string | null;
+  clusterId?: number | null;
+  kind?: string | null;
+  sort?: "recent" | "name" | "size" | "kind";
+  query?: string | null;
+  page?: number;
+  pageSize?: number;
+}
+
+/** 检索枢纽 + 文件中心命令封装 */
+export const files = {
+  /** 文件库总览:类型分布 + 语义簇 + 根列表 + 索引状态 */
+  overview: (root?: string | null) =>
+    invoke<FileOverview>("file_overview", { root: root ?? null }),
+  /** 分页拉取文件卡片(可按簇/类型/文件名过滤、排序) */
+  grid: (p: FileGridParams = {}) =>
+    invoke<FileGridPage>("file_grid", {
+      root: p.root ?? null,
+      clusterId: p.clusterId ?? null,
+      kind: p.kind ?? null,
+      sort: p.sort ?? "recent",
+      query: p.query ?? null,
+      page: p.page ?? 0,
+      pageSize: p.pageSize ?? 60,
+    }),
+  /** 缩略图/首帧 → data URL(失败返回 null,前端落类型图标);磁盘缓存 */
+  thumb: (abspath: string, max = 360) =>
+    invoke<string | null>("file_thumb", { abspath, max }),
+  /** 按需内容速览(抽取式,零 token,带缓存) */
+  gist: (abspath: string) => invoke<string>("file_gist", { abspath }),
+  /** 重建语义聚类(复用已存向量,纯数学;同步返回汇总) */
+  clusterBuild: (root?: string | null) =>
+    invoke<ClusterBuildSummary>("file_cluster_build", { root: root ?? null }),
+  /** 批量预热缩略图缓存(进入网格时后台调,滚动更顺);返回成功数 */
+  warmThumbs: (paths: string[], max = 360) =>
+    invoke<number>("file_warm_thumbs", { paths, max }),
+  /** 开始盘点磁盘根(缺省=知识库根),进度走 fable:inventory 事件 */
+  inventoryStart: (root?: string | null) =>
+    invoke<void>("fable_inventory_start", { root: root ?? null }),
+  /** 检索枢纽混合检索(grep ∥ 向量 RRF) */
+  search: (query: string, topK = 24, mode: "hybrid" | "grep" | "vector" = "hybrid") =>
+    invoke<FableSearchResult>("fable_search", { query, topK, mode }),
+};
+
+export interface FableHit {
+  path: string;
+  abspath: string;
+  location: string;
+  snippet: string;
+  score: number;
+  lanes: string[];
+}
+export interface FableSearchResult {
+  query: string;
+  mode: string;
+  hits: FableHit[];
+  grepHits: number;
+  vectorHits: number;
+  reranked: boolean;
+  grepTruncated: boolean;
+  ms: number;
+}
+
+// ──────────────────────────────────────────────────────────────
 // Sandbox module → 已迁出至 features/sandbox/api.ts (架构重构 Phase 1)
 // 浏览器降级 stub 仍保留在本文件下方的 browserStub() 中。
 // ──────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@
 //! 千万级时在 `index::vector_topk` 内换 ANN/量化,签名不变。
 
 pub mod agent;
+pub mod files;
 pub mod index;
 pub mod inventory;
 pub mod retrieve;
@@ -99,9 +100,29 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             UNIQUE(file_id, seq)
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+        CREATE TABLE IF NOT EXISTS clusters(
+            id       INTEGER PRIMARY KEY,
+            root_id  INTEGER NOT NULL,
+            label    TEXT NOT NULL DEFAULT '',
+            color    TEXT NOT NULL DEFAULT '',
+            keywords TEXT NOT NULL DEFAULT '',
+            size     INTEGER NOT NULL DEFAULT 0,
+            built_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS gists(
+            key     TEXT PRIMARY KEY,
+            text    TEXT NOT NULL DEFAULT '',
+            made_at INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )
-    .map_err(|e| format!("fable.db 迁移失败: {e}"))
+    .map_err(|e| format!("fable.db 迁移失败: {e}"))?;
+    // 文件中心:文件归簇列(语义聚类写入)。ALTER 无 IF NOT EXISTS → 先探列是否已在。
+    if conn.prepare("SELECT cluster_id FROM files LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE files ADD COLUMN cluster_id INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|e| format!("fable.db 加 cluster_id 列失败: {e}"))?;
+    }
+    Ok(())
 }
 
 /// 启动时调用(桌面 setup / server main):只确保库可开、表就位,不做扫描。

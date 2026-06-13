@@ -492,6 +492,28 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             opt_str(a, "mode"),
         )?),
 
+        // ── 文件中心(可视化文件库)──
+        "file_overview" => ok(fable::files::file_overview(opt_str(a, "root"))?),
+        "file_grid" => ok(fable::files::file_grid(
+            opt_str(a, "root"),
+            a.get("clusterId").and_then(|v| v.as_i64()),
+            opt_str(a, "kind"),
+            opt_str(a, "sort"),
+            opt_str(a, "query"),
+            opt_usize(a, "page"),
+            opt_usize(a, "pageSize"),
+        )?),
+        "file_thumb" => ok(fable::files::file_thumb(
+            req_str(a, "abspath")?,
+            a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
+        )?),
+        "file_gist" => ok(fable::files::file_gist(req_str(a, "abspath")?)?),
+        "file_cluster_build" => ok(fable::files::file_cluster_build(opt_str(a, "root"))?),
+        "file_warm_thumbs" => ok(fable::files::file_warm_thumbs(
+            vec_str(a, "paths"),
+            a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
+        )?),
+
         // ── Conv ──
         "conv_list_projects" => ok(conv::conv_list_projects()),
         "conv_create_project" => ok(conv::conv_create_project(req_str(a, "name")?)?),
