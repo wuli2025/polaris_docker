@@ -513,6 +513,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             vec_str(a, "paths"),
             a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
         )?),
+        "file_cluster_llm" => ok(fable::files::file_cluster_llm(app, opt_str(a, "root"))?),
 
         // ── Conv ──
         "conv_list_projects" => ok(conv::conv_list_projects()),

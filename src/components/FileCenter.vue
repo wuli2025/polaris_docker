@@ -21,6 +21,8 @@ import {
   Wand2,
   Zap,
   KeyRound,
+  Brain,
+  FileText,
   LoaderCircle,
   ArrowDownWideNarrow,
 } from "@lucide/vue";
@@ -58,6 +60,11 @@ const clusterMsg = ref("");
 const building = ref(false);
 const buildMsg = ref("");
 let unlistenIndex: (() => void) | null = null;
+// 大模型语义归类(免 key)+ 桌面报告
+const llmClustering = ref(false);
+const llmMsg = ref("");
+const reportPath = ref("");
+let unlistenLlm: (() => void) | null = null;
 
 // 语义检索结果(独立于网格的一条结果带)
 interface SemHit {
@@ -311,6 +318,47 @@ async function buildIndex() {
   }
 }
 
+// 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告。
+async function doClusterLlm() {
+  if (llmClustering.value) return;
+  llmClustering.value = true;
+  reportPath.value = "";
+  llmMsg.value = "正在用大模型按语义归类(读文件清单 → 主题分组)…";
+  try {
+    if (!unlistenLlm) {
+      unlistenLlm = await listen<{
+        kind: string;
+        text?: string;
+        clusters?: number;
+        assigned?: number;
+        report?: string;
+        message?: string;
+      }>("file:cluster_llm", (p) => {
+        if (p.kind === "phase") {
+          llmMsg.value = p.text ?? "";
+        } else if (p.kind === "done") {
+          llmMsg.value = `AI 归类完成 · ${p.clusters ?? 0} 个主题簇 · ${p.assigned ?? 0} 个文件已归类 · 报告已存桌面`;
+          reportPath.value = p.report ?? "";
+          llmClustering.value = false;
+          loadOverview();
+          loadGrid(true);
+          view.value = "clusters";
+        } else if (p.kind === "error") {
+          llmMsg.value = `AI 归类失败:${p.message ?? ""}`;
+          llmClustering.value = false;
+        }
+      });
+    }
+    await fc.clusterLlm(null);
+  } catch (e: any) {
+    llmMsg.value = `AI 归类失败:${e?.message ?? e}`;
+    llmClustering.value = false;
+  }
+}
+function openReport() {
+  if (reportPath.value) openPath(reportPath.value);
+}
+
 // ───────────────────────── 语义检索 ─────────────────────────
 async function runSemantic() {
   const q = searchText.value.trim();
@@ -507,6 +555,7 @@ onBeforeUnmount(() => {
   moreObs?.disconnect();
   if (unlistenScan) unlistenScan();
   if (unlistenIndex) unlistenIndex();
+  if (unlistenLlm) unlistenLlm();
 });
 </script>
 
@@ -584,7 +633,26 @@ onBeforeUnmount(() => {
           <Wand2 v-else :size="14" :stroke-width="1.8" />
           <span>{{ clustering ? "归类中" : "智能归类" }}</span>
         </button>
+        <button
+          class="tool-btn ai"
+          :disabled="llmClustering || !overview?.totalFiles"
+          title="用已连接的大模型按语义归类(免嵌入 key)并在桌面生成 HTML 报告"
+          @click="doClusterLlm"
+        >
+          <LoaderCircle v-if="llmClustering" :size="14" class="spin" />
+          <Brain v-else :size="14" :stroke-width="1.8" />
+          <span>{{ llmClustering ? "AI 归类中" : "AI 归类" }}</span>
+        </button>
       </div>
+    </div>
+
+    <!-- AI 归类进度 / 报告 -->
+    <div v-if="llmMsg" class="fc-llm">
+      <Brain :size="14" :stroke-width="1.8" class="llm-ic" />
+      <span class="llm-text">{{ llmMsg }}</span>
+      <button v-if="reportPath" class="link-btn" @click="openReport">
+        <FileText :size="13" :stroke-width="1.8" /> 打开桌面报告
+      </button>
     </div>
 
     <!-- 语义就绪度:解释「智能归类」当前能力 + 一键升级到语义 -->
@@ -592,8 +660,8 @@ onBeforeUnmount(() => {
       <template v-if="!overview?.hasEmbedProvider">
         <Zap :size="14" :stroke-width="1.8" class="sem-ic warn" />
         <span class="sem-text">
-          语义增强未启用 —— 智能归类当前按<b>文件夹 / 名称</b>把相似文件归一起。
-          配置硅基流动 key(<b>免费</b>)并构建索引后,自动升级为<b>语义归类</b>与语义检索。
+          想按<b>内容语义</b>归类?最省事:直接点上面的 <b>「AI 归类」</b>——用已连接的大模型分组,<b>免 key</b>,还会在桌面出报告。
+          或配置硅基 key(<b>免费</b>)建向量索引,升级为语义检索 + 语义归类。「智能归类」当前按文件夹/名称归。
         </span>
         <button class="link-btn" @click="app.setView('sense_api')">
           <KeyRound :size="13" :stroke-width="1.8" /> 去配置 key
@@ -1036,7 +1104,46 @@ onBeforeUnmount(() => {
 .tool-btn.accent:hover:not(:disabled) {
   background: color-mix(in srgb, var(--gold) 12%, transparent);
 }
+.tool-btn.ai {
+  border-color: color-mix(in srgb, #8b6cff 50%, transparent);
+  color: #8b6cff;
+  background: color-mix(in srgb, #8b6cff 8%, transparent);
+}
+.tool-btn.ai:hover:not(:disabled) {
+  background: color-mix(in srgb, #8b6cff 16%, transparent);
+}
 .tool-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* AI 归类进度 / 报告条 */
+.fc-llm {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 14px;
+  margin: 0 2px;
+  border-radius: 12px;
+  background: color-mix(in srgb, #8b6cff 8%, var(--panel));
+  border: 1px solid color-mix(in srgb, #8b6cff 26%, transparent);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.llm-ic { color: #8b6cff; flex: none; }
+.llm-text { flex: 1; min-width: 0; }
+.fc-llm .link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, #8b6cff 50%, transparent);
+  background: color-mix(in srgb, #8b6cff 14%, transparent);
+  color: #8b6cff;
+  border-radius: 9px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: none;
+}
+.fc-llm .link-btn:hover { background: color-mix(in srgb, #8b6cff 22%, transparent); }
 
 .fc-note {
   font-size: 12px;

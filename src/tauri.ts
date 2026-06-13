@@ -541,6 +541,9 @@ export const files = {
   /** 重建语义聚类(复用已存向量,纯数学;同步返回汇总) */
   clusterBuild: (root?: string | null) =>
     invoke<ClusterBuildSummary>("file_cluster_build", { root: root ?? null }),
+  /** 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告;进度走 file:cluster_llm 事件 */
+  clusterLlm: (root?: string | null) =>
+    invoke<void>("file_cluster_llm", { root: root ?? null }),
   /** 批量预热缩略图缓存(进入网格时后台调,滚动更顺);返回成功数 */
   warmThumbs: (paths: string[], max = 360) =>
     invoke<number>("file_warm_thumbs", { paths, max }),
