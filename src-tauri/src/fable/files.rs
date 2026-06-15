@@ -10,7 +10,7 @@
 //! 铁律(与 fable 其余模块同构):AI 出决策、代码执行;单一事实源 fable.db;
 //! 全部命令同步、无 AppHandle 依赖 → 桌面 / Docker / CLI 三壳共用同一份。
 
-use super::{open_db, worker_count};
+use super::{open_db, worker_count, FlagGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -292,6 +292,33 @@ pub struct FileCard {
     pub mtime: i64,
     pub cluster_id: i64,
     pub thumbable: bool,
+    /// 来源徽标:下载 / 微信 / QQ / 企业微信 / ""(普通文件,不显示)。按根路径 + relpath 识别。
+    pub source: String,
+}
+
+/// 文件来源标签:按所属根路径末段 + 相对路径识别「下载 / 微信 / QQ…」。
+/// 纯路径判断、零 IO;空串 = 普通文件。与 inventory::app_data_roots 的预设根对应。
+fn source_tag(root_path: &str, relpath: &str) -> &'static str {
+    let last = root_path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let rel = relpath.replace('\\', "/").to_lowercase();
+    if last == "downloads" {
+        "下载"
+    } else if last.contains("wechat") {
+        // wechat files / xwechat_files / wechatfiles
+        "微信"
+    } else if last == "wxwork" {
+        "企业微信"
+    } else if last == "tencent files" || rel.contains("filerecv") {
+        "QQ"
+    } else {
+        ""
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +396,7 @@ pub fn grid(
             let root: String = r.get(1)?;
             let rel: String = r.get(2)?;
             let abspath = Path::new(&root).join(&rel).to_string_lossy().into_owned();
+            let source = source_tag(&root, &rel).to_string();
             let name: String = r.get(3)?;
             let kind: String = r.get(5)?;
             let size = r.get::<_, i64>(6)? as u64;
@@ -391,6 +419,7 @@ pub fn grid(
                 mtime: r.get(7)?,
                 cluster_id: r.get(8)?,
                 thumbable,
+                source,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1780,12 +1809,12 @@ pub fn file_warm_thumbs(paths: Vec<String>, max: Option<u32>) -> Result<usize, S
 /// 后台线程跑,进度走 `file:cluster_llm` 事件(phase/tick/done/error)。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn file_cluster_llm(app: AppHandle, root: Option<String>) -> Result<(), String> {
-    if LLM_CLUSTERING.swap(true, Ordering::SeqCst) {
+    let Some(guard) = FlagGuard::acquire(&LLM_CLUSTERING) else {
         return Err("AI 归类正在进行中".into());
-    }
+    };
     std::thread::spawn(move || {
+        let _guard = guard; // panic 栈展开也释放闸,防永久锁死
         let res = cluster_llm_run(&app, root);
-        LLM_CLUSTERING.store(false, Ordering::SeqCst);
         match res {
             Ok((clusters, assigned, report)) => emit_llm(
                 &app,
@@ -1801,12 +1830,12 @@ pub fn file_cluster_llm(app: AppHandle, root: Option<String>) -> Result<(), Stri
 /// 后台线程跑,进度走 `file:title_llm` 事件(phase/tick/done/error)。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn file_titles_llm(app: AppHandle, root: Option<String>) -> Result<(), String> {
-    if LLM_TITLING.swap(true, Ordering::SeqCst) {
+    let Some(guard) = FlagGuard::acquire(&LLM_TITLING) else {
         return Err("AI 命名正在进行中".into());
-    }
+    };
     std::thread::spawn(move || {
+        let _guard = guard; // panic 栈展开也释放闸,防永久锁死
         let res = titles_llm_run(&app, root);
-        LLM_TITLING.store(false, Ordering::SeqCst);
         match res {
             Ok(n) => emit_title(&app, json!({ "kind": "done", "count": n })),
             Err(e) => emit_title(&app, json!({ "kind": "error", "message": e })),
@@ -1893,6 +1922,19 @@ mod tests {
     fn human_size_scales() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn source_tag_recognizes_download_dirs() {
+        assert_eq!(source_tag(r"C:\Users\me\Downloads", "a.pdf"), "下载");
+        assert_eq!(source_tag(r"C:\Users\me\Documents\WeChat Files", "x/y.jpg"), "微信");
+        assert_eq!(source_tag(r"C:\Users\me\Documents\xwechat_files", "f.docx"), "微信");
+        assert_eq!(source_tag(r"C:\Users\me\Documents\WXWork", "f.zip"), "企业微信");
+        // Tencent Files:按根末段,或 relpath 里的 FileRecv 命中
+        assert_eq!(source_tag(r"C:\Users\me\Documents\Tencent Files", "123/FileRecv/a.7z"), "QQ");
+        assert_eq!(source_tag("/data/nas/share", "2024/FileRecv/b.rar"), "QQ");
+        // 普通目录 → 空(不显示徽标)
+        assert_eq!(source_tag(r"D:\datasets", "housing/a.csv"), "");
     }
 
     #[test]

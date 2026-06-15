@@ -14,25 +14,22 @@ pub mod forge_pptx;
 pub mod forge_pptx_native; // 路线 B:spec JSON → 原生可编辑 .pptx(零浏览器,Docker slim 可用)
 pub mod forge_tts;
 pub mod forge_video;
+pub mod fable;
 pub mod infer;
 pub mod kb;
 pub mod persona;
-// 寓言计划三件套:回声层(对话沉淀) / 检索枢纽(盘点+混检) / 感官坞(API 管理)
 pub mod echo;
-pub mod fable;
 pub mod project;
 pub mod provider;
-// 全盘资源归集(扫描 → 多维表格 → 归入核心层);跨平台,server 亦编译。
 pub mod scan;
 pub mod sense;
 pub mod skills;
-// 语音输入「极速说」防污染秒达档(纯 pinyin,零系统依赖;server 亦编译)。
 pub mod voice;
 // 语音识别运行时(本地 SenseVoice via sherpa-rs);默认不编译,保护现有 build。
 #[cfg(feature = "voice-asr")]
 pub mod voice_asr;
 // 实时语音输入(录音+全局热键+注入);桌面专属,默认不编译。
-#[cfg(all(feature = "voice-asr", feature = "desktop"))]
+#[cfg(feature = "voice-live")]
 pub mod voice_live;
 pub mod wecom;
 // 自动更新依赖 Tauri updater/restart/package_info → 桌面专属（Docker 用 docker pull 更新）。
@@ -97,6 +94,12 @@ pub fn run() {
             skills::seed_deck_studio_skill();
             // 确保「网站生成」技能落盘（支撑「网站生成」入口）。
             skills::seed_web_studio_skill();
+            // 确保「极速下载」技能落盘（含 fast_download.py：跨平台 aria2c 多连接下载器，
+            // spawn 的 claude agent 才能在磁盘上直接 `uv run …/fast_download.py` 跑它）。best-effort。
+            skills::seed_turbo_download_skill();
+            // 确保「浏览器智能体 browser-use」技能落盘（含 browser_use_runner.py：browser-use
+            // 经 CDP 驱动 CloakBrowser，spawn 的 claude agent 才能直接 `uv run …` 跑它）。best-effort。
+            skills::seed_browser_use_skill();
             // 确保「壹伴排版优化」技能落盘（含 wechat_yiban.py：壹伴样式引擎 + CloakBrowser 驱动，
             // spawn 的 claude agent 才能在磁盘上直接 python 跑它）。best-effort，不阻断启动。
             skills::seed_wechat_typesetter_skill();
@@ -110,6 +113,13 @@ pub fn run() {
             let _ = updater::init(h);
             // 飞书网关「开机自动启动」：若用户开了 auto_start 且凭证齐全，后台自动拉起（不阻塞启动）。
             feishu::auto_start_if_enabled(h);
+            // 寓言计划:感官 API 坞(注册表合并 + 落盘)与回声层「每日做梦」调度。
+            sense::init();
+            // 语音输入「极速说」:配置 + 个人词表(首启种子)就位,供防污染秒达档使用。
+            voice::init();
+            echo::start_scheduler(h.clone());
+            // 寓言计划:检索枢纽(fable.db 表结构就位;盘点/索引由用户在设置页触发)。
+            fable::init();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -135,6 +145,9 @@ pub fn run() {
             kb::kb_pack_list,
             kb::kb_pack_install,
             kb::kb_pack_remove,
+            // 全盘资源归集（扫描 C/D 盘 → 多维表格 → 归档资源库 / 摄入核心层）
+            scan::scan_roots,
+            scan::scan_resources,
             // Sandbox (板块⑤ 已抽离为 polaris-sandbox crate, 命令名不变)
             polaris_sandbox::commands::sandbox_status,
             polaris_sandbox::commands::sandbox_build_image,
@@ -214,6 +227,9 @@ pub fn run() {
             provider::codex_status,
             provider::codex_start_login,
             provider::codex_poll_login,
+            provider::claude_oauth_status,
+            provider::claude_start_login,
+            provider::claude_finish_login,
             codex_proxy::codex_proxy_info,
             // Forge 跨平台渲染能力 preflight（能出 PPT/视频吗、缺啥降级，三平台各报各的阶梯）
             forge::forge_preflight,
@@ -221,6 +237,8 @@ pub fn run() {
             forge::forge_build_pptx,
             forge::forge_screenshot,
             forge::forge_deck_to_pptx,
+            // 路线 B：spec JSON → 原生可编辑 .pptx（传统PPT模式，零浏览器）
+            forge::forge_spec_to_pptx,
             forge::forge_deck_to_video,
             forge::forge_deck_fx_video,
             forge::forge_tts,
@@ -230,6 +248,9 @@ pub fn run() {
             doctor::env_install_claude,
             doctor::env_install_node,
             doctor::env_install_pwsh,
+            doctor::env_install_uv,
+            doctor::env_uv_cache_info,
+            doctor::env_uv_cache_clean,
             doctor::env_claude_update_check,
             doctor::env_update_claude,
             doctor::env_cancel,
@@ -239,6 +260,59 @@ pub fn run() {
             updater::updater_apply,
             // 原生标题栏染色（主题切换联动）
             titlebar::set_titlebar_color,
+            // 寓言计划 · 感官 API 坞(设置页:服务商配置/探活/本地感官包下载)
+            sense::sense_list,
+            sense::sense_set,
+            sense::sense_switches_set,
+            sense::sense_test,
+            sense::sense_pack_install,
+            sense::sense_pack_remove,
+            // 语音输入「极速说」:配置 / 个人词表 / 防污染(秒达档)/ 词表自学
+            voice::voice_config_get,
+            voice::voice_config_set,
+            voice::voice_lexicon_get,
+            voice::voice_hotword_add,
+            voice::voice_hotword_remove,
+            voice::voice_correction_add,
+            voice::voice_correction_remove,
+            voice::voice_anti_pollute,
+            voice::voice_learn_correction,
+            voice::voice_lexicon_learn,
+            voice::voice_transcribe_file,
+            voice::voice_listen_start,
+            voice::voice_listen_stop,
+            voice::voice_dictate_start,
+            voice::voice_dictate_stop,
+            // 寓言计划 · 回声层(对话归档 + 每日做梦蒸馏)
+            conv::conv_archive_conversation,
+            echo::echo_status,
+            echo::echo_set,
+            echo::echo_dream_now,
+            echo::echo_distill_conversation,
+            // 寓言计划 · 检索枢纽(盘点 L1a + 向量索引 + 塌平混检)
+            fable::fable_status,
+            fable::fable_cancel,
+            fable::inventory::fable_inventory_start,
+            fable::inventory::fable_scan_folders,
+            fable::inventory::fable_scan_folder_children,
+            fable::inventory::fable_folder_size,
+            fable::index::fable_index_start,
+            fable::index::fable_index_optimize,
+            fable::retrieve::fable_search,
+            fable::eval::fable_eval,
+            fable::eval::fable_eval_template,
+            // 文件中心(知识库内的可视化文件库:类型/语义聚类/缩略图/速览)
+            fable::files::file_overview,
+            fable::files::file_grid,
+            fable::files::file_thumb,
+            fable::files::file_gist,
+            fable::files::file_cluster_build,
+            fable::files::file_warm_thumbs,
+            fable::files::file_cluster_llm,
+            fable::files::file_titles_llm,
+            fable::files::file_titles_clear,
+            fable::files::file_cluster_model_get,
+            fable::files::file_cluster_model_set,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Polaris application")

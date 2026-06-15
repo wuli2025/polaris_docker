@@ -6,7 +6,7 @@
 //! - 「seen 代际」机制:全量重扫后自动清掉已消失文件(及其 chunks),幂等可重入;
 //! - mtime/size 没变的文件保留 chunked 标记 → 重扫不会废掉已建好的向量索引。
 
-use super::{cancelled, open_db, worker_count, CANCEL, SCANNING};
+use super::{cancelled, open_db, worker_count, FlagGuard, CANCEL, SCANNING};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -90,6 +90,26 @@ fn skip_dir_scan(name: &str) -> bool {
     }
     let low = name.to_ascii_lowercase();
     SCAN_EXTRA_SKIP.iter().any(|s| *s == low)
+}
+
+/// 盘 `parent` 时是否真能扫到 `child`:child 在 parent 之内,且从 parent 到 child 的
+/// 每一段目录名都不会被 [`skip_dir_scan`] 剪掉(否则 walker 会在中途剪枝、到不了 child)。
+/// 嵌套根去重用它:被剪枝挡住的子根不算「已覆盖」,须独立保留(典型=appdata 内的下载目录)。
+fn covered_by(parent: &str, child: &str) -> bool {
+    if child == parent {
+        return true;
+    }
+    let pn = parent.trim_end_matches(['/', '\\']);
+    let rest = match child
+        .strip_prefix(&format!("{pn}/"))
+        .or_else(|| child.strip_prefix(&format!("{pn}\\")))
+    {
+        Some(s) => s,
+        None => return false,
+    };
+    !rest
+        .split(['/', '\\'])
+        .any(|seg| !seg.is_empty() && skip_dir_scan(seg))
 }
 
 // ───────────────────────── 扫描核心(三壳共用)─────────────────────────
@@ -380,9 +400,50 @@ fn inventory_roots(explicit: Option<String>) -> Vec<String> {
     if !kb.trim().is_empty() {
         roots.push(kb);
     }
+    // App 数据下载/接收目录(微信/QQ/浏览器…),默认纳入盘点 —— 用户最关心的「收到的文件」
+    // 大多在这里,且常埋在 Documents 深处或 appdata(整盘扫会被剪掉),故单列为默认根。
+    for r in app_data_roots() {
+        roots.push(r.path);
+    }
     roots.sort();
     roots.dedup();
     roots
+}
+
+/// 「App 数据」下载 / 接收目录预设(浏览器下载、微信、QQ/TIM、企业微信…)。
+/// 这些目录里全是用户真实下载 / 收到的文件,但常埋在 `Documents` 深处、甚至 `AppData`
+/// (被 [`skip_dir_scan`] 整棵剪掉)里 → 整盘盘点极易漏。故把它们提成**默认勾选的独立根**:
+/// 既「一键收下载」,又因为是**显式根**(walker 从这里起步、永不途经名为 appdata 的目录),
+/// 天然绕过 appdata 黑名单 —— 这正是「对 appdata 只放行这几个已知子路径」的白名单例外。
+/// 只返回真实存在的目录;同一类(版本/路径不同)给多个候选,命中即收、按路径去重。
+fn app_data_roots() -> Vec<ScanRootInfo> {
+    let mut out: Vec<ScanRootInfo> = Vec::new();
+    let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) else {
+        return out;
+    };
+    // (相对 home 的子路径段, 显示名)。
+    let candidates: &[(&[&str], &str)] = &[
+        (&["Downloads"], "下载"),
+        (&["Documents", "WeChat Files"], "微信文件"), // 微信 3.x
+        (&["Documents", "xwechat_files"], "微信文件"), // 微信 4.x
+        (&["Documents", "WeChatFiles"], "微信文件"),
+        (&["Documents", "Tencent Files"], "QQ/TIM 文件"), // 含各账号的 FileRecv
+        (&["Documents", "WXWork"], "企业微信文件"),
+    ];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (segs, label) in candidates {
+        let mut p = home.clone();
+        for s in *segs {
+            p = p.join(s);
+        }
+        if p.is_dir() {
+            let path = p.to_string_lossy().to_string();
+            if seen.insert(path.clone()) {
+                out.push(ScanRootInfo { path, label: (*label).to_string(), default_on: true });
+            }
+        }
+    }
+    out
 }
 
 /// 开始盘点。立即返回,进度走 `fable:inventory` 事件。
@@ -412,14 +473,14 @@ pub fn fable_inventory_start(
     .collect();
     roots.sort();
     roots.dedup();
-    // 去掉「嵌套根」:若 B 在 A 之内,盘 A 已覆盖 B,留 A 去 B(否则同一文件挂两个 root 重复)。
-    // 排序后父目录必排在子目录前,顺序扫描即可。
+    // 去掉「嵌套根」:若 B 在 A 之内**且 A 扫得到 B**,盘 A 已覆盖 B,留 A 去 B(免重复)。
+    // 排序后父目录必排在子目录前,顺序扫描即可。注意「扫得到」要排除中途被剪枝的情况:
+    // 例如 B = …/AppData/…/Downloads 在 A = C:\ 之内,但扫 C:\ 时 `appdata` 整棵被
+    // [`skip_dir_scan`] 剪掉、根本到不了 B → 此时必须保留 B(否则下载目录又被吞没)。
     {
         let mut kept: Vec<String> = Vec::new();
         for r in roots.into_iter() {
-            let inside = kept.iter().any(|k| {
-                r == *k || r.starts_with(&format!("{k}/")) || r.starts_with(&format!("{k}\\"))
-            });
+            let inside = kept.iter().any(|k| covered_by(k, &r));
             if !inside {
                 kept.push(r);
             }
@@ -435,11 +496,13 @@ pub fn fable_inventory_start(
         .map(|p| p.trim_end_matches(['/', '\\']).to_string())
         .filter(|p| !p.is_empty())
         .collect();
-    if SCANNING.swap(true, Ordering::SeqCst) {
+    let Some(scan_guard) = FlagGuard::acquire(&SCANNING) else {
         return Err("盘点已在进行中".into());
-    }
+    };
     CANCEL.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
+        // 守卫 move 进线程:正常结束或 panic 栈展开都会释放 SCANNING 闸(防永久锁死)。
+        let _scan_guard = scan_guard;
         // 多根串行盘点;进度按「已盘过的根」累加,前端看到的是全量计数。
         let mut acc_files = 0u64;
         let mut acc_bytes = 0u64;
@@ -470,7 +533,6 @@ pub fn fable_inventory_start(
                 Err(e) => last_err = Some(e),
             }
         }
-        SCANNING.store(false, Ordering::SeqCst);
         if cancelled() {
             emit(&app, json!({ "kind": "error", "message": "已取消" }));
         } else if acc_files == 0 {
@@ -556,13 +618,18 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
     let mut out: Vec<ScanRootInfo> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let kb = crate::kb::kb_root();
-    // 默认勾:知识库根 + NAS 挂载点(沿用盘点默认根集合)。
+    // App 数据根的友好名(下载/微信/QQ…),给下方贴标签用(inventory_roots 已含这些路径)。
+    let app_labels: std::collections::HashMap<String, String> =
+        app_data_roots().into_iter().map(|r| (r.path, r.label)).collect();
+    // 默认勾:知识库根 + NAS 挂载点 + App 数据下载目录(沿用盘点默认根集合)。
     for r in inventory_roots(None) {
         if !Path::new(&r).is_dir() || !seen.insert(r.clone()) {
             continue;
         }
         let label = if r == kb {
             "知识库".to_string()
+        } else if let Some(l) = app_labels.get(&r) {
+            l.clone()
         } else {
             Path::new(&r)
                 .file_name()
@@ -720,4 +787,37 @@ pub fn fable_folder_size(path: String) -> Result<FolderSize, String> {
     let mut bytes = 0u64;
     folder_size_rec(p, &mut files, &mut bytes);
     Ok(FolderSize { files, bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_dir_scan_prunes_system_and_appdata() {
+        for n in ["Windows", "Program Files", "AppData", "node_modules", "$Recycle.Bin", "@eaDir"] {
+            assert!(skip_dir_scan(n), "{n} 应被剪掉");
+        }
+        for n in ["Downloads", "Documents", "WeChat Files", "datasets"] {
+            assert!(!skip_dir_scan(n), "{n} 不应被剪掉");
+        }
+    }
+
+    #[test]
+    fn covered_by_respects_pruned_path() {
+        // 普通嵌套:扫父能到子 → 视为已覆盖,子根可去重。
+        assert!(covered_by(r"C:\data", r"C:\data\sub\deep"));
+        assert!(covered_by("/mnt/a", "/mnt/a/b/c"));
+        // 相同路径。
+        assert!(covered_by(r"C:\data", r"C:\data"));
+        // 不在父之内。
+        assert!(!covered_by(r"C:\data", r"D:\data\x"));
+        // 关键:子根埋在 appdata 内,扫父会在 appdata 处剪枝、到不了 → 不算覆盖,须保留。
+        assert!(!covered_by(
+            r"C:\Users\me",
+            r"C:\Users\me\AppData\Roaming\app\Downloads"
+        ));
+        // 前缀像但非真子目录(data2 不是 data 的子目录)→ 不覆盖。
+        assert!(!covered_by(r"C:\data", r"C:\data2\x"));
+    }
 }

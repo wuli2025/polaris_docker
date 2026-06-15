@@ -45,6 +45,29 @@ pub(crate) fn cancelled() -> bool {
     CANCEL.load(Ordering::Relaxed)
 }
 
+/// 任务闸 RAII 守卫:`acquire` 成功后,持有它即代表「已上闸」;drop 时(含工作线程 panic
+/// 的栈展开)自动复位闸位 —— 根治「工作线程 panic → 手动 `store(false)` 被跳过 →
+/// 闸永久停在 true、不重启进程就再也无法盘点/索引」这一类死锁。
+/// 用法:`acquire` 后把守卫 move 进工作线程,线程无论正常结束还是 panic 都会释放闸。
+pub(crate) struct FlagGuard(&'static AtomicBool);
+
+impl FlagGuard {
+    /// 尝试上闸:已被占用返回 `None`;成功返回守卫(离开作用域即释放)。
+    pub(crate) fn acquire(flag: &'static AtomicBool) -> Option<Self> {
+        if flag.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(FlagGuard(flag))
+        }
+    }
+}
+
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 // ───────────────────────── SQLite 地基 ─────────────────────────
 
 pub fn db_path() -> Option<PathBuf> {
@@ -62,6 +85,15 @@ pub(crate) fn open_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.pragma_update(None, "synchronous", "NORMAL").ok();
     conn.busy_timeout(std::time::Duration::from_secs(20)).ok();
+    // ── 20TB 级调优 ──
+    // 大库下(向量 BLOB 可达上百 GB)让 SQLite 内存映射读 + 加大页缓存,显著加速向量车道
+    // 对 bits/vec 列的顺序扫描;临时表放内存;WAL 自动检查点抬高,减少长事务被频繁打断。
+    // cache 取每连接 64 MiB(worker 多连接累加仍可控,弱 NAS 不致 OOM);mmap 取 2 GiB
+    // (虚拟映射,实际占用由 OS 页缓存按需管理,过大会被编译期上限静默 clamp)。
+    conn.pragma_update(None, "temp_store", "MEMORY").ok();
+    conn.pragma_update(None, "mmap_size", 2_147_483_648i64).ok(); // 2 GiB
+    conn.pragma_update(None, "cache_size", -65_536i64).ok(); // 64 MiB(负值=KiB)
+    conn.pragma_update(None, "wal_autocheckpoint", 20_000i64).ok();
     migrate(&conn)?;
     Ok(conn)
 }
@@ -158,6 +190,35 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("ALTER TABLE files ADD COLUMN ftsed INTEGER NOT NULL DEFAULT 0", [])
             .map_err(|e| format!("fable.db 加 files.ftsed 列失败: {e}"))?;
     }
+    // ── 20TB 整改 · 向量 IVF 倒排单元(ANN)──
+    // chunks.cell:该向量被分配到的倒排单元(二值质心)id;-1=未分配(新入库、尚未优化)。
+    // 向量车道查询只扫「最近 nprobe 个 cell + cell=-1 的新数据」,把每查询全表 O(N) 扫降到
+    // ~O(N·nprobe/cells)。cell=-1 的全扫回退保证刚入库还没优化的数据不漏召回。
+    if conn.prepare("SELECT cell FROM chunks LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE chunks ADD COLUMN cell INTEGER NOT NULL DEFAULT -1", [])
+            .map_err(|e| format!("fable.db 加 chunks.cell 列失败: {e}"))?;
+    }
+    // 20TB 热点查询复合索引 + IVF 质心表(均在所需列 ALTER 之后建,故放此处)。
+    conn.execute_batch(
+        r#"
+        -- 嵌入待办/计数:WHERE kind='text' AND chunked=0 AND size<=? 直接走索引,免 files 大表全扫。
+        CREATE INDEX IF NOT EXISTS idx_files_embed_pending ON files(kind, chunked, size);
+        -- 倒排待办/计数:WHERE kind='text' AND ftsed=0 AND size<=? 同理。
+        CREATE INDEX IF NOT EXISTS idx_files_lex_pending   ON files(kind, ftsed, size);
+        -- 向量车道按 (model, cell) 取候选:IVF 探针命中的 cell 直接走索引。
+        CREATE INDEX IF NOT EXISTS idx_chunks_cell         ON chunks(model, cell);
+        -- IVF 二值质心:每模型 K 个 cell,bits=按位多数表决得到的二值码,分配/找最近 cell 都用汉明。
+        CREATE TABLE IF NOT EXISTS vec_cells(
+            id    INTEGER PRIMARY KEY,
+            model TEXT NOT NULL,
+            dim   INTEGER NOT NULL,
+            bits  BLOB NOT NULL,
+            n     INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_vec_cells_model ON vec_cells(model, dim);
+        "#,
+    )
+    .map_err(|e| format!("fable.db 20TB 索引/IVF 迁移失败: {e}"))?;
     // ── 20TB 整改 · P1-2 全文倒排表(FTS5 trigram)──
     // lex(rowid=file_id, body=正文):提前建好的倒排索引,查词秒回、覆盖全部文本文件,
     // 取代 grep 车道「查询时临时打开几万个文件当场读」的硬上限漏检。trigram 分词支持
@@ -264,6 +325,10 @@ pub struct FableStatus {
     pub pending_lex: u64,
     /// 与当前嵌入模型不一致、需重建的陈旧向量数(P2-2;model='' 的旧向量也计入)
     pub stale_chunks: u64,
+    /// 已建的向量 IVF 倒排单元数(0=未优化,向量车道走全表扫;>0=已 ANN 加速)
+    pub ivf_cells: u64,
+    /// 已建 cell 后仍未分配(cell=-1)的向量数:新入库增量,巡夜再跑「优化」即可纳入 ANN
+    pub ivf_unassigned: u64,
     pub scanning: bool,
     pub indexing: bool,
     /// 当前生效的嵌入服务商(无则向量车道不可用,grep 车道照常)
@@ -304,6 +369,28 @@ pub fn status() -> Result<FableStatus, String> {
             .unwrap_or(0) as u64,
         None => 0,
     };
+    // IVF 优化状态:已建 cell 数;以及已建 cell 后新入库、尚未分配进 ANN 的向量数。
+    let (ivf_cells, ivf_unassigned) = match &active_model {
+        Some(m) => {
+            let cells = conn
+                .query_row("SELECT COUNT(*) FROM vec_cells WHERE model=?1", [m], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap_or(0) as u64;
+            let un = if cells > 0 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE model=?1 AND bits IS NOT NULL AND cell=-1",
+                    [m],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0) as u64
+            } else {
+                0
+            };
+            (cells, un)
+        }
+        None => (0, 0),
+    };
     Ok(FableStatus {
         db_path: db_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         roots,
@@ -319,6 +406,8 @@ pub fn status() -> Result<FableStatus, String> {
             "SELECT COUNT(*) FROM files WHERE kind='text' AND ftsed=0 AND size<=4000000",
         ),
         stale_chunks,
+        ivf_cells,
+        ivf_unassigned,
         scanning: SCANNING.load(Ordering::Relaxed),
         indexing: INDEXING.load(Ordering::Relaxed),
         embed_provider: crate::sense::active_provider("embed").map(|p| p.name),
@@ -341,7 +430,40 @@ pub fn fable_cancel() {
 
 #[cfg(test)]
 mod tests {
+    use super::FlagGuard;
     use rusqlite::Connection;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 守卫正常生命周期:上闸 → 重复上闸被拒 → drop 释放 → 可再次上闸。
+    #[test]
+    fn flag_guard_acquire_block_and_release() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        {
+            let g = FlagGuard::acquire(&FLAG);
+            assert!(g.is_some(), "首次上闸应成功");
+            assert!(FLAG.load(Ordering::SeqCst), "持有守卫期间闸应为 true");
+            assert!(FlagGuard::acquire(&FLAG).is_none(), "已占用时重复上闸应被拒");
+        }
+        assert!(!FLAG.load(Ordering::SeqCst), "守卫 drop 后闸应释放");
+        assert!(FlagGuard::acquire(&FLAG).is_some(), "释放后应能再次上闸");
+    }
+
+    /// 本次修复的核心:工作线程 panic 时,栈展开也会 drop 守卫 → 闸必被释放,
+    /// 不会停在 true 把功能永久锁死(回归此前「panic → store(false) 被跳过」的死锁)。
+    #[test]
+    fn flag_guard_releases_on_panic() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 静音预期内的 panic 输出
+        let r = std::panic::catch_unwind(|| {
+            let _g = FlagGuard::acquire(&FLAG).expect("上闸成功");
+            assert!(FLAG.load(Ordering::SeqCst));
+            panic!("模拟工作线程 panic");
+        });
+        std::panic::set_hook(prev);
+        assert!(r.is_err(), "应捕获到 panic");
+        assert!(!FLAG.load(Ordering::SeqCst), "panic 栈展开后闸必须已释放");
+    }
 
     /// 实测 bundled SQLite 编入了 FTS5 + trigram 分词器,且 trigram 的子串 MATCH 对
     /// 中文/代码都能命中(P1-2 全文倒排的硬前提;否则 lex 建表失败 → 静默退回实时扫描)。

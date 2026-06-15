@@ -179,32 +179,79 @@
     render();
     window.__deck = { total: total, current: function () { return idx; }, go: go, next: next, prev: prev };
 
-    // ---- 隐形文本层提取(?extract=1):算活动页文本块的包围盒,写进 <script id=polaris-text-rects>。
-    //      forge 用 chromium --dump-dom 取走 → build_pptx 叠 alpha=0 文本框 = 图片精确还可搜索。
+    // ════ 可编辑 PPT 分层导出(路线 A)═══════════════════════════════
+    // ?extract=1 → 抽活动页文本块包围盒+样式,写进 <script id=polaris-text-rects>(dump-dom 取走)。
+    // ?notext=1  → 把同一批文本块 visibility:hidden,截出「无字背景图」。
+    // 两个模式必须共用同一套选择逻辑:背景里隐藏的 = 文本框里重建的,一一对应才不重影/不丢字。
+    var TEXT_SEL = "h1,h2,h3,h4,h5,h6,p,li,blockquote,dt,dd,td,th,figcaption,.kicker,.eyebrow,.pill,.label,.title,.subtitle,.lede,.caption";
+    function isArtText(cs) {
+      // 渐变字/镂空字/阴影字:PPT 文本框只能近似 → 保真优先,留在背景图里(不抽取也不隐藏)。
+      if (cs.webkitBackgroundClip === "text" || cs.backgroundClip === "text") return true;
+      if (cs.webkitTextFillColor === "transparent" || cs.webkitTextFillColor === "rgba(0, 0, 0, 0)") return true;
+      if (cs.textShadow && cs.textShadow !== "none") return true;
+      return false;
+    }
+    function collectTextNodes(root) {
+      var nodes = Array.prototype.slice.call(root.querySelectorAll(TEXT_SEL));
+      var out = [];
+      nodes.forEach(function (el) {
+        var t = (el.textContent || "").trim();
+        if (!t) return;
+        if (el.querySelector(TEXT_SEL)) return; // 取叶子文本块,避免嵌套重复
+        var cs = window.getComputedStyle(el);
+        if (isArtText(cs)) return;
+        out.push({ el: el, cs: cs, text: t });
+      });
+      return out;
+    }
+    function cssColorToHex(c) {
+      var m = /rgba?\((\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+))?\)/.exec(c || "");
+      if (!m) return null;
+      if (m[4] !== undefined && parseFloat(m[4]) === 0) return null; // 全透明字不值得建框
+      function hx(n) { return ("0" + (+n).toString(16)).slice(-2); }
+      return (hx(m[1]) + hx(m[2]) + hx(m[3])).toUpperCase();
+    }
+
+    // ---- ?notext=1:同步隐藏(DOMContentLoaded 即生效,先于首帧渲染,screenshot 无竞态)----
+    if (/[?&]notext=1/.test(location.search)) {
+      slides.forEach(function (s) {
+        collectTextNodes(s).forEach(function (n) { n.el.style.visibility = "hidden"; });
+      });
+    }
+
+    // ---- ?extract=1:文本块包围盒+样式 → JSON(等字体/布局稳定后抽取)----
     if (/[?&]extract=1/.test(location.search)) {
-      var TEXT_SEL = "h1,h2,h3,h4,h5,h6,p,li,blockquote,td,th,figcaption,.kicker,.eyebrow,.pill,.label,.title,.subtitle";
       var extractRects = function () {
         var active = slides[idx];
         if (!active) return;
-        var nodes = Array.prototype.slice.call(active.querySelectorAll(TEXT_SEL));
         var out = [];
-        nodes.forEach(function (el) {
-          var t = (el.textContent || "").trim();
-          if (!t) return;
-          if (el.querySelector(TEXT_SEL)) return; // 取叶子文本块,避免嵌套重复
-          var r = el.getBoundingClientRect();
+        collectTextNodes(active).forEach(function (n) {
+          var r = n.el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0) return;
-          var cs = window.getComputedStyle(el);
+          var cs = n.cs;
+          var text = n.text;
+          // li 的项目符号是 ::marker 伪元素,textContent 不含 → 手动补回,否则可编辑版丢符号。
+          if (n.el.tagName === "LI" && cs.listStyleType !== "none") text = "• " + text;
+          var align = cs.textAlign === "center" ? "ctr"
+            : cs.textAlign === "right" || cs.textAlign === "end" ? "r"
+            : cs.textAlign === "justify" ? "just" : "l";
           out.push({
-            text: t.slice(0, 2000),
+            text: text.slice(0, 2000),
             x: Math.round(r.left), y: Math.round(r.top),
             w: Math.round(r.width), h: Math.round(r.height),
             size: Math.round(parseFloat(cs.fontSize) || 16),
-            bold: (parseInt(cs.fontWeight, 10) || 400) >= 600
+            bold: (parseInt(cs.fontWeight, 10) || 400) >= 600,
+            italic: cs.fontStyle === "italic",
+            color: cssColorToHex(cs.color) || "000000",
+            align: align,
+            serif: /serif/i.test(cs.fontFamily) && !/sans-serif/i.test(cs.fontFamily),
+            lh: Math.round(parseFloat(cs.lineHeight) || 0)
           });
         });
         var s = document.getElementById("polaris-text-rects");
         if (!s) { s = document.createElement("script"); s.type = "application/json"; s.id = "polaris-text-rects"; document.body.appendChild(s); }
+        // 能力标记:Rust 看到它才敢用「无字背景+可见文本框」;旧 deck 没有 → 自动降级隐形层。
+        s.setAttribute("data-notext-capable", "1");
         s.textContent = JSON.stringify(out);
       };
       // 等字体/图片布局稳定后抽取。

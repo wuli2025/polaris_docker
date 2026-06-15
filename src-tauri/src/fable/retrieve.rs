@@ -252,16 +252,61 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
 
     let conn = open_db()?;
 
+    // ── IVF 探针(20TB ANN):若该模型已建倒排单元,先在质心里找最近的 nprobe 个 cell,
+    //    第一段只在这些 cell(+cell=-1 的未分配新数据)里粗筛,把全表 O(N) 扫降到
+    //    ~O(N·nprobe/cells);未建 cell 时 probes 为空 → 退回全表扫(零回归)。 ──
+    let probes: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id, bits FROM vec_cells WHERE model=?1 AND dim=?2")
+            .map_err(|e| e.to_string())?;
+        let cells: Vec<(i64, Vec<u8>)> = stmt
+            .query_map(rusqlite::params![model, qv.len() as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        if cells.is_empty() {
+            Vec::new()
+        } else {
+            // nprobe ≈ √cells,夹在 [8,64]:扫约 nprobe/cells 比例的向量(K=5500 时约 1%)。
+            let nprobe = ((cells.len() as f64).sqrt() as usize).clamp(8, 64);
+            let mut scored: Vec<(u32, i64)> = cells
+                .iter()
+                .filter(|(_, b)| b.len() == qbits.len())
+                .map(|(id, b)| (super::index::hamming(&qbits, b), *id))
+                .collect();
+            scored.sort_by_key(|x| x.0);
+            scored.truncate(nprobe);
+            scored.into_iter().map(|x| x.1).collect()
+        }
+    };
+
     // ── 第一段 · 二值粗筛(P1-1):只读 bits 算汉明距离(读量约 f32 的 1/32),
     //    有界 top 表选出候选;P2-2 只认与当前模型一致、维度匹配的向量。 ──
     let cand_n = (top_k * 8).max(200);
     let mut cand: Vec<(i64, u32)> = Vec::with_capacity(cand_n + 1); // (chunk id, hamming)
     {
-        let mut stmt = conn
-            .prepare("SELECT id, bits FROM chunks WHERE dim=?1 AND model=?2 AND bits IS NOT NULL")
-            .map_err(|e| e.to_string())?;
+        // probes 非空时只扫探针 cell + 未分配新数据;为空时扫全表(回退)。
+        let stage1_sql = if probes.is_empty() {
+            "SELECT id, bits FROM chunks WHERE dim=?1 AND model=?2 AND bits IS NOT NULL".to_string()
+        } else {
+            let csv = probes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            format!(
+                "SELECT id, bits FROM chunks WHERE dim=?1 AND model=?2 AND bits IS NOT NULL \
+                 AND (cell=-1 OR cell IN ({csv}))"
+            )
+        };
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Integer(qv.len() as i64),
+            rusqlite::types::Value::Text(model.clone()),
+        ];
+        for p in &probes {
+            params.push(rusqlite::types::Value::Integer(*p));
+        }
+        let mut stmt = conn.prepare(&stage1_sql).map_err(|e| e.to_string())?;
         let mut rows = stmt
-            .query(rusqlite::params![qv.len() as i64, model])
+            .query(rusqlite::params_from_iter(params.iter()))
             .map_err(|e| e.to_string())?;
         let mut worst = u32::MAX;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {

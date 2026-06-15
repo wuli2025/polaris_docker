@@ -104,7 +104,6 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/api/file", get(serve_file))
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/status", get(status))
-        .route("/api/version", get(version))
         .route("/ws", get(ws_handler))
         .fallback(get(spa_fallback))
         // 上传整体进内存; 不设上限则单个大 body 直接 OOM 服务进程。512MB 足够覆盖
@@ -138,52 +137,6 @@ async fn status(State(state): State<AppState>) -> Response {
         .await
         .unwrap_or_else(|_| json!({ "ok": false, "error": "status 采集失败" }));
     Json(v).into_response()
-}
-
-// ───────────────────────── /api/version 真实版本（前端"更新"板块用）─────────────────────────
-//
-// 返回 { version, flavor, updater_enabled, socket_present }。与 /api/health、/api/status
-// 一样不需鉴权（只暴露版本与能力位元，不含敏感信息）。容器模式读 /app/VERSION + POLARIS_VERSION 兜底；
-// 桌面模式取 Cargo package version。
-async fn version() -> Response {
-    let v = tokio::task::spawn_blocking(collect_version)
-        .await
-        .unwrap_or_else(|_| json!({ "version": "unknown" }));
-    Json(v).into_response()
-}
-
-fn collect_version() -> Value {
-    #[cfg(feature = "server")]
-    {
-        // 容器内：/app/VERSION（Dockerfile 阶段3 拷入）→ POLARIS_VERSION env（CI build-arg 兜底）→ unknown
-        let version = std::fs::read_to_string("/app/VERSION")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("POLARIS_VERSION").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "unknown".to_string());
-        json!({
-            "version": version,
-            "flavor": "docker",
-            "updater_enabled": docker_updater_enabled(),
-            "socket_present": std::path::Path::new("/var/run/docker.sock").exists(),
-        })
-    }
-    #[cfg(feature = "desktop")]
-    {
-        json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "flavor": "desktop",
-            "updater_enabled": false,
-            "socket_present": false,
-        })
-    }
-}
-
-/// 「容器内一键更新」能力位：feature=server && 显式 POLARIS_DOCKER_SOCKET=1。
-/// 默认关——把宿主 docker.sock 挂进容器等于容器 = 宿主 root，必须显式开启。
-fn docker_updater_enabled() -> bool {
-    std::env::var("POLARIS_DOCKER_SOCKET").ok().as_deref() == Some("1")
 }
 
 fn collect_status(auth_set: bool) -> Value {
@@ -534,6 +487,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "fable_index_start" => {
             ok(fable::index::fable_index_start(app, opt_usize(a, "maxChunks"))?)
         }
+        "fable_index_optimize" => ok(fable::index::fable_index_optimize()?),
         "fable_search" => ok(fable::retrieve::fable_search(
             req_str(a, "query")?,
             opt_usize(a, "topK"),
@@ -684,6 +638,13 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             req_str(a, "deviceCode")?,
             req_str(a, "userCode")?,
         )?),
+        "claude_oauth_status" => ok(provider::claude_oauth_status()?),
+        "claude_start_login" => ok(provider::claude_start_login()?),
+        "claude_finish_login" => ok(provider::claude_finish_login(
+            req_str(a, "pasted")?,
+            req_str(a, "verifier")?,
+            req_str(a, "state")?,
+        )?),
         "codex_proxy_info" => ok(codex_proxy::codex_proxy_info()),
 
         // ── 推理后端(R3)：外部 GPU 节点端点状态(含连通性探测)──
@@ -700,7 +661,10 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             opt_usize(a, "height").map(|n| n as u32),
             opt_usize(a, "scale").map(|n| n as u32),
         ),
-        "forge_deck_to_pptx" => forge::forge_deck_to_pptx(
+        // spec JSON → 原生可编辑 .pptx(路线 B 传统PPT,零浏览器 → slim 镜像也能出 PPT)
+        "forge_spec_to_pptx" => forge::spec_to_pptx_sync(req_str(a, "spec")?, req_str(a, "out")?),
+        // 桌面同名命令是 async 包装(防冻 UI); 这里本就在阻塞线程池, 直调同步内核
+        "forge_deck_to_pptx" => forge::deck_to_pptx_sync(
             req_str(a, "deck")?,
             req_str(a, "out")?,
             opt_usize(a, "width").map(|n| n as u32),
@@ -784,81 +748,8 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "updater_check" => ok(json!({"phase":"idle"})),
         "updater_apply" => Err("容器版请用 docker pull 拉新镜像更新。".to_string()),
 
-        // ── Docker 一键更新（Web UI 真实可点的入口） ──────────────────────────
-        // 前端 UpdatePanel 在容器模式下走这两条命令：
-        //   docker_status  →  返回 updater_enabled / socket_present / 当前 tag，让 UI 判断按钮是否可点
-        //   docker_update  →  spawn /usr/local/bin/update.sh 拉新镜像并重建容器
-        // 两条都用 #[cfg(feature="server")] 包住，桌面端编译时不存在。
-        #[cfg(feature = "server")]
-        "docker_status" => ok(collect_docker_status()),
-        #[cfg(feature = "server")]
-        "docker_update" => do_docker_update(a),
-
         other => Err(format!("未知命令: {other}")),
     }
-}
-
-#[cfg(feature = "server")]
-fn collect_docker_status() -> Value {
-    let tag = std::env::var("POLARIS_TAG").unwrap_or_else(|_| "latest".to_string());
-    json!({
-        "updater_enabled": docker_updater_enabled(),
-        "socket_present": std::path::Path::new("/var/run/docker.sock").exists(),
-        "current_tag": tag,
-        "update_script": std::path::Path::new("/usr/local/bin/update.sh").exists(),
-    })
-}
-
-#[cfg(feature = "server")]
-fn do_docker_update(a: &Value) -> Result<Value, String> {
-    // 1) 能力闸：必须 feature=server + POLARIS_DOCKER_SOCKET=1 + 宿主 socket 真挂上了
-    if !docker_updater_enabled() {
-        return Err("Docker 更新未启用：请在 docker-compose 取消注释 # POLARIS_DOCKER_SOCKET=\"1\" 并取消挂载 /var/run/docker.sock".to_string());
-    }
-    if !std::path::Path::new("/var/run/docker.sock").exists() {
-        return Err("docker.sock 未挂载进容器，无法触发宿主 docker".to_string());
-    }
-    let confirm = a.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !confirm {
-        return Err("需在 args.confirm=true 显式确认（防误触发）".to_string());
-    }
-
-    // 2) 干跑（dry-run）模式：仅打印将执行的命令，不真跑。供运维验证用。
-    let dry_run = a.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    let tag = std::env::var("POLARIS_TAG").unwrap_or_else(|_| "latest".to_string());
-    let script = "/usr/local/bin/update.sh";
-    if !std::path::Path::new(script).exists() {
-        return Err(format!("{script} 不存在：镜像构建时未注入 update.sh"));
-    }
-
-    if dry_run {
-        return Ok(json!({
-            "dryRun": true,
-            "wouldRun": format!("POLARIS_TAG={tag} {script}"),
-            "tag": tag,
-        }));
-    }
-
-    // 3) 真正执行。update.sh 在容器内不直接跑 pull/up -d（compose 客户端会随旧容器
-    //    一起被杀，新容器永远起不来）——它派出一个独立"替身"容器去做 pull + up -d，
-    //    自己几秒内就返回。替身完成拉取后才替换当前容器，届时本进程被 SIGTERM 是预期行为。
-    use std::process::Command;
-    let out = Command::new(script)
-        .env("POLARIS_TAG", &tag)
-        .arg("--non-interactive")
-        .output()
-        .map_err(|e| format!("启动 update.sh 失败: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    Ok(json!({
-        "success": out.status.success(),
-        "exit_code": out.status.code(),
-        "tag": tag,
-        "stdout": stdout,
-        "stderr": stderr,
-        "note": "替身更新容器已出发：拉取新镜像完成后会替换当前容器（约 1~3 分钟，取决于网速），届时连接断开，稍后刷新页面即可。",
-    }))
 }
 
 // ───────────────────────── WebSocket（emit 推流）─────────────────────────

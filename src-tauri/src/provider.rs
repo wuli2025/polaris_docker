@@ -55,6 +55,8 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
+    // Polaris 联动写全局时盖的戳, 见 apply_settings_config —— 隔离模式净化的最强证据
+    "POLARIS_LINKED",
 ];
 
 /// 模型钉选的四档键 —— 第三方单模型供应商把这四档全设成同一个 model id,
@@ -421,21 +423,11 @@ pub fn init(_app: &AppHandle) -> Result<()> {
             }
         } else {
             // 隔离(默认):
-            // ① 一次性净化 —— 联动时代(或旧版本)写进全局 settings.json 的受管键还躺在
-            //    那里污染外部 CLI。仅当全局 base_url 恰等于「Polaris 当前供应商」的
-            //    base_url(强证据是我们写的)才清, 用户自己在终端配的第三方不动。
-            let live_base = read_live_env()
-                .get("ANTHROPIC_BASE_URL")
-                .and_then(|v| v.as_str())
-                .map(normalize_url)
-                .unwrap_or_default();
-            if !live_base.is_empty() {
-                if let Some(cur) = views.iter().find(|v| v.id == store.current_id) {
-                    if normalize_url(&cur.base_url) == live_base {
-                        let _ = apply_settings_config(&json!({ "env": {} }));
-                    }
-                }
-            }
+            // ① 净化 —— 联动时代(或旧版本)写进全局 settings.json 的受管键还躺在那里
+            //    污染外部 CLI。旧规则只认「全局 base_url == 当前供应商」, 用户切回官方后
+            //    current 的 base 变空, 残留永远匹配不上、永远清不掉(实测就是「切一次
+            //    MiniMax 就再也切不回来」)。证据判定改走 global_env_is_ours 四级证据。
+            purge_global_residue(&views, &store);
             // ② 重启后进程 env 是空的, 把当前供应商重新作用上去, 否则 Polaris 内的
             //    选择一重启就回落官方。配置不全(如 key 被删)就静默跳过 = 官方。
             if let Some(v) = views.iter().find(|v| v.id == store.current_id) {
@@ -698,6 +690,60 @@ fn read_live_env() -> Map<String, Value> {
     v.get("env").and_then(|e| e.as_object()).cloned().unwrap_or_default()
 }
 
+/// 隔离模式下判定「全局 settings.json 的受管 env 是不是我们(联动时代/旧版本)写的」。
+/// 证据从强到弱:
+/// ① POLARIS_LINKED 戳(新版联动写全局时盖的);
+/// ② base_url 命中当前供应商(旧规则, 保留兼容);
+/// ③ base_url 命中任一已知供应商 **且** token 与我们存的该家 key 一致 —— 用户已切回
+///    官方、残留还指着上一家时, ①②全失效, 残留永远清不掉(实测踩坑「切一次就切不
+///    回来」), 全靠这条兜底; key 不同则视为用户自己在终端配的, 不动。
+/// ④ base 已清但模型钉选残留(等于我们某家钉的模型) —— 官方端点带着 MiniMax-M3
+///    这种钉选必然 4xx, 属我们的残留, 清。
+fn global_env_is_ours(live: &Map<String, Value>, views: &[ProviderView], store: &Store) -> bool {
+    if live.contains_key("POLARIS_LINKED") {
+        return true;
+    }
+    let live_str = |k: &str| {
+        live.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let live_base = normalize_url(&live_str("ANTHROPIC_BASE_URL"));
+    if !live_base.is_empty() {
+        if let Some(cur) = views.iter().find(|v| v.id == store.current_id) {
+            if normalize_url(&cur.base_url) == live_base {
+                return true;
+            }
+        }
+        return views.iter().any(|v| {
+            !v.auth_token.trim().is_empty()
+                && !v.base_url.is_empty()
+                && normalize_url(&v.base_url) == live_base
+                && [DEFAULT_TOKEN_FIELD, API_KEY_FIELD]
+                    .iter()
+                    .any(|f| live_str(f) == v.auth_token.trim())
+        });
+    }
+    MODEL_ENV_KEYS.iter().any(|k| {
+        let m = live_str(k);
+        !m.is_empty()
+            && views
+                .iter()
+                .any(|v| cfg_env_str(&v.settings_config, k).trim() == m)
+    })
+}
+
+/// 隔离模式的残留体检: 全局 settings.json 里若还躺着我们写的受管键, 清回官方。
+/// init 启动时和每次切换都跑一遍 —— 无证据时只读不写, 幂等且零成本。
+fn purge_global_residue(views: &[ProviderView], store: &Store) {
+    let live = read_live_env();
+    if !live.is_empty() && global_env_is_ours(&live, views, store) {
+        let _ = apply_settings_config(&json!({ "env": {} }));
+    }
+}
+
 /// 把供应商 settings_config 合并写进 live settings.json：
 /// 先从 live 清掉受管 env/top 键，再套用 cfg 的 env 与顶层键，其余 live 键原样保留。
 fn apply_settings_config(cfg: &Value) -> Result<(), String> {
@@ -751,6 +797,16 @@ fn apply_settings_config(cfg: &Value) -> Result<(), String> {
         for (k, v) in src_env {
             env.insert(k.clone(), v.clone());
         }
+    }
+    // 真正路由了全局(env 带 base_url)就盖 POLARIS_LINKED 戳: 日后隔离模式的净化
+    // 凭这个戳就能确认残留是我们写的, 不再依赖「当前供应商恰好没换」这种弱证据。
+    let routed = env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if routed {
+        env.insert("POLARIS_LINKED".into(), Value::String("1".into()));
     }
     // 顶层键 (除 env) 套用
     if let Some(src) = cfg.as_object() {
@@ -983,9 +1039,13 @@ pub fn provider_switch(id: String) -> Result<String, String> {
         .ok_or_else(|| format!("供应商不存在: {id}"))?;
 
     let cfg = cfg_for_view(v)?;
-    // 联动才碰全局 settings.json; 隔离只走进程 env, 外部 CLI 原封不动。
+    // 联动才碰全局 settings.json; 隔离只走进程 env, 外部 CLI 原封不动 ——
+    // 但顺手做一次残留体检: 全局若还躺着我们(旧版/联动时代)写的受管键, 先清掉,
+    // 用户不用重启 Polaris 外部 CLI 就立即恢复干净。
     if store.link_global {
         apply_settings_config(&cfg)?;
+    } else {
+        purge_global_residue(&views, &store);
     }
     apply_process_env(&cfg);
 
@@ -1399,7 +1459,14 @@ fn codex_write_auth_json(
 
     let content = serde_json::to_string_pretty(&auth)
         .map_err(|e| format!("序列化 auth.json 失败: {e}"))?;
-    fs::write(&path, content).map_err(|e| format!("写入 ~/.codex/auth.json 失败: {e}"))?;
+    // auth.json 含 refresh/access/id token:① 原子写防写一半撕裂 → 外部 codex CLI 读到坏 JSON;
+    // ② Unix 下收紧到 0600,NAS/Docker 多用户主机上不让同机其他用户读走凭证。
+    atomic_write(&path, &content).map_err(|e| format!("写入 ~/.codex/auth.json 失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -1447,6 +1514,256 @@ fn codex_open_browser(url: &str) -> Result<(), String> {
         Command::new("xdg-open").arg(url).spawn().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ───────────────────────── Commands: Claude 官方订阅授权 (PKCE Authorization Code) ─────────────────────────
+//
+// Claude 官方订阅登录(与 `claude setup-token` 同源的 OAuth 流):浏览器登录 + 手工回贴授权码。
+// 不依赖外部 CLI —— 后端自起浏览器到 claude.ai 授权页,用户登录授权后页面给出 `code#state`,
+// 贴回 Polaris,后端用 PKCE code_verifier 换 access/refresh token,按官方
+// `~/.claude/.credentials.json` 的 `claudeAiOauth` 结构落盘。外部 `claude` CLI 与 Polaris
+// 自起的 claude 都能直接复用这份订阅凭据,无需在外壳里再登录一次。
+//
+// 两步: ① claude_start_login 生成 PKCE(S256)+ state,拼授权 URL(已自动开浏览器),
+//          把 verifier/state 回给前端(本地 IPC,无状态后端,免全局可变态);
+//        ② claude_finish_login(回贴的 code、verifier、state)换 token 落盘。
+
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const CLAUDE_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+const CLAUDE_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
+
+fn claude_credentials_path() -> Option<PathBuf> {
+    claude_dir().map(|d| d.join(".credentials.json"))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAuthStatus {
+    pub logged_in: bool,
+    pub cred_path: String,
+}
+
+/// .credentials.json 存在且带非空 claudeAiOauth.accessToken
+fn claude_creds_has_token(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("claudeAiOauth")
+                .and_then(|o| o.get("accessToken"))
+                .and_then(|a| a.as_str())
+                .map(|s| !s.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// 是否已登录 Claude 官方订阅
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn claude_oauth_status() -> Result<ClaudeAuthStatus, String> {
+    let path = claude_credentials_path();
+    let logged_in = path
+        .as_ref()
+        .map(|p| claude_creds_has_token(p))
+        .unwrap_or(false);
+    Ok(ClaudeAuthStatus {
+        logged_in,
+        cred_path: path
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+/// `claude_start_login` 返回给前端的授权信息
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeLoginStart {
+    /// 授权页 URL(已自动打开, UI 也展示便于手动打开)
+    pub authorize_url: String,
+    /// PKCE code_verifier, 回贴换 token 时原样带回
+    pub verifier: String,
+    /// 防串话 state, 回贴换 token 时原样带回 (授权码尾部 #state 须与之一致)
+    pub state: String,
+}
+
+/// ① 生成 PKCE(S256)+ state, 拼授权 URL 并打开浏览器
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn claude_start_login() -> Result<ClaudeLoginStart, String> {
+    let verifier = claude_rand_b64url(32)?;
+    let state = claude_rand_b64url(32)?;
+    let challenge = claude_b64url_encode(&claude_sha256(verifier.as_bytes()));
+    let authorize_url = format!(
+        "{base}?code=true&client_id={cid}&response_type=code&redirect_uri={redir}&scope={scope}&code_challenge={chal}&code_challenge_method=S256&state={state}",
+        base = CLAUDE_OAUTH_AUTHORIZE_URL,
+        cid = CLAUDE_OAUTH_CLIENT_ID,
+        redir = claude_url_encode(CLAUDE_OAUTH_REDIRECT_URI),
+        scope = claude_url_encode(CLAUDE_OAUTH_SCOPES),
+        chal = challenge,
+        state = state,
+    );
+    // 自动拉起浏览器到授权页 (失败不致命, UI 仍展示链接供手动打开)
+    let _ = codex_open_browser(&authorize_url);
+    Ok(ClaudeLoginStart {
+        authorize_url,
+        verifier,
+        state,
+    })
+}
+
+#[derive(Deserialize)]
+struct ClaudeTokenResp {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// ② 用户回贴的授权码(授权页给的是 `code#state`)+ verifier/state 换 token 落盘
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn claude_finish_login(
+    pasted: String,
+    verifier: String,
+    state: String,
+) -> Result<ClaudeAuthStatus, String> {
+    let pasted = pasted.trim();
+    if pasted.is_empty() {
+        return Err("请先粘贴授权码".into());
+    }
+    // 授权页给的是 `code#state`:拆出 code,并核对尾部 state 防串话 / 防贴错
+    let mut parts = pasted.splitn(2, '#');
+    let code = parts.next().unwrap_or("").trim().to_string();
+    let returned_state = parts.next().map(|s| s.trim().to_string());
+    if let Some(rs) = returned_state.as_ref() {
+        if !rs.is_empty() && rs != &state {
+            return Err("授权码与本次请求不匹配(state 不一致),请重新发起授权".into());
+        }
+    }
+    if code.is_empty() {
+        return Err("授权码为空".into());
+    }
+
+    let resp = codex_agent()
+        .post(CLAUDE_OAUTH_TOKEN_URL)
+        .set("Content-Type", "application/json")
+        .set("User-Agent", CODEX_USER_AGENT)
+        .send_json(json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "state": state,
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+            "redirect_uri": CLAUDE_OAUTH_REDIRECT_URI,
+            "code_verifier": verifier,
+        }))
+        .map_err(|e| format!("换取 Claude Token 失败: {}", codex_http_err(e)))?;
+
+    let tokens: ClaudeTokenResp = resp
+        .into_json()
+        .map_err(|e| format!("解析 Token 响应失败: {e}"))?;
+    let refresh = tokens.refresh_token.clone().unwrap_or_default();
+    let expires_at = claude_expires_at_ms(tokens.expires_in.unwrap_or(0));
+    let scope_str = tokens.scope.as_deref().unwrap_or(CLAUDE_OAUTH_SCOPES);
+    let scopes: Vec<&str> = scope_str.split_whitespace().collect();
+
+    claude_write_credentials(&tokens.access_token, &refresh, expires_at, &scopes)?;
+    claude_oauth_status()
+}
+
+/// 按官方 `~/.claude/.credentials.json` 的 claudeAiOauth 结构写;合并保留文件里已有的其它键。
+fn claude_write_credentials(
+    access: &str,
+    refresh: &str,
+    expires_at: u64,
+    scopes: &[&str],
+) -> Result<(), String> {
+    let path = claude_credentials_path().ok_or_else(|| "无法定位 ~/.claude".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建 ~/.claude 目录失败: {e}"))?;
+    }
+    // 保留已有其它键(如 codeWorkspaceTrust 等),只覆盖 claudeAiOauth 块
+    let mut root: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    root["claudeAiOauth"] = json!({
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": expires_at,
+        "scopes": scopes,
+    });
+    let content = serde_json::to_string_pretty(&root).map_err(|e| format!("序列化凭据失败: {e}"))?;
+    // 原子写防撕裂(外部 claude CLI 并发读不会读到坏 JSON);Unix 收紧 0600 不让同机他人读走凭证。
+    atomic_write(&path, &content).map_err(|e| format!("写入 ~/.claude/.credentials.json 失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// 当前毫秒时间戳 + expires_in(秒)→ claudeAiOauth.expiresAt(毫秒)
+fn claude_expires_at_ms(expires_in_secs: u64) -> u64 {
+    now_ms() + expires_in_secs.saturating_mul(1000)
+}
+
+/// 加密安全随机 n 字节 → base64url(无填充)。verifier/state 必须不可预测。
+fn claude_rand_b64url(n: usize) -> Result<String, String> {
+    let mut buf = vec![0u8; n];
+    getrandom::getrandom(&mut buf).map_err(|e| format!("生成安全随机数失败: {e}"))?;
+    Ok(claude_b64url_encode(&buf))
+}
+
+/// SHA-256(PKCE S256 的 code_challenge 用)
+fn claude_sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// base64url 编码(无填充)—— 与 codex_b64url_decode 对偶
+fn claude_b64url_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(T[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// 极简 percent-encoding:只放行 RFC3986 unreserved,其余按 %XX 编码(够 query 值用)
+fn claude_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ───────────────────────── Commands: 用量看板 ─────────────────────────
@@ -1709,4 +2026,69 @@ fn ymd_string(z: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = y + if m <= 2 { 1 } else { 0 };
     format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+// ───────────────────────── 单测: Claude PKCE 密码学正确性 ─────────────────────────
+#[cfg(test)]
+mod claude_oauth_tests {
+    use super::*;
+
+    /// base64url(无填充)对已知向量正确,且与 codex_b64url_decode 互逆
+    #[test]
+    fn b64url_encode_known_vectors() {
+        assert_eq!(claude_b64url_encode(b""), "");
+        assert_eq!(claude_b64url_encode(b"f"), "Zg");
+        assert_eq!(claude_b64url_encode(b"fo"), "Zm8");
+        assert_eq!(claude_b64url_encode(b"foo"), "Zm9v");
+        assert_eq!(claude_b64url_encode(b"foob"), "Zm9vYg");
+        assert_eq!(claude_b64url_encode(b"fooba"), "Zm9vYmE");
+        assert_eq!(claude_b64url_encode(b"foobar"), "Zm9vYmFy");
+        // 含会被标准 base64 编成 '+' '/' 的字节,base64url 必须出 '-' '_'
+        let enc = claude_b64url_encode(&[0xfb, 0xff, 0xbf]);
+        assert!(!enc.contains('+') && !enc.contains('/') && !enc.contains('='));
+        // 编码→解码 round-trip
+        let raw: Vec<u8> = (0u8..=255).collect();
+        let back = codex_b64url_decode(&claude_b64url_encode(&raw)).unwrap();
+        assert_eq!(raw, back);
+    }
+
+    /// SHA-256 对 "abc" 的标准向量(NIST FIPS 180-4)
+    #[test]
+    fn sha256_known_vector() {
+        let d = claude_sha256(b"abc");
+        let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// PKCE S256 端到端:RFC 7636 附录 B 的官方测试向量
+    /// verifier "dBjft...60M" → challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    #[test]
+    fn pkce_s256_rfc7636_vector() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = claude_b64url_encode(&claude_sha256(verifier.as_bytes()));
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    /// 随机 verifier/state 不可预测且长度足够(32 字节 → 43 字符 base64url)
+    #[test]
+    fn rand_b64url_len_and_uniqueness() {
+        let a = claude_rand_b64url(32).unwrap();
+        let b = claude_rand_b64url(32).unwrap();
+        assert_eq!(a.len(), 43);
+        assert_ne!(a, b);
+        assert!(!a.contains('=') && !a.contains('+') && !a.contains('/'));
+    }
+
+    /// query 值百分号编码:空格不留原样,unreserved 不动
+    #[test]
+    fn url_encode_query_value() {
+        assert_eq!(
+            claude_url_encode("org:create_api_key user:profile"),
+            "org%3Acreate_api_key%20user%3Aprofile"
+        );
+        assert_eq!(claude_url_encode("aZ09-_.~"), "aZ09-_.~");
+    }
 }

@@ -6,7 +6,7 @@
 //! 工程姿势(PRD「巡夜人/滴灌」):一次构建只消化一个预算额(默认 4000 chunk),
 //! 幂等续跑 —— files.chunked 标记位,断了再点继续;429 限速指数退避。
 
-use super::{cancelled, lex_available, open_db, CANCEL, INDEXING};
+use super::{cancelled, lex_available, open_db, FlagGuard, CANCEL, INDEXING};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -446,6 +446,10 @@ pub fn build_index(
     let files_pending: i64 = conn
         .query_row(pending_count_sql, [MAX_LEX_FILE_BYTES], |r| r.get(0))
         .unwrap_or(0);
+    // 首次跨过规模门槛时自动建一次 IVF 倒排单元(20TB 级检索开箱即亚秒);未取消时才做。
+    if !cancelled() {
+        maybe_optimize(&conn, &model);
+    }
     Ok(IndexSummary {
         files_done,
         chunks_added,
@@ -453,6 +457,238 @@ pub fn build_index(
         seconds: started.elapsed().as_secs_f64(),
         stopped,
     })
+}
+
+// ───────────────────────── 向量 IVF 优化(20TB 级 ANN)─────────────────────────
+//
+// 把全部向量按「二值质心」聚成若干倒排单元(cell);查询时只在最近的 nprobe 个 cell
+// 里粗筛(+cell=-1 的未分配新数据),把向量车道从「每查询全表 O(N) 扫」降到
+// ~O(N·nprobe/cells)。质心是二值码,训练(k-means)与分配都只用汉明 popcount,
+// 弱 NAS CPU 也跑得动;未建 cell 时检索自动退回全扫(零回归)。
+
+/// IVF 启用门槛:同模型 chunk 数低于此值时,全表暴力扫已是亚秒级,不建 cell(省训练成本)。
+const IVF_MIN_CHUNKS: i64 = 50_000;
+/// 训练采样上限(在采样上跑 k-means,弱 CPU 也快;分配仍覆盖全量)。
+const IVF_SAMPLE: usize = 100_000;
+/// 二值 k-means 迭代轮数(二值质心收敛快)。
+const IVF_ITERS: usize = 8;
+
+/// 一组二值码按位多数表决求质心:某位上「置 1 的成员数 > 半数」则该位为 1。
+fn majority_bits(members: &[&[u8]], nbytes: usize) -> Vec<u8> {
+    let mut counts = vec![0i32; nbytes * 8];
+    for m in members {
+        for (bytei, &b) in m.iter().enumerate().take(nbytes) {
+            for bit in 0..8 {
+                if b & (1 << bit) != 0 {
+                    counts[bytei * 8 + bit] += 1;
+                }
+            }
+        }
+    }
+    let half = members.len() as i32 / 2;
+    let mut out = vec![0u8; nbytes];
+    for (i, c) in counts.iter().enumerate() {
+        if *c > half {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
+/// 返回 `bits` 在 `centroids` 里汉明最近的下标(centroids 非空;等长项才参与)。
+fn nearest_centroid(bits: &[u8], centroids: &[Vec<u8>]) -> usize {
+    let mut best = 0usize;
+    let mut bestd = u32::MAX;
+    for (i, c) in centroids.iter().enumerate() {
+        if c.len() != bits.len() {
+            continue;
+        }
+        let d = hamming(bits, c);
+        if d < bestd {
+            bestd = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// 在采样 bits 上跑二值 k-means,产出 ≤k 个二值质心(空输入/k=0 返回空)。
+/// 初始质心用等距抽样(确定性,免随机源,可复现);空簇保留旧质心不退化为全 0。
+fn train_binary_centroids(sample: &[Vec<u8>], k: usize, iters: usize) -> Vec<Vec<u8>> {
+    if sample.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let nbytes = sample[0].len();
+    let k = k.min(sample.len());
+    let stride = (sample.len() / k).max(1);
+    let mut centroids: Vec<Vec<u8>> =
+        (0..k).map(|i| sample[(i * stride).min(sample.len() - 1)].clone()).collect();
+    for _ in 0..iters {
+        let mut buckets: Vec<Vec<&[u8]>> = vec![Vec::new(); centroids.len()];
+        for s in sample {
+            let c = nearest_centroid(s, &centroids);
+            buckets[c].push(s.as_slice());
+        }
+        for (ci, bucket) in buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                centroids[ci] = majority_bits(bucket, nbytes);
+            }
+        }
+    }
+    centroids
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OptimizeSummary {
+    pub model: String,
+    pub chunks: u64,
+    pub cells: u64,
+    pub assigned: u64,
+    pub seconds: f64,
+    /// 提前结束/跳过的说明
+    pub note: String,
+}
+
+/// 训练 IVF 质心并把每个向量分配到最近 cell(20TB 级 ANN 的「建索引」步,适合巡夜/大批入库后跑)。
+/// 同模型 chunk < `IVF_MIN_CHUNKS` 时跳过(全扫已够快)。可被取消(分配按批轮询 CANCEL)。
+pub fn optimize_vectors() -> Result<OptimizeSummary, String> {
+    let started = std::time::Instant::now();
+    let conn = open_db()?;
+    let model = active_embed_model()
+        .ok_or("没有可用的嵌入服务商,无法确定向量模型")?;
+    let (n, dim): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(dim),0) FROM chunks WHERE model=?1 AND bits IS NOT NULL",
+            [&model],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    if n < IVF_MIN_CHUNKS {
+        return Ok(OptimizeSummary {
+            model,
+            chunks: n as u64,
+            cells: 0,
+            assigned: 0,
+            seconds: started.elapsed().as_secs_f64(),
+            note: format!("chunk 数 {n} < {IVF_MIN_CHUNKS}:全表暴力扫已足够快,跳过建 cell"),
+        });
+    }
+    // K ≈ √N(IVF 经验值),封顶 8192;采样训练集等距抽样。
+    let k = ((n as f64).sqrt() as usize).clamp(64, 8192);
+    let sample_n = IVF_SAMPLE.min(n as usize);
+    let stride = (n as usize / sample_n.max(1)).max(1);
+    let sample: Vec<Vec<u8>> = {
+        let mut stmt = conn
+            .prepare("SELECT bits FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![model, dim], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(sample_n);
+        for (i, b) in rows.flatten().enumerate() {
+            if i % stride == 0 {
+                out.push(b);
+                if out.len() >= sample_n {
+                    break;
+                }
+            }
+        }
+        out
+    };
+    let centroids = train_binary_centroids(&sample, k, IVF_ITERS);
+    if centroids.is_empty() {
+        return Err("IVF 训练得到空质心(无可用 bits)".into());
+    }
+
+    // 落质心:先清本模型旧 cell,再插入新质心并记下各自 rowid。
+    conn.execute("DELETE FROM vec_cells WHERE model=?1", [&model]).map_err(|e| e.to_string())?;
+    let mut cell_ids: Vec<i64> = Vec::with_capacity(centroids.len());
+    {
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        {
+            let mut ins = conn
+                .prepare_cached("INSERT INTO vec_cells(model, dim, bits, n) VALUES(?1,?2,?3,0)")
+                .map_err(|e| e.to_string())?;
+            for c in &centroids {
+                ins.execute(rusqlite::params![model, dim, c]).map_err(|e| e.to_string())?;
+                cell_ids.push(conn.last_insert_rowid());
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    }
+
+    // 分配:按主键 keyset 分页流式读(内存有界、避免在开着的游标上改表),逐批 UPDATE cell。
+    let mut last_id = 0i64;
+    let mut assigned = 0u64;
+    loop {
+        if cancelled() {
+            break;
+        }
+        let batch: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, bits FROM chunks
+                     WHERE model=?1 AND dim=?2 AND bits IS NOT NULL AND id>?3
+                     ORDER BY id LIMIT 10000",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map(rusqlite::params![model, dim, last_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .collect();
+            rows
+        };
+        if batch.is_empty() {
+            break;
+        }
+        last_id = batch.last().map(|x| x.0).unwrap_or(last_id);
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        {
+            let mut up = conn
+                .prepare_cached("UPDATE chunks SET cell=?2 WHERE id=?1")
+                .map_err(|e| e.to_string())?;
+            for (id, bits) in &batch {
+                let ci = nearest_centroid(bits, &centroids);
+                up.execute(rusqlite::params![id, cell_ids[ci]]).map_err(|e| e.to_string())?;
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        assigned += batch.len() as u64;
+    }
+
+    Ok(OptimizeSummary {
+        model,
+        chunks: n as u64,
+        cells: cell_ids.len() as u64,
+        assigned,
+        seconds: started.elapsed().as_secs_f64(),
+        note: if cancelled() { "已取消(部分分配)".into() } else { "完成".into() },
+    })
+}
+
+/// 构建尾声的自动维护:首次跨过 IVF 门槛(尚无 cell)时顺带建一次倒排单元,
+/// 让向量车道在大规模下「开箱即亚秒」,无需用户手动点优化。已有 cell 后的增量
+/// 维护(随新数据增长重训)交给显式 `fable_index_optimize`/CLI `fable optimize`(巡夜)。
+fn maybe_optimize(conn: &rusqlite::Connection, model: &str) {
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunks WHERE model=?1 AND bits IS NOT NULL",
+            [model],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if total < IVF_MIN_CHUNKS {
+        return;
+    }
+    let cells: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_cells WHERE model=?1", [model], |r| r.get(0))
+        .unwrap_or(0);
+    if cells == 0 {
+        let _ = optimize_vectors(); // 首次自动建;失败不影响构建结果(检索退回全扫)
+    }
 }
 
 // ───────────────────────── 命令(后台线程 + 事件)─────────────────────────
@@ -464,12 +700,14 @@ fn emit(app: &AppHandle, payload: Value) {
 /// 开始(或继续)构建向量索引。立即返回,进度走 `fable:index` 事件。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn fable_index_start(app: AppHandle, max_chunks: Option<usize>) -> Result<(), String> {
-    if INDEXING.swap(true, Ordering::SeqCst) {
+    let Some(index_guard) = FlagGuard::acquire(&INDEXING) else {
         return Err("索引构建已在进行中".into());
-    }
+    };
     CANCEL.store(false, Ordering::SeqCst);
     let budget = max_chunks.unwrap_or(4000).clamp(100, 200_000);
     std::thread::spawn(move || {
+        // 守卫 move 进线程:正常结束或 panic 栈展开都会释放 INDEXING 闸(防永久锁死)。
+        let _index_guard = index_guard;
         let app2 = app.clone();
         let result = build_index(budget, &move |files, chunks, current| {
             emit(
@@ -477,7 +715,6 @@ pub fn fable_index_start(app: AppHandle, max_chunks: Option<usize>) -> Result<()
                 json!({ "kind": "progress", "files": files, "chunks": chunks, "current": current }),
             );
         });
-        INDEXING.store(false, Ordering::SeqCst);
         match result {
             Ok(s) => emit(
                 &app,
@@ -490,6 +727,17 @@ pub fn fable_index_start(app: AppHandle, max_chunks: Option<usize>) -> Result<()
         }
     });
     Ok(())
+}
+
+/// 重建向量 IVF 倒排单元(20TB 级 ANN 的「优化/建索引」步)。同步返回汇总;
+/// 与构建/盘点共用 INDEXING 闸(进行中则拒绝),用 RAII 守卫确保 panic 也释放闸。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn fable_index_optimize() -> Result<OptimizeSummary, String> {
+    let Some(_guard) = FlagGuard::acquire(&INDEXING) else {
+        return Err("索引任务进行中,稍后再优化".into());
+    };
+    CANCEL.store(false, Ordering::SeqCst);
+    optimize_vectors()
 }
 
 #[cfg(test)]
@@ -531,6 +779,40 @@ mod tests {
         assert!(!embeddable("log", 1000)); // 日志类不嵌入(P1-4)
         assert!(!embeddable("csv", 1000));
         assert!(!embeddable("md", MAX_EMBED_FILE_BYTES + 1)); // 超嵌入上限不嵌入
+    }
+
+    #[test]
+    fn ivf_majority_and_nearest_centroid() {
+        // 多数表决:3 成员,某位 ≥2 个置 1 → 该位为 1。
+        let a = vec![0b0000_0001u8];
+        let b = vec![0b0000_0011u8];
+        let c = vec![0b0000_0010u8];
+        let maj = majority_bits(&[&a, &b, &c], 1);
+        assert_eq!(maj[0], 0b0000_0011); // bit0(a,b)、bit1(b,c)各 2/3 > 半数
+        // 汉明最近质心。
+        let cents = vec![vec![0b0000_0000u8], vec![0b1111_1111u8]];
+        assert_eq!(nearest_centroid(&[0b0000_0001u8], &cents), 0);
+        assert_eq!(nearest_centroid(&[0b1111_1110u8], &cents), 1);
+    }
+
+    #[test]
+    fn ivf_train_separates_two_clusters() {
+        // 两簇:全 0 与 全 1。训练出的两个质心应把两类样本分到不同 cell。
+        let mut sample: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..50 {
+            sample.push(vec![0u8, 0u8]);
+        }
+        for _ in 0..50 {
+            sample.push(vec![0xFFu8, 0xFFu8]);
+        }
+        let cents = train_binary_centroids(&sample, 2, IVF_ITERS);
+        assert_eq!(cents.len(), 2);
+        let c0 = nearest_centroid(&[0u8, 0u8], &cents);
+        let c1 = nearest_centroid(&[0xFFu8, 0xFFu8], &cents);
+        assert_ne!(c0, c1, "两个分得很开的簇应落到不同质心");
+        // 空输入 / k=0 安全返回空。
+        assert!(train_binary_centroids(&[], 4, 4).is_empty());
+        assert!(train_binary_centroids(&sample, 0, 4).is_empty());
     }
 
     #[test]

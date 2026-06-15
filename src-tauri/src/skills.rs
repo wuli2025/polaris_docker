@@ -106,7 +106,18 @@ const WECHAT_TS_ID: &str = "wechat-md-typesetter";
 //     publish-image=切片转 dataURL→File→合成 paste 贴进编辑器(原生欢迎零清洗)→等 img 落位/
 //     换 mmbiz 外链→真文字导语(--intro)→填标题→存草稿。MediaOps 加「长图模式」开关(__longimg,
 //     隐式带上本技能)。snapshot 已本地实测(单/多切片+段落切点目检);publish-image 待真机。
-const WECHAT_TS_VERSION: &str = "8";
+// v9：耗时根治+保存前移——snapshot 整页只成像一次(Pillow 本地裁切,缺 Pillow 退回逐段截图);
+//     publish-image 贴图改「落位即贴下一张」,换 mmbiz 外链统一收尾等一轮(此前逐张串行死等
+//     +累计判定级联烧满超时,是「传半天」的根因);file-input 通道缓存有效 input;
+//     **填标题+首次保存挪到贴图之前**(草稿条目先进草稿箱——此前全贴完才保存,进程中途被
+//     上层超时杀掉→保存从未执行→草稿箱空,用户实证);保存等回执期间点掉挡路确认弹窗。
+// v10：按用户反馈调长图观感——①字号/行高/段距整体调大放疏(THEMES size→17/17.5,lh→~2.0,
+//     h1/h2/h3 与段落间距全加大),长图不再「太紧凑」;②snapshot 改铺满整幅+主题色画布
+//     (无 bg 主题给暖纸色 #f7f5ef),弃用 render 那层 max-width:677 居中外壳→**杜绝白边**;
+//     ③默认截一整张(--no-slice;SLICE_MAX_CSS 2800→12000);④正文铁律加「开头不写摘要/导语」
+//     +「h2 加 emoji 图标、关键句做 blockquote 卡片」营造配图感(SKILL.md 同步)。
+//     MediaOps 交付改两个功能键二选一:「排版 HTML 文件」(render 出文件自传) /「截图上传」(长图)。
+const WECHAT_TS_VERSION: &str = "10";
 const WECHAT_TS_SKILL_MD: &str =
     include_str!("templates/skills/wechat-md-typesetter/SKILL.md");
 const WECHAT_TS_YIBAN_PY: &str =
@@ -124,6 +135,18 @@ const TURBO_FAST_DL: &str =
     include_str!("templates/skills/turbo-download/scripts/fast_download.py");
 const TURBO_FLAGS_MD: &str =
     include_str!("templates/skills/turbo-download/references/aria2_flags.md");
+
+// ───────── 「浏览器智能体 browser-use」多文件技能（驱动 CloakBrowser，编译期内嵌，启动落盘）─────────
+// 高层多步网页自动化:给一句目标,browser-use 智能体自跑「看页面→决策→操作」循环。底层浏览器
+// 强制走 CloakBrowser 的隐身 Chromium(经 CDP 连接,绝不用 browser-use 自带浏览器 —— 用户硬规矩)。
+// 和 deck/turbo 同套路:编译期内嵌、启动确保落到 ~/Polaris/skills(版本号比对覆盖),让 spawn 的
+// claude agent 能直接 `uv run …/browser_use_runner.py` 跑它。
+const BROWSER_USE_ID: &str = "browser-use";
+// 改动 SKILL.md / browser_use_runner.py 后必须 +1,让已安装用户下次启动拿到更新。
+const BROWSER_USE_VERSION: &str = "1";
+const BROWSER_USE_SKILL_MD: &str = include_str!("templates/skills/browser-use/SKILL.md");
+const BROWSER_USE_RUNNER: &str =
+    include_str!("templates/skills/browser-use/scripts/browser_use_runner.py");
 
 // ═══════════════════════════════════════════════════════════════
 // 统一目录 Catalog（编译期，只读）
@@ -336,6 +359,124 @@ fn catalog() -> Vec<CatalogSkill> {
             preinstalled: true,
             system_prompt: include_str!("templates/skills/gz-notion-infographic.md"),
         },
+        // ═══ 开发工程师工具箱（市场精选，点安装即用）═══
+        // 来源:obra superpowers(工程纪律)+ Trae 官方/社区 TRAE-Skills 仓(开发场景)
+        // + WorkBuddy 类聚合市场的高频品类。均 preinstalled=false,不污染每轮对话,按需安装/自动激活。
+        // ── superpowers 系(工程纪律;按用户既定取舍,刻意不收 TDD-always/子代理/worktree/激进调度) ──
+        CatalogSkill {
+            id: "writing-plans",
+            name: "写实现计划",
+            description: "多步骤/跨文件/有不确定性的任务,动手前先成文一份可执行计划(目标验收+现状勘查+分步+风险回滚+明确不做);单文件小改不必。源自 obra superpowers",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/writing-plans.md"),
+        },
+        CatalogSkill {
+            id: "systematic-debugging",
+            name: "系统化调试",
+            description: "遇 bug/报错不瞎猜:复现→读真相→二分缩小→定根因(一句话说清因果)→最小修复→防回归;拒绝 shotgun debugging 与把症状压下去当修好。源自 obra superpowers",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/systematic-debugging.md"),
+        },
+        CatalogSkill {
+            id: "verification-before-done",
+            name: "完成前验证",
+            description: "宣称完成/修好/通过或提交前,先真跑验证命令看到通过输出再下结论;证据先于断言,失败如实报。贴合 Polaris 现实=cargo+vue-tsc+真机点测。源自 obra superpowers",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/verification-before-done.md"),
+        },
+        CatalogSkill {
+            id: "brainstorming",
+            name: "方案头脑风暴",
+            description: "路线不唯一或需求未定形时先发散 2-4 个方案比较取舍(工作量/风险/可逆/侵入),再给推荐而非罗列;复用现有轮子优先。源自 obra superpowers",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/brainstorming.md"),
+        },
+        CatalogSkill {
+            id: "code-review",
+            name: "代码审查",
+            description: "合并前把关:当审查者按正确性/安全/复用简化/一致性抓真问题(给 file:line+必改vs可选);当被审者先验证再改、不盲从也不敷衍。融合 superpowers + Trae code-review",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/code-review.md"),
+        },
+        // ── Trae 开发场景系(官方市场 + 社区 TRAE-Skills 仓 150+ 精选) ──
+        CatalogSkill {
+            id: "git-commit",
+            name: "智能提交 Conventional Commits",
+            description: "把工作区改动整理成规范 commit:看 diff 懂意图→合理拆分暂存→生成 type(scope): 祈使句标题+解释为什么的正文;优先新建不 amend、不跳 hook、不带密钥。源自 Trae",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/git-commit.md"),
+        },
+        CatalogSkill {
+            id: "gh-cli",
+            name: "GitHub CLI 速查",
+            description: "用 gh 命令行管仓库/Issue/PR/Actions/Release,不必开网页;含常用 PR/CI 日志/release 配方与 --json 取结构化结果。破坏性动作先确认。源自 Trae",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/gh-cli.md"),
+        },
+        CatalogSkill {
+            id: "frontend-ui",
+            name: "高级前端 UI(去 AI 味)",
+            description: "做网页/组件/落地页时产出像真人精修的界面:避开紫蓝渐变+居中卡片+emoji 堆砌的通用 AI 模板,讲排版层级/有主张配色/留白节奏/状态细节/响应式可访问。源自 Trae 官方市场",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/frontend-ui.md"),
+        },
+        CatalogSkill {
+            id: "rest-api-design",
+            name: "REST API 设计",
+            description: "设计/评审 HTTP API 遵循 REST 约定:名词复数资源、方法语义与幂等、状态码正确、统一错误体、分页过滤版本化鉴权幂等键。源自 Trae",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/rest-api-design.md"),
+        },
+        CatalogSkill {
+            id: "unit-testing",
+            name: "单元测试生成",
+            description: "为函数/模块写拦得住真 bug 的单测:认清契约→覆盖正常/边界/错误/并发→隔离外部依赖→断言具体值→实际跑绿;按需写非强制 TDD,难测代码如实说明。源自 Trae",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/unit-testing.md"),
+        },
+        CatalogSkill {
+            id: "docker-deploy",
+            name: "Docker 容器化部署",
+            description: "把应用打成精简可复现的镜像:多阶段构建+小基镜像+缓存层+非 root+.dockerignore;compose 配资源上限/日志轮转/机密走 env;构建后实跑验证。源自 Trae",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/docker-deploy.md"),
+        },
+        CatalogSkill {
+            id: "sql-optimization",
+            name: "SQL 查询优化",
+            description: "让慢查询变快:先 EXPLAIN 量执行计划→定位缺索引/回表/JOIN/N+1→针对性改(复合/覆盖索引、避函数失效、游标分页)→真实数据量验证;索引非越多越好。源自 Trae",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/sql-optimization.md"),
+        },
+        // ── 安全审计 + 技术文档(Trae 安全/文档 + WorkBuddy 聚合市场高频品类) ──
+        CatalogSkill {
+            id: "security-audit",
+            name: "安全审计(Web/依赖)",
+            description: "防御性安全:按注入(SQL/命令/路径穿越/XSS/SSRF)、鉴权与会话(越权/机密/CSRF)、依赖漏洞(npm/pip/cargo audit)系统过一遍,给严重级+复现+修法。只审自己代码不助攻。源自 Trae/WorkBuddy",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/security-audit.md"),
+        },
+        CatalogSkill {
+            id: "tech-writing",
+            name: "技术文档(README/API/Changelog)",
+            description: "把项目写成读者用得起来的文档:README(一句话定位+可复制的快速开始+用法+配置)、API 文档(契约+例子)、Changelog(Keep a Changelog 分类);写真话、例子能跑通。源自 Trae/WorkBuddy",
+            source: "third-party",
+            preinstalled: false,
+            system_prompt: include_str!("templates/skills/tech-writing.md"),
+        },
         // ── 默认浏览器插件（预装、默认开启，可随时移除） ──
         CatalogSkill {
             id: "cloak-browser",
@@ -344,6 +485,15 @@ fn catalog() -> Vec<CatalogSkill> {
             source: "third-party",
             preinstalled: true,
             system_prompt: include_str!("templates/skills/cloak-browser.md"),
+        },
+        // ── 浏览器智能体（预装、默认开启）：高层多步网页自动化,底层走 CloakBrowser ──
+        CatalogSkill {
+            id: BROWSER_USE_ID,
+            name: "浏览器智能体 browser-use",
+            description: "给一句高层目标,browser-use 智能体自跑「看页面→决策→点击/输入/翻页」循环完成多步网页任务,不用手写 Playwright 步骤。底层浏览器强制走 CloakBrowser 隐身 Chromium(过 Cloudflare/反爬),绝不用其自带浏览器。复杂多步网页自动化用它,简单单步截图/抓取用 CloakBrowser",
+            source: "third-party",
+            preinstalled: true,
+            system_prompt: BROWSER_USE_SKILL_MD,
         },
     ]
 }
@@ -607,6 +757,23 @@ pub fn detect_browser_intent(prompt: &str) -> bool {
     triggers.iter().any(|t| lower.contains(t))
 }
 
+/// 检测是否是「高层、多步、需临场决策的网页自动化」任务 → 自动激活 browser-use 浏览器智能体
+/// （它驱动 CloakBrowser）。与 detect_browser_intent 区分:那个覆盖一切网页动作(含简单单步截图/
+/// 抓取,激活 cloak-browser);这个只命中「给目标让它自主跑多步流程」的智能体场景。两者可同时命中,
+/// browser-use 的 prompt 本就以 CloakBrowser 为底层,不冲突。
+pub fn detect_browser_use_intent(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let triggers = [
+        // 英文 · 直指本技能 / 智能体浏览
+        "browser-use", "browser use", "browser agent", "autonomous browser", "web agent",
+        // 中文 · 智能体 / 自主多步
+        "浏览器智能体", "网页智能体", "自主浏览", "自主操作", "自动操作网页", "自动跑流程",
+        "自动完成网页", "自动帮我在", "替我在网", "自动登录并", "自动下单", "自动预订",
+        "自动填表并提交", "自动在网站", "帮我在网站上",
+    ];
+    triggers.iter().any(|t| lower.contains(t))
+}
+
 /// 检测是否是「做 PPT / 演示文稿」的任务。命中即自动激活 pptx 技能，
 /// 不再要求用户先去技能中心安装 / 在对话框点选 —— 这是「无法产出 PPT」的首要原因。
 pub fn detect_pptx_intent(prompt: &str) -> bool {
@@ -696,6 +863,11 @@ pub fn auto_skills_for_intent(prompt: &str) -> Vec<(SkillMeta, String)> {
     }
     if detect_browser_intent(prompt) {
         if let Some(s) = find("cloak-browser") {
+            out.push(s);
+        }
+    }
+    if detect_browser_use_intent(prompt) {
+        if let Some(s) = find(BROWSER_USE_ID) {
             out.push(s);
         }
     }
@@ -1039,6 +1211,36 @@ fn write_turbo_download_files(dest: &Path) -> Result<(), String> {
     fs::write(dest.join("skill.md"), TURBO_SKILL_MD).map_err(|e| e.to_string())?;
     fs::write(scripts.join("fast_download.py"), TURBO_FAST_DL).map_err(|e| e.to_string())?;
     fs::write(references.join("aria2_flags.md"), TURBO_FLAGS_MD).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 启动时确保「浏览器智能体 browser-use」技能在 ~/Polaris/skills 落盘（含可执行 runner）。
+/// 策略同上（版本号比对覆盖）。best-effort：失败只让该技能脚本暂不可用，不阻断 App 启动。
+/// runner 必须真落到磁盘，spawn 的 claude agent 才能 `uv run …/browser_use_runner.py` 跑它。
+pub fn seed_browser_use_skill() {
+    let Some(root) = skills_dir() else {
+        return;
+    };
+    let dest = root.join(BROWSER_USE_ID);
+    let ver_file = dest.join(".polaris_version");
+    let stored = fs::read_to_string(&ver_file).unwrap_or_default();
+    let present = dest.join("skill.md").exists();
+    if present && stored.trim() == BROWSER_USE_VERSION {
+        return;
+    }
+    if write_browser_use_files(&dest).is_ok() {
+        let _ = fs::write(&ver_file, BROWSER_USE_VERSION);
+    }
+}
+
+/// 把内嵌的「浏览器智能体」文件写到目标目录（含 scripts/ 子树）。
+/// 技能正文写成小写 `skill.md`，与 `scan_user_skills` 约定一致。
+fn write_browser_use_files(dest: &Path) -> Result<(), String> {
+    let scripts = dest.join("scripts");
+    fs::create_dir_all(&scripts).map_err(|e| e.to_string())?;
+    fs::write(dest.join("skill.md"), BROWSER_USE_SKILL_MD).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("browser_use_runner.py"), BROWSER_USE_RUNNER)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

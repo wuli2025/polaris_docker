@@ -3931,7 +3931,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-app"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3943,6 +3943,7 @@ dependencies = [
  "encoding_rs",
  "enigo",
  "futures-util",
+ "getrandom 0.2.17",
  "headless_chrome",
  "image",
  "libc",
@@ -3959,6 +3960,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sherpa-rs",
  "tauri",
  "tauri-build",
@@ -3974,6 +3976,15 @@ dependencies = [
  "walkdir",
  "windows-sys 0.59.0",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "polaris-cli"
+version = "1.2.1"
+dependencies = [
+ "polaris-app",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

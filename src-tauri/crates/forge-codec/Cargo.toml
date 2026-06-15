@@ -2,6 +2,13 @@
 name = "polaris-forge-codec"
 version = "0.1.0"
 edition = "2021"
+# 本 crate 是被主 crate 依赖的**库**,不产二进制。
+# autobins=false 关掉 src/bin/ 自动发现:历史上 src/bin/polaris-forge.rs 会被 autobin
+# 产出一个与 polaris-cli 的 [[bin]] name="polaris-forge" **同名**的二进制 → 两者写同一
+# 路径 target/release/polaris-forge,cargo build --workspace 互相覆盖、谁后编谁赢,
+# 极易让播种/Docker 拿到只会 preflight 的那个,使 agent 的 `polaris-forge fable search`
+# 静默失效。preflight 已由 polaris-cli 的 `preflight` 子命令(走主 lib)统一提供。
+autobins = false
 description = "Polaris Forge codec 板块:openh264-rs + 自写 BMFF muxer + ebur128 + cosmic-text + symphonia + audiopus,替 ffmpeg CLI;二进制增量 3.3-5MB"
 authors = ["winner3388"]
 license = "MIT"
