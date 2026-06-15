@@ -58,7 +58,7 @@ fn no_window(cmd: &mut Command) {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolStatus {
-    /// 稳定标识: claude | pwsh | node | npm
+    /// 稳定标识: claude | pwsh | node | npm | uv | python
     pub key: String,
     /// 展示名
     pub name: String,
@@ -85,6 +85,11 @@ pub struct EnvReport {
     pub pwsh: ToolStatus,
     pub node: ToolStatus,
     pub npm: ToolStatus,
+    /// uv —— Python 脚本运行时的统一托管者 (脚本执行公约依赖它; 一个二进制管解释器+依赖)。
+    pub uv: ToolStatus,
+    /// 系统 Python —— 仅作信息展示。found=false 时多半是「只有 Store 占位符」(detect 已滤掉),
+    /// 脚本一律由 uv 按需托管, 不依赖这一项, 故 not required。
+    pub python: ToolStatus,
     /// claude.exe 应在 / 已在的目录 (用于「修复 PATH」)
     pub claude_dir: Option<String>,
     /// 该目录是否已在「用户 PATH」里 (Windows)。false ⇒ 需要修复
@@ -349,6 +354,13 @@ static CLAUDE_EXE_CACHE: once_cell::sync::Lazy<Mutex<Option<PathBuf>>> =
 ///    → 连不上本地翻译代理、报「连接 ChatGPT 后端失败」。把回环列入 `NO_PROXY`/`no_proxy` 即绕开代理直连。
 ///    只补回环、不动其他代理设置 —— 代理本身（claude 直连远端 API 时要用）照常生效。
 /// ② **清干扰继承变量**：`DEBUG`（让 Node 生态吐调试噪声、行为不可预测）；Linux 的 `LD_PRELOAD`（注入）。
+/// ③ **root 下放行 bypassPermissions**：claude CLI 有条安全铁律——进程是 root(euid==0)时
+///    拒绝 `--permission-mode=bypassPermissions` / `--dangerously-skip-permissions`，报
+///    「cannot be used with root/sudo privileges」。但 **Docker 版容器必须跑 root**(群晖
+///    bind mount 里 synoacl 失效 → 共享 000 权限 → 非 root 全读不了，见 nas-polaris-datasets-mount)，
+///    一旦走到 kb.rs 硬编 bypass 的路径(文件中心 AI 归类 / KB 构建 / 回声层做梦 / fable 索引)
+///    claude 必挂。官方逃生口 = 设 `IS_SANDBOX=1`，root 下即放行。仅 Linux 且确为 root 时设置，
+///    桌面(非 root)不触发，无副作用。
 pub fn harden_child_env(cmd: &mut Command) {
     for key in ["NO_PROXY", "no_proxy"] {
         let current = std::env::var(key).unwrap_or_default();
@@ -356,7 +368,13 @@ pub fn harden_child_env(cmd: &mut Command) {
     }
     cmd.env_remove("DEBUG");
     #[cfg(target_os = "linux")]
-    cmd.env_remove("LD_PRELOAD");
+    {
+        cmd.env_remove("LD_PRELOAD");
+        // SAFETY: getuid 是纯读、线程安全的 libc 调用，无副作用。
+        if unsafe { libc::geteuid() } == 0 {
+            cmd.env("IS_SANDBOX", "1");
+        }
+    }
 }
 
 /// 把回环主机（`127.0.0.1` / `localhost` / `::1`）并进既有 NO_PROXY 值：
@@ -750,6 +768,45 @@ if ($parts -notcontains $d) {{ \
     }
 }
 
+// ───────────────────────── uv (Python 运行时托管) ─────────────────────────
+
+/// uv 安装目录: `~/.local/bin` —— 与 uv 官方安装器在两端的默认落脚点一致(也与本仓库
+/// claude 原生脚本的 `~/.local/bin` 同构)。装在用户目录, 不需要管理员/sudo。
+fn uv_bin_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".local").join("bin"))
+}
+
+/// uv 可执行文件名 (随平台)。
+fn uv_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "uv.exe"
+    } else {
+        "uv"
+    }
+}
+
+/// 解析一个可直接 spawn 的 uv 路径: PATH 命中优先(滤掉 Store 占位符——uv 本身不是占位符,
+/// 但走同一道防御闸更稳), 否则取 `~/.local/bin/uv(.exe)`。
+fn resolve_uv_exe() -> Option<PathBuf> {
+    if let Some(p) = which_all("uv").into_iter().find(|p| !is_app_exec_alias(p)) {
+        return Some(p);
+    }
+    uv_bin_dir()
+        .map(|d| d.join(uv_exe_name()))
+        .filter(|p| p.exists())
+}
+
+/// 把 uv 所在目录 (`~/.local/bin`) 并进**本进程** PATH —— 让之后 spawn 的 claude 在其 shell 里
+/// `uv run` 能命中(脚本执行公约依赖此)。仅当该目录里确有 uv 时才动, 幂等。与
+/// `prime_path_for_claude` 同一「只改进程 env、不写注册表」的轻量哲学。
+pub fn ensure_uv_on_process_path() {
+    if let Some(dir) = uv_bin_dir() {
+        if dir.join(uv_exe_name()).exists() {
+            prepend_process_path(&dir.to_string_lossy());
+        }
+    }
+}
+
 /// 由一个具体的 claude 可执行文件路径推出「该上 PATH 的目录」。
 /// npm 装解析到的常是 `node_modules/.../bin/claude.exe` —— 该上 PATH 的是 npm 全局前缀
 /// (放 `claude.cmd` 的地方, npm 通常已替我们加好), 而非内部 bin 目录; 其余情况取父目录。
@@ -871,6 +928,8 @@ fn prime_path_for_claude_inner() {
             prepend_process_path(&dir.to_string_lossy());
         }
     }
+    // ①.5 uv 目录上进程 PATH —— 脚本执行公约要求 claude 用 `uv run` 跑 Python, 它的 shell 得找得到 uv
+    ensure_uv_on_process_path();
     // ② 真身 pwsh 目录上进程 PATH (滤掉 Store 别名: pwsh_candidates 只列 Program Files 真身)
     #[cfg(windows)]
     if let Some(exe) = pwsh_candidates().into_iter().find(|p| p.exists()) {
@@ -892,6 +951,10 @@ fn prime_path_for_claude_inner() {
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn env_check() -> EnvReport {
     let os = std::env::consts::OS.to_string();
+
+    // 体检顺手把 uv 目录并进本进程 PATH(幂等): 用户刚在本面板装完 uv 后, 前端会立即复检一次,
+    // 这一步保证之后 spawn 的 claude 当轮就能 `uv run`, 无需重启 app。
+    ensure_uv_on_process_path();
 
     let claude = detect(
         "claude",
@@ -929,6 +992,48 @@ pub fn env_check() -> EnvReport {
         false,
         "未安装",
     );
+    // uv —— Python 脚本运行时的统一托管者(脚本执行公约依赖它)。候选含 ~/.local/bin/uv(.exe)。
+    let uv = detect(
+        "uv",
+        "uv",
+        "uv",
+        &["--version"],
+        &uv_bin_dir()
+            .map(|d| vec![d.join(uv_exe_name())])
+            .unwrap_or_default(),
+        false,
+        "未安装 —— 一键安装后, Claude 写的 Python 脚本即可 `uv run` 跑(自动管解释器+依赖)",
+    );
+    // 系统 Python —— 仅信息展示。detect 已滤掉 WindowsApps 的 0 字节占位符, 故「只有 Store 占位符」
+    // 的机器这里 found=false, 如实反映「没有可用 Python」(脚本改由 uv 托管, 不依赖此项)。
+    let python = {
+        let mut p = detect(
+            "python",
+            "Python",
+            "python",
+            &["--version"],
+            &[],
+            false,
+            "无可用系统 Python(脚本已由 uv 按需托管, 无需手动安装)",
+        );
+        // Windows 上 `python` 常只剩占位符; 退一步认 `python3`(detect 同样滤占位符)。
+        if !p.found {
+            let p3 = detect(
+                "python3",
+                "Python",
+                "python3",
+                &["--version"],
+                &[],
+                false,
+                "无可用系统 Python(脚本已由 uv 按需托管, 无需手动安装)",
+            );
+            if p3.found {
+                p = p3;
+                p.key = "python".to_string();
+            }
+        }
+        p
+    };
 
     // PATH 体检: claude 安装目录是否在用户 PATH 里
     let claude_dir = claude_dir_for_fix(&claude);
@@ -952,6 +1057,8 @@ pub fn env_check() -> EnvReport {
         pwsh,
         node,
         npm,
+        uv,
+        python,
         claude_dir: claude_dir.as_deref().map(to_fwd),
         claude_dir_on_user_path,
         shell_ready,
@@ -1181,6 +1288,251 @@ Remove-Item $dst -ErrorAction SilentlyContinue
 if ($p.ExitCode -ne 0) { Write-Output ('msiexec 退出码 ' + $p.ExitCode); exit 1 }
 Write-Output 'PowerShell 7 安装完成。'
 "#;
+
+// ───────────────────────── uv (Python 运行时托管) 安装 ─────────────────────────
+
+/// 安装 uv —— Python 脚本运行时的统一托管者。装到用户目录 `~/.local/bin`(免管理员/sudo),
+/// 顺带写一份「国内镜像」uv 配置(仅当用户尚无配置时), 让之后 `uv python install` / 依赖解析走
+/// 清华 PyPI + gh-proxy 的 python-build-standalone, 国内可达。装完无需改注册表: `env_check` 与
+/// 启动期 `prime_path_for_claude` 都会把 `~/.local/bin` 并进进程 PATH, claude 当轮即可 `uv run`。
+///
+/// 下载走 GitHub Release 直链 + 国内文件代理(gh-proxy / ghfast)兜底(与 PowerShell 7 同策略),
+/// 解压即用(uv 是单文件二进制, 无安装器、无 UAC)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn env_install_uv(app: AppHandle) -> Result<String, String> {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = &app;
+        return Err(
+            "uv 自动安装目前支持 Windows 与 macOS; Linux 请用 `curl -LsSf https://astral.sh/uv/install.sh | sh`。"
+                .into(),
+        );
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let req_id = next_req_id();
+        #[cfg(windows)]
+        let cmd = build_powershell(UV_INSTALL_SCRIPT);
+        #[cfg(target_os = "macos")]
+        let cmd = build_install_shell(MAC_UV_INSTALL_SCRIPT);
+        stream_install(app, req_id.clone(), cmd, false, "uv");
+        Ok(req_id)
+    }
+}
+
+/// Windows uv 安装脚本: 下载官方 release zip(国内代理加速)→ 解压到 `~/.local/bin` → 写国内镜像配置。
+/// uv 是 MIT/Apache 双许可的单文件二进制, 解压即用, 不需要管理员权限。
+#[cfg(windows)]
+const UV_INSTALL_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Continue'
+$arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'aarch64' } 'AMD64' { 'x86_64' } default { 'x86_64' } }
+$asset = "uv-$arch-pc-windows-msvc.zip"
+$rel = "https://github.com/astral-sh/uv/releases/latest/download/$asset"
+$urls = @(
+  "https://gh-proxy.com/$rel",
+  "https://ghfast.top/$rel",
+  "https://ghproxy.net/$rel",
+  $rel
+)
+$dst = Join-Path $env:TEMP $asset
+$ok = $false
+foreach ($u in $urls) {
+  try {
+    Write-Output "下载: $u"
+    Invoke-WebRequest -Uri $u -OutFile $dst -UseBasicParsing -TimeoutSec 600
+    if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 500KB)) { $ok = $true; break }
+  } catch {
+    Write-Output ("  下载失败: " + $_.Exception.Message)
+  }
+}
+if (-not $ok) { Write-Output 'uv 下载失败 (可检查网络 / 代理后重试)。'; exit 1 }
+$bin = Join-Path $env:USERPROFILE '.local\bin'
+New-Item -ItemType Directory -Force -Path $bin | Out-Null
+try {
+  Expand-Archive -Path $dst -DestinationPath $bin -Force
+} catch {
+  Write-Output ('解压失败: ' + $_.Exception.Message); Remove-Item $dst -ErrorAction SilentlyContinue; exit 1
+}
+Remove-Item $dst -ErrorAction SilentlyContinue
+$uv = Join-Path $bin 'uv.exe'
+if (-not (Test-Path $uv)) { Write-Output 'uv.exe 解压后未找到。'; exit 1 }
+# 国内镜像配置: 仅当用户尚无 uv.toml 时写入, 尊重既有配置
+$cfgDir = Join-Path $env:APPDATA 'uv'
+$cfg = Join-Path $cfgDir 'uv.toml'
+if (-not (Test-Path $cfg)) {
+  New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+  $toml = @'
+# 由北极星写入: Python 解释器与依赖走国内镜像, 国内可达。删掉本文件即恢复 uv 默认源。
+python-install-mirror = "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+'@
+  Set-Content -Path $cfg -Value $toml -Encoding UTF8
+  Write-Output "已写入 uv 国内镜像配置: $cfg"
+}
+Write-Output ("uv 安装完成: " + (& $uv --version))
+Write-Output "已装到 $bin —— 重启后终端可直接用; 本应用内 Claude 立即可用 (uv run)。"
+"#;
+
+/// macOS uv 安装脚本 (POSIX sh): 下载 release tar.gz(国内代理加速)→ 解压到 `~/.local/bin` →
+/// 写国内镜像配置 + 写 PATH 进 shell 配置(与 Node 安装一致)。免 sudo。
+#[cfg(target_os = "macos")]
+const MAC_UV_INSTALL_SCRIPT: &str = r#"
+ARCH=$(uname -m)
+case "$ARCH" in
+  arm64|aarch64) UARCH=aarch64 ;;
+  x86_64) UARCH=x86_64 ;;
+  *) UARCH=x86_64 ;;
+esac
+ASSET="uv-${UARCH}-apple-darwin.tar.gz"
+REL="https://github.com/astral-sh/uv/releases/latest/download/${ASSET}"
+TMP="$(mktemp -d)"
+TARBALL="$TMP/$ASSET"
+OK=0
+for U in \
+  "https://gh-proxy.com/$REL" \
+  "https://ghfast.top/$REL" \
+  "$REL" ; do
+  echo "下载: $U"
+  if curl -fsSL "$U" -o "$TARBALL" && [ -s "$TARBALL" ]; then OK=1; break; fi
+  echo "  下载失败, 试下一个镜像..."
+done
+if [ "$OK" != "1" ]; then echo "uv 下载失败 (检查网络/代理后重试)。"; rm -rf "$TMP"; exit 1; fi
+BIN="$HOME/.local/bin"
+mkdir -p "$BIN"
+tar -xzf "$TARBALL" -C "$BIN" --strip-components=1 || { echo "解压失败。"; rm -rf "$TMP"; exit 1; }
+rm -rf "$TMP"
+if [ ! -x "$BIN/uv" ]; then echo "uv 解压后未找到。"; exit 1; fi
+# 国内镜像配置: 仅当用户尚无 uv.toml 时写入
+CFG="$HOME/.config/uv/uv.toml"
+if [ ! -f "$CFG" ]; then
+  mkdir -p "$HOME/.config/uv"
+  cat > "$CFG" <<'EOF'
+# 由北极星写入: Python 解释器与依赖走国内镜像, 国内可达。删掉本文件即恢复 uv 默认源。
+python-install-mirror = "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+EOF
+  echo "已写入 uv 国内镜像配置: $CFG"
+fi
+# 把 ~/.local/bin 写进 shell 配置 (zsh 为 macOS 默认), 已存在则不重复
+LINE="export PATH=\"$BIN:\$PATH\""
+for RC in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.profile" ; do
+  touch "$RC" 2>/dev/null || true
+  grep -qF "$BIN" "$RC" 2>/dev/null || printf '\n# Added by Polaris (uv)\n%s\n' "$LINE" >> "$RC"
+done
+echo "uv 安装完成: $("$BIN/uv" --version)"
+echo "已写入 ~/.zshrc 等; 本应用内 Claude 立即可用 (uv run)。"
+"#;
+
+// ───────────────────────── uv 缓存治理 ─────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UvCacheInfo {
+    /// uv 是否可用 (装了才谈缓存)
+    pub available: bool,
+    /// 缓存目录 (`uv cache dir`)
+    pub dir: Option<String>,
+    /// 缓存占用字节数
+    pub bytes: u64,
+    /// 人类可读大小 (如 "1.3 GB")
+    pub human: String,
+}
+
+/// 人类可读字节数。
+fn human_bytes(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} {}", U[0])
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+/// 递归统计目录字节数 (跟随符号链接会有重复风险, 故不跟随; 仅用于缓存大小估算, 不求绝对精确)。
+fn dir_size(p: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    for ent in rd.flatten() {
+        let Ok(ft) = ent.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size(&ent.path()));
+        } else if let Ok(md) = ent.metadata() {
+            total = total.saturating_add(md.len());
+        }
+    }
+    total
+}
+
+/// uv 缓存目录及占用大小 —— 给「环境医生」展示 + 决定是否提示清理(uv 缓存放任会涨到数 GB)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn env_uv_cache_info() -> UvCacheInfo {
+    let Some(uv) = resolve_uv_exe() else {
+        return UvCacheInfo {
+            available: false,
+            dir: None,
+            bytes: 0,
+            human: "0 B".into(),
+        };
+    };
+    // `uv cache dir` 打印缓存目录路径
+    let mut cmd = Command::new(&uv);
+    cmd.args(["cache", "dir"]);
+    cmd.stdin(Stdio::null());
+    no_window(&mut cmd);
+    let dir = output_with_timeout(cmd, Duration::from_secs(20))
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .map(|s| s.to_string())
+        });
+    let (bytes, dir_str) = match &dir {
+        Some(d) => {
+            let pb = PathBuf::from(d);
+            (if pb.exists() { dir_size(&pb) } else { 0 }, Some(to_fwd(&pb)))
+        }
+        None => (0, None),
+    };
+    UvCacheInfo {
+        available: true,
+        dir: dir_str,
+        bytes,
+        human: human_bytes(bytes),
+    }
+}
+
+/// 清理 uv 缓存 (`uv cache clean`) —— 释放空间。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn env_uv_cache_clean() -> Result<String, String> {
+    let uv = resolve_uv_exe().ok_or_else(|| "未找到 uv (请先安装)。".to_string())?;
+    let mut cmd = Command::new(&uv);
+    cmd.args(["cache", "clean"]);
+    cmd.stdin(Stdio::null());
+    no_window(&mut cmd);
+    let out = output_with_timeout(cmd, Duration::from_secs(120))
+        .ok_or_else(|| "`uv cache clean` 执行超时或无法启动。".to_string())?;
+    if out.status.success() {
+        Ok("uv 缓存已清理。".to_string())
+    } else {
+        Err(format!(
+            "清理失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
 
 // ───────────────────────── Claude Code 更新 ─────────────────────────
 

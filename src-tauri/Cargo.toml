@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "1.1.1"
+version = "1.2.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -80,6 +80,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 语音输入 · 防污染秒达档(voice.rs §7):个人词表拼音对齐纠同音错。
 # 纯 Rust 内嵌音节表,零系统依赖;只用 ToPinyin 取无调音节做编辑距离匹配。
 pinyin = "0.10"
+# 文件中心 · 非 UTF-8 文件名修复(fable/inventory.rs):Linux/Docker 上 GBK 中文名
+# 用 to_string_lossy 会变成乱码 �;用它把 GBK 字节解回中文,IO 时再编码回字节命中磁盘。
+encoding_rs = "0.8"
 # 语音识别运行时(voice-asr feature):sherpa-onnx 的 Rust 绑定,本地跑 SenseVoice。
 # download-binaries = 构建时下载预编译 sherpa-onnx 库(免 cmake 从源码编译,本机最稳)。
 # optional + 专属 feature → 默认 build 不拉它,保护现有绿色编译;实测/发版时显式开 voice-asr。

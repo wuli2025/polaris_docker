@@ -32,7 +32,8 @@ export type ViewKey =
 export const useAppStore = defineStore("app", () => {
   const view = ref<ViewKey>("chat");
   const sidebarCollapsed = ref(false);
-  const drawerCollapsed = ref(false);
+  // 右抽屉(成品预览)默认收起 → 把横向空间让给主区;点对话里的成品 chip 或顶栏抽屉按钮即展开
+  const drawerCollapsed = ref(true);
 
   // 置顶对话：仅前端持久化（localStorage），侧栏排序时置顶优先
   const PINNED_KEY = "polaris.pinnedConvs.v1";
@@ -281,6 +282,19 @@ export const useAppStore = defineStore("app", () => {
     if (pinnedConvs.value.has(conv.id)) togglePin(conv.id);
   }
 
+  /** 回声层:归档对话 —— 从列表移除(消息保留在磁盘,可逆),不删数据。 */
+  async function archiveConversation(conv: Conversation) {
+    await convApi.archiveConversation(conv.id, true);
+    const cur = conversationsByProject.value[conv.projectId] ?? [];
+    conversationsByProject.value = {
+      ...conversationsByProject.value,
+      [conv.projectId]: cur.filter((c) => c.id !== conv.id),
+    };
+    if (currentConvId.value === conv.id) {
+      currentConvId.value = null;
+    }
+  }
+
   async function renameConversation(conv: Conversation, title: string) {
     const t = title.trim();
     if (!t || t === conv.title) return;
@@ -334,6 +348,7 @@ export const useAppStore = defineStore("app", () => {
     openProjectDir,
     createConversation,
     deleteConversation,
+    archiveConversation,
     renameConversation,
     selectConversation,
   };

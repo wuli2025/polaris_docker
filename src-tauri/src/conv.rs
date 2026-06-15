@@ -452,7 +452,8 @@ pub fn conv_list_conversations(project_id: String) -> Vec<Conversation> {
         .read()
         .conversations
         .iter()
-        .filter(|c| c.project_id == project_id)
+        // 归档的对话移出列表(回声层动作一:纯状态位,文件/消息都保留,可逆)
+        .filter(|c| c.project_id == project_id && !c.archived)
         .cloned()
         .collect();
     list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -538,6 +539,38 @@ pub(crate) fn transcripts_since(
             (c.title.clone(), s)
         })
         .collect()
+}
+
+/// 回声层「沉淀为记忆」单条用:取某一对话的文字稿 → (标题, 文字稿)。
+/// 与 transcripts_since 同口径(只含 user/assistant、超长截尾留最新),但**不看 archived**
+/// ——用户在侧栏手动点的就是这一条,归档与否都该能沉淀。空对话返回 None。
+pub(crate) fn transcript_of(id: &str) -> Option<(String, String)> {
+    const PER_CONV_CHARS: usize = 12_000;
+    let state = STATE.read();
+    let c = state.conversations.iter().find(|c| c.id == id)?;
+    let mut buf = String::new();
+    for msg in state.messages.iter().filter(|m| m.conversation_id == c.id) {
+        let who = match msg.role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            _ => continue,
+        };
+        buf.push_str(who);
+        buf.push_str(": ");
+        buf.push_str(msg.content.trim());
+        buf.push('\n');
+    }
+    if buf.trim().is_empty() {
+        return None;
+    }
+    let s = if buf.chars().count() > PER_CONV_CHARS {
+        let chars: Vec<char> = buf.chars().collect();
+        let tail: String = chars[chars.len() - PER_CONV_CHARS..].iter().collect();
+        format!("…(前文截断)\n{tail}")
+    } else {
+        buf
+    };
+    Some((c.title.clone(), s))
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]

@@ -222,7 +222,7 @@ async function startInventory() {
   scanLine.value = "启动盘点…";
   try {
     await invoke("fable_inventory_start", {
-      root: scanRoot.value.trim() || null,
+      roots: scanRoot.value.trim() ? [scanRoot.value.trim()] : [],
     });
     if (fable.value) fable.value = { ...fable.value, scanning: true };
   } catch (e) {

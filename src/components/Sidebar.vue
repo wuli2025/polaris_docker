@@ -4,7 +4,6 @@ import {
   MessagesSquare,
   Library,
   Database,
-  Waypoints,
   Clock,
   Puzzle,
   CloudDownload,
@@ -24,12 +23,20 @@ import {
   Megaphone,
   Presentation,
   Globe,
+  Users,
+  Sparkles,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
 import ProviderDock from "./ProviderDock.vue";
-import type { Conversation } from "../tauri";
+import {
+  persona as personaApi,
+  convApi,
+  type Conversation,
+  type PersonaPreset,
+} from "../tauri";
+import { toast } from "../composables/useToast";
 
 const app = useAppStore();
 const chat = useChatStore();
@@ -41,7 +48,7 @@ const primaryNav: NavItem[] = [
   { key: "wiki", label: "知识库", icon: Library },
   // 文件中心:把整台电脑当成数据库 —— 可视化文件库 + 智能归类 + 语义检索
   { key: "file_center", label: "文件中心", icon: Database },
-  { key: "graph", label: "图谱", icon: Waypoints },
+  // 图谱已并入「知识库」顶部 tab(当一个小功能键),不再单列侧栏项
   { key: "automation", label: "自动化", icon: Clock },
   // 沙箱入口已隐藏：进入沙箱视图首挂载较重、点击有卡顿，且当前非核心路径。
   // 视图与路由（App.vue / SandboxStatus）保留，未来需要时把这一项加回即可。
@@ -95,6 +102,35 @@ async function confirmDelete(c: Conversation) {
   }
 }
 
+// ─────────── 对话行「⋯」菜单(回声层:沉淀为记忆 / 归档)───────────
+const openConvMenuId = ref<string | null>(null);
+function toggleConvMenu(id: string) {
+  openConvMenuId.value = openConvMenuId.value === id ? null : id;
+}
+function closeConvMenu() {
+  openConvMenuId.value = null;
+}
+// 把这条对话立刻沉淀成记忆(后台跑;完成后可在「设置 › 回声」看到条数增加)
+async function distillConv(c: Conversation) {
+  closeConvMenu();
+  try {
+    await convApi.distillConversation(c.id);
+    toast.info(`正在把「${c.title}」沉淀为记忆…完成后可在「设置 › 回声」查看`);
+  } catch (e) {
+    toast.error(`沉淀失败：${e}`);
+  }
+}
+async function archiveConv(c: Conversation) {
+  closeConvMenu();
+  if (
+    confirm(
+      `归档对话「${c.title}」?\n会从列表移除（消息保留在磁盘、不参与做梦取材），可逆。`
+    )
+  ) {
+    await app.archiveConversation(c);
+  }
+}
+
 // 项目「…」更多菜单（仿 Codex 项目操作）：在资源管理器打开 / 归档移除
 const openMenuPid = ref<string | null>(null);
 function toggleProjMenu(pid: string) {
@@ -119,6 +155,55 @@ async function archiveProj(proj: { id: string; name: string }) {
     )
   ) {
     await app.archiveProject(proj.id);
+  }
+}
+
+// ─────────── 入驻专家 / 专家团（写项目 CLAUDE.md，复用 persona_apply）───────────
+// 在「…」菜单点「入驻专家 / 专家团」→ 弹浮层选单专家或专家团 → 选中即注入本项目 CLAUDE.md。
+// 单专家=一段人设皮肤；专家团=战略师领衔的编排型 CLAUDE.md（按情况组阵、四模式默认单 agent）。
+const personaPickerPid = ref<string | null>(null);
+const personaPresets = ref<PersonaPreset[]>([]);
+const applyingPersona = ref(false);
+const teamPresets = computed(() => personaPresets.value.filter((p) => p.kind === "team"));
+const singlePresets = computed(() => personaPresets.value.filter((p) => p.kind !== "team"));
+
+async function openPersonaPicker(pid: string) {
+  openMenuPid.value = null;
+  personaPickerPid.value = pid;
+  if (personaPresets.value.length === 0) {
+    try {
+      personaPresets.value = await personaApi.list();
+    } catch (e) {
+      toast.error(`加载专家库失败：${e}`);
+    }
+  }
+}
+function closePersonaPicker() {
+  personaPickerPid.value = null;
+}
+async function applyExpert(pid: string, preset: PersonaPreset) {
+  if (applyingPersona.value) return;
+  applyingPersona.value = true;
+  try {
+    try {
+      await personaApi.apply(pid, preset.id, false);
+    } catch {
+      // 已有人格内容 → 二次确认后覆盖
+      if (!confirm(`本项目已有人格/专家内容，确认替换为「${preset.name}」？`)) {
+        applyingPersona.value = false;
+        return;
+      }
+      await personaApi.apply(pid, preset.id, true);
+    }
+    toast.success(
+      `已为本项目入驻${preset.kind === "team" ? "专家团" : "专家"}「${preset.name}」`
+    );
+    closePersonaPicker();
+    await app.refreshProjects();
+  } catch (e) {
+    toast.error(`入驻失败：${e}`);
+  } finally {
+    applyingPersona.value = false;
   }
 }
 
@@ -316,6 +401,10 @@ const sortedProjects = computed(() => {
 
           <!-- 项目操作菜单（仿 Codex 右侧「…」）-->
           <div v-if="openMenuPid === proj.id" class="proj-menu" @click.stop>
+            <button class="pm-item" @click="openPersonaPicker(proj.id)">
+              <Users :size="14" :stroke-width="1.7" />
+              <span>入驻专家 / 专家团</span>
+            </button>
             <button class="pm-item" @click="revealProject(proj.id)">
               <FolderOpen :size="14" :stroke-width="1.7" />
               <span>在资源管理器中打开</span>
@@ -324,6 +413,51 @@ const sortedProjects = computed(() => {
             <button class="pm-item danger" @click="archiveProj(proj)">
               <Archive :size="14" :stroke-width="1.7" />
               <span>归档项目（移出列表）</span>
+            </button>
+          </div>
+
+          <!-- 入驻专家 / 专家团 选择浮层 -->
+          <div
+            v-if="personaPickerPid === proj.id"
+            class="persona-pick"
+            @click.stop
+          >
+            <div class="pp-head">
+              <span>为「{{ proj.name }}」入驻</span>
+              <button class="pp-x" @click="closePersonaPicker">✕</button>
+            </div>
+            <div class="pp-hint">
+              注入本项目 <code>CLAUDE.md</code>，下次对话即生效；不同项目互不影响。
+            </div>
+            <div class="pp-grp">专家团 · 战略师领衔</div>
+            <button
+              v-for="ps in teamPresets"
+              :key="ps.id"
+              class="pp-item team"
+              :disabled="applyingPersona"
+              :title="ps.description"
+              @click="applyExpert(proj.id, ps)"
+            >
+              <span class="pp-ic">{{ ps.icon }}</span>
+              <span class="pp-tx">
+                <span class="pp-nm">{{ ps.name }}</span>
+                <span class="pp-ds">{{ ps.description }}</span>
+              </span>
+            </button>
+            <div class="pp-grp">单专家</div>
+            <button
+              v-for="ps in singlePresets"
+              :key="ps.id"
+              class="pp-item"
+              :disabled="applyingPersona"
+              :title="ps.description"
+              @click="applyExpert(proj.id, ps)"
+            >
+              <span class="pp-ic">{{ ps.icon }}</span>
+              <span class="pp-tx">
+                <span class="pp-nm">{{ ps.name }}</span>
+                <span class="pp-ds">{{ ps.description }}</span>
+              </span>
             </button>
           </div>
         </div>
@@ -357,6 +491,14 @@ const sortedProjects = computed(() => {
             <template v-else>
               <span class="cv-time">{{ fmtAgo(effMs(c)) }}</span>
               <button
+                class="ca cv-dots"
+                :class="{ on: openConvMenuId === c.id }"
+                title="更多操作"
+                @click.stop="toggleConvMenu(c.id)"
+              >
+                <MoreHorizontal :size="13" :stroke-width="1.8" />
+              </button>
+              <button
                 class="ca delete"
                 title="删除对话"
                 @click.stop="confirmDelete(c)"
@@ -364,6 +506,23 @@ const sortedProjects = computed(() => {
                 ×
               </button>
             </template>
+
+            <!-- 对话操作菜单(回声层:沉淀为记忆 / 归档)-->
+            <div
+              v-if="openConvMenuId === c.id"
+              class="conv-menu"
+              @click.stop
+            >
+              <button class="pm-item" @click="distillConv(c)">
+                <Sparkles :size="14" :stroke-width="1.7" />
+                <span>沉淀为记忆</span>
+              </button>
+              <div class="pm-sep"></div>
+              <button class="pm-item danger" @click="archiveConv(c)">
+                <Archive :size="14" :stroke-width="1.7" />
+                <span>归档对话（移出列表）</span>
+              </button>
+            </div>
           </div>
           <div
             v-if="(app.conversationsByProject[proj.id] || []).length === 0"
@@ -375,8 +534,14 @@ const sortedProjects = computed(() => {
       </div>
     </div>
 
-    <!-- 点击空白处关闭项目菜单 -->
+    <!-- 点击空白处关闭项目菜单 / 专家入驻浮层 / 对话菜单 -->
     <div v-if="openMenuPid" class="menu-backdrop" @click="closeProjMenu()"></div>
+    <div v-if="openConvMenuId" class="menu-backdrop" @click="closeConvMenu()"></div>
+    <div
+      v-if="personaPickerPid"
+      class="menu-backdrop"
+      @click="closePersonaPicker()"
+    ></div>
 
     <div class="footer">
       <ProviderDock :collapsed="app.sidebarCollapsed" />
@@ -762,6 +927,106 @@ const sortedProjects = computed(() => {
   z-index: 45;
 }
 
+/* 入驻专家 / 专家团 选择浮层 */
+.persona-pick {
+  position: absolute;
+  z-index: 50;
+  top: 30px;
+  right: 6px;
+  width: 244px;
+  max-height: 380px;
+  overflow-y: auto;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.2), 0 2px 8px rgba(0, 0, 0, 0.1);
+  animation: pmIn 0.13s ease;
+}
+.pp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  padding: 2px 4px 6px;
+}
+.pp-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.pp-x:hover {
+  color: var(--text);
+}
+.pp-hint {
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.5;
+  padding: 0 4px 6px;
+}
+.pp-hint code {
+  font-size: 10.5px;
+  background: var(--selection-bg);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.pp-grp {
+  font-family: var(--serif);
+  font-size: 10.5px;
+  letter-spacing: 1.2px;
+  color: var(--dim);
+  padding: 8px 4px 4px;
+}
+.pp-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 8px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.pp-item:hover {
+  background: var(--selection-bg);
+}
+.pp-item.team:hover {
+  border-color: var(--primary);
+}
+.pp-item:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.pp-ic {
+  font-size: 18px;
+  line-height: 1.2;
+  flex-shrink: 0;
+}
+.pp-tx {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.pp-nm {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.pp-ds {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
 /* 行尾相对时间（仿 Codex）：常态显示，hover 让位给删除按钮 */
 .cv-time {
   flex-shrink: 0;
@@ -774,6 +1039,7 @@ const sortedProjects = computed(() => {
 }
 /* 对话 = 实体（仿 Codex）：更醒目、可点的主条目，颜色加深、字号略大 */
 .conv {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -862,6 +1128,37 @@ const sortedProjects = computed(() => {
 }
 .ca.delete:hover {
   color: var(--vermilion);
+}
+/* 对话行「⋯」钮：与删除钮同样常态隐藏、hover 现身；菜单展开时(.on)常驻高亮 */
+.conv .ca.cv-dots {
+  display: none;
+}
+.conv:hover .ca.cv-dots {
+  display: inline-flex;
+}
+.ca.cv-dots.on {
+  display: inline-flex;
+  opacity: 1;
+  background: var(--border);
+  color: var(--text);
+}
+/* 对话操作下拉菜单(复用 .pm-item / .pm-sep) */
+.conv-menu {
+  position: absolute;
+  z-index: 50;
+  top: 28px;
+  right: 6px;
+  min-width: 184px;
+  padding: 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16), 0 2px 8px rgba(0, 0, 0, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: pmIn 0.13s ease;
+  cursor: default;
 }
 
 .empty-hint {

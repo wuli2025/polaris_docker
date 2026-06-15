@@ -20,6 +20,7 @@
 //! 千万级时在 `index::vector_topk` 内换 ANN/量化,签名不变。
 
 pub mod agent;
+pub mod eval;
 pub mod files;
 pub mod index;
 pub mod inventory;
@@ -114,6 +115,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             text    TEXT NOT NULL DEFAULT '',
             made_at INTEGER NOT NULL DEFAULT 0
         );
+        -- 文件中心 · 智能显示标题(覆盖原始乱/杂文件名;仅显示,不改磁盘)。
+        -- 本地启发式不入库(grid 里现算);此表只存 AI 生成的标题(source='llm')。
+        CREATE TABLE IF NOT EXISTS titles(
+            file_id INTEGER PRIMARY KEY,
+            title   TEXT NOT NULL DEFAULT '',
+            source  TEXT NOT NULL DEFAULT '',
+            made_at INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )
     .map_err(|e| format!("fable.db 迁移失败: {e}"))?;
@@ -122,7 +131,51 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("ALTER TABLE files ADD COLUMN cluster_id INTEGER NOT NULL DEFAULT 0", [])
             .map_err(|e| format!("fable.db 加 cluster_id 列失败: {e}"))?;
     }
+    // 文件中心:簇层级列(parent=0 顶层主题;parent=父簇 id 子主题)。语义两级归类写入。
+    if conn.prepare("SELECT parent FROM clusters LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE clusters ADD COLUMN parent INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|e| format!("fable.db 加 clusters.parent 列失败: {e}"))?;
+    }
+    // ── 20TB 整改 · P2-2 嵌入模型版本隔离 ──
+    // chunks.model:写入该 chunk 时生效的嵌入模型标识(provider.default_model)。
+    // 换模型后旧向量 model 不匹配 → 检索时直接被 SQL 过滤,不再「静默混入异源向量」,
+    // 并据此在 status 里报「需重建的陈旧向量数」。旧库 model='' 视为陈旧。
+    if conn.prepare("SELECT model FROM chunks LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE chunks ADD COLUMN model TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|e| format!("fable.db 加 chunks.model 列失败: {e}"))?;
+    }
+    // ── 20TB 整改 · P1-1/P1-3 二值量化粗筛位 ──
+    // chunks.bits:入库时按符号位打包的二值码(dim/8 字节)。向量车道两段式 ANN:
+    // 第一段只读 bits 算汉明距离(读量 1/32),粗筛出候选;第二段对候选读 f32 原始向量精排。
+    // 旧库 bits=NULL → 该 chunk 退回暴力精排(不丢召回,只是慢)。
+    if conn.prepare("SELECT bits FROM chunks LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE chunks ADD COLUMN bits BLOB", [])
+            .map_err(|e| format!("fable.db 加 chunks.bits 列失败: {e}"))?;
+    }
+    // ── 20TB 整改 · P1-2 全文倒排(FTS5)就绪标记 ──
+    // files.ftsed:该文件正文是否已写入 lex 倒排索引(类 chunked,幂等续跑;mtime 变即重置)。
+    if conn.prepare("SELECT ftsed FROM files LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE files ADD COLUMN ftsed INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|e| format!("fable.db 加 files.ftsed 列失败: {e}"))?;
+    }
+    // ── 20TB 整改 · P1-2 全文倒排表(FTS5 trigram)──
+    // lex(rowid=file_id, body=正文):提前建好的倒排索引,查词秒回、覆盖全部文本文件,
+    // 取代 grep 车道「查询时临时打开几万个文件当场读」的硬上限漏检。trigram 分词支持
+    // 中文/代码的 ≥3 字符子串匹配。FTS5 未编入(理论上不会)时静默跳过 → 退回实时扫描。
+    let _ = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS lex USING fts5(body, tokenize='trigram');",
+    );
     Ok(())
+}
+
+/// lex 倒排表是否就绪(FTS5 编入且建表成功)。检索/构建据此在「倒排」与「实时扫描」间择路。
+pub(crate) fn lex_available(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lex'",
+        [],
+        |_| Ok(()),
+    )
+    .is_ok()
 }
 
 /// 启动时调用(桌面 setup / server main):只确保库可开、表就位,不做扫描。
@@ -130,6 +183,49 @@ pub fn init() {
     if let Err(e) = open_db() {
         eprintln!("[fable] init: {e}");
     }
+}
+
+/// 文件系统名/路径段 → 显示用 String。修「Docker/NAS 上非 UTF-8 文件名(多为 Windows/
+/// 网盘下载来的 GBK 中文名)经 to_string_lossy 变成乱码 �」:
+///   ① 本就是合法 UTF-8(含纯 ASCII 与正常中文)→ 原样返回(零成本,绝大多数);
+///   ② 否则(Unix 上拿到原始字节)→ 按 GBK 解码,无错且无替换符才采信(恢复真中文);
+///   ③ 仍不行 → 退回 lossy(至少不崩)。
+/// 注:这是「显示」用的解码;真要对该文件做 IO 时用 [`reencode_fs_path`] 把 UTF-8 编回字节命中磁盘。
+pub(crate) fn decode_fs(os: &std::ffi::OsStr) -> String {
+    if let Some(s) = os.to_str() {
+        return s.to_string();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (cow, _enc, had_err) = encoding_rs::GBK.decode(os.as_bytes());
+        if !had_err && !cow.contains('\u{fffd}') {
+            return cow.into_owned();
+        }
+    }
+    os.to_string_lossy().into_owned()
+}
+
+/// 把 [`decode_fs`] 解出的显示路径还原成磁盘上真实路径:UTF-8 路径若已存在直接用;
+/// 否则(Unix 上原本是 GBK 名)把字符串按 GBK 编回字节、用原始字节构路径再试。
+/// 让 GBK 命名的图片/文档仍能出缩略图/速览,而存进 DB 的是好看的 UTF-8 路径。
+pub(crate) fn reencode_fs_path(display_abspath: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(display_abspath);
+    if p.exists() {
+        return p;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (bytes, _enc, had_err) = encoding_rs::GBK.encode(display_abspath);
+        if !had_err {
+            let alt = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+            if alt.exists() {
+                return alt;
+            }
+        }
+    }
+    p
 }
 
 /// 并行度:留一个核给 UI/主循环,封顶 12(NAS 盘 IO 先饱和)。
@@ -162,6 +258,12 @@ pub struct FableStatus {
     pub embedded_files: u64,
     /// 还在排队等嵌入的文本文件数
     pub pending_files: u64,
+    /// 已写入全文倒排(lex)的文本文件数(P1-2)
+    pub lex_files: u64,
+    /// 还没进倒排的文本文件数(P1-2)
+    pub pending_lex: u64,
+    /// 与当前嵌入模型不一致、需重建的陈旧向量数(P2-2;model='' 的旧向量也计入)
+    pub stale_chunks: u64,
     pub scanning: bool,
     pub indexing: bool,
     /// 当前生效的嵌入服务商(无则向量车道不可用,grep 车道照常)
@@ -194,6 +296,14 @@ pub fn status() -> Result<FableStatus, String> {
     let one = |sql: &str| -> u64 {
         conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
     };
+    // 当前生效嵌入模型(用于算「陈旧向量」);无服务商时陈旧数报 0(向量车道本就停摆)。
+    let active_model = crate::sense::active_provider("embed").map(|p| p.default_model);
+    let stale_chunks = match &active_model {
+        Some(m) => conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE model<>?1", [m], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as u64,
+        None => 0,
+    };
     Ok(FableStatus {
         db_path: db_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         roots,
@@ -204,6 +314,11 @@ pub fn status() -> Result<FableStatus, String> {
         pending_files: one(
             "SELECT COUNT(*) FROM files WHERE kind='text' AND chunked=0 AND size<=2000000",
         ),
+        lex_files: one("SELECT COUNT(*) FROM files WHERE kind='text' AND ftsed=1"),
+        pending_lex: one(
+            "SELECT COUNT(*) FROM files WHERE kind='text' AND ftsed=0 AND size<=4000000",
+        ),
+        stale_chunks,
         scanning: SCANNING.load(Ordering::Relaxed),
         indexing: INDEXING.load(Ordering::Relaxed),
         embed_provider: crate::sense::active_provider("embed").map(|p| p.name),
@@ -222,4 +337,49 @@ pub fn fable_status() -> Result<FableStatus, String> {
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn fable_cancel() {
     CANCEL.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    /// 实测 bundled SQLite 编入了 FTS5 + trigram 分词器,且 trigram 的子串 MATCH 对
+    /// 中文/代码都能命中(P1-2 全文倒排的硬前提;否则 lex 建表失败 → 静默退回实时扫描)。
+    #[test]
+    fn bundled_sqlite_has_fts5_trigram_substring_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE VIRTUAL TABLE lex USING fts5(body, tokenize='trigram');")
+            .expect("bundled SQLite 缺 FTS5/trigram —— P1-2 倒排会退回实时扫描");
+        conn.execute(
+            "INSERT INTO lex(rowid, body) VALUES(?1, ?2)",
+            rusqlite::params![1i64, "营业时间是早上九点到下午五点 open_hours=9to5"],
+        )
+        .unwrap();
+        // 中文子串(≥3 字符)命中
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lex WHERE body MATCH '\"营业时间\"'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "trigram 中文子串 MATCH 应命中");
+        // 代码标识符子串命中
+        let m: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lex WHERE body MATCH '\"open_hours\"'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(m, 1, "trigram ASCII 子串 MATCH 应命中");
+        // bm25 排序可用(检索路用它取候选);term 取 ≥3 字符(trigram 索引不了 1~2 字符)
+        let ordered: i64 = conn
+            .query_row(
+                "SELECT rowid FROM lex WHERE body MATCH '\"下午五点\"' ORDER BY bm25(lex) LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordered, 1);
+        // 反证 trigram 的 ≥3 字符下限:2 字符 term 不该命中(检索代码据此回退实时扫描)
+        let two: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lex WHERE body MATCH '\"九点\"'", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(two, 0, "2 字符 term 在 trigram 下不命中(已知下限)");
+    }
 }

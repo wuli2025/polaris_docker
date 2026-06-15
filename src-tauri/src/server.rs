@@ -513,13 +513,24 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "echo_status" => ok(echo::echo_status()),
         "echo_set" => ok(echo::echo_set(opt_bool(a, "enabled"), opt_u8(a, "hour"))),
         "echo_dream_now" => ok(echo::echo_dream_now(app)?),
+        "echo_distill_conversation" => {
+            ok(echo::echo_distill_conversation(app, req_str(a, "convId")?)?)
+        }
 
         // ── 寓言计划 · 检索枢纽(盘点 L1a + 向量索引 + 塌平混检)──
         "fable_status" => ok(fable::fable_status()?),
         "fable_cancel" => ok(fable::fable_cancel()),
-        "fable_inventory_start" => {
-            ok(fable::inventory::fable_inventory_start(app, opt_str(a, "root"))?)
-        }
+        "fable_inventory_start" => ok(fable::inventory::fable_inventory_start(
+            app,
+            Some(vec_str(a, "roots")),
+            Some(vec_str(a, "exclude")),
+        )?),
+        "fable_scan_folders" => ok(fable::inventory::fable_scan_folders(opt_str(a, "root"))?),
+        "fable_scan_folder_children" => ok(fable::inventory::fable_scan_folder_children(
+            req_str(a, "root")?,
+            req_str(a, "path")?,
+        )?),
+        "fable_folder_size" => ok(fable::inventory::fable_folder_size(req_str(a, "path")?)?),
         "fable_index_start" => {
             ok(fable::index::fable_index_start(app, opt_usize(a, "maxChunks"))?)
         }
@@ -528,6 +539,12 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             opt_usize(a, "topK"),
             opt_str(a, "mode"),
         )?),
+        "fable_eval" => ok(fable::eval::fable_eval(
+            opt_str(a, "path"),
+            opt_usize(a, "topK"),
+            opt_str(a, "mode"),
+        )?),
+        "fable_eval_template" => ok(fable::eval::fable_eval_template(opt_str(a, "path"))?),
 
         // ── 文件中心(可视化文件库)──
         "file_overview" => ok(fable::files::file_overview(opt_str(a, "root"))?),
@@ -551,6 +568,8 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
         )?),
         "file_cluster_llm" => ok(fable::files::file_cluster_llm(app, opt_str(a, "root"))?),
+        "file_titles_llm" => ok(fable::files::file_titles_llm(app, opt_str(a, "root"))?),
+        "file_titles_clear" => ok(fable::files::file_titles_clear()?),
         "file_cluster_model_get" => ok(fable::files::file_cluster_model_get()),
         "file_cluster_model_set" => ok(fable::files::file_cluster_model_set(
             opt_bool(a, "enabled"),

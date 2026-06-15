@@ -19,12 +19,20 @@ import {
   FolderOpen,
   X,
   Wand2,
-  Zap,
   KeyRound,
   Brain,
   FileText,
   LoaderCircle,
   ArrowDownWideNarrow,
+  ChevronDown,
+  ChevronRight,
+  ChevronLeft,
+  Folder,
+  SlidersHorizontal,
+  Layers,
+  FolderTree,
+  Check,
+  RotateCcw,
 } from "@lucide/vue";
 import {
   files as fc,
@@ -33,6 +41,8 @@ import {
   type FileOverview,
   type FileCard,
   type FcCluster,
+  type FolderNode,
+  type ScanRootInfo,
 } from "../tauri";
 import { useAppStore } from "../stores/app";
 
@@ -55,6 +65,28 @@ const searchText = ref("");
 
 const scanning = ref(false);
 const scanMsg = ref("");
+
+// ── 「盘点」= 先扫一眼文件夹结构 → 勾选要盘点的目录(不限知识库)→ 建库 ──
+const pickerOpen = ref(false);
+const pickerLoading = ref(false);
+const pickerErr = ref("");
+const pickerTruncated = ref(false);
+const scanRoots = ref<ScanRootInfo[]>([]);
+// 已加载的全部节点(根的第一层 + 用户点开后懒加载的更深层)。path → 节点。
+const allNodes = reactive(new Map<string, FolderNode>());
+// parent 路径 → 其直属子文件夹(后端已按名排序)。
+const childIndex = reactive(new Map<string, FolderNode[]>());
+// 正在懒加载子目录的文件夹路径。
+const childLoading = reactive(new Set<string>());
+// 文件夹路径 → 递归总量{files,bytes}(按需限并发计算)。
+const sizeCache = reactive(new Map<string, { files: number; bytes: number }>());
+// 层级复选框:显式勾上 / 显式取消 的路径(根路径或文件夹路径)。
+// 未显式标记的节点 → 继承最近祖先的标记;祖先都没标记 → 看所属根的 defaultOn。
+const checked = reactive(new Set<string>());
+const unchecked = reactive(new Set<string>());
+// 展开了子目录的文件夹/根路径。
+const expanded = reactive(new Set<string>());
+
 const clustering = ref(false);
 const clusterMsg = ref("");
 const building = ref(false);
@@ -65,6 +97,68 @@ const llmClustering = ref(false);
 const llmMsg = ref("");
 const reportPath = ref("");
 let unlistenLlm: (() => void) | null = null;
+
+// 折叠状态(均持久化记住用户选择):头部横幅(体积/数量/统计)· 语义分类 · 类型筛选。
+// 默认把横幅收起 → 功能键整体上移、把纵向空间让给下方可观看的文件网格。
+function loadFc(key: string, def: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? def : v === "1";
+  } catch {
+    return def;
+  }
+}
+function saveFc(key: string, v: boolean) {
+  try {
+    localStorage.setItem(key, v ? "1" : "0");
+  } catch {
+    /* storage 不可用 */
+  }
+}
+const bannerOpen = ref(loadFc("polaris.fc.banner", false));
+const foldersOpen = ref(loadFc("polaris.fc.folders", true));
+const kindOpen = ref(loadFc("polaris.fc.kinds", false));
+watch(bannerOpen, (v) => saveFc("polaris.fc.banner", v));
+watch(foldersOpen, (v) => saveFc("polaris.fc.folders", v));
+watch(kindOpen, (v) => saveFc("polaris.fc.kinds", v));
+// 语义文件夹下钻路径(目前两级:[] = 顶层主题;[topId] = 某主题内看子主题)
+const folderPath = ref<number[]>([]);
+
+// ── 聚类树状图:展开的顶层节点集合(默认全部收起,只露顶层大类)──
+const treeExpanded = reactive(new Set<number>());
+function toggleTree(id: number) {
+  if (treeExpanded.has(id)) treeExpanded.delete(id);
+  else treeExpanded.add(id);
+}
+// 右上角 minimap 点某大类 → 展开该枝并滚动到位
+const treeRef = ref<HTMLElement | null>(null);
+function focusBranch(id: number) {
+  treeExpanded.add(id);
+  nextTick(() => {
+    const el = treeRef.value?.querySelector(`[data-cl="${id}"]`) as HTMLElement | null;
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+  });
+}
+
+// 归类小提示(默认不常驻,只在点「智能归类 / AI 归类」时弹一下)
+const tip = reactive({ show: false, kind: "" as "" | "cluster" | "ai" });
+let tipTimer: ReturnType<typeof setTimeout> | null = null;
+function flashTip(kind: "cluster" | "ai") {
+  tip.kind = kind;
+  tip.show = true;
+  if (tipTimer) clearTimeout(tipTimer);
+  tipTimer = setTimeout(() => (tip.show = false), 9000);
+}
+function closeTip() {
+  tip.show = false;
+  if (tipTimer) clearTimeout(tipTimer);
+}
+
+// AI 智能命名(给乱码/杂乱文件名起可读标题)
+const llmTitling = ref(false);
+const titleMsg = ref("");
+const titleDone = ref(false);
+let unlistenTitle: (() => void) | null = null;
 
 // 语义检索结果(独立于网格的一条结果带)
 interface SemHit {
@@ -124,6 +218,24 @@ const clusterColor = computed<Record<number, FcCluster>>(() => {
   for (const c of overview.value?.clusters ?? []) m[c.id] = c;
   return m;
 });
+
+// ───────────────────────── 语义文件夹层级(两级) ─────────────────────────
+const allClusters = computed<FcCluster[]>(() => overview.value?.clusters ?? []);
+const topFolders = computed<FcCluster[]>(() => allClusters.value.filter((c) => c.parent === 0));
+function childrenOf(id: number): FcCluster[] {
+  return allClusters.value.filter((c) => c.parent === id);
+}
+function hasChildren(id: number): boolean {
+  return allClusters.value.some((c) => c.parent === id);
+}
+const hasClusters = computed(() => allClusters.value.length > 0);
+// 当前文件夹层要显示的卡片:根 → 顶层主题;进入某主题 → 其子主题
+const folderCards = computed<FcCluster[]>(() =>
+  folderPath.value.length ? childrenOf(folderPath.value[0]) : topFolders.value,
+);
+const currentFolder = computed<FcCluster | null>(() =>
+  folderPath.value.length ? clusterColor.value[folderPath.value[0]] ?? null : null,
+);
 
 function accentFor(card: FileCard): string {
   if (card.clusterId > 0 && clusterColor.value[card.clusterId]) {
@@ -222,6 +334,33 @@ function pickCluster(id: number | null) {
   if (activeCluster.value !== null) view.value = "gallery";
   applyFilters();
 }
+
+// 点一张语义文件夹卡片:有子主题 → 下钻;否则(叶/无子)→ 选中筛选画廊。
+function openFolder(c: FcCluster) {
+  if (c.parent === 0 && hasChildren(c.id)) {
+    folderPath.value = [c.id];
+    activeCluster.value = null;
+    activeKind.value = null;
+  } else {
+    activeKind.value = null;
+    activeCluster.value = c.id;
+    view.value = "gallery";
+    applyFilters();
+  }
+}
+// 看某主题下的全部文件(不再细分子主题)。
+function viewWholeFolder(c: FcCluster) {
+  activeKind.value = null;
+  activeCluster.value = c.id;
+  view.value = "gallery";
+  applyFilters();
+}
+// 回到顶层主题。
+function folderHome() {
+  folderPath.value = [];
+  activeCluster.value = null;
+  applyFilters();
+}
 function setSort(s: typeof sort.value) {
   sort.value = s;
   applyFilters();
@@ -231,11 +370,14 @@ function onSearchInput() {
   searchTimer = setTimeout(() => applyFilters(), 240);
 }
 
-// ───────────────────────── 盘点 / 聚类 ─────────────────────────
-async function doScan() {
+// ───────────────────────── 盘点(扫描 + 选目录 + 建库)─────────────────────────
+// 「盘点」点开 → 扫一眼文件夹结构 → 勾选要盘点的目录 → 开始建库。
+async function doScan(roots: string[], exclude: string[]) {
   if (scanning.value) return;
   scanning.value = true;
-  scanMsg.value = "正在盘点磁盘…";
+  scanMsg.value = exclude.length
+    ? `正在盘点(已跳过 ${exclude.length} 个文件夹)…`
+    : "正在盘点磁盘…";
   try {
     if (!unlistenScan) {
       unlistenScan = await listen<{ kind: string; files?: number; message?: string }>(
@@ -254,15 +396,261 @@ async function doScan() {
         },
       );
     }
-    await fc.inventoryStart(null);
+    await fc.inventoryStart(roots, exclude);
   } catch (e: any) {
     scanMsg.value = `盘点失败:${e?.message ?? e}`;
     scanning.value = false;
   }
 }
 
+// ── 打开「盘点」:先扫文件夹结构(根+第一层),让用户勾选 / 逐层点开要盘点的目录 ──
+function ingestNodes(nodes: FolderNode[]) {
+  for (const n of nodes) {
+    if (!allNodes.has(n.path)) allNodes.set(n.path, n);
+    const arr = childIndex.get(n.parent);
+    if (arr) {
+      if (!arr.some((x) => x.path === n.path)) arr.push(n);
+    } else {
+      childIndex.set(n.parent, [n]);
+    }
+    requestSize(n.path); // 后台算这个文件夹有多大
+  }
+}
+async function openFolderPicker() {
+  if (pickerLoading.value || scanning.value) return;
+  pickerOpen.value = true;
+  pickerLoading.value = true;
+  pickerErr.value = "";
+  try {
+    allNodes.clear();
+    childIndex.clear();
+    childLoading.clear();
+    sizeCache.clear();
+    sizeQueue.length = 0;
+    sizeInflight.clear();
+    checked.clear();
+    unchecked.clear();
+    expanded.clear();
+    const res = await fc.scanFolders(null);
+    scanRoots.value = res.roots;
+    pickerTruncated.value = res.truncated;
+    ingestNodes(res.folders);
+    // 默认勾上的根自动展开,方便直接看到知识库的子目录。
+    for (const r of res.roots) if (r.defaultOn) expanded.add(r.path);
+  } catch (e: any) {
+    pickerErr.value = `扫描失败:${e?.message ?? e}`;
+    scanRoots.value = [];
+  } finally {
+    pickerLoading.value = false;
+  }
+}
+function closeFolderPicker() {
+  pickerOpen.value = false;
+}
+
+const rootByPath = computed(() => {
+  const m = new Map<string, ScanRootInfo>();
+  for (const r of scanRoots.value) m.set(r.path, r);
+  return m;
+});
+
+// 从某路径向上的祖先链(不含自身),最后到所属根路径。
+function ancestorsOf(path: string): string[] {
+  const out: string[] = [];
+  let cur = allNodes.get(path)?.parent;
+  while (cur) {
+    out.push(cur);
+    const pn = allNodes.get(cur);
+    if (!pn) break; // cur 已是根路径(根没有 FolderNode)
+    cur = pn.parent;
+  }
+  return out;
+}
+function rootOf(path: string): string {
+  return allNodes.get(path)?.root ?? path;
+}
+// 节点(根或文件夹)是否「最终被勾选」= 盘点范围内。
+function isIncluded(path: string): boolean {
+  const chain = [path, ...ancestorsOf(path)];
+  for (const p of chain) {
+    if (checked.has(p)) return true;
+    if (unchecked.has(p)) return false;
+  }
+  return rootByPath.value.get(rootOf(path))?.defaultOn ?? false;
+}
+// 父节点(根→无父,看根默认;文件夹→其 parent)的最终状态。
+function parentIncluded(path: string): boolean {
+  const node = allNodes.get(path);
+  if (!node) return false; // 这是根:无父
+  return isIncluded(node.parent);
+}
+function toggleNode(path: string) {
+  const want = !isIncluded(path);
+  // 清掉所有(已加载)后代的显式标记,让它们继承新状态。
+  for (const key of allNodes.keys()) {
+    if (key !== path && (key.startsWith(path + "\\") || key.startsWith(path + "/"))) {
+      checked.delete(key);
+      unchecked.delete(key);
+    }
+  }
+  const node = allNodes.get(path);
+  // 基准 = 父节点最终态(根没有父 → 看根 defaultOn)。
+  const base = node ? isIncluded(node.parent) : (rootByPath.value.get(path)?.defaultOn ?? false);
+  checked.delete(path);
+  unchecked.delete(path);
+  if (want !== base) (want ? checked : unchecked).add(path);
+}
+async function toggleExpand(path: string) {
+  if (expanded.has(path)) {
+    expanded.delete(path);
+    return;
+  }
+  expanded.add(path);
+  // 文件夹(非根)且还没加载过子目录 → 懒加载。
+  const node = allNodes.get(path);
+  if (node && node.hasChildren && !childIndex.has(path) && !childLoading.has(path)) {
+    childLoading.add(path);
+    try {
+      const kids = await fc.scanFolderChildren(node.root, path);
+      ingestNodes(kids);
+      if (!childIndex.has(path)) childIndex.set(path, []); // 兜底:全被剪掉 → 空数组
+    } catch {
+      childIndex.set(path, []);
+    } finally {
+      childLoading.delete(path);
+    }
+  }
+}
+function resetPicker() {
+  checked.clear();
+  unchecked.clear();
+}
+// 已勾选盘点的文件夹数(用于底部计数;只统计已加载节点)。
+const pickerSelected = computed(() => {
+  let n = 0;
+  for (const node of allNodes.values()) if (isIncluded(node.path)) n++;
+  return n;
+});
+// 至少勾了一个根或文件夹?
+const pickerHasSelection = computed(
+  () => scanRoots.value.some((r) => isIncluded(r.path)) || pickerSelected.value > 0,
+);
+
+// ── 文件夹大小:限并发的后台计算队列 ──
+const SIZE_CONCURRENCY = 4;
+const sizeQueue: string[] = [];
+const sizeInflight = new Set<string>();
+let sizeActive = 0;
+function requestSize(path: string) {
+  if (sizeCache.has(path) || sizeInflight.has(path) || sizeQueue.includes(path)) return;
+  sizeQueue.push(path);
+  pumpSize();
+}
+function pumpSize() {
+  while (sizeActive < SIZE_CONCURRENCY && sizeQueue.length) {
+    const p = sizeQueue.shift()!;
+    sizeInflight.add(p);
+    sizeActive++;
+    fc.folderSize(p)
+      .then((r) => sizeCache.set(p, r))
+      .catch(() => sizeCache.set(p, { files: 0, bytes: 0 }))
+      .finally(() => {
+        sizeActive--;
+        sizeInflight.delete(p);
+        pumpSize();
+      });
+  }
+}
+// 仿 WizTree:每层同级里算占比 + 条形(占比=该文件夹/同级已知总和;条长=该文件夹/同级最大)。
+const siblingStats = computed(() => {
+  const m = new Map<string, { sum: number; max: number }>();
+  for (const [parent, kids] of childIndex) {
+    let sum = 0;
+    let max = 1;
+    for (const k of kids) {
+      const s = sizeCache.get(k.path);
+      if (s) {
+        sum += s.bytes;
+        if (s.bytes > max) max = s.bytes;
+      }
+    }
+    m.set(parent, { sum, max });
+  }
+  return m;
+});
+function sizePct(node: FolderNode): number | null {
+  const s = sizeCache.get(node.path);
+  if (!s) return null;
+  const st = siblingStats.value.get(node.parent);
+  if (!st || st.sum <= 0) return 0;
+  return (s.bytes / st.sum) * 100;
+}
+function sizeBar(node: FolderNode): number {
+  const s = sizeCache.get(node.path);
+  if (!s) return 0;
+  const st = siblingStats.value.get(node.parent);
+  if (!st || st.max <= 0) return 0;
+  return s.bytes / st.max;
+}
+
+// ── 扁平化「当前可见行」(支持任意深度的展开)给模板渲染 ──
+interface PickerRow {
+  key: string;
+  kind: "root" | "folder" | "loading" | "empty";
+  level: number;
+  root?: ScanRootInfo;
+  node?: FolderNode;
+}
+const visibleRows = computed<PickerRow[]>(() => {
+  const rows: PickerRow[] = [];
+  const pushChildren = (parentPath: string, level: number) => {
+    const kids = childIndex.get(parentPath);
+    if (childLoading.has(parentPath) && (!kids || !kids.length)) {
+      rows.push({ key: parentPath + "#loading", kind: "loading", level });
+      return;
+    }
+    if (!kids || !kids.length) {
+      rows.push({ key: parentPath + "#empty", kind: "empty", level });
+      return;
+    }
+    for (const k of kids) {
+      rows.push({ key: k.path, kind: "folder", level, node: k });
+      if (expanded.has(k.path)) pushChildren(k.path, level + 1);
+    }
+  };
+  for (const r of scanRoots.value) {
+    rows.push({ key: r.path, kind: "root", level: 0, root: r });
+    if (expanded.has(r.path)) pushChildren(r.path, 1);
+  }
+  return rows;
+});
+
+// 计算要传给盘点的 roots(最顶层被勾选项)+ exclude(被勾范围内又取消的最顶层项)。
+function collectInventoryArgs(): { roots: string[]; exclude: string[] } {
+  const roots: string[] = [];
+  const exclude: string[] = [];
+  // 根:被勾选 → 成为盘点根。
+  for (const r of scanRoots.value) {
+    if (isIncluded(r.path)) roots.push(r.path);
+  }
+  // 文件夹:被勾但父未勾 → 顶层勾选项(成为根);未勾但父已勾 → 顶层排除项。
+  for (const f of allNodes.values()) {
+    const inc = isIncluded(f.path);
+    const pinc = parentIncluded(f.path);
+    if (inc && !pinc) roots.push(f.path);
+    else if (!inc && pinc) exclude.push(f.path);
+  }
+  return { roots, exclude };
+}
+async function startInventoryFromPicker() {
+  const { roots, exclude } = collectInventoryArgs();
+  pickerOpen.value = false;
+  await doScan(roots, exclude);
+}
+
 async function doCluster() {
   if (clustering.value) return;
+  flashTip("cluster");
   clustering.value = true;
   const semantic = (overview.value?.embeddedFiles ?? 0) > 0;
   clusterMsg.value = semantic
@@ -271,9 +659,10 @@ async function doCluster() {
   try {
     const r = await fc.clusterBuild(null);
     clusterMsg.value = r.note;
+    folderPath.value = [];
+    activeCluster.value = null;
     await loadOverview();
     await loadGrid(true);
-    if ((overview.value?.clusters.length ?? 0) > 0) view.value = "clusters";
   } catch (e: any) {
     clusterMsg.value = `归类失败:${e?.message ?? e}`;
   } finally {
@@ -321,6 +710,7 @@ async function buildIndex() {
 // 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告。
 async function doClusterLlm() {
   if (llmClustering.value) return;
+  flashTip("ai");
   llmClustering.value = true;
   reportPath.value = "";
   llmMsg.value = "正在用大模型按语义归类(读文件清单 → 主题分组)…";
@@ -337,12 +727,13 @@ async function doClusterLlm() {
         if (p.kind === "phase") {
           llmMsg.value = p.text ?? "";
         } else if (p.kind === "done") {
-          llmMsg.value = `AI 归类完成 · ${p.clusters ?? 0} 个主题簇 · ${p.assigned ?? 0} 个文件已归类 · 报告已存桌面`;
+          llmMsg.value = `AI 归类完成 · ${p.clusters ?? 0} 个子主题 · ${p.assigned ?? 0} 个文件已归类 · 报告已存桌面`;
           reportPath.value = p.report ?? "";
           llmClustering.value = false;
+          folderPath.value = [];
+          activeCluster.value = null;
           loadOverview();
           loadGrid(true);
-          view.value = "clusters";
         } else if (p.kind === "error") {
           llmMsg.value = `AI 归类失败:${p.message ?? ""}`;
           llmClustering.value = false;
@@ -357,6 +748,61 @@ async function doClusterLlm() {
 }
 function openReport() {
   if (reportPath.value) openPath(reportPath.value);
+}
+
+// 合并后的统一「智能归类」入口:
+//  · 配了硅基流动嵌入 key(hasEmbedProvider)→ 自动按语义 / AI 归类(复用已有向量并在桌面出报告),
+//    doClusterLlm 内部会弹提示条提醒用户正在做 AI 归类。
+//  · 没配 key → doCluster 走离线「文件夹 / 名称」启发式(即之前的智能归类),
+//    其弹出的提示条会提醒「未配置 API key」并给出配 key 入口。
+async function doSmartCluster() {
+  if (clustering.value || llmClustering.value) return;
+  if (overview.value?.hasEmbedProvider) {
+    await doClusterLlm();
+  } else {
+    await doCluster();
+  }
+}
+
+async function doTitlesLlm() {
+  if (llmTitling.value) return;
+  llmTitling.value = true;
+  titleDone.value = false;
+  titleMsg.value = "正在用大模型给文件起可读标题(读文件清单 → 起名)…";
+  try {
+    if (!unlistenTitle) {
+      unlistenTitle = await listen<{ kind: string; text?: string; count?: number; message?: string }>(
+        "file:title_llm",
+        (p) => {
+          if (p.kind === "phase") {
+            titleMsg.value = p.text ?? "";
+          } else if (p.kind === "done") {
+            titleMsg.value = `AI 整理完成 · 已为 ${p.count ?? 0} 个文件生成智能标题`;
+            titleDone.value = true;
+            llmTitling.value = false;
+            loadGrid(true);
+          } else if (p.kind === "error") {
+            titleMsg.value = `AI 整理失败:${p.message ?? ""}`;
+            llmTitling.value = false;
+          }
+        }
+      );
+    }
+    await fc.titlesLlm(null);
+  } catch (e: any) {
+    titleMsg.value = `AI 整理失败:${e?.message ?? e}`;
+    llmTitling.value = false;
+  }
+}
+async function resetTitles() {
+  try {
+    await fc.titlesClear();
+    titleMsg.value = "已撤销 AI 名称,回落到本地清洗名";
+    titleDone.value = false;
+    loadGrid(true);
+  } catch (e: any) {
+    titleMsg.value = `撤销失败:${e?.message ?? e}`;
+  }
 }
 
 // ───────────────────────── 语义检索 ─────────────────────────
@@ -492,22 +938,6 @@ async function revealCard(card: FileCard) {
   }
 }
 
-// ───────────────────────── 星图布局(phyllotaxis) ─────────────────────────
-const starOrbs = computed(() => {
-  const cl = (overview.value?.clusters ?? []).slice(0, 40);
-  if (!cl.length) return [];
-  const maxSize = Math.max(...cl.map((c) => c.size), 1);
-  const golden = Math.PI * (3 - Math.sqrt(5));
-  return cl.map((c, i) => {
-    const r = 40 * Math.sqrt(i + 0.6);
-    const a = i * golden;
-    const x = 50 + (r * Math.cos(a)) / 6.2;
-    const y = 50 + (r * Math.sin(a)) / 6.2;
-    const d = 34 + 70 * Math.sqrt(c.size / maxSize);
-    return { ...c, x, y, d };
-  });
-});
-
 // ───────────────────────── 辅助 ─────────────────────────
 function fmtTime(sec: number): string {
   if (!sec) return "";
@@ -556,23 +986,31 @@ onBeforeUnmount(() => {
   if (unlistenScan) unlistenScan();
   if (unlistenIndex) unlistenIndex();
   if (unlistenLlm) unlistenLlm();
+  if (unlistenTitle) unlistenTitle();
+  if (tipTimer) clearTimeout(tipTimer);
 });
 </script>
 
 <template>
   <div class="fc">
-    <!-- 顶部琉璃横幅 -->
-    <div class="fc-banner glass">
+    <!-- 顶部琉璃横幅(可收起:收起后只留一条,显示文件数/总量) -->
+    <div class="fc-banner glass" :class="{ collapsed: !bannerOpen }">
       <div class="fc-title-wrap">
         <div class="fc-title"><Orbit :size="17" :stroke-width="1.6" /> 文件中心</div>
-        <div class="fc-sub">同类数据自动归在一起 · 缩略图 / 首帧 / 类型图标 · 智能检索</div>
+        <div v-if="bannerOpen" class="fc-sub">同类数据自动归在一起 · 缩略图 / 首帧 / 类型图标 · 智能检索</div>
+        <div v-else class="fc-mini">
+          {{ (overview?.totalFiles ?? 0).toLocaleString() }} 个文件 · {{ fmtBytes(overview?.totalBytes ?? 0) }}
+        </div>
       </div>
-      <div class="fc-stats">
+      <div v-if="bannerOpen" class="fc-stats">
         <div v-for="s in headerStats" :key="s.label" class="stat">
           <div class="stat-val">{{ s.value }}</div>
           <div class="stat-lab">{{ s.label }}</div>
         </div>
       </div>
+      <button class="fc-collapse" :title="bannerOpen ? '收起' : '展开'" @click="bannerOpen = !bannerOpen">
+        <ChevronDown :size="16" :stroke-width="1.8" :class="{ flip: !bannerOpen }" />
+      </button>
     </div>
 
     <!-- 工具条 -->
@@ -581,8 +1019,8 @@ onBeforeUnmount(() => {
         <button class="seg-btn" :class="{ on: view === 'gallery' }" @click="view = 'gallery'" title="网格画廊">
           <LayoutGrid :size="15" :stroke-width="1.7" />
         </button>
-        <button class="seg-btn" :class="{ on: view === 'clusters' }" @click="view = 'clusters'" title="聚类星图">
-          <Orbit :size="15" :stroke-width="1.7" />
+        <button class="seg-btn" :class="{ on: view === 'clusters' }" @click="view = 'clusters'" title="分类树状图">
+          <FolderTree :size="15" :stroke-width="1.7" />
         </button>
         <button class="seg-btn" :class="{ on: view === 'list' }" @click="view = 'list'" title="列表">
           <ListIcon :size="15" :stroke-width="1.7" />
@@ -618,32 +1056,46 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="actions">
-        <button class="tool-btn" :disabled="scanning" title="扫描磁盘建立文件索引" @click="doScan">
-          <LoaderCircle v-if="scanning" :size="14" class="spin" />
+        <button
+          class="tool-btn"
+          :disabled="scanning || pickerLoading"
+          title="盘点:先扫一眼文件夹结构,勾选要盘点的目录(可选知识库之外的盘符/文件夹),再建库"
+          @click="openFolderPicker"
+        >
+          <LoaderCircle v-if="scanning || pickerLoading" :size="14" class="spin" />
           <FolderSearch v-else :size="14" :stroke-width="1.8" />
           <span>{{ scanning ? "盘点中" : "盘点" }}</span>
         </button>
         <button
           class="tool-btn accent"
-          :disabled="clustering || !overview?.totalFiles"
-          :title="(overview?.embeddedFiles ?? 0) > 0 ? '按语义把相似文件归类(复用已有向量)' : '按文件夹/名称把相似文件归类(离线;配硅基 key 建索引后升级为语义)'"
-          @click="doCluster"
+          :disabled="clustering || llmClustering || !overview?.totalFiles"
+          :title="overview?.hasEmbedProvider
+            ? '已配嵌入 key:用语义模型自动归类(复用已有向量)并在桌面生成报告'
+            : '未配 API key:按文件夹 / 名称离线归类;到设置页配硅基 key(免费)后自动升级为语义 AI 归类'"
+          @click="doSmartCluster"
         >
-          <LoaderCircle v-if="clustering" :size="14" class="spin" />
+          <LoaderCircle v-if="clustering || llmClustering" :size="14" class="spin" />
           <Wand2 v-else :size="14" :stroke-width="1.8" />
-          <span>{{ clustering ? "归类中" : "智能归类" }}</span>
+          <span>{{ clustering || llmClustering ? "归类中" : "智能归类" }}</span>
         </button>
         <button
           class="tool-btn ai"
-          :disabled="llmClustering || !overview?.totalFiles"
-          title="用已连接的大模型按语义归类(免嵌入 key)并在桌面生成 HTML 报告"
-          @click="doClusterLlm"
+          :disabled="llmTitling || !overview?.totalFiles"
+          title="用大模型给乱码/杂乱的文件名起可读的中文标题(只改显示,不改磁盘文件名)"
+          @click="doTitlesLlm"
         >
-          <LoaderCircle v-if="llmClustering" :size="14" class="spin" />
-          <Brain v-else :size="14" :stroke-width="1.8" />
-          <span>{{ llmClustering ? "AI 归类中" : "AI 归类" }}</span>
+          <LoaderCircle v-if="llmTitling" :size="14" class="spin" />
+          <Sparkles v-else :size="14" :stroke-width="1.8" />
+          <span>{{ llmTitling ? "整理中" : "AI 整理名称" }}</span>
         </button>
       </div>
+    </div>
+
+    <!-- AI 整理名称进度 -->
+    <div v-if="titleMsg" class="fc-llm">
+      <Sparkles :size="14" :stroke-width="1.8" class="llm-ic" />
+      <span class="llm-text">{{ titleMsg }}</span>
+      <button v-if="titleDone" class="link-btn" @click="resetTitles">撤销 AI 名称</button>
     </div>
 
     <!-- AI 归类进度 / 报告 -->
@@ -655,77 +1107,136 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <!-- 语义就绪度:解释「智能归类」当前能力 + 一键升级到语义 -->
-    <div v-if="hasFiles" class="fc-semantic">
-      <template v-if="!overview?.hasEmbedProvider">
-        <Zap :size="14" :stroke-width="1.8" class="sem-ic warn" />
-        <span class="sem-text">
-          想按<b>内容语义</b>归类?最省事:直接点上面的 <b>「AI 归类」</b>——用已连接的大模型分组,<b>免 key</b>,还会在桌面出报告。
-          或配置硅基 key(<b>免费</b>)建向量索引,升级为语义检索 + 语义归类。「智能归类」当前按文件夹/名称归。
-        </span>
-        <button class="link-btn" @click="app.setView('sense_api')">
-          <KeyRound :size="13" :stroke-width="1.8" /> 去配置 key
-        </button>
-      </template>
-      <template v-else>
-        <Radar :size="14" :stroke-width="1.8" class="sem-ic ok" />
-        <span class="sem-text">
-          向量索引:<b>{{ overview.embeddedFiles }}</b> / {{ overview.textFiles }} 个文本已嵌入
-          <span v-if="overview.embeddedFiles > 0" class="sem-ok">· 语义归类与检索已就绪</span>
-        </span>
-        <button
-          v-if="overview.textFiles > overview.embeddedFiles"
-          class="link-btn"
-          :disabled="building"
-          @click="buildIndex"
-        >
-          <LoaderCircle v-if="building" :size="13" class="spin" />
-          <Radar v-else :size="13" :stroke-width="1.8" />
-          {{ building ? "构建中…" : (overview.embeddedFiles > 0 ? "续建索引" : "构建向量索引") }}
-        </button>
-      </template>
-      <span v-if="buildMsg" class="build-msg">{{ buildMsg }}</span>
-    </div>
+    <!-- 归类小提示:默认不常驻,只在点「智能归类 / AI 归类」时弹一下解释能力 -->
+    <transition name="tip">
+      <div v-if="tip.show && hasFiles" class="fc-tip">
+        <button class="tip-x" title="关闭" @click="closeTip"><X :size="12" :stroke-width="2" /></button>
+        <template v-if="tip.kind === 'cluster'">
+          <Wand2 :size="14" :stroke-width="1.8" class="tip-ic" />
+          <span class="tip-body">
+            <template v-if="(overview?.embeddedFiles ?? 0) > 0">
+              按<b>内容语义</b>把相似文件归成两级主题树(复用已有向量,零新增嵌入)。
+            </template>
+            <template v-else>
+              <b>未配置 API key</b>,当前按<b>文件夹 / 名称</b>离线归类。到设置页配硅基 key(<b>免费</b>)后,「智能归类」会自动升级为按<b>内容语义</b>的 AI 归类。
+            </template>
+          </span>
+          <button v-if="overview && !overview.hasEmbedProvider" class="tip-act" @click="app.setView('sense_api')">
+            <KeyRound :size="12" :stroke-width="1.8" /> 配 key
+          </button>
+          <button
+            v-else-if="overview && overview.textFiles > overview.embeddedFiles"
+            class="tip-act"
+            :disabled="building"
+            @click="buildIndex"
+          >
+            <LoaderCircle v-if="building" :size="12" class="spin" />
+            <Radar v-else :size="12" :stroke-width="1.8" />
+            {{ overview.embeddedFiles > 0 ? "续建索引" : "建索引" }}
+          </button>
+        </template>
+        <template v-else>
+          <Brain :size="14" :stroke-width="1.8" class="tip-ic ai" />
+          <span class="tip-body">
+            用已连接的大模型按<b>思想主题</b>归成两级树(<b>免 key</b>),完成后桌面出 HTML 报告。
+          </span>
+        </template>
+      </div>
+    </transition>
 
     <div v-if="scanMsg || clusterMsg" class="fc-note">{{ clusterMsg || scanMsg }}</div>
 
-    <!-- 过滤胶囊 -->
-    <div v-if="hasFiles" class="fc-chips">
-      <button class="chip" :class="{ on: activeKind === null && activeCluster === null }" @click="activeKind = null; activeCluster = null; applyFilters()">
-        全部
+    <!-- 语义文件夹:同主题归一格,点开看子主题,再点筛选画廊 -->
+    <div v-if="hasFiles && hasClusters" class="fc-folders">
+      <div class="fld-bar">
+        <button class="fld-toggle" :class="{ open: foldersOpen }" :title="foldersOpen ? '收起分类' : '展开分类'" @click="foldersOpen = !foldersOpen">
+          <ChevronDown :size="14" :stroke-width="1.8" :class="{ flip: !foldersOpen }" />
+          <span>分类</span>
+          <span class="fld-toggle-n">{{ folderCards.length }}</span>
+        </button>
+        <button class="crumb" :class="{ on: folderPath.length === 0 && activeCluster === null }" @click="folderHome">
+          <Layers :size="13" :stroke-width="1.8" /> 全部主题
+        </button>
+        <template v-if="currentFolder">
+          <ChevronRight :size="13" :stroke-width="2" class="crumb-sep" />
+          <span class="crumb cur" :style="{ '--c': currentFolder.color }">
+            <span class="crumb-dot" />{{ currentFolder.label }}
+          </span>
+          <button class="crumb-all" @click="viewWholeFolder(currentFolder)">看全部 {{ currentFolder.size }} 个</button>
+        </template>
+      </div>
+      <div v-show="foldersOpen" class="fld-grid">
+        <button
+          v-if="folderPath.length"
+          class="fld-card back"
+          @click="folderHome"
+        >
+          <span class="fld-ic"><ChevronLeft :size="18" :stroke-width="1.8" /></span>
+          <span class="fld-main"><span class="fld-name">返回全部主题</span></span>
+        </button>
+        <button
+          v-for="c in folderCards"
+          :key="'f' + c.id"
+          class="fld-card"
+          :class="{ on: activeCluster === c.id, drill: c.parent === 0 && hasChildren(c.id) }"
+          :style="{ '--c': c.color }"
+          :title="c.label"
+          @click="openFolder(c)"
+        >
+          <span class="fld-ic">
+            <Folder :size="19" :stroke-width="1.5" />
+            <span v-if="hasChildren(c.id)" class="fld-stack" />
+          </span>
+          <span class="fld-main">
+            <span class="fld-name">{{ c.label }}</span>
+            <span class="fld-meta">
+              {{ c.size }} 个<template v-if="hasChildren(c.id)"> · {{ childrenOf(c.id).length }} 类</template>
+            </span>
+          </span>
+          <ChevronRight v-if="c.parent === 0 && hasChildren(c.id)" :size="15" :stroke-width="1.8" class="fld-arrow" />
+        </button>
+      </div>
+    </div>
+    <div v-else-if="hasFiles" class="fld-hint">
+      <Layers :size="14" :stroke-width="1.7" />
+      <span>还没按主题归类。点上方 <b>「智能归类」</b>,文件会按内容主题自动归进文件夹(配了 API key 走语义 AI 归类,没配则按文件夹 / 名称离线归)。</span>
+    </div>
+
+    <!-- 按类型筛选(可收起,默认收起,腾出下方空间) -->
+    <div v-if="hasFiles" class="fc-kinds">
+      <button class="kinds-toggle" :class="{ open: kindOpen }" @click="kindOpen = !kindOpen">
+        <SlidersHorizontal :size="13" :stroke-width="1.8" />
+        <span>按类型筛选</span>
+        <span v-if="activeKind" class="kinds-active" :style="{ '--c': KIND_COLOR[activeKind] || KIND_COLOR.other }">
+          <span class="chip-dot" />{{ KIND_LABEL[activeKind] || activeKind }}
+        </span>
+        <ChevronDown :size="14" :stroke-width="1.8" class="kinds-chev" :class="{ flip: kindOpen }" />
       </button>
-      <button
-        v-for="kc in overview?.byKind ?? []"
-        :key="kc.kind"
-        class="chip"
-        :class="{ on: activeKind === kc.kind }"
-        :style="{ '--chip': KIND_COLOR[kc.kind] || KIND_COLOR.other }"
-        @click="pickKind(kc.kind)"
-      >
-        <span class="chip-dot" />{{ KIND_LABEL[kc.kind] || kc.kind }}
-        <span class="chip-n">{{ kc.count }}</span>
-      </button>
-      <span v-if="(overview?.clusters.length ?? 0) > 0" class="chip-div" />
-      <button
-        v-for="c in (overview?.clusters ?? []).slice(0, 12)"
-        :key="'c' + c.id"
-        class="chip cluster"
-        :class="{ on: activeCluster === c.id }"
-        :style="{ '--chip': c.color }"
-        @click="pickCluster(c.id)"
-      >
-        <span class="chip-dot" />{{ c.label }}
-        <span class="chip-n">{{ c.size }}</span>
-      </button>
+      <div v-if="kindOpen" class="fc-chips">
+        <button class="chip" :class="{ on: activeKind === null }" @click="activeKind = null; applyFilters()">
+          全部类型
+        </button>
+        <button
+          v-for="kc in overview?.byKind ?? []"
+          :key="kc.kind"
+          class="chip"
+          :class="{ on: activeKind === kc.kind }"
+          :style="{ '--chip': KIND_COLOR[kc.kind] || KIND_COLOR.other }"
+          @click="pickKind(kc.kind)"
+        >
+          <span class="chip-dot" />{{ KIND_LABEL[kc.kind] || kc.kind }}
+          <span class="chip-n">{{ kc.count }}</span>
+        </button>
+      </div>
     </div>
 
     <!-- 空库引导 -->
     <div v-if="!hasFiles" class="fc-empty glass">
       <div class="empty-orb"><FolderSearch :size="30" :stroke-width="1.3" /></div>
       <div class="empty-title">文件中心还是空的</div>
-      <div class="empty-sub">点「盘点」扫描知识库根目录,把磁盘上的文件建成可视化文件库;<br />已嵌入文本可再点「智能归类」把相似数据自动放在一起。</div>
-      <button class="empty-cta" :disabled="scanning" @click="doScan">
-        <LoaderCircle v-if="scanning" :size="15" class="spin" />
+      <div class="empty-sub">点「盘点」先扫一眼文件夹,勾选要盘点的目录(可选知识库之外的盘符/文件夹),建成可视化文件库;<br />已嵌入文本可再点「智能归类」把相似数据自动放在一起。</div>
+      <button class="empty-cta" :disabled="scanning || pickerLoading" @click="openFolderPicker">
+        <LoaderCircle v-if="scanning || pickerLoading" :size="15" class="spin" />
         <FolderSearch v-else :size="15" :stroke-width="1.8" />
         <span>{{ scanning ? "盘点中…" : "立即盘点" }}</span>
       </button>
@@ -783,7 +1294,7 @@ onBeforeUnmount(() => {
             <span v-if="card.kind === 'video'" class="play-badge">▶</span>
           </div>
           <div class="tile-meta">
-            <div class="tile-name" :title="card.name">{{ card.name }}</div>
+            <div class="tile-name" :title="card.name">{{ card.title || card.name }}</div>
             <div class="tile-sub">
               <span v-if="card.clusterId > 0 && clusterColor[card.clusterId]" class="tile-cluster" :style="{ color: clusterColor[card.clusterId].color }">
                 {{ clusterColor[card.clusterId].label }}
@@ -797,36 +1308,80 @@ onBeforeUnmount(() => {
         <div v-if="!cards.length && !loading" class="grid-empty">该筛选下没有文件</div>
       </div>
 
-      <!-- 星图 -->
-      <div v-show="view === 'clusters'" class="starmap glass">
+      <!-- 分类树状图 -->
+      <div v-show="view === 'clusters'" class="clustree glass">
         <div v-if="!overview?.clusters.length" class="star-empty">
           <Sparkles :size="26" :stroke-width="1.4" />
           <div>还没有归类</div>
           <div class="star-hint">
-            点「智能归类」把相似文件归成一张星图 —— 有向量索引走<b>语义</b>,没有就按<b>文件夹 / 名称</b>归类,
-            <b>两种都能用、都能点</b>。点球可筛选出该簇的文件。
+            点「智能归类」把相似文件归成一棵<b>分类树</b> —— 有向量索引走<b>语义</b>,没有就按<b>文件夹 / 名称</b>归类。
+            每个大类点开能看它下面又分了哪些子类,点节点即可筛出该类的文件。
           </div>
-          <button class="empty-cta" :disabled="clustering || !overview?.totalFiles" @click="doCluster">
-            <LoaderCircle v-if="clustering" :size="15" class="spin" />
-            <Wand2 v-else :size="15" :stroke-width="1.8" /><span>{{ clustering ? "归类中…" : "智能归类" }}</span>
+          <button class="empty-cta" :disabled="clustering || llmClustering || !overview?.totalFiles" @click="doSmartCluster">
+            <LoaderCircle v-if="clustering || llmClustering" :size="15" class="spin" />
+            <Wand2 v-else :size="15" :stroke-width="1.8" /><span>{{ clustering || llmClustering ? "归类中…" : "智能归类" }}</span>
           </button>
         </div>
-        <div v-else class="star-field">
-          <div
-            v-for="o in starOrbs"
-            :key="o.id"
-            class="orb"
-            :class="{ on: activeCluster === o.id }"
-            :style="{ left: o.x + '%', top: o.y + '%', '--d': o.d + 'px', '--c': o.color }"
-            @click="pickCluster(o.id)"
-          >
-            <div class="orb-core" />
-            <div class="orb-label">
-              <span class="orb-name">{{ o.label }}</span>
-              <span class="orb-n">{{ o.size }}</span>
+        <template v-else>
+          <!-- 右上角缩略地图(看板边框内浮层) -->
+          <div class="tree-map">
+            <div class="tm-head"><Orbit :size="12" :stroke-width="1.7" /> 全景</div>
+            <div class="tm-body">
+              <button
+                v-for="c in topFolders"
+                :key="'tm' + c.id"
+                class="tm-node"
+                :class="{ on: activeCluster === c.id }"
+                :style="{ '--c': c.color }"
+                :title="c.label + ' · ' + c.size + ' 个'"
+                @click="focusBranch(c.id)"
+              >
+                <span class="tm-dot" />
+                <span class="tm-name">{{ c.label }}</span>
+                <span v-if="hasChildren(c.id)" class="tm-sub">{{ childrenOf(c.id).length }}</span>
+              </button>
             </div>
           </div>
-        </div>
+
+          <!-- 树主体(默认全收起:只露顶层大类,点 ▸ 展开子类) -->
+          <div ref="treeRef" class="tree-scroll">
+            <div
+              v-for="c in topFolders"
+              :key="'t' + c.id"
+              class="tree-branch"
+              :data-cl="c.id"
+            >
+              <div class="tree-node top" :class="{ on: activeCluster === c.id }" :style="{ '--c': c.color }">
+                <button class="tn-twist" :class="{ vis: hasChildren(c.id) }" :title="treeExpanded.has(c.id) ? '收起子类' : '展开子类'" @click="toggleTree(c.id)">
+                  <ChevronRight :size="14" :stroke-width="2" :class="{ open: treeExpanded.has(c.id) }" />
+                </button>
+                <button class="tn-body" :title="'查看「' + c.label + '」的全部文件'" @click="viewWholeFolder(c)">
+                  <span class="tn-dot" />
+                  <span class="tn-name">{{ c.label }}</span>
+                  <span v-if="hasChildren(c.id)" class="tn-kinds">{{ childrenOf(c.id).length }} 类</span>
+                  <span class="tn-count">{{ c.size }}</span>
+                </button>
+              </div>
+              <!-- 子类 -->
+              <div v-if="treeExpanded.has(c.id) && hasChildren(c.id)" class="tree-children">
+                <div
+                  v-for="ch in childrenOf(c.id)"
+                  :key="'tc' + ch.id"
+                  class="tree-node sub"
+                  :class="{ on: activeCluster === ch.id }"
+                  :style="{ '--c': ch.color || c.color }"
+                >
+                  <span class="tn-elbow" />
+                  <button class="tn-body" :title="'查看「' + ch.label + '」的全部文件'" @click="viewWholeFolder(ch)">
+                    <span class="tn-dot small" />
+                    <span class="tn-name">{{ ch.label }}</span>
+                    <span class="tn-count">{{ ch.size }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
       </div>
 
       <!-- 列表 -->
@@ -847,7 +1402,7 @@ onBeforeUnmount(() => {
         >
           <span class="lv-c-name">
             <svg viewBox="0 0 48 48" class="glyph lv-glyph" v-html="GLYPHS[glyphFor(card)]" />
-            <span class="lv-name" :title="card.name">{{ card.name }}</span>
+            <span class="lv-name" :title="card.name">{{ card.title || card.name }}</span>
           </span>
           <span class="lv-c-cluster">
             <span v-if="card.clusterId > 0 && clusterColor[card.clusterId]" class="lv-tag" :style="{ '--c': clusterColor[card.clusterId].color }">
@@ -876,7 +1431,8 @@ onBeforeUnmount(() => {
             <svg viewBox="0 0 48 48" class="glyph" v-html="GLYPHS[glyphFor(selected)]" />
           </div>
         </div>
-        <div class="detail-name">{{ selected.name }}</div>
+        <div class="detail-name">{{ selected.title || selected.name }}</div>
+        <div v-if="selected.title && selected.title !== selected.name" class="detail-rawname" :title="selected.name">原名：{{ selected.name }}</div>
         <div class="detail-path">{{ selected.path }}</div>
         <div class="detail-tags">
           <span class="dtag">{{ KIND_LABEL[selected.kind] || selected.kind }}</span>
@@ -899,6 +1455,103 @@ onBeforeUnmount(() => {
     </transition>
     <transition name="fade">
       <div v-if="selected" class="detail-scrim" @click="closeDetail" />
+    </transition>
+
+    <!-- 文件夹选择器:盘点前先扫一眼,取消勾选不要的文件夹 -->
+    <transition name="fade">
+      <div v-if="pickerOpen" class="picker-scrim" @click="closeFolderPicker">
+        <div class="picker glass" @click.stop>
+          <div class="picker-head">
+            <div class="picker-title">
+              <FolderTree :size="17" :stroke-width="1.7" />
+              <span>选择要盘点的文件夹</span>
+            </div>
+            <button class="picker-close" @click="closeFolderPicker"><X :size="16" :stroke-width="2" /></button>
+          </div>
+          <div class="picker-sub">
+            勾选<b>要盘点的目录</b>(可勾知识库之外的盘符 / 文件夹),再开始建库。知识库默认已勾,
+            盘符默认不勾 —— 展开后勾上你想纳入的文件夹即可。
+          </div>
+
+          <div v-if="pickerLoading" class="picker-loading">
+            <LoaderCircle :size="20" class="spin" /> 正在扫描文件夹结构…
+          </div>
+          <div v-else-if="pickerErr" class="picker-error">{{ pickerErr }}</div>
+          <div v-else-if="!scanRoots.length" class="picker-error">没有可盘点的目录。</div>
+          <div v-else class="picker-tree">
+            <template v-for="row in visibleRows" :key="row.key">
+              <!-- 根行(整盘/整库) -->
+              <div
+                v-if="row.kind === 'root'"
+                class="picker-row root"
+                :class="{ off: !isIncluded(row.root!.path) }"
+                :style="{ paddingLeft: 8 + 'px' }"
+              >
+                <button class="pk-check" :class="{ on: isIncluded(row.root!.path) }" @click="toggleNode(row.root!.path)">
+                  <Check v-if="isIncluded(row.root!.path)" :size="12" :stroke-width="2.6" />
+                </button>
+                <button class="pk-expand vis" @click="toggleExpand(row.root!.path)">
+                  <ChevronRight :size="19" :stroke-width="2" :class="{ open: expanded.has(row.root!.path) }" />
+                </button>
+                <Layers :size="14" :stroke-width="1.8" class="pk-ic" />
+                <span class="pk-name root-name" :title="row.root!.path">{{ row.root!.label }}</span>
+                <span class="pk-meta">{{ row.root!.path }}</span>
+              </div>
+              <!-- 文件夹行(任意深度) -->
+              <div
+                v-else-if="row.kind === 'folder'"
+                class="picker-row"
+                :class="{ off: !isIncluded(row.node!.path) }"
+                :style="{ paddingLeft: 8 + row.level * 20 + 'px' }"
+              >
+                <button class="pk-check" :class="{ on: isIncluded(row.node!.path) }" @click="toggleNode(row.node!.path)">
+                  <Check v-if="isIncluded(row.node!.path)" :size="12" :stroke-width="2.6" />
+                </button>
+                <button class="pk-expand" :class="{ vis: row.node!.hasChildren }" @click="toggleExpand(row.node!.path)">
+                  <ChevronRight :size="19" :stroke-width="2" :class="{ open: expanded.has(row.node!.path) }" />
+                </button>
+                <Folder :size="15" :stroke-width="1.6" class="pk-ic" />
+                <span class="pk-name" :title="row.node!.path">{{ row.node!.name }}</span>
+                <template v-if="sizeCache.get(row.node!.path)">
+                  <span class="pk-bar" :title="(sizePct(row.node!) ?? 0).toFixed(1) + '% 占同级'">
+                    <span class="pk-bar-fill" :style="{ width: Math.max(2, sizeBar(row.node!) * 100) + '%' }" />
+                  </span>
+                  <span class="pk-pct">{{ (sizePct(row.node!) ?? 0).toFixed(1) }}%</span>
+                  <span class="pk-size">{{ fmtBytes(sizeCache.get(row.node!.path)!.bytes) }}</span>
+                </template>
+                <span v-else class="pk-meta calc">计算大小…</span>
+              </div>
+              <!-- 懒加载占位 -->
+              <div
+                v-else-if="row.kind === 'loading'"
+                class="picker-row sub-loading"
+                :style="{ paddingLeft: 8 + row.level * 20 + 'px' }"
+              >
+                <LoaderCircle :size="13" class="spin" /> 加载子文件夹…
+              </div>
+              <!-- 空目录占位 -->
+              <div
+                v-else
+                class="picker-row empty-row"
+                :style="{ paddingLeft: 8 + row.level * 20 + 'px' }"
+              >
+                （无子文件夹）
+              </div>
+            </template>
+            <div v-if="pickerTruncated" class="picker-trunc">顶层文件夹太多,列表已截断到前 5000 个。</div>
+          </div>
+
+          <div class="picker-foot">
+            <button class="pk-reset" :disabled="!checked.size && !unchecked.size" title="恢复默认勾选" @click="resetPicker">
+              <RotateCcw :size="13" :stroke-width="1.8" /> 恢复默认
+            </button>
+            <span class="pk-count">已选 <b>{{ pickerSelected }}</b> 个文件夹</span>
+            <button class="pk-go" :disabled="pickerLoading || !pickerHasSelection" @click="startInventoryFromPicker">
+              <FolderSearch :size="14" :stroke-width="1.8" /> 开始盘点
+            </button>
+          </div>
+        </div>
+      </div>
     </transition>
   </div>
 </template>
@@ -974,6 +1627,265 @@ onBeforeUnmount(() => {
   color: var(--muted);
   margin-top: 2px;
 }
+
+/* 横幅收起态:压成一条,只留标题 + 文件数/总量 */
+.fc-banner { transition: padding 0.2s; }
+.fc-banner.collapsed { padding: 9px 16px 9px 22px; }
+.fc-mini {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.fc-collapse {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  color: var(--muted);
+  border-radius: 8px;
+  cursor: pointer;
+  flex: none;
+  transition: color 0.16s, border-color 0.16s;
+}
+.fc-collapse:hover { color: var(--text); border-color: var(--border-strong); }
+.fc-collapse .flip { transform: rotate(180deg); }
+.fc-collapse :deep(svg) { transition: transform 0.2s; }
+
+/* ── 归类小提示(弹出) ── */
+.fc-tip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 2px;
+  padding: 9px 32px 9px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--primary) 8%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+  font-size: 12.5px;
+  color: var(--text-2);
+  box-shadow: var(--shadow-sm);
+}
+.tip-ic { color: var(--gold); flex: none; }
+.tip-ic.ai { color: #8b6cff; }
+.tip-body { flex: 1; min-width: 0; line-height: 1.6; }
+.tip-body b { color: var(--text); }
+.tip-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: none;
+}
+.tip-act:hover:not(:disabled) { background: color-mix(in srgb, var(--primary) 20%, transparent); }
+.tip-act:disabled { opacity: 0.55; cursor: default; }
+.tip-x {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 6px;
+}
+.tip-x:hover { color: var(--text); background: var(--selection-bg); }
+.tip-enter-active, .tip-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.tip-enter-from, .tip-leave-to { opacity: 0; transform: translateY(-4px); }
+
+/* ── 语义文件夹 ── */
+.fc-folders {
+  margin: 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.fld-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 0 4px;
+}
+.fld-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text-2);
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.16s, border-color 0.16s;
+}
+.fld-toggle:hover, .fld-toggle.open { color: var(--text); border-color: var(--border-strong); }
+.fld-toggle :deep(svg) { transition: transform 0.2s; color: var(--dim); }
+.fld-toggle .flip { transform: rotate(-90deg); }
+.fld-toggle-n {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text-2);
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.crumb:hover { color: var(--text); }
+.crumb.on { color: var(--text); border-color: var(--border-strong); }
+.crumb.cur {
+  --c: var(--muted);
+  cursor: default;
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--c) 45%, transparent);
+  background: color-mix(in srgb, var(--c) 12%, transparent);
+}
+.crumb-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c); }
+.crumb-sep { color: var(--dim); flex: none; }
+.crumb-all {
+  margin-left: 2px;
+  border: none;
+  background: transparent;
+  color: var(--primary);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.crumb-all:hover { text-decoration: underline; }
+.fld-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+}
+.fld-card {
+  --c: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+  border-radius: 13px;
+  cursor: pointer;
+  text-align: left;
+  transition: transform 0.16s, border-color 0.16s, box-shadow 0.16s, background 0.16s;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+.fld-card:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--c) 55%, transparent);
+  box-shadow: 0 10px 24px -14px color-mix(in srgb, var(--c) 70%, transparent);
+}
+.fld-card.on {
+  border-color: color-mix(in srgb, var(--c) 75%, transparent);
+  background: color-mix(in srgb, var(--c) 13%, transparent);
+}
+.fld-card.back { --c: var(--muted); color: var(--muted); }
+.fld-ic {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 10px;
+  color: var(--c);
+  background: color-mix(in srgb, var(--c) 16%, transparent);
+}
+.fld-stack {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--c);
+  box-shadow: -3px -3px 0 -1px color-mix(in srgb, var(--c) 45%, transparent);
+}
+.fld-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.fld-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fld-meta { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.fld-arrow { color: var(--dim); flex: none; }
+.fld-card:hover .fld-arrow { color: var(--c); }
+.fld-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 4px;
+  padding: 9px 14px;
+  border-radius: 12px;
+  border: 1px dashed var(--border-soft);
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.fld-hint b { color: var(--text); }
+
+/* ── 类型筛选(可收起) ── */
+.fc-kinds { margin: 0 2px; }
+.kinds-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text-2);
+  border-radius: 9px;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: color 0.16s, border-color 0.16s;
+}
+.kinds-toggle:hover, .kinds-toggle.open { color: var(--text); border-color: var(--border-strong); }
+.kinds-active {
+  --c: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--c) 14%, transparent);
+  color: var(--text);
+  font-size: 11.5px;
+}
+.kinds-chev { color: var(--dim); transition: transform 0.2s; }
+.kinds-chev.flip { transform: rotate(180deg); }
+.fc-kinds .fc-chips { margin-top: 8px; padding: 0 4px; }
 
 /* ── 工具条 ── */
 .fc-toolbar {
@@ -1484,83 +2396,217 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
 }
 
-/* ── 星图 ── */
-.starmap {
+/* ── 分类树状图 ── */
+.clustree {
   height: calc(100vh - 320px);
   min-height: 420px;
   position: relative;
   overflow: hidden;
   background:
-    radial-gradient(80% 80% at 50% 40%, color-mix(in srgb, var(--primary) 8%, transparent), transparent 70%),
+    radial-gradient(90% 80% at 28% 0%, color-mix(in srgb, var(--primary) 6%, transparent), transparent 62%),
     color-mix(in srgb, var(--panel) 50%, transparent);
 }
-.star-field {
+.tree-scroll {
   position: absolute;
   inset: 0;
+  overflow-y: auto;
+  padding: 20px 22px 26px;
 }
-.orb {
-  position: absolute;
-  width: var(--d);
-  height: var(--d);
-  transform: translate(-50%, -50%);
-  cursor: pointer;
+.tree-branch { position: relative; }
+
+/* 节点(顶层 / 子类共用主体) */
+.tree-node {
+  --c: var(--muted);
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  position: relative;
+}
+.tn-twist {
+  flex: none;
+  width: 22px;
+  height: 38px;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: transform 0.25s;
-  animation: float 6s ease-in-out infinite;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  visibility: hidden;
 }
-.orb:nth-child(even) { animation-duration: 7.5s; }
-.orb:nth-child(3n) { animation-duration: 9s; }
-@keyframes float {
-  0%, 100% { margin-top: 0; }
-  50% { margin-top: -8px; }
+.tn-twist.vis { visibility: visible; }
+.tn-twist:hover { color: var(--text); }
+.tn-twist :deep(svg) { transition: transform 0.18s; }
+.tn-twist :deep(svg.open) { transform: rotate(90deg); }
+.tn-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 40px;
+  margin: 3px 0;
+  padding: 0 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: transform 0.16s, border-color 0.16s, background 0.16s, box-shadow 0.16s;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
 }
-.orb-core {
-  position: absolute;
-  inset: 0;
+.tree-node.top > .tn-body { height: 44px; }
+.tn-body:hover {
+  transform: translateX(2px);
+  border-color: color-mix(in srgb, var(--c) 55%, transparent);
+  box-shadow: 0 9px 22px -15px color-mix(in srgb, var(--c) 80%, transparent);
+}
+.tree-node.on > .tn-body {
+  border-color: color-mix(in srgb, var(--c) 75%, transparent);
+  background: color-mix(in srgb, var(--c) 13%, transparent);
+}
+.tn-dot {
+  width: 12px;
+  height: 12px;
+  flex: none;
   border-radius: 50%;
-  background: radial-gradient(circle at 38% 32%, color-mix(in srgb, var(--c) 90%, #fff 30%), var(--c) 60%, color-mix(in srgb, var(--c) 40%, transparent));
+  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--c) 92%, #fff 35%), var(--c) 70%);
   box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--c) 50%, transparent),
-    0 8px 28px -6px color-mix(in srgb, var(--c) 75%, transparent),
-    inset 0 0 22px color-mix(in srgb, #fff 18%, transparent);
-  transition: box-shadow 0.25s, transform 0.25s;
+    0 0 0 3px color-mix(in srgb, var(--c) 16%, transparent),
+    0 0 8px color-mix(in srgb, var(--c) 55%, transparent);
 }
-.orb:hover { transform: translate(-50%, -50%) scale(1.08); z-index: 5; }
-.orb:hover .orb-core {
-  box-shadow:
-    0 0 0 2px color-mix(in srgb, var(--c) 80%, transparent),
-    0 14px 40px -6px color-mix(in srgb, var(--c) 90%, transparent),
-    inset 0 0 26px color-mix(in srgb, #fff 28%, transparent);
+.tn-dot.small {
+  width: 9px;
+  height: 9px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--c) 16%, transparent);
 }
-.orb.on .orb-core {
-  box-shadow:
-    0 0 0 3px var(--c),
-    0 14px 44px -4px color-mix(in srgb, var(--c) 95%, transparent);
-}
-.orb-label {
-  position: relative;
-  text-align: center;
-  pointer-events: none;
-  padding: 0 4px;
-  max-width: calc(var(--d) + 30px);
-}
-.orb-name {
-  display: block;
-  font-size: 11.5px;
+.tn-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
   font-weight: 600;
-  color: #fff;
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.orb-n {
+.tree-node.sub .tn-name { font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.tn-kinds {
+  flex: none;
+  font-size: 11px;
+  color: var(--c);
+  font-variant-numeric: tabular-nums;
+}
+.tn-count {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  padding: 1px 9px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--c) 13%, transparent);
+}
+
+/* 子类缩进 + L 形连接线 */
+.tree-children {
+  position: relative;
+  margin-left: 32px;
+  padding-left: 18px;
+}
+.tree-children::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: -3px;
+  bottom: 23px;
+  width: 1.5px;
+  background: color-mix(in srgb, var(--border-strong) 75%, transparent);
+}
+.tn-elbow {
+  position: absolute;
+  left: -18px;
+  top: 50%;
+  width: 16px;
+  height: 1.5px;
+  background: color-mix(in srgb, var(--border-strong) 75%, transparent);
+}
+
+/* 右上角缩略地图 minimap */
+.tree-map {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 4;
+  width: 170px;
+  max-height: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow: 0 14px 34px -18px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.tm-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 11px 6px;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--hairline);
+}
+.tm-body {
+  overflow-y: auto;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tm-node {
+  --c: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  border: none;
+  background: transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.14s;
+}
+.tm-node:hover { background: var(--selection-bg); }
+.tm-node.on { background: color-mix(in srgb, var(--c) 16%, transparent); }
+.tm-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--c) 70%, transparent);
+}
+.tm-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tm-node.on .tm-name { color: var(--text); }
+.tm-sub {
+  flex: none;
   font-size: 10px;
-  color: rgba(255, 255, 255, 0.85);
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 .star-empty {
   position: absolute;
@@ -1667,6 +2713,13 @@ onBeforeUnmount(() => {
 }
 .empty-cta:hover:not(:disabled) { transform: translateY(-1px); }
 .empty-cta:disabled { opacity: 0.6; cursor: default; }
+.empty-actions { display: flex; gap: 10px; align-items: center; }
+.empty-cta.ghost {
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  border: 1px solid var(--border-soft);
+  color: var(--text);
+}
+.empty-cta.ghost:hover:not(:disabled) { border-color: var(--border-strong); }
 
 /* ── 详情抽屉 ── */
 .detail-scrim {
@@ -1724,6 +2777,13 @@ onBeforeUnmount(() => {
   font-size: 15px;
   font-weight: 600;
   color: var(--text);
+  word-break: break-all;
+  line-height: 1.4;
+}
+.detail-rawname {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
   word-break: break-all;
   line-height: 1.4;
 }
@@ -1799,6 +2859,213 @@ onBeforeUnmount(() => {
   border-color: transparent;
 }
 .detail-btn.primary:hover { opacity: 0.9; }
+
+/* ── 文件夹选择器(盘点前先扫一眼) ── */
+.picker-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 50%, transparent);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  padding: 24px;
+}
+.picker {
+  width: min(760px, 100%);
+  max-height: min(82vh, 760px);
+  display: flex;
+  flex-direction: column;
+  padding: 18px 20px 16px;
+  box-shadow: var(--shadow-lg, 0 24px 60px -20px rgba(0, 0, 0, 0.45));
+}
+.picker-head { display: flex; align-items: center; justify-content: space-between; }
+.picker-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--serif);
+  font-size: 16px;
+  letter-spacing: 1px;
+  color: var(--ink);
+}
+.picker-close {
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 7px;
+}
+.picker-close:hover { color: var(--text); background: var(--selection-bg); }
+.picker-sub { margin: 6px 0 12px; font-size: 12.5px; line-height: 1.6; color: var(--muted); }
+.picker-sub b { color: var(--text); }
+.picker-loading, .picker-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 26px 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.picker-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 6px;
+  background: color-mix(in srgb, var(--panel) 40%, transparent);
+}
+.picker-root + .picker-root { margin-top: 8px; }
+.picker-root-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 8px;
+}
+.picker-row:hover { background: var(--selection-bg); }
+.picker-row.root { margin-top: 4px; }
+.picker-row.root .root-name { font-weight: 650; font-size: 13.5px; }
+.picker-row.empty-row { font-size: 12px; color: var(--dim); height: 26px; }
+.picker-row.sub-loading { font-size: 12px; color: var(--muted); height: 28px; gap: 7px; }
+.picker-row.off .pk-name, .picker-row.off .pk-meta { opacity: 0.4; }
+.picker-row.off .root-name { text-decoration: none; }
+.pk-check {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--btn-solid-text);
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s;
+}
+.pk-check.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+.pk-check:disabled { opacity: 0.35; cursor: default; }
+.pk-expand {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  visibility: hidden;
+  border-radius: 8px;
+  transition: background 0.14s, color 0.14s;
+}
+.pk-expand.vis { visibility: visible; }
+.pk-expand.vis:hover { background: var(--selection-bg); color: var(--text); }
+.pk-expand :deep(svg) { transition: transform 0.18s; }
+.pk-expand :deep(svg.open) { transform: rotate(90deg); }
+.pk-ic { color: var(--muted); flex: none; }
+.pk-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pk-meta { flex: none; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pk-meta.calc { font-style: italic; opacity: 0.7; }
+/* ── 仿 WizTree 占比条 + 百分比 + 大小 ── */
+.pk-bar {
+  flex: none;
+  width: 120px;
+  height: 9px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+  overflow: hidden;
+}
+.pk-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 5px;
+  background: linear-gradient(90deg, var(--primary), var(--gold));
+}
+.pk-pct {
+  flex: none;
+  width: 50px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.pk-size {
+  flex: none;
+  width: 78px;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.picker-trunc { padding: 8px; font-size: 11.5px; color: var(--dim); text-align: center; }
+.picker-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+.pk-reset {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--text-2);
+  border-radius: 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pk-reset:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
+.pk-reset:disabled { opacity: 0.45; cursor: default; }
+.pk-count { flex: 1; font-size: 12.5px; color: var(--muted); text-align: center; }
+.pk-count b { color: var(--text); font-variant-numeric: tabular-nums; }
+.pk-go {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 18px;
+  border: none;
+  border-radius: 10px;
+  background: var(--btn-solid-bg);
+  color: var(--btn-solid-text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity 0.16s, transform 0.16s;
+}
+.pk-go:hover:not(:disabled) { transform: translateY(-1px); }
+.pk-go:disabled { opacity: 0.55; cursor: default; }
 
 /* ── 动效 ── */
 .spin { animation: spin 0.9s linear infinite; }

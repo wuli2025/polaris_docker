@@ -2468,13 +2468,15 @@ pub fn kb_graph() -> KbGraph {
     let mut edge_set: HashSet<(String, String)> = HashSet::new();
     let mut folder_set: HashSet<String> = HashSet::new();
 
-    // ① 文档节点
+    // ① 文档节点。memory/ 第四车道(回声层沉淀的记忆)单独标 kind=feedback,
+    //    在星河图谱里显示为玫红「回声展区」(PRD v5 §6.3④);其余皆 doc。
     for d in idx.iter() {
+        let is_memory = d.rel_path.replace('\\', "/").starts_with("memory/");
         nodes.push(KbNode {
             id: d.rel_path.clone(),
             title: d.title.clone(),
             category: d.category.clone(),
-            kind: "doc".into(),
+            kind: if is_memory { "feedback".into() } else { "doc".into() },
         });
     }
 

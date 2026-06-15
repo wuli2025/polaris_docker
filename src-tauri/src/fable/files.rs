@@ -108,6 +108,8 @@ pub struct ClusterView {
     pub color: String,
     pub keywords: String,
     pub size: u64,
+    /// 0 = 顶层主题文件夹;否则为所属父主题的簇 id(语义两级归类)。
+    pub parent: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,7 +231,7 @@ pub fn overview(root: Option<String>) -> Result<FileOverview, String> {
             format!(" WHERE root_id IN ({})", list.join(","))
         };
         let sql = format!(
-            "SELECT id, label, color, keywords, size FROM clusters{cfilter} ORDER BY size DESC"
+            "SELECT id, label, color, keywords, size, parent FROM clusters{cfilter} ORDER BY size DESC"
         );
         if let Ok(mut stmt) = conn.prepare(&sql) {
             if let Ok(rows) = stmt.query_map([], |r| {
@@ -239,6 +241,7 @@ pub fn overview(root: Option<String>) -> Result<FileOverview, String> {
                     color: r.get(2)?,
                     keywords: r.get(3)?,
                     size: r.get::<_, i64>(4)? as u64,
+                    parent: r.get::<_, i64>(5)?,
                 })
             }) {
                 for c in rows.flatten() {
@@ -280,6 +283,8 @@ pub struct FileCard {
     pub path: String,
     pub abspath: String,
     pub name: String,
+    /// 智能显示标题:AI 起的名(若有)否则本地清洗文件名;前端用它当卡片主标题,原名做副标题/悬停。
+    pub title: String,
     pub ext: String,
     pub kind: String,
     pub size: u64,
@@ -314,7 +319,11 @@ pub fn grid(
     where_sql.push_str(&in_clause(&ids));
     if let Some(cid) = cluster_id {
         if cid > 0 {
-            where_sql.push_str(&format!(" AND f.cluster_id={cid}"));
+            // 选中的可能是顶层主题(父簇,自身不直接挂文件)或叶簇 —— 统一展开:
+            // 命中该簇本身或其任意子簇下的文件。
+            where_sql.push_str(&format!(
+                " AND f.cluster_id IN (SELECT id FROM clusters WHERE id={cid} OR parent={cid})"
+            ));
         }
     }
     let kinds: Vec<&str> = match kind.as_deref() {
@@ -349,8 +358,9 @@ pub fn grid(
     let page_size = page_size.clamp(12, 400);
     let offset = page.saturating_mul(page_size);
     let sql = format!(
-        "SELECT f.id, r.path, f.relpath, f.name, f.ext, f.kind, f.size, f.mtime, f.cluster_id
-         FROM files f JOIN roots r ON r.id=f.root_id {where_sql}
+        "SELECT f.id, r.path, f.relpath, f.name, f.ext, f.kind, f.size, f.mtime, f.cluster_id, t.title
+         FROM files f JOIN roots r ON r.id=f.root_id
+         LEFT JOIN titles t ON t.file_id=f.id {where_sql}
          ORDER BY {order} LIMIT {page_size} OFFSET {offset}"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -359,14 +369,21 @@ pub fn grid(
             let root: String = r.get(1)?;
             let rel: String = r.get(2)?;
             let abspath = Path::new(&root).join(&rel).to_string_lossy().into_owned();
+            let name: String = r.get(3)?;
             let kind: String = r.get(5)?;
             let size = r.get::<_, i64>(6)? as u64;
             let thumbable = kind == "image" || kind == "video";
+            // AI 起的名优先;否则本地清洗原始文件名(去时间戳/哈希/计数器/分隔符)。
+            let stored: Option<String> = r.get::<_, Option<String>>(9).ok().flatten();
+            let title = stored
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| clean_title(&name));
             Ok(FileCard {
                 id: r.get(0)?,
                 path: rel,
                 abspath,
-                name: r.get(3)?,
+                name,
+                title,
                 ext: r.get(4)?,
                 kind,
                 size,
@@ -404,7 +421,9 @@ fn jpeg_data_url(rgb: &image::DynamicImage) -> Result<String, String> {
 
 /// 生成(或读缓存)缩略图,统一返回 data URL;无法出图返回 None(前端落类型图标)。
 pub fn thumb(abspath: String, max: u32) -> Result<Option<String>, String> {
-    let p = Path::new(&abspath);
+    // 显示路径可能是 GBK 名解码出的 UTF-8;还原成磁盘真实路径再读(否则 GBK 图片出不了图)。
+    let real = super::reencode_fs_path(&abspath);
+    let p = real.as_path();
     if !p.is_file() {
         return Ok(None);
     }
@@ -549,7 +568,8 @@ fn extract_gist(text: &str) -> String {
 
 /// 按需速览:文本/文档抽取式总结(缓存);其余类型给「类型 · 大小」简述。
 pub fn gist(abspath: String) -> Result<String, String> {
-    let p = Path::new(&abspath);
+    let real = super::reencode_fs_path(&abspath);
+    let p = real.as_path();
     if !p.is_file() {
         return Err("文件不存在".into());
     }
@@ -781,75 +801,30 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
     files.sort_by_key(|f| f.file_id);
 
     let n = files.len();
-    let dim = files[0].vec.len();
+    let file_vecs: Vec<Vec<f32>> = files.iter().map(|f| f.vec.clone()).collect();
+    // 一级(叶):细粒度语义簇
     let k = ((n as f64).sqrt().round() as usize).clamp(3, 18).min(n);
+    let (assign, leaf_centroids) = spherical_kmeans(&file_vecs, k);
 
-    // 确定性初始化:farthest-first traversal(余弦),避免依赖随机数
-    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
-    centroids.push(files[0].vec.clone());
-    while centroids.len() < k {
-        let mut best_i = 0usize;
-        let mut best_d = f32::MIN;
-        for (i, f) in files.iter().enumerate() {
-            // 到已选中心的最大相似度 → 取「最不相似」的当新中心
-            let max_sim = centroids.iter().map(|c| dot(c, &f.vec)).fold(f32::MIN, f32::max);
-            let d = -max_sim;
-            if d > best_d {
-                best_d = d;
-                best_i = i;
-            }
-        }
-        centroids.push(files[best_i].vec.clone());
-    }
-
-    // Lloyd 迭代(球面)
-    let mut assign = vec![0usize; n];
-    for _ in 0..16 {
-        let mut changed = false;
-        for (i, f) in files.iter().enumerate() {
-            let mut best = 0usize;
-            let mut best_sim = f32::MIN;
-            for (ci, c) in centroids.iter().enumerate() {
-                let s = dot(c, &f.vec);
-                if s > best_sim {
-                    best_sim = s;
-                    best = ci;
-                }
-            }
-            if assign[i] != best {
-                assign[i] = best;
-                changed = true;
-            }
-        }
-        // 重算中心
-        let mut sums = vec![vec![0.0f32; dim]; k];
-        let mut counts = vec![0u32; k];
-        for (i, f) in files.iter().enumerate() {
-            let c = assign[i];
-            for (a, b) in sums[c].iter_mut().zip(f.vec.iter()) {
-                *a += b;
-            }
-            counts[c] += 1;
-        }
-        for ci in 0..k {
-            if counts[ci] > 0 {
-                for x in sums[ci].iter_mut() {
-                    *x /= counts[ci] as f32;
-                }
-                normalize(&mut sums[ci]);
-                centroids[ci] = std::mem::take(&mut sums[ci]);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // 按簇成员命名 + 着色,并把空簇剔除、重编号
-    let mut members: Vec<Vec<usize>> = vec![Vec::new(); k];
+    // 叶簇成员(剔空簇)
+    let mut members_all: Vec<Vec<usize>> = vec![Vec::new(); leaf_centroids.len()];
     for (i, &c) in assign.iter().enumerate() {
-        members[c].push(i);
+        members_all[c].push(i);
     }
+    let leaf_idx: Vec<usize> = (0..members_all.len()).filter(|&c| !members_all[c].is_empty()).collect();
+    let members: Vec<Vec<usize>> = leaf_idx.iter().map(|&c| members_all[c].clone()).collect();
+    let n_leaf = members.len();
+
+    // 二级(父):叶簇质心再聚合成「顶层主题」。叶簇 ≥4 才分两级,否则全部顶层。
+    let two_level = n_leaf >= 4;
+    let parent_of_leaf: Vec<usize> = if two_level {
+        let k_parent = ((n_leaf as f64).sqrt().ceil() as usize).clamp(2, 6).min(n_leaf);
+        let cvecs: Vec<Vec<f32>> = leaf_idx.iter().map(|&c| leaf_centroids[c].clone()).collect();
+        spherical_kmeans(&cvecs, k_parent).0
+    } else {
+        (0..n_leaf).collect()
+    };
+    let n_parents = parent_of_leaf.iter().copied().max().map(|m| m + 1).unwrap_or(0);
 
     // 清旧簇(对涉及的根)
     if ids.is_empty() {
@@ -865,21 +840,44 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
     let built_at = chrono::Local::now().timestamp_millis();
     let mut new_clusters = 0usize;
     conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-    for mem in members.iter() {
-        if mem.is_empty() {
-            continue;
+
+    // 先写顶层主题(父簇:自身不直接挂文件,颜色按主题分配)。
+    let mut parent_ids: Vec<i64> = vec![0; n_parents];
+    if two_level {
+        for p in 0..n_parents {
+            // 该主题下所有文件 = 旗下叶簇成员之并
+            let mut union: Vec<usize> = Vec::new();
+            for (li, &leaf_p) in parent_of_leaf.iter().enumerate() {
+                if leaf_p == p {
+                    union.extend_from_slice(&members[li]);
+                }
+            }
+            if union.is_empty() {
+                continue;
+            }
+            let (label, keywords) = name_cluster(&files, &union);
+            let color = CLUSTER_PALETTE[p % CLUSTER_PALETTE.len()];
+            conn.execute(
+                "INSERT INTO clusters(root_id,label,color,keywords,size,built_at,parent) VALUES(?1,?2,?3,?4,?5,?6,0)",
+                rusqlite::params![rep_root(&files, &union), label, color, keywords, union.len() as i64, built_at],
+            )
+            .map_err(|e| e.to_string())?;
+            parent_ids[p] = conn.last_insert_rowid();
         }
+    }
+
+    // 再写叶簇(两级时 parent=父 id 且与父同色;单级时 parent=0)并把文件挂到叶簇。
+    for (li, mem) in members.iter().enumerate() {
         let (label, keywords) = name_cluster(&files, mem);
-        // 簇的代表根 = 成员里出现最多的 root_id
-        let mut root_freq: HashMap<i64, usize> = HashMap::new();
-        for &i in mem {
-            *root_freq.entry(files[i].root_id).or_insert(0) += 1;
-        }
-        let root_id = root_freq.into_iter().max_by_key(|(_, c)| *c).map(|(r, _)| r).unwrap_or(0);
-        let color = CLUSTER_PALETTE[new_clusters % CLUSTER_PALETTE.len()];
+        let p = parent_of_leaf[li];
+        let (parent, color) = if two_level {
+            (parent_ids[p], CLUSTER_PALETTE[p % CLUSTER_PALETTE.len()])
+        } else {
+            (0i64, CLUSTER_PALETTE[new_clusters % CLUSTER_PALETTE.len()])
+        };
         conn.execute(
-            "INSERT INTO clusters(root_id,label,color,keywords,size,built_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![root_id, label, color, keywords, mem.len() as i64, built_at],
+            "INSERT INTO clusters(root_id,label,color,keywords,size,built_at,parent) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![rep_root(&files, mem), label, color, keywords, mem.len() as i64, built_at, parent],
         )
         .map_err(|e| e.to_string())?;
         let cluster_id = conn.last_insert_rowid();
@@ -908,6 +906,84 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
             )
         },
     })
+}
+
+/// 确定性球面 k-means(余弦):farthest-first 初始化 + Lloyd 迭代。
+/// 输入向量须已 L2 归一化。返回 (每点所属簇下标, 各簇质心)。两级归类两层都复用它。
+fn spherical_kmeans(vecs: &[Vec<f32>], k: usize) -> (Vec<usize>, Vec<Vec<f32>>) {
+    let n = vecs.len();
+    if n == 0 || k == 0 {
+        return (vec![0; n], Vec::new());
+    }
+    let k = k.min(n);
+    let dim = vecs[0].len();
+    // 确定性初始化:farthest-first traversal(余弦),避免依赖随机数
+    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
+    centroids.push(vecs[0].clone());
+    while centroids.len() < k {
+        let mut best_i = 0usize;
+        let mut best_d = f32::MIN;
+        for (i, v) in vecs.iter().enumerate() {
+            let max_sim = centroids.iter().map(|c| dot(c, v)).fold(f32::MIN, f32::max);
+            let d = -max_sim;
+            if d > best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        centroids.push(vecs[best_i].clone());
+    }
+    // Lloyd 迭代(球面)
+    let mut assign = vec![0usize; n];
+    for _ in 0..16 {
+        let mut changed = false;
+        for (i, v) in vecs.iter().enumerate() {
+            let mut best = 0usize;
+            let mut best_sim = f32::MIN;
+            for (ci, c) in centroids.iter().enumerate() {
+                let s = dot(c, v);
+                if s > best_sim {
+                    best_sim = s;
+                    best = ci;
+                }
+            }
+            if assign[i] != best {
+                assign[i] = best;
+                changed = true;
+            }
+        }
+        let mut sums = vec![vec![0.0f32; dim]; k];
+        let mut counts = vec![0u32; k];
+        for (i, v) in vecs.iter().enumerate() {
+            let c = assign[i];
+            for (a, b) in sums[c].iter_mut().zip(v.iter()) {
+                *a += b;
+            }
+            counts[c] += 1;
+        }
+        for ci in 0..k {
+            if counts[ci] > 0 {
+                for x in sums[ci].iter_mut() {
+                    *x /= counts[ci] as f32;
+                }
+                normalize(&mut sums[ci]);
+                centroids[ci] = std::mem::take(&mut sums[ci]);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (assign, centroids)
+}
+
+/// 簇代表根 = 成员里出现最多的 root_id。
+fn rep_root(files: &[FileVec], members: &[usize]) -> i64 {
+    let mut freq: HashMap<i64, usize> = HashMap::new();
+    for &i in members {
+        *freq.entry(files[i].root_id).or_insert(0) += 1;
+    }
+    freq.into_iter().max_by_key(|(_, c)| *c).map(|(r, _)| r).unwrap_or(0)
 }
 
 /// 簇命名:优先成员里出现最多的「非通用」目录段;退化用文件名高频词。
@@ -995,6 +1071,59 @@ fn tokenize(name: &str) -> Vec<String> {
     // 过滤纯数字/常见噪声词
     out.retain(|t| !t.chars().all(|c| c.is_ascii_digit()) && t != "copy" && t != "final");
     out
+}
+
+/// 把杂乱/带噪文件名清洗成可读标题(纯字符串,无 IO,grid 里现算):
+/// 去扩展名 → 分隔符(_ - + ~ . 空格 括号 ·)切词 → 丢纯数字/时间戳/长哈希/常见噪声词
+/// (img/screenshot/副本/微信图片…)→ 余下用空格连。清完为空(纯哈希图片名等)退回去扩展名的原名。
+/// 这是「本地档」标题;AI 档会把更难的(纯乱码/纯哈希)写进 titles 表覆盖它。
+fn clean_title(name: &str) -> String {
+    const NOISE: &[&str] = &[
+        "copy", "final", "副本", "未命名", "untitled", "new", "draft", "tmp", "temp", "out",
+        "img", "image", "photo", "pic", "dsc", "vid", "video", "screenshot", "截图", "屏幕截图",
+        "微信图片", "mmexport", "download", "下载", "wechat", "qq图片",
+    ];
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in stem.chars() {
+        if matches!(
+            ch,
+            '_' | '-' | '+' | '~' | '.' | ' ' | '(' | ')' | '[' | ']' | '{' | '}' | '·' | '@' | '#'
+        ) {
+            let t = cur.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        parts.push(t.to_string());
+    }
+
+    let is_noise = |t: &str| -> bool {
+        let low = t.to_lowercase();
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            return true; // 纯数字:计数器/年份/时间戳片段
+        }
+        if t.len() >= 8 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return true; // 长 hex:哈希样
+        }
+        NOISE.contains(&low.as_str())
+    };
+
+    let kept: Vec<String> = parts.into_iter().filter(|t| !is_noise(t)).collect();
+    let title = kept.join(" ");
+    let title = title.trim();
+    if title.chars().count() >= 2 {
+        title.to_string()
+    } else {
+        stem.trim().to_string() // 全是噪声/太短 → 退回原名(去扩展名),总比空好
+    }
 }
 
 // ───────────────────────── 缩略图批量预热(可选,后台友好) ─────────────────────────
@@ -1141,6 +1270,16 @@ struct LlmGroup {
     label: String,
     #[serde(default)]
     files: Vec<Value>,
+    /// 两级归类:本组若是「大主题」,其下的子主题放这里(子主题再各自带 files)。
+    #[serde(default)]
+    groups: Vec<LlmGroup>,
+}
+
+/// 报告用:一个顶层主题 + 其下若干子主题(子主题各自的成员下标)。
+struct ReportTheme {
+    label: String,
+    color: String,
+    children: Vec<(String, Vec<usize>)>,
 }
 
 fn esc(s: &str) -> String {
@@ -1178,17 +1317,18 @@ fn llm_cluster_directive(files: &[FileLite]) -> String {
     }
     format!(
         r#"你是文件库的「语义归类员」。下面是用户文件库里的文件清单(每行:[序号] 相对路径 (类型))。
-请按**内容主题 / 用途**把它们归成若干有意义的组——把相似、相关、同主题的文件放进同一组,
-给每组起一个简短贴切的中文标签(4~10 字)。
+请**纯按内容主题 / 思想类型**把它们归成**两级**树:先归成几个「大主题」,每个大主题下再分若干「子主题」。
+完全按语义归——把同一思想 / 同一话题 / 同一用途的文件放在一起,**不要按文件类型(图片/视频/文档)来分**。
 
 要求:
-- 组数控制在 3~16 之间;每组尽量有 ≥2 个文件;
-- 用文件名、目录、扩展名推断主题;同一系列/同一项目/同一话题的归一起;
-- 每个文件最多归一组;实在归不进任何主题的文件可以不出现在结果里;
-- 标签要能概括该组内容,别用「其它/杂项」这种空标签,除非确实无主题。
+- 大主题 3~8 个;每个大主题下 2~6 个子主题;子主题尽量 ≥2 个文件;
+- 大主题是宽泛的思想/领域(如「产品设计」「财务合同」「学习资料」);子主题是其下更细的话题;
+- 用文件名、目录、内容线索推断主题;同系列/同项目/同话题归一起;
+- 每个文件最多归一个子主题;实在归不进的可不出现;
+- 所有标签都用简短贴切的**中文**(大主题 2~8 字、子主题 4~12 字),别用「其它/杂项」这种空标签。
 
-**只输出一个 JSON 数组,不要任何额外文字、不要 markdown 代码围栏**:
-[{{"label":"组标签","files":[序号,序号,...]}}, ...]
+**只输出一个 JSON 数组,不要任何额外文字、不要 markdown 代码围栏**。格式为大主题数组,每个大主题含 groups 子主题数组:
+[{{"label":"大主题","groups":[{{"label":"子主题","files":[序号,序号,...]}}, ...]}}, ...]
 
 文件清单({} 个):
 {list}"#,
@@ -1269,86 +1409,144 @@ fn cluster_llm_run(app: &AppHandle, root: Option<String>) -> Result<(usize, usiz
     }
 
     let built_at = chrono::Local::now().timestamp_millis();
-    let mut report_groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+    let mut report_themes: Vec<ReportTheme> = Vec::new();
     let mut assigned = 0usize;
-    let mut n_clusters = 0usize;
-    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-    for g in &groups {
-        // 解析成员下标,去重
-        let mut members: Vec<usize> = Vec::new();
+    let mut n_clusters = 0usize; // 叶簇数(实际承载文件的子主题)
+    let mut color_i = 0usize;
+
+    // 一个 group 的 files 字段 → 去重后的成员下标
+    let resolve_members = |g: &LlmGroup| -> Vec<usize> {
+        let mut m: Vec<usize> = Vec::new();
         for v in &g.files {
             if let Some(i) = resolve_index(v, &files) {
-                if !members.contains(&i) {
-                    members.push(i);
+                if !m.contains(&i) {
+                    m.push(i);
                 }
             }
         }
-        if members.is_empty() {
-            continue;
-        }
-        let label = if g.label.trim().is_empty() { "未命名".to_string() } else { g.label.trim().to_string() };
-        let color = CLUSTER_PALETTE[n_clusters % CLUSTER_PALETTE.len()].to_string();
-        // 代表根 = 成员里最多的 root_id 不必算,这里直接取第一成员所在文件的 root(简化)
-        let root_id: i64 = conn
-            .query_row(
-                "SELECT root_id FROM files WHERE id=?1",
-                [files[members[0]].id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        conn.execute(
-            "INSERT INTO clusters(root_id,label,color,keywords,size,built_at) VALUES(?1,?2,?3,'',?4,?5)",
-            rusqlite::params![root_id, label, color, members.len() as i64, built_at],
-        )
-        .map_err(|e| e.to_string())?;
-        let cluster_id = conn.last_insert_rowid();
-        {
-            let mut stmt = conn
-                .prepare_cached("UPDATE files SET cluster_id=?1 WHERE id=?2")
-                .map_err(|e| e.to_string())?;
-            for &i in &members {
-                stmt.execute(rusqlite::params![cluster_id, files[i].id]).map_err(|e| e.to_string())?;
+        m
+    };
+
+    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    for top in &groups {
+        let theme_label = if top.label.trim().is_empty() {
+            "未命名主题".to_string()
+        } else {
+            top.label.trim().to_string()
+        };
+        // 子主题:模型给了 groups 用之;没给则把本组自身当成唯一子主题(扁平兜底,层级仍统一)
+        let mut children: Vec<(String, Vec<usize>)> = Vec::new();
+        if !top.groups.is_empty() {
+            for sub in &top.groups {
+                let m = resolve_members(sub);
+                if m.is_empty() {
+                    continue;
+                }
+                let lab = if sub.label.trim().is_empty() {
+                    theme_label.clone()
+                } else {
+                    sub.label.trim().to_string()
+                };
+                children.push((lab, m));
+            }
+        } else {
+            let m = resolve_members(top);
+            if !m.is_empty() {
+                children.push((theme_label.clone(), m));
             }
         }
-        assigned += members.len();
-        report_groups.push((label, color, members));
-        n_clusters += 1;
+        if children.is_empty() {
+            continue;
+        }
+
+        let color = CLUSTER_PALETTE[color_i % CLUSTER_PALETTE.len()].to_string();
+        color_i += 1;
+        let total: usize = children.iter().map(|(_, m)| m.len()).sum();
+        let root_id: i64 = conn
+            .query_row("SELECT root_id FROM files WHERE id=?1", [files[children[0].1[0]].id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+
+        // 顶层主题(父簇:不直接挂文件,size = 旗下文件总数)
+        conn.execute(
+            "INSERT INTO clusters(root_id,label,color,keywords,size,built_at,parent) VALUES(?1,?2,?3,'',?4,?5,0)",
+            rusqlite::params![root_id, theme_label, color, total as i64, built_at],
+        )
+        .map_err(|e| e.to_string())?;
+        let parent_id = conn.last_insert_rowid();
+
+        // 子主题(叶簇:与父同色,挂文件)
+        for (lab, m) in &children {
+            let croot: i64 = conn
+                .query_row("SELECT root_id FROM files WHERE id=?1", [files[m[0]].id], |r| r.get(0))
+                .unwrap_or(root_id);
+            conn.execute(
+                "INSERT INTO clusters(root_id,label,color,keywords,size,built_at,parent) VALUES(?1,?2,?3,'',?4,?5,?6)",
+                rusqlite::params![croot, lab, color, m.len() as i64, built_at, parent_id],
+            )
+            .map_err(|e| e.to_string())?;
+            let cid = conn.last_insert_rowid();
+            {
+                let mut stmt = conn
+                    .prepare_cached("UPDATE files SET cluster_id=?1 WHERE id=?2")
+                    .map_err(|e| e.to_string())?;
+                for &i in m {
+                    stmt.execute(rusqlite::params![cid, files[i].id]).map_err(|e| e.to_string())?;
+                }
+            }
+            assigned += m.len();
+            n_clusters += 1;
+        }
+        report_themes.push(ReportTheme { label: theme_label, color, children });
     }
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
 
-    let report_path = write_report_html(&files, &report_groups, assigned)?;
+    let report_path = write_report_html(&files, &report_themes, assigned)?;
     Ok((n_clusters, assigned, report_path))
 }
 
 /// 生成自包含 HTML 报告 → 桌面,返回文件路径。
 fn write_report_html(
     files: &[FileLite],
-    groups: &[(String, String, Vec<usize>)],
+    themes: &[ReportTheme],
     assigned: usize,
 ) -> Result<String, String> {
     let now = chrono::Local::now();
     let stamp = now.format("%Y%m%d-%H%M%S").to_string();
     let human = now.format("%Y-%m-%d %H:%M").to_string();
 
+    let mut n_sub = 0usize;
     let mut cards = String::new();
-    for (label, color, members) in groups {
-        let mut items = String::new();
-        for &i in members {
-            let f = &files[i];
-            items.push_str(&format!(
-                r#"<li><span class="dot" style="background:{c}"></span><span class="fn">{name}</span><span class="fp">{path}</span><span class="fk">{kind}</span></li>"#,
-                c = esc(color),
-                name = esc(&f.name),
-                path = esc(&f.relpath),
-                kind = esc(&f.kind),
+    for t in themes {
+        let total: usize = t.children.iter().map(|(_, m)| m.len()).sum();
+        let mut subs = String::new();
+        for (lab, members) in &t.children {
+            n_sub += 1;
+            let mut items = String::new();
+            for &i in members {
+                let f = &files[i];
+                items.push_str(&format!(
+                    r#"<li><span class="dot" style="background:{c}"></span><span class="fn">{name}</span><span class="fp">{path}</span><span class="fk">{kind}</span></li>"#,
+                    c = esc(&t.color),
+                    name = esc(&f.name),
+                    path = esc(&f.relpath),
+                    kind = esc(&f.kind),
+                ));
+            }
+            subs.push_str(&format!(
+                r#"<div class="subgrp"><div class="subgrp-h"><span class="sbadge">{n}</span>{lab}</div><ul>{items}</ul></div>"#,
+                n = members.len(),
+                lab = esc(lab),
+                items = items,
             ));
         }
         cards.push_str(&format!(
-            r#"<section class="cluster"><header style="--c:{c}"><span class="badge">{n}</span><h2>{label}</h2></header><ul>{items}</ul></section>"#,
-            c = esc(color),
-            n = members.len(),
-            label = esc(label),
-            items = items,
+            r#"<section class="cluster"><header style="--c:{c}"><span class="badge">{n}</span><h2>{label}</h2></header><div class="subs">{subs}</div></section>"#,
+            c = esc(&t.color),
+            n = total,
+            label = esc(&t.label),
+            subs = subs,
         ));
     }
 
@@ -1375,7 +1573,12 @@ background:color-mix(in srgb,var(--c) 14%,transparent);border-bottom:1px solid v
 box-shadow:0 0 10px var(--c)}}
 .cluster h2{{font-size:15px;margin:0;flex:1}}
 .badge{{font-size:12px;color:#0f1115;background:var(--c);padding:1px 9px;border-radius:99px;font-weight:700}}
-.cluster ul{{list-style:none;margin:0;padding:8px 0;max-height:420px;overflow:auto}}
+.subs{{padding:6px 0}}
+.subgrp{{border-bottom:1px solid var(--line)}}
+.subgrp:last-child{{border-bottom:none}}
+.subgrp-h{{display:flex;align-items:center;gap:8px;padding:9px 18px 4px;font-size:12.5px;font-weight:600;color:var(--ink)}}
+.sbadge{{font-size:10.5px;color:var(--mut);background:rgba(255,255,255,.06);padding:0 7px;border-radius:99px}}
+.cluster ul{{list-style:none;margin:0;padding:2px 0 8px;max-height:420px;overflow:auto}}
 .cluster li{{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px;
 padding:6px 18px;font-size:12.5px;border-bottom:1px solid rgba(255,255,255,.03)}}
 .cluster li:hover{{background:rgba(255,255,255,.03)}}
@@ -1387,17 +1590,19 @@ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .foot{{margin-top:40px;color:#5a606b;font-size:12px;text-align:center}}
 </style></head><body><div class="wrap">
 <h1>文件中心 · AI 语义归类报告</h1>
-<div class="sub">由已连接的大模型按主题归类 · 生成于 {human}</div>
+<div class="sub">由已连接的大模型按语义两级归类 · 生成于 {human}</div>
 <div class="stats">
-<div class="stat"><div class="v">{ng}</div><div class="l">主题簇</div></div>
+<div class="stat"><div class="v">{ng}</div><div class="l">大主题</div></div>
+<div class="stat"><div class="v">{ns}</div><div class="l">子主题</div></div>
 <div class="stat"><div class="v">{na}</div><div class="l">已归类文件</div></div>
 <div class="stat"><div class="v">{nt}</div><div class="l">参与归类</div></div>
 </div>
 <div class="grid">{cards}</div>
-<div class="foot">Polaris 文件中心 · AI 语义归类 · 大模型语义分组,非嵌入向量</div>
+<div class="foot">Polaris 文件中心 · AI 语义两级归类 · 大模型按思想主题分组,非嵌入向量</div>
 </div></body></html>"##,
         human = esc(&human),
-        ng = groups.len(),
+        ng = themes.len(),
+        ns = n_sub,
         na = assigned,
         nt = files.len(),
         cards = cards,
@@ -1410,6 +1615,116 @@ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
     let path = desktop.join(format!("文件中心-AI归类报告-{stamp}.html"));
     std::fs::write(&path, html).map_err(|e| format!("写报告失败: {e}"))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+// ───────────────────────── AI 智能命名(可选;免嵌入 key) ─────────────────────────
+//
+// 「本地档」清洗名(clean_title)救不了的(纯哈希/纯乱码/纯时间戳图片名),交给已连接的大模型
+// 按目录+类型+名字线索起个可读中文标题,写进 titles 表覆盖显示(磁盘文件名不动)。复用归类那套
+// (独立归类模型 or run_claude_readonly + extract_balanced_json)。
+
+static LLM_TITLING: AtomicBool = AtomicBool::new(false);
+
+fn emit_title(app: &AppHandle, payload: Value) {
+    let _ = app.emit("file:title_llm", payload);
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmTitle {
+    #[serde(default)]
+    i: Value,
+    #[serde(default)]
+    title: String,
+}
+
+fn titles_llm_directive(files: &[FileLite]) -> String {
+    let mut list = String::new();
+    for (i, f) in files.iter().enumerate() {
+        list.push_str(&format!("[{i}] {} | {} ({})\n", f.name, f.relpath, f.kind));
+    }
+    format!(
+        r#"你是文件库的「智能命名员」。下面每行是一个文件:[序号] 原文件名 | 相对路径 (类型)。
+很多原文件名是乱码、哈希、时间戳或无意义的(如 IMG_20230101、a1b2c3d4.jpg、新建文档)。
+请根据**文件名线索 + 所在目录 + 类型**,为每个文件起一个**简短、可读、能概括内容**的中文标题(4~16 字)。
+
+要求:
+- 标题要像人给文件起的名,别保留原始乱码/哈希/纯时间戳;
+- 拿不准的就根据目录和类型给个合理概括(如「项目截图」「会议记录」「数据表」);
+- 不要带扩展名;不要加引号;每个文件都要有标题。
+
+**只输出一个 JSON 数组,无任何额外文字、无 markdown 围栏**:
+[{{"i":序号,"title":"标题"}}, ...]
+
+文件清单({} 个):
+{list}"#,
+        files.len()
+    )
+}
+
+fn titles_llm_run(app: &AppHandle, root: Option<String>) -> Result<usize, String> {
+    emit_title(app, json!({ "kind": "phase", "text": "收集文件清单…" }));
+    let conn = open_db()?;
+    let ids = resolve_root_ids(&conn, &root);
+    let filter = if ids.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        format!(" AND f.root_id IN ({})", list.join(","))
+    };
+    let files = load_files_for_llm(&conn, &filter)?;
+    if files.is_empty() {
+        return Err("没有可命名的文件,先点「盘点」扫描磁盘文件".into());
+    }
+
+    let prompt = titles_llm_directive(&files);
+    let collected = if let Some(cfg) = active_cluster_model() {
+        emit_title(
+            app,
+            json!({ "kind": "phase", "text": format!("用独立归类模型「{}」给 {} 个文件起名…", cfg.model, files.len()) }),
+        );
+        chat_complete(&cfg, &prompt)?
+    } else {
+        emit_title(
+            app,
+            json!({ "kind": "phase", "text": format!("用已连接的对话大模型给 {} 个文件起名…", files.len()) }),
+        );
+        let kb_root = PathBuf::from(crate::kb::kb_root());
+        let cwd = if kb_root.exists() { kb_root } else { std::env::temp_dir() };
+        crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _text| {
+            if kind == "delta" {
+                emit_title(app, json!({ "kind": "tick" }));
+            }
+        })?
+    };
+    let raw = crate::kb::extract_balanced_json(&collected)
+        .ok_or("大模型没有返回可解析的 JSON(可换更强的模型,或稍后重试)")?;
+    let arr: Vec<LlmTitle> =
+        serde_json::from_str(&raw).map_err(|e| format!("标题 JSON 解析失败: {e}"))?;
+
+    emit_title(app, json!({ "kind": "phase", "text": "写回标题…" }));
+    let made_at = chrono::Local::now().timestamp_millis();
+    let mut n = 0usize;
+    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO titles(file_id,title,source,made_at) VALUES(?1,?2,'llm',?3)",
+            )
+            .map_err(|e| e.to_string())?;
+        for t in &arr {
+            let title = t.title.trim();
+            if title.is_empty() {
+                continue;
+            }
+            if let Some(idx) = resolve_index(&t.i, &files) {
+                stmt.execute(rusqlite::params![files[idx].id, title, made_at])
+                    .map_err(|e| e.to_string())?;
+                n += 1;
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    Ok(n)
 }
 
 // ───────────────────────── 命令(薄包装;三壳共用) ─────────────────────────
@@ -1480,6 +1795,31 @@ pub fn file_cluster_llm(app: AppHandle, root: Option<String>) -> Result<(), Stri
         }
     });
     Ok(())
+}
+
+/// AI 智能命名:给杂乱/乱码文件名起可读中文标题,写进 titles 表(只覆盖显示,不改磁盘)。
+/// 后台线程跑,进度走 `file:title_llm` 事件(phase/tick/done/error)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_titles_llm(app: AppHandle, root: Option<String>) -> Result<(), String> {
+    if LLM_TITLING.swap(true, Ordering::SeqCst) {
+        return Err("AI 命名正在进行中".into());
+    }
+    std::thread::spawn(move || {
+        let res = titles_llm_run(&app, root);
+        LLM_TITLING.store(false, Ordering::SeqCst);
+        match res {
+            Ok(n) => emit_title(&app, json!({ "kind": "done", "count": n })),
+            Err(e) => emit_title(&app, json!({ "kind": "error", "message": e })),
+        }
+    });
+    Ok(())
+}
+
+/// 清空 AI 标题 → 卡片标题回落到本地清洗名(撤销 AI 命名)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_titles_clear() -> Result<usize, String> {
+    let conn = open_db()?;
+    conn.execute("DELETE FROM titles", []).map_err(|e| e.to_string())
 }
 
 /// 读「归类专用模型」配置(key 只回 key_set,不回明文)。
@@ -1553,5 +1893,17 @@ mod tests {
     fn human_size_scales() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn clean_title_strips_noise_keeps_meaning() {
+        // 时间戳/计数器/分隔符清掉,保留有意义的词
+        assert_eq!(clean_title("全澳房产_dataset_v2 (3).csv"), "全澳房产 dataset v2");
+        // 纯噪声图片名:无可保留 → 退回去扩展名的原名(总比空好)
+        assert_eq!(clean_title("IMG_20230101_123456.jpg"), "IMG_20230101_123456");
+        // 长 hex 哈希被丢
+        assert_eq!(clean_title("a1b2c3d4e5f6 报告.pdf"), "报告");
+        // 正常中文名原样
+        assert_eq!(clean_title("会议纪要.docx"), "会议纪要");
     }
 }

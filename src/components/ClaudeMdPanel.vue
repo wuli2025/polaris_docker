@@ -45,6 +45,10 @@ const message = ref<{ kind: "ok" | "err"; text: string } | null>(null);
 
 const dirty = computed(() => content.value !== originalContent.value);
 
+// 画廊分组：专家团（战略师领衔的编排型）单独成组，单专家一组
+const teamPresets = computed(() => presets.value.filter((p) => p.kind === "team"));
+const singlePresets = computed(() => presets.value.filter((p) => p.kind !== "team"));
+
 const selectedMeta = computed(() => {
   const s = selected.value;
   if (!s) return null;
@@ -356,22 +360,42 @@ onMounted(refresh);
             </div>
           </div>
 
-          <!-- 预设人格画廊（仿 WeSight 右侧选人格） -->
-          <div v-if="selected.kind === 'project' && showGallery" class="gallery">
-            <button
-              v-for="ps in presets"
-              :key="ps.id"
-              class="p-card"
-              :class="{ on: currentPersona?.id === ps.id }"
-              :disabled="applying"
-              @click="applyPreset(ps)"
-              :title="ps.description"
-            >
-              <span class="pc-icon">{{ ps.icon }}</span>
-              <span class="pc-name">{{ ps.name }}</span>
-              <span class="pc-desc">{{ ps.description }}</span>
-              <span v-if="ps.kbScope" class="pc-scope">📚 {{ ps.kbScope }}</span>
-            </button>
+          <!-- 预设人格画廊（仿 WeSight 右侧选人格）：专家团 + 单专家两组 -->
+          <div v-if="selected.kind === 'project' && showGallery" class="gallery-wrap">
+            <div class="g-grp">专家团 · 战略师领衔（注入后默认单 agent，值得才升级）</div>
+            <div class="gallery">
+              <button
+                v-for="ps in teamPresets"
+                :key="ps.id"
+                class="p-card team"
+                :class="{ on: currentPersona?.id === ps.id }"
+                :disabled="applying"
+                @click="applyPreset(ps)"
+                :title="ps.description"
+              >
+                <span class="pc-icon">{{ ps.icon }}</span>
+                <span class="pc-name">{{ ps.name }}</span>
+                <span class="pc-desc">{{ ps.description }}</span>
+                <span v-if="ps.kbScope" class="pc-scope">📚 {{ ps.kbScope }}</span>
+              </button>
+            </div>
+            <div class="g-grp">单专家</div>
+            <div class="gallery">
+              <button
+                v-for="ps in singlePresets"
+                :key="ps.id"
+                class="p-card"
+                :class="{ on: currentPersona?.id === ps.id }"
+                :disabled="applying"
+                @click="applyPreset(ps)"
+                :title="ps.description"
+              >
+                <span class="pc-icon">{{ ps.icon }}</span>
+                <span class="pc-name">{{ ps.name }}</span>
+                <span class="pc-desc">{{ ps.description }}</span>
+                <span v-if="ps.kbScope" class="pc-scope">📚 {{ ps.kbScope }}</span>
+              </button>
+            </div>
           </div>
 
           <div v-if="message" class="msg" :class="message.kind">
@@ -690,15 +714,28 @@ onMounted(refresh);
   outline: none;
   border-color: var(--primary);
 }
+.gallery-wrap {
+  padding: 10px 18px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  overflow-y: auto;
+  max-height: 340px;
+  background: var(--bg-soft);
+}
+.g-grp {
+  font-family: var(--serif);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--dim);
+  padding: 10px 2px 6px;
+}
 .gallery {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
   gap: 10px;
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border-soft);
-  overflow-y: auto;
-  max-height: 280px;
-  background: var(--bg-soft);
+}
+.p-card.team {
+  background: linear-gradient(180deg, var(--panel), var(--bg-soft));
+  border-color: var(--primary);
 }
 .p-card {
   display: flex;

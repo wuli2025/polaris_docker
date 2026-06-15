@@ -37,6 +37,7 @@ import {
   Hand,
   RotateCcw,
   Mic,
+  SlidersHorizontal,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import {
@@ -480,6 +481,26 @@ function toggleBatch() {
   batchMode.value = !batchMode.value;
   if (batchMode.value) nextTick(() => inputEl.value?.focus());
 }
+
+// ─────────── 「模式」合并键 ───────────
+// 把 目标 / 动态编排 / 知识库 / 分批长任务 四个开关收进一枚「模式」键的弹出面板，
+// 减少工具栏拥挤。底层 4 个 ref 与发送逻辑保持不变，这里只是统一的开关入口。
+const showModePanel = ref(false);
+const activeModeCount = computed(
+  () =>
+    (goalMode.value ? 1 : 0) +
+    (orchestrateMode.value ? 1 : 0) +
+    (kbMode.value ? 1 : 0) +
+    (batchMode.value ? 1 : 0)
+);
+const activeModeSummary = computed(() => {
+  const on: string[] = [];
+  if (goalMode.value) on.push("目标");
+  if (orchestrateMode.value) on.push("编排");
+  if (kbMode.value) on.push("知识库");
+  if (batchMode.value) on.push("分批");
+  return on.join(" · ");
+});
 
 // ─────────── 工作流包「使用」→ 填入输入框 ───────────
 // 右侧「工作流包」点「使用」时，store 发来拼装好的提示词：已有内容则追加，否则填入；
@@ -1327,6 +1348,50 @@ async function deleteCurrentConv() {
         </div>
       </div>
 
+      <!-- 「模式」弹窗：目标 / 动态编排 / 知识库 / 分批长任务 合并到一处 -->
+      <div v-if="showModePanel" class="mode-panel">
+        <div class="skill-panel-head">
+          <span class="skill-panel-title">模式</span>
+          <button class="skill-panel-close" @click="showModePanel = false">
+            <X :size="14" :stroke-width="2" />
+          </button>
+        </div>
+        <div class="mode-list">
+          <button class="mode-row" :class="{ on: goalMode }" @click="toggleGoal">
+            <Target :size="16" :stroke-width="1.7" class="mr-ic" />
+            <span class="mr-tx">
+              <span class="mr-nm">目标模式</span>
+              <span class="mr-ds">设一个完成条件，持续推进直到达成，不中途收尾、不反问</span>
+            </span>
+            <span class="mr-sw" :class="{ on: goalMode }"></span>
+          </button>
+          <button class="mode-row" :class="{ on: orchestrateMode }" @click="toggleOrchestrate">
+            <Workflow :size="16" :stroke-width="1.7" class="mr-ic" />
+            <span class="mr-tx">
+              <span class="mr-nm">动态编排（多智能体）</span>
+              <span class="mr-ds">拆成多个独立子任务并行干，每条 实现→校验→修复；可拆分+可验证才用，更贵</span>
+            </span>
+            <span class="mr-sw" :class="{ on: orchestrateMode }"></span>
+          </button>
+          <button class="mode-row" :class="{ on: kbMode }" @click="toggleKb">
+            <BookOpen :size="16" :stroke-width="1.7" class="mr-ic" />
+            <span class="mr-tx">
+              <span class="mr-nm">知识库</span>
+              <span class="mr-ds">注入完整 KB 结构化 wiki + 双链地图（消耗较多 token，默认关）</span>
+            </span>
+            <span class="mr-sw" :class="{ on: kbMode }"></span>
+          </button>
+          <button class="mode-row" :class="{ on: batchMode }" @click="toggleBatch">
+            <Layers :size="16" :stroke-width="1.7" class="mr-ic" />
+            <span class="mr-tx">
+              <span class="mr-nm">分批长任务</span>
+              <span class="mr-ds">超长生成先规划成清单，每轮只建一小批，断线从断点续跑</span>
+            </span>
+            <span class="mr-sw" :class="{ on: batchMode }"></span>
+          </button>
+        </div>
+      </div>
+
       <!-- 输入卡片 -->
       <div class="input-card" :class="{ 'goal-on': goalMode }">
         <!-- Skill 标签 -->
@@ -1411,64 +1476,17 @@ async function deleteCurrentConv() {
             </button>
             <button
               class="toolbar-btn"
-              :class="{ active: goalMode }"
-              @click="toggleGoal"
+              :class="{ active: activeModeCount > 0 || showModePanel }"
+              @click="showModePanel = !showModePanel"
             >
-              <Target :size="14" :stroke-width="1.8" />
-              <span>目标模式</span>
+              <SlidersHorizontal :size="14" :stroke-width="1.8" />
+              <span>{{ activeModeCount > 0 ? `模式 · ${activeModeSummary}` : "模式" }}</span>
+              <span v-if="activeModeCount > 0" class="mode-badge">{{ activeModeCount }}</span>
               <div class="btn-tooltip">
                 <div class="btn-tooltip-inner">
-                  设定一个完成条件，Claude 会持续推进直到达成
+                  在一处统一开关：目标模式 / 动态编排 / 知识库 / 分批长任务
                   <div class="btn-tooltip-sub">
-                    条件满足前不中途收尾、不反问，自行规划下一步
-                  </div>
-                </div>
-              </div>
-            </button>
-            <button
-              class="toolbar-btn"
-              :class="{ active: orchestrateMode }"
-              @click="toggleOrchestrate"
-            >
-              <Workflow :size="14" :stroke-width="1.8" />
-              <span>动态编排</span>
-              <div class="btn-tooltip">
-                <div class="btn-tooltip-inner">
-                  多智能体编排：拆成多个独立子任务并行干，每条 实现→校验→修复
-                  <div class="btn-tooltip-sub">
-                    适合可拆分 + 可验证的任务（批量改写 / 多维审查 / 调研）· 比单轮更贵
-                  </div>
-                </div>
-              </div>
-            </button>
-            <button
-              class="toolbar-btn"
-              :class="{ active: kbMode }"
-              @click="toggleKb"
-            >
-              <BookOpen :size="14" :stroke-width="1.8" />
-              <span>知识库</span>
-              <div class="btn-tooltip">
-                <div class="btn-tooltip-inner">
-                  打开后注入完整 KB 结构化 wiki + 双链地图（消耗大量 token）
-                  <div class="btn-tooltip-sub">
-                    默认关闭以节省上下文；只在需要严格搜索知识库时打开
-                  </div>
-                </div>
-              </div>
-            </button>
-            <button
-              class="toolbar-btn"
-              :class="{ active: batchMode }"
-              @click="toggleBatch"
-            >
-              <Layers :size="14" :stroke-width="1.8" />
-              <span>分批长任务</span>
-              <div class="btn-tooltip">
-                <div class="btn-tooltip-inner">
-                  超长生成（如 60 页 PPT）先规划成清单，每轮只建一小批，断线从断点续跑
-                  <div class="btn-tooltip-sub">
-                    规避单轮输出过长把连接拖死；关时也会按「N 页/张/章」自动判定
+                    默认全关（单 agent 直接答）；按这件事的需要逐项打开，可叠加
                   </div>
                 </div>
               </div>
@@ -2496,6 +2514,113 @@ async function deleteCurrentConv() {
 }
 .sp-manage:hover {
   background: var(--primary-soft);
+}
+
+/* 「模式」合并键弹窗 + 角标 */
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  margin-left: 1px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  border-radius: 999px;
+  background: var(--primary);
+  color: #fff;
+}
+.mode-panel {
+  position: absolute;
+  bottom: calc(100% - 8px);
+  left: 32px;
+  width: 360px;
+  max-height: 420px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.mode-list {
+  padding: 6px;
+  overflow-y: auto;
+}
+.mode-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 10px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.mode-row:hover {
+  background: var(--bg-soft);
+}
+.mode-row.on {
+  background: var(--primary-soft);
+}
+.mr-ic {
+  color: var(--muted);
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+.mode-row.on .mr-ic {
+  color: var(--primary);
+}
+.mr-tx {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mr-nm {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.mr-ds {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.mr-sw {
+  position: relative;
+  width: 30px;
+  height: 17px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  border-radius: 999px;
+  background: var(--border);
+  transition: background 0.15s ease;
+}
+.mr-sw::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 0.15s ease;
+}
+.mr-sw.on {
+  background: var(--primary);
+}
+.mr-sw.on::after {
+  transform: translateX(13px);
 }
 
 /* 输入卡片 —— 宽度仿豆包（输入多了高度自动撑大）；

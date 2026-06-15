@@ -182,10 +182,24 @@ pub fn echo_set(enabled: Option<bool>, hour: Option<u8>) -> EchoStatus {
     echo_status()
 }
 
-/// 手动「现在做一次梦」。后台线程跑,进度走 `echo:dream` 事件。
+/// 手动「现在做一次梦」(全量:取最近所有新对话)。后台线程跑,进度走 `echo:dream` 事件。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn echo_dream_now(app: AppHandle) -> Result<(), String> {
     spawn_dream(app, true)
+}
+
+/// 把**单条对话**立刻沉淀为记忆(侧栏「⋯ › 沉淀为记忆」)。复用做梦管线,
+/// 但不动每日调度状态(last_dream_day/ms)——它是一次性的手动沉淀,不顶替「今天的梦」。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn echo_distill_conversation(app: AppHandle, conv_id: String) -> Result<(), String> {
+    if DREAMING.swap(true, Ordering::SeqCst) {
+        return Err("正在沉淀中,请稍候".into());
+    }
+    std::thread::spawn(move || {
+        let result = distill_one(&app, &conv_id);
+        finish_job(&app, result, false);
+    });
+    Ok(())
 }
 
 // ───────────────────────── 调度器 ─────────────────────────
@@ -212,23 +226,31 @@ fn spawn_dream(app: AppHandle, manual: bool) -> Result<(), String> {
     }
     std::thread::spawn(move || {
         let result = dream(&app, manual);
-        DREAMING.store(false, Ordering::SeqCst);
-        match result {
-            Ok((n, summary)) => {
-                {
-                    let mut cfg = CFG.write();
-                    cfg.last_dream_day = local_day();
-                    cfg.last_dream_ms = now_ms();
-                    cfg.log.insert(0, DreamLog { ts: now_ms(), day: local_day(), episodes: n, summary: summary.clone() });
-                    cfg.log.truncate(30);
-                }
-                persist_cfg();
-                emit_dream(&app, "done", Some(summary), Some(n));
-            }
-            Err(e) => emit_dream(&app, "error", Some(e), None),
-        }
+        finish_job(&app, result, true);
     });
     Ok(())
+}
+
+/// 一次沉淀作业收尾:解锁 → 记日志(成功时) →(可选)推进每日调度状态 → emit done/error。
+/// `advance_schedule`:每日做梦走 true(记下「今天梦过了」);单条手动沉淀走 false。
+fn finish_job(app: &AppHandle, result: Result<(usize, String), String>, advance_schedule: bool) {
+    DREAMING.store(false, Ordering::SeqCst);
+    match result {
+        Ok((n, summary)) => {
+            {
+                let mut cfg = CFG.write();
+                if advance_schedule {
+                    cfg.last_dream_day = local_day();
+                    cfg.last_dream_ms = now_ms();
+                }
+                cfg.log.insert(0, DreamLog { ts: now_ms(), day: local_day(), episodes: n, summary: summary.clone() });
+                cfg.log.truncate(30);
+            }
+            persist_cfg();
+            emit_dream(app, "done", Some(summary), Some(n));
+        }
+        Err(e) => emit_dream(app, "error", Some(e), None),
+    }
 }
 
 // ───────────────────────── 做梦管线 ─────────────────────────
@@ -256,6 +278,7 @@ fn is_safe_memory_relpath(rel: &str) -> bool {
         && r != "memory/index.md"
 }
 
+/// 每日做梦:取 last_dream_ms 之后有更新的对话(全量),交给共用蒸馏核。
 fn dream(app: &AppHandle, manual: bool) -> Result<(usize, String), String> {
     emit_dream(app, "phase", Some("收集今天的对话…".into()), None);
     let since = {
@@ -265,6 +288,25 @@ fn dream(app: &AppHandle, manual: bool) -> Result<(usize, String), String> {
     let transcripts = crate::conv::transcripts_since(since, 8, 12_000);
     if transcripts.is_empty() {
         return Ok((0, if manual { "没有新对话可沉淀".into() } else { "今夜无梦(无新对话)".into() }));
+    }
+    distill_and_write(app, &transcripts)
+}
+
+/// 单条沉淀:取这一条对话的文字稿,交给共用蒸馏核。
+fn distill_one(app: &AppHandle, conv_id: &str) -> Result<(usize, String), String> {
+    emit_dream(app, "phase", Some("读取这条对话…".into()), None);
+    let t = crate::conv::transcript_of(conv_id).ok_or("找不到该对话,或对话为空")?;
+    distill_and_write(app, std::slice::from_ref(&t))
+}
+
+/// 蒸馏核(做梦与单条沉淀共用):把若干 (标题, 文字稿) 蒸成 memory/ 记忆,
+/// AI 出决策(只读 claude 输出 JSON),Rust 校验路径后写盘 + 重建 index。
+fn distill_and_write(
+    app: &AppHandle,
+    transcripts: &[(String, String)],
+) -> Result<(usize, String), String> {
+    if transcripts.is_empty() {
+        return Ok((0, "没有可沉淀的内容".into()));
     }
 
     let kb_root = PathBuf::from(crate::kb::kb_root());
@@ -279,7 +321,7 @@ fn dream(app: &AppHandle, manual: bool) -> Result<(usize, String), String> {
     let existing_index = fs::read_to_string(mem_root.join("index.md")).unwrap_or_default();
 
     let mut convo_block = String::new();
-    for (title, text) in &transcripts {
+    for (title, text) in transcripts {
         convo_block.push_str(&format!("\n### 对话「{title}」\n{text}\n"));
     }
 

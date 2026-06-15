@@ -18,7 +18,7 @@ try {
 }
 
 const container = ref<HTMLDivElement | null>(null);
-const stats = ref({ docs: 0, folders: 0, edges: 0 });
+const stats = ref({ docs: 0, folders: 0, edges: 0, memories: 0 });
 const empty = ref(false);
 const showFolders = ref(true);
 const spinning = ref(true); // 初始即自动旋转
@@ -43,6 +43,7 @@ const PAL: Record<string, Star> = {
   root: { grad: "#fff6e0 #efa838", glow: "#f0b24a" }, // 星系核心 · 暖金
   folder: { grad: "#e6f2ff #5fa8e6", glow: "#5fa8e6" }, // 亮蓝巨星
   doc: { grad: "#dbe7ff #4f7fd0", glow: "#4f7fd0" }, // 蓝白主序星
+  feedback: { grad: "#ffe0ec #f0567f", glow: "#f0567f" }, // 玫红 · 回声记忆(对话沉淀)
   概念: { grad: "#d6e6ff #5577d8", glow: "#5577d8" },
   课程: { grad: "#fff0cf #e0a23c", glow: "#e0a23c" },
   人物: { grad: "#ecdcff #9a6fe0", glow: "#9a6fe0" },
@@ -52,6 +53,7 @@ const PAL: Record<string, Star> = {
 function palKey(n: KbNode): string {
   if (n.kind === "root") return "root";
   if (n.kind === "folder") return "folder";
+  if (n.kind === "feedback") return "feedback"; // 回声记忆走玫红,不按 category
   return PAL[n.category] ? n.category : "doc";
 }
 function nodeSize(kind: KbNode["kind"], deg: number): number {
@@ -112,7 +114,10 @@ function render() {
   }
 
   const keepFolders = showFolders.value;
-  const nodes = graphData.nodes.filter((n) => keepFolders || n.kind === "doc");
+  // 文档与回声记忆始终显示;目录/根节点仅在「目录结构」开启时显示
+  const nodes = graphData.nodes.filter(
+    (n) => keepFolders || n.kind === "doc" || n.kind === "feedback"
+  );
   const keepIds = new Set(nodes.map((n) => n.id));
   const edges = graphData.edges.filter(
     (e) => keepIds.has(e.source) && keepIds.has(e.target)
@@ -129,6 +134,7 @@ function render() {
     docs: nodes.filter((n) => n.kind === "doc").length,
     folders: nodes.filter((n) => n.kind === "folder").length,
     edges: edges.length,
+    memories: nodes.filter((n) => n.kind === "feedback").length,
   };
 
   cy = cytoscape({
@@ -149,7 +155,7 @@ function render() {
             upad: glowPad(size),
             uopa: glowOpacity(n.kind, size),
             deg: deg[n.id] || 0,
-            path: n.kind === "doc" ? n.id : "",
+            path: n.kind === "doc" || n.kind === "feedback" ? n.id : "",
           },
         };
       }),
@@ -252,7 +258,9 @@ function wireInteractions(c: Core) {
     const show = c.zoom() >= 0.9;
     if (show !== labelsShown) {
       labelsShown = show;
-      c.batch(() => c.nodes('[kind = "doc"]').toggleClass("show-label", show));
+      c.batch(() =>
+        c.nodes('[kind = "doc"], [kind = "feedback"]').toggleClass("show-label", show)
+      );
     }
   };
   c.on("zoom", syncLabels);
@@ -368,6 +376,7 @@ onMounted(async () => {
     docs: graphData.nodes.filter((n) => n.kind === "doc").length,
     folders: graphData.nodes.filter((n) => n.kind === "folder").length,
     edges: graphData.edges.length,
+    memories: graphData.nodes.filter((n) => n.kind === "feedback").length,
   };
   if (empty.value) {
     emit("ready");
@@ -434,6 +443,9 @@ onUnmounted(() => {
         </button>
         <div class="stats">
           文档 <strong>{{ stats.docs }}</strong>
+          <template v-if="stats.memories"
+            >· <span class="echo-stat">记忆 {{ stats.memories }}</span></template
+          >
           <template v-if="showFolders"
             >· 目录 <strong>{{ stats.folders }}</strong></template
           >
@@ -468,6 +480,9 @@ onUnmounted(() => {
         <span><i class="dot" style="--c: #f0b24a"></i>知识库</span>
         <span><i class="dot sq" style="--c: #5fa8e6"></i>目录</span>
         <span><i class="dot" style="--c: #4f7fd0"></i>文档</span>
+        <span v-if="stats.memories"
+          ><i class="dot" style="--c: #f0567f"></i>记忆</span
+        >
       </div>
 
       <transition name="fade">
@@ -478,6 +493,8 @@ onUnmounted(() => {
                 ? "星系核心 · 知识库"
                 : selected.kind === "folder"
                 ? "目录中枢"
+                : selected.kind === "feedback"
+                ? "回声 · 记忆"
                 : "文档"
             }}
           </div>
@@ -562,6 +579,11 @@ onUnmounted(() => {
 }
 .stats strong {
   color: var(--ink);
+  font-family: var(--mono);
+}
+.stats .echo-stat {
+  color: #f0567f;
+  font-weight: 700;
   font-family: var(--mono);
 }
 

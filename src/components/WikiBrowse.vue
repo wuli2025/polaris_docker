@@ -14,6 +14,7 @@ import {
   Trash2,
   Download,
   Sparkles,
+  Waypoints,
 } from "@lucide/vue";
 import {
   kb,
@@ -570,6 +571,11 @@ function sendTableCmd() {
         >
           {{ t.l }}
         </button>
+        <!-- 图谱:并入知识库的小功能键,点开切到星河图谱视图(复用其全屏加载机) -->
+        <button class="tab tab-graph" title="知识图谱·星河" @click="app.setView('graph')">
+          <Waypoints :size="14" :stroke-width="1.8" />
+          图谱
+        </button>
       </div>
       <div class="root">
         <span class="root-label">KB 根:</span>
@@ -1009,6 +1015,18 @@ function sendTableCmd() {
   color: var(--text);
   font-weight: 600;
   border-bottom: 2px solid var(--ink);
+}
+.tab-graph {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 4px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border-soft);
+  color: var(--primary);
+}
+.tab-graph:hover {
+  color: var(--text);
 }
 .root {
   margin-top: 8px;
