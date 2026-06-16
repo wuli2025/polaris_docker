@@ -1246,7 +1246,6 @@ onBeforeUnmount(() => {
               <div v-if="card.thumbable && !thumbCache.has(card.abspath)" class="shimmer" />
             </div>
             <span class="ext-badge">{{ card.ext || card.kind }}</span>
-            <span v-if="card.source" class="src-badge">{{ card.source }}</span>
             <span v-if="card.kind === 'video'" class="play-badge">▶</span>
           </div>
           <div class="tile-meta">
@@ -2346,20 +2345,6 @@ onBeforeUnmount(() => {
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
   box-shadow: 0 2px 8px -2px color-mix(in srgb, var(--accent) 70%, transparent);
-}
-.src-badge {
-  position: absolute;
-  left: 9px;
-  top: 9px;
-  font-size: 9.5px;
-  letter-spacing: 0.3px;
-  padding: 2px 7px;
-  border-radius: 6px;
-  color: #fff;
-  background: color-mix(in srgb, #6fcf97 80%, #000 12%);
-  -webkit-backdrop-filter: blur(6px);
-  backdrop-filter: blur(6px);
-  box-shadow: 0 2px 8px -2px color-mix(in srgb, #6fcf97 60%, transparent);
 }
 .play-badge {
   position: absolute;
