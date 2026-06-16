@@ -795,6 +795,45 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "updater_check" => ok(json!({"phase":"idle"})),
         "updater_apply" => Err("容器版请用 docker pull 拉新镜像更新。".to_string()),
 
+        // ── 容器自更新(前端 useUpdater.ts 容器线调用)──
+        // docker_status:报「能不能自更新」给 UpdatePanel(POLARIS_DOCKER_SOCKET 开关 + docker.sock 在位
+        //   + 当前镜像 tag + update.sh 是否打进镜像)。
+        "docker_status" => ok(json!({
+            "updater_enabled": std::env::var("POLARIS_DOCKER_SOCKET").map(|v| v == "1").unwrap_or(false),
+            "socket_present": std::path::Path::new("/var/run/docker.sock").exists(),
+            "current_tag": std::env::var("POLARIS_TAG").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "latest".to_string()),
+            "update_script": std::path::Path::new("/usr/local/bin/update.sh").exists(),
+        })),
+        // docker_update:跑 /usr/local/bin/update.sh(默认模式)——它经 docker.sock 用「自己的镜像」
+        //   起一个独立替身容器执行 pull + up -d(不能在被替换的容器里直接 up,compose 会随旧容器被杀)。
+        //   脚本起完 detached 替身即返回;真正的替换由替身异步完成(约 1~3 分钟,期间连接断,刷新即可)。
+        "docker_update" => {
+            if !bool_def(a, "confirm", false) {
+                return Err("更新需要确认 (confirm: true)".to_string());
+            }
+            if !std::env::var("POLARIS_DOCKER_SOCKET").map(|v| v == "1").unwrap_or(false) {
+                return Err("远程更新未启用:请在 compose 设 POLARIS_DOCKER_SOCKET=1 并挂载 /var/run/docker.sock。".to_string());
+            }
+            if !std::path::Path::new("/var/run/docker.sock").exists() {
+                return Err("/var/run/docker.sock 未挂载,容器无法自更新。".to_string());
+            }
+            if !std::path::Path::new("/usr/local/bin/update.sh").exists() {
+                return Err("/usr/local/bin/update.sh 不存在(镜像未含更新脚本)。".to_string());
+            }
+            let tag = std::env::var("POLARIS_TAG").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "latest".to_string());
+            match std::process::Command::new("/usr/local/bin/update.sh").output() {
+                Ok(out) => ok(json!({
+                    "success": out.status.success(),
+                    "exit_code": out.status.code(),
+                    "tag": tag,
+                    "stdout": String::from_utf8_lossy(&out.stdout).to_string(),
+                    "stderr": String::from_utf8_lossy(&out.stderr).to_string(),
+                    "note": "替身已出发。拉取完成后当前容器会被替换(约 1~3 分钟,取决于网速),期间连接会断,稍后刷新页面即可。",
+                })),
+                Err(e) => Err(format!("启动 update.sh 失败: {e}")),
+            }
+        }
+
         other => Err(format!("未知命令: {other}")),
     }
 }
