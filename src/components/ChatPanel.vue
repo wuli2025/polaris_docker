@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
+import ExpertTeam from "./ExpertTeam.vue";
+import ExpertTeamStudio from "./ExpertTeamStudio.vue";
 import {
   Puzzle,
   ChevronDown,
@@ -44,6 +46,7 @@ import {
   chat,
   convApi,
   skills as skillsApi,
+  expert,
   invoke,
   listen,
   isTauri,
@@ -52,6 +55,7 @@ import {
   type Skill,
   type AttachedFile,
   type Message,
+  type ExpertAgentStatus,
 } from "../tauri";
 import { WebVoiceRecorder } from "../lib/webVoice";
 import { renderMarkdown, mdVersion } from "../lib/markdown";
@@ -285,6 +289,7 @@ async function regenerate(t: Turn) {
     permissionMode: permMode.value,
     skillIds: Array.from(skillsStore.enabledSkills),
     useKb: kbMode.value || undefined,
+    agentMode: agentMode.value,
   });
 }
 function editTurn(t: Turn) {
@@ -465,13 +470,75 @@ function toggleOrchestrate() {
   if (orchestrateMode.value) nextTick(() => inputEl.value?.focus());
 }
 
-// ─────────── 知识库严格搜索（KB）模式开关 ───────────
-// 默认关闭：不注入大段 KB 导航，节省 token。打开后注入结构化 wiki + 双链地图。
-const kbMode = ref(false);
+// ─────────── 知识库模式开关（双库强制召回）───────────
+// 默认开启：让用户一开箱就体验到知识库便利。开启后后端会替模型先查两个库
+//（妈妈库 wiki 权威 + 外库 raw/output 混检 40→重排取优）并把命中片段喂进上下文，
+// 同时注入结构化 wiki 导航。关闭则只留极简根路径提示，省 token。
+const kbMode = ref(true);
 function toggleKb() {
   kbMode.value = !kbMode.value;
   if (kbMode.value) nextTick(() => inputEl.value?.focus());
 }
+
+// ─────────── 每日晨报建议（回声层做梦产物）───────────
+// 「让 AI 更懂你」：后台做梦据你新加入的内容产出工程化建议，展示在对话框顶部，
+// 点「让我去做」= 把建议的 action 当 prompt 直接发起一轮对话。
+interface Suggestion {
+  id: string;
+  title: string;
+  why: string;
+  how: string;
+  action: string;
+}
+const briefings = ref<Suggestion[]>([]);
+const briefCollapsed = ref(true);
+async function loadBriefings() {
+  if (!isTauri) return;
+  try {
+    briefings.value = await invoke<Suggestion[]>("echo_briefing_today");
+  } catch (e) {
+    console.error("加载晨报失败", e);
+  }
+}
+async function dismissBriefing(id: string) {
+  try {
+    briefings.value = await invoke<Suggestion[]>("echo_briefing_dismiss", { id });
+  } catch (e) {
+    console.error("忽略建议失败", e);
+  }
+}
+async function runBriefing(s: Suggestion) {
+  const prompt = (s.action && s.action.trim()) || s.title;
+  // 每条「今日建议」在各自独立的新对话里执行 —— 不挤占当前对话、彼此互不卡死。
+  // 走 chat store 的 convId 多开 + App 级流式监听:连点几条会各自起一个对话，
+  // 全在后台并行推进，切到别的界面也照常跑、回来仍能看到各自进度。
+  let pid = app.currentProjectId;
+  if (!pid) {
+    await app.refreshProjects();
+    pid = app.currentProjectId;
+  }
+  if (!pid) {
+    const p = await app.createProject("默认项目");
+    pid = p.id;
+  }
+  const c = await app.createConversation(pid); // 新建对话并切过去看它启动
+  await dismissBriefing(s.id);
+  await chatStore.send(c.id, prompt, s.title || prompt, undefined, {
+    permissionMode: permMode.value,
+    skillIds: Array.from(skillsStore.enabledSkills),
+    useKb: kbMode.value || undefined,
+    agentMode: agentMode.value,
+  });
+}
+onMounted(() => {
+  loadBriefings();
+  if (isTauri) {
+    // 做梦/晨报生成完 → 刷新建议条
+    listen("echo:dream", (p: any) => {
+      if (p?.payload?.kind === "done") loadBriefings();
+    });
+  }
+});
 
 // ─────────── 分批长任务（Batch Build）模式开关 ───────────
 // 超长生成（如 60 页 PPT）强制走分批：先规划成清单，每轮只建一小批，断线从清单续跑，
@@ -482,10 +549,96 @@ function toggleBatch() {
   if (batchMode.value) nextTick(() => inputEl.value?.focus());
 }
 
+// ─────────── 百人专家团模式 ──────────
+// 单 agent / 单专家 / 专家团 / 智能匹配（默认），这四个是互斥的，只选一个
+type AgentMode = "single-agent" | "single-expert" | "expert-team" | "auto-match";
+const agentMode = ref<AgentMode>("auto-match");
+const expertModeLabels: Record<AgentMode, string> = {
+  "single-agent": "单Agent",
+  "single-expert": "单专家",
+  "expert-team": "专家团",
+  "auto-match": "智能匹配",
+};
+
+function setAgentMode(m: AgentMode) {
+  agentMode.value = m;
+}
+
+// 「智能体」切换器：四种互斥模式（切换不叠加）
+const showAgentPanel = ref(false);
+const agentModeOptions: { mode: AgentMode; name: string; desc: string; icon: string }[] = [
+  {
+    mode: "auto-match",
+    name: "智能匹配专家团",
+    desc: "每轮自动召集最合适的专家，并说明为什么是 TA",
+    icon: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="4"/><path d="m5 5 2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>`,
+  },
+  {
+    mode: "expert-team",
+    name: "专家团协作",
+    desc: "战略师领衔，按需召集整支业务团并行分工",
+    icon: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="7" r="3"/><circle cx="17" cy="7" r="3"/><path d="M3 20c0-4 2.7-7 6-7"/><path d="M15 15c0 3.3-2.7 6-6 6s-6-2.7-6-6"/><path d="M21 20c0-2.7-1.3-5-3-6"/><path d="M21 14c0 2.7-1.3 5-3 6"/></svg>`,
+  },
+  {
+    mode: "single-expert",
+    name: "单专家",
+    desc: "只用当前入驻 / 最匹配的一位专家视角作答",
+    icon: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>`,
+  },
+  {
+    mode: "single-agent",
+    name: "单 Agent",
+    desc: "关闭专家加成，通用助手直接答，最省",
+    icon: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="3"/><path d="M12 8v3"/><path d="M8 15h0M16 15h0"/></svg>`,
+  },
+];
+function pickAgentMode(m: AgentMode) {
+  agentMode.value = m;
+  showAgentPanel.value = false;
+}
+
+// ─────────── 专家团实时状态轮询 ──────────
+const teamAgentsStatus = ref<ExpertAgentStatus[]>([]);
+let agentsPollInterval: ReturnType<typeof setInterval> | null = null;
+
+async function pollAgentsStatus() {
+  const pid = app.currentProjectId;
+  if (!pid) return;
+  try {
+    teamAgentsStatus.value = await expert.agentsStatus(pid);
+  } catch {
+    /* ignore */
+  }
+}
+
+function startAgentsPoll() {
+  if (agentsPollInterval) return;
+  pollAgentsStatus();
+  agentsPollInterval = setInterval(pollAgentsStatus, 3000);
+}
+
+function stopAgentsPoll() {
+  if (agentsPollInterval) {
+    clearInterval(agentsPollInterval);
+    agentsPollInterval = null;
+  }
+}
+
+// 当切换到专家团模式时启动轮询，切换走时停止
+watch(agentMode, (m) => {
+  if (m === "expert-team") {
+    startAgentsPoll();
+  } else {
+    stopAgentsPoll();
+    teamAgentsStatus.value = [];
+  }
+});
+
 // ─────────── 「模式」合并键 ───────────
 // 把 目标 / 动态编排 / 知识库 / 分批长任务 四个开关收进一枚「模式」键的弹出面板，
 // 减少工具栏拥挤。底层 4 个 ref 与发送逻辑保持不变，这里只是统一的开关入口。
 const showModePanel = ref(false);
+const showExpertTeam = ref(false); // 百人专家团画廊浮层
 const activeModeCount = computed(
   () =>
     (goalMode.value ? 1 : 0) +
@@ -821,6 +974,7 @@ async function send() {
     goal: goalMode.value && text ? text : undefined,
     dynamicWorkflow: orchestrateMode.value || undefined,
     useKb: kbMode.value || undefined,
+    agentMode: agentMode.value,
   });
 }
 
@@ -1159,6 +1313,14 @@ async function deleteCurrentConv() {
         </template>
       </div>
 
+      <!-- 专家团工作台：入驻了团/专家（expert-team / single-expert）时显示在消息区下方 -->
+      <div v-if="(agentMode === 'expert-team' || agentMode === 'single-expert') && app.currentProjectId" class="expert-team-studio-wrap">
+        <ExpertTeamStudio
+          :project-id="app.currentProjectId"
+          :agents-status="teamAgentsStatus"
+        />
+      </div>
+
       <!-- 历史折叠:更早的回合不渲染,点击逐段放开 -->
       <div v-if="hiddenCount > 0" class="earlier-wrap">
         <button class="earlier-btn" @click="showEarlier">
@@ -1392,6 +1554,63 @@ async function deleteCurrentConv() {
         </div>
       </div>
 
+      <!-- 「智能体」切换器：四种互斥模式，切换不叠加（智能匹配默认开） -->
+      <div v-if="showAgentPanel" class="mode-panel agent-panel">
+        <div class="skill-panel-head">
+          <span class="skill-panel-title">智能体 · 谁来回答</span>
+          <button class="skill-panel-close" @click="showAgentPanel = false">
+            <X :size="14" :stroke-width="2" />
+          </button>
+        </div>
+        <div class="mode-list">
+          <button
+            v-for="opt in agentModeOptions"
+            :key="opt.mode"
+            class="mode-row exclusive"
+            :class="{ on: agentMode === opt.mode }"
+            @click="pickAgentMode(opt.mode)"
+          >
+            <span class="mr-ic" v-html="opt.icon"></span>
+            <span class="mr-tx">
+              <span class="mr-nm">{{ opt.name }}<span v-if="opt.mode === 'auto-match'" class="mr-default">默认</span></span>
+              <span class="mr-ds">{{ opt.desc }}</span>
+            </span>
+            <span class="mr-radio" :class="{ on: agentMode === opt.mode }"></span>
+          </button>
+          <div class="agent-panel-foot">
+            想换具体专家或整支业务团？打开左侧「专家团」中心挑选并入驻。
+          </div>
+        </div>
+      </div>
+
+      <!-- 百人专家团浮层 -->
+      <div v-if="showExpertTeam" class="expert-team-panel">
+        <div class="skill-panel-head">
+          <span class="skill-panel-title">🧭 专家团</span>
+          <button class="skill-panel-close" @click="showExpertTeam = false">
+            <X :size="14" :stroke-width="2" />
+          </button>
+        </div>
+        <ExpertTeam
+          @select-team="async (id: string) => {
+            const pid = app.currentProjectId;
+            if (!pid) { showExpertTeam = false; return; }
+            try { await expert.teamApply(pid, id, true); }
+            catch (e) { console.error('team.apply 失败', e); }
+            setAgentMode('expert-team');
+            showExpertTeam = false;
+          }"
+          @select-expert="async (id: string) => {
+            const pid = app.currentProjectId;
+            if (!pid) { showExpertTeam = false; return; }
+            try { await expert.apply(pid, id, true); }
+            catch (e) { console.error('expert.apply 失败', e); }
+            setAgentMode('single-expert');
+            showExpertTeam = false;
+          }"
+        />
+      </div>
+
       <!-- 输入卡片 -->
       <div class="input-card" :class="{ 'goal-on': goalMode }">
         <!-- Skill 标签 -->
@@ -1481,12 +1700,27 @@ async function deleteCurrentConv() {
             >
               <SlidersHorizontal :size="14" :stroke-width="1.8" />
               <span>{{ activeModeCount > 0 ? `模式 · ${activeModeSummary}` : "模式" }}</span>
-              <span v-if="activeModeCount > 0" class="mode-badge">{{ activeModeCount }}</span>
               <div class="btn-tooltip">
                 <div class="btn-tooltip-inner">
                   在一处统一开关：目标模式 / 动态编排 / 知识库 / 分批长任务
                   <div class="btn-tooltip-sub">
                     默认全关（单 agent 直接答）；按这件事的需要逐项打开，可叠加
+                  </div>
+                </div>
+              </div>
+            </button>
+            <button
+              class="toolbar-btn agent-toggle"
+              :class="{ active: agentMode !== 'single-agent' || showAgentPanel }"
+              @click="showAgentPanel = !showAgentPanel"
+            >
+              <Sparkles :size="14" :stroke-width="1.8" />
+              <span>{{ expertModeLabels[agentMode] }}</span>
+              <div class="btn-tooltip">
+                <div class="btn-tooltip-inner">
+                  谁来回答这条消息（四选一，互斥切换）
+                  <div class="btn-tooltip-sub">
+                    默认「智能匹配」自动召集最合适的专家；可切单专家 / 专家团 / 单 Agent
                   </div>
                 </div>
               </div>
@@ -1530,6 +1764,38 @@ async function deleteCurrentConv() {
 
       <!-- 底部授权栏 -->
       <div class="auth-bar">
+        <!-- 今日建议（每日任务）：默认收起为小胶囊，置于「手动授权」左侧，点开向上弹出 -->
+        <div v-if="briefings.length" class="brief-mini">
+          <button
+            class="brief-chip"
+            :class="{ active: !briefCollapsed }"
+            @click="briefCollapsed = !briefCollapsed"
+          >
+            <Sparkles :size="13" :stroke-width="1.9" class="bc-spark" />
+            <span class="bc-text">今日建议</span>
+            <span class="bc-count">{{ briefings.length }}</span>
+          </button>
+          <div v-if="!briefCollapsed" class="brief-pop">
+            <div class="bp-head">
+              <Sparkles :size="13" :stroke-width="1.9" class="bs-spark" />
+              <span class="bs-title">今日建议 · 让 AI 更懂你</span>
+              <span class="bs-count">{{ briefings.length }}</span>
+            </div>
+            <div class="bs-cards">
+              <div v-for="s in briefings" :key="s.id" class="bs-card">
+                <div class="bsc-title">💡 {{ s.title }}</div>
+                <div v-if="s.why" class="bsc-why">{{ s.why }}</div>
+                <div v-if="s.how" class="bsc-how">{{ s.how }}</div>
+                <div class="bsc-act">
+                  <button class="bsc-go" @click="runBriefing(s)">
+                    <ArrowRight :size="12" :stroke-width="2" /> 让我去做
+                  </button>
+                  <button class="bsc-dismiss" @click="dismissBriefing(s.id)">忽略</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
         <div class="perm-wrap" style="margin-right: 48px;">
           <button
             class="auth-btn"
@@ -2380,6 +2646,94 @@ async function deleteCurrentConv() {
   gap: 8px;
   pointer-events: none;
 }
+
+/* ── 今日建议（每日任务）：底部授权栏左侧的小胶囊 + 向上弹出面板 ── */
+.brief-mini {
+  position: relative;
+  pointer-events: auto;
+}
+.brief-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  cursor: pointer;
+}
+.brief-chip:hover { border-color: var(--border); color: var(--text); }
+.brief-chip.active { border-color: var(--border); color: var(--ink); }
+.bc-spark { color: var(--gold, #d4b06a); flex-shrink: 0; }
+.bc-text { letter-spacing: 0.3px; }
+.bc-count {
+  font-size: 11px; color: var(--btn-solid-text, #fff);
+  background: var(--btn-solid-bg); border-radius: 20px;
+  padding: 0 6px; line-height: 16px; min-width: 16px; text-align: center;
+}
+/* 向上弹出的建议面板 */
+.brief-pop {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  width: 340px;
+  max-width: 78vw;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  z-index: 20;
+}
+.bp-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.bs-spark { color: var(--gold, #d4b06a); }
+.bs-title { font-size: 12.5px; font-weight: 600; color: var(--ink); letter-spacing: 0.3px; }
+.bs-count {
+  font-size: 11px; color: var(--btn-solid-text, #fff);
+  background: var(--btn-solid-bg); border-radius: 20px;
+  padding: 0 7px; line-height: 17px; min-width: 17px; text-align: center;
+}
+.bs-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 12px 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.bs-card {
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--bg-soft, var(--bg));
+}
+.bsc-title { font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.5; }
+.bsc-why, .bsc-how {
+  font-size: 11.5px; color: var(--text-2); line-height: 1.6; margin-top: 4px;
+}
+.bsc-how { color: var(--muted); }
+.bsc-act { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+.bsc-go {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: none; cursor: pointer;
+  background: var(--btn-solid-bg); color: var(--btn-solid-text);
+  font-size: 12px; letter-spacing: 0.5px;
+  padding: 5px 11px; border-radius: 7px;
+}
+.bsc-go:hover { background: var(--primary, var(--btn-solid-bg)); }
+.bsc-dismiss {
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+  font-size: 12px; padding: 5px 10px; border-radius: 7px; cursor: pointer;
+}
+.bsc-dismiss:hover { border-color: var(--ink); color: var(--ink); }
 .input-area > * {
   pointer-events: auto;
 }
@@ -2621,6 +2975,69 @@ async function deleteCurrentConv() {
 }
 .mr-sw.on::after {
   transform: translateX(13px);
+}
+
+/* 专家模式分隔线 */
+.mode-sep {
+  text-align: center;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 4px 8px;
+  letter-spacing: 0.5px;
+  opacity: 0.7;
+}
+.mode-row.agent-mode { gap: 8px; }
+
+/* 「智能体」互斥切换器 */
+.agent-panel { left: auto; right: 8px; width: 320px; }
+.mode-row.exclusive { align-items: center; }
+.mr-default {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--btn-solid-text);
+  background: var(--primary);
+  border-radius: 999px;
+  padding: 0 6px;
+  vertical-align: middle;
+}
+.mr-radio {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 1.6px solid var(--border);
+  transition: border-color 0.15s ease;
+}
+.mr-radio.on {
+  border-color: var(--primary);
+}
+.mr-radio.on::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+.agent-panel-foot {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.5;
+  padding: 8px 10px 4px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 4px;
+}
+.toolbar-btn.agent-toggle.active {
+  color: var(--primary);
+}
+
+/* 百人专家团浮层 */
+.expert-team-panel {
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 8px;
 }
 
 /* 输入卡片 —— 宽度仿豆包（输入多了高度自动撑大）；
@@ -2928,7 +3345,9 @@ html[data-theme="dark"] .btn-tooltip-inner {
   width: 100%;
   max-width: 1394px;
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 8px;
 }
 .perm-wrap {
   position: relative;

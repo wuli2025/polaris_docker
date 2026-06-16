@@ -40,15 +40,16 @@ function authToken(): string | null {
   }
 }
 
-export function authHeaders(): Record<string, string> {
+function authHeaders(): Record<string, string> {
   const t = authToken();
   return t ? { authorization: `Bearer ${t}` } : {};
 }
 
 /**
- * 后端受限文件 URL（/api/file）。window.open/<a download> 等导航请求带不了
- * Authorization 头，故 token 走 query（与 /ws 同理）。download=true 让后端加
- * Content-Disposition: attachment 强制下载。
+ * 受 token 保护的后端文件 URL（Docker/Web 用）。
+ * - 默认内联：HTML 在新标签渲染、图片直接显示。
+ * - download:true → 后端加 Content-Disposition: attachment，强制下载。
+ * window.open / <a download> 等导航请求带不了 Authorization 头，token 故走 query（与 /ws 同理）。
  */
 export function backendFileUrl(
   path: string,
@@ -542,6 +543,8 @@ export interface FileCard {
   mtime: number;
   clusterId: number;
   thumbable: boolean;
+  /** 来源徽标:下载 / 微信 / QQ / 企业微信 / ""(普通文件,不显示) */
+  source: string;
 }
 export interface FileGridPage {
   items: FileCard[];
@@ -615,12 +618,18 @@ export const files = {
     invoke<string | null>("file_thumb", { abspath, max }),
   /** 按需内容速览(抽取式,零 token,带缓存) */
   gist: (abspath: string) => invoke<string>("file_gist", { abspath }),
-  /** 重建语义聚类(复用已存向量,纯数学;同步返回汇总) */
+  /** 重建语义聚类(复用已存向量,纯数学)。后台线程跑,进度走 file:cluster 事件(phase/done/error) */
   clusterBuild: (root?: string | null) =>
-    invoke<ClusterBuildSummary>("file_cluster_build", { root: root ?? null }),
+    invoke<void>("file_cluster_build", { root: root ?? null }),
   /** 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告;进度走 file:cluster_llm 事件 */
   clusterLlm: (root?: string | null) =>
     invoke<void>("file_cluster_llm", { root: root ?? null }),
+  /** 「让 AI 更懂你」:据盘点统计确定性生成知识画像 HTML → 桌面,返回文件路径(同步,不调大模型) */
+  profileHtml: (root?: string | null) =>
+    invoke<string>("file_profile_html", { root: root ?? null }),
+  /** 文件中心「星图」:语义簇 + 抽样文件 → 与知识图谱同构的 KbGraph(供星河渲染复用) */
+  graph: (root?: string | null) =>
+    invoke<KbGraph>("file_graph", { root: root ?? null }),
   /** AI 智能命名:给乱码/杂乱文件名起可读中文标题(只覆盖显示,不改磁盘);进度走 file:title_llm 事件 */
   titlesLlm: (root?: string | null) =>
     invoke<void>("file_titles_llm", { root: root ?? null }),
@@ -708,6 +717,8 @@ export interface ChatSendArgs {
   batchBuild?: boolean;
   /** 每批最多构建几个单元（页/章/文件）。 */
   batchSize?: number;
+  /** 智能体模式："auto-match"(默认智能匹配) | "expert-team" | "single-expert" | "single-agent"。 */
+  agentMode?: string;
 }
 
 export interface ChatStreamEvent {
@@ -835,6 +846,12 @@ export const artifacts = {
   /** 跨所有对话检索历史产物文件（文件名 + 正文） */
   search: (query: string) =>
     invoke<ArtifactSearchHit[]>("artifact_search", { query }),
+  /** deck.html → .pptx 重新导出（自研 forge 管线逐页截图 + 纯 Rust OOXML，覆盖写出） */
+  deckToPptx: (deck: string, out: string) =>
+    invoke<unknown>("forge_deck_to_pptx", { deck, out }),
+  /** polaris.slides.json(spec) → 原生可编辑 .pptx（路线 B 传统PPT，零浏览器）。spec 传文件路径或 JSON 字符串 */
+  specToPptx: (spec: string, out: string) =>
+    invoke<{ ok: boolean; slides: number; warnings: string[] }>("forge_spec_to_pptx", { spec, out }),
 };
 
 /** 跨对话产物搜索命中 */
@@ -1067,6 +1084,140 @@ export const persona = {
 };
 
 // ──────────────────────────────────────────────────────────────
+// 百人专家团 module — 运行时动态召集 + 可解释路由
+// ──────────────────────────────────────────────────────────────
+export interface ExpertCard {
+  id: string;
+  name: string;
+  icon: string;
+  role: string;
+  description: string;
+  triggerSignals: string[];
+  complements: string;
+  keywords: string[];
+  capabilities: string[];
+  claudeMdRef: string;
+  modelHint: string;
+  costTier: number;
+  exclusiveWith: string[];
+  source: string;
+  license: string;
+  group: string;
+}
+
+export interface ExpertMatch {
+  expert: ExpertCard;
+  hitSignals: string[];
+  similarity: number;
+  complements: string;
+  isPrimary: boolean;
+}
+
+export interface ExpertAgentStatus {
+  expertId: string;
+  name: string;
+  status: string;
+  lastActive: string;
+}
+
+export interface ExpertGroup {
+  id: string;
+  name: string;
+  icon: string;
+  count: number;
+}
+
+export interface RouteRequest {
+  query: string;
+  limit?: number;
+  groupFilter?: string;
+}
+
+/** 业务专家团：领衔者 + 成员的成建制队伍 */
+export interface ExpertTeam {
+  id: string;
+  name: string;
+  icon: string;
+  tagline: string;
+  description: string;
+  leadId: string;
+  memberIds: string[];
+  tags: string[];
+}
+
+/** 路由调试一行：每个候选专家的命中明细 */
+export interface ExpertDebugRow {
+  id: string;
+  name: string;
+  group: string;
+  hitSignals: string[];
+  similarity: number;
+  wouldSelect: boolean;
+}
+
+/** 按知识库反推的专家团推荐 */
+export interface KbRecommendation {
+  team: ExpertTeam | null;
+  reason: string;
+  topExperts: ExpertCard[];
+  matchedTopics: string[];
+  corpusSize: number;
+}
+
+export const expert = {
+  list: () => invoke<ExpertCard[]>("expert_list"),
+  listByGroup: (group: string) => invoke<ExpertCard[]>("expert_list_by_group", { group }),
+  groups: () => invoke<ExpertGroup[]>("expert_groups"),
+  route: (req: RouteRequest) => invoke<ExpertMatch[]>("expert_route", { req }),
+  get: (id: string) => invoke<ExpertCard | null>("expert_get", { id }),
+  matchAuto: (query: string) => invoke<ExpertMatch[]>("expert_match_auto", { query }),
+  /** 把专家的 CLAUDE.md 模板应用到项目（写 CLAUDE.md + 记录 persona_id）；已有内容需 overwrite=true */
+  apply: (projectId: string, expertId: string, overwrite = false) =>
+    invoke<void>("expert_apply", { projectId, expertId, overwrite }),
+  /** 取专家/专家团头像 base64 data URL（失败返回 null，前端落 gradient 占位） */
+  getAvatar: (id: string) => invoke<string | null>("expert_avatar", { id }),
+  /** 一次性取全部 9 张头像（按槽位），配合 avatarSlot(id) 本地映射，避免逐卡 IPC 卡顿 */
+  avatarSlots: () => invoke<string[]>("expert_avatar_slots"),
+  /** 召集专家团：分析任务并返回推荐的专家列表（最多5个） */
+  teamSpawn: (projectId: string, task: string) =>
+    invoke<ExpertMatch[]>("expert_team_spawn", { projectId, taskDescription: task }),
+  /** 查询项目当前专家团各专家的状态（idle|working|done） */
+  agentsStatus: (projectId: string) =>
+    invoke<ExpertAgentStatus[]>("expert_agents_status", { projectId }),
+  /** 全部业务专家团 */
+  teams: () => invoke<ExpertTeam[]>("expert_teams"),
+  /** 取单个业务团 */
+  teamGet: (id: string) => invoke<ExpertTeam | null>("expert_team_get", { id }),
+  /** 把业务团应用到项目（组装战略师领衔的编排型 CLAUDE.md）；已有内容需 overwrite=true */
+  teamApply: (projectId: string, teamId: string, overwrite = false) =>
+    invoke<void>("team_apply", { projectId, teamId, overwrite }),
+  /** 「下载」专家：返回其完整 CLAUDE.md 文本 */
+  exportExpert: (id: string) => invoke<string>("expert_export", { id }),
+  /** 「下载」业务团：返回其完整编排型 CLAUDE.md 文本 */
+  exportTeam: (id: string) => invoke<string>("team_export", { id }),
+  /** 调试某条查询的智能匹配，返回全部命中专家的打分明细 */
+  routeDebug: (query: string) => invoke<ExpertDebugRow[]>("expert_route_debug", { query }),
+  /** 按知识库反推该配哪支专家团（scope 可限定子目录，空=全库） */
+  recommendFromKb: (scope?: string) =>
+    invoke<KbRecommendation>("expert_recommend_from_kb", { scope: scope ?? null }),
+};
+
+/**
+ * 头像槽位：与后端 avatars.rs 的 FNV-1a 一致，把任意 expert/team id 映射到 0..9。
+ * 专家/团 id 都是 ASCII，charCodeAt 即字节，结果与 Rust 一致。
+ * 用法：拉一次 expert.avatarSlots() 得到 9 张 dataURL，再用 slots[avatarSlot(id)] 取图，
+ * 100+ 张卡片零额外 IPC。
+ */
+export function avatarSlot(id: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < id.length; i++) {
+    h = (h ^ id.charCodeAt(i)) >>> 0;
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h % 9;
+}
+
+// ──────────────────────────────────────────────────────────────
 // API 供应商坞 + 用量看板 module
 // ──────────────────────────────────────────────────────────────
 export interface ProviderView {
@@ -1143,6 +1294,15 @@ export interface CodexProxyInfo {
   port: number;
   lastError: string;
 }
+export interface ClaudeAuthStatus {
+  loggedIn: boolean;
+  credPath: string;
+}
+export interface ClaudeLoginStart {
+  authorizeUrl: string;
+  verifier: string;
+  state: string;
+}
 
 export const provider = {
   list: () => invoke<ProviderListResult>("provider_list"),
@@ -1158,13 +1318,18 @@ export const provider = {
   codexPollLogin: (deviceCode: string, userCode: string) =>
     invoke<CodexPollResult>("codex_poll_login", { deviceCode, userCode }),
   codexProxyInfo: () => invoke<CodexProxyInfo>("codex_proxy_info"),
+  // Claude 官方订阅 OAuth(PKCE):start 开浏览器并回 verifier/state;finish 回贴授权码换 token
+  claudeAuthStatus: () => invoke<ClaudeAuthStatus>("claude_oauth_status"),
+  claudeStartLogin: () => invoke<ClaudeLoginStart>("claude_start_login"),
+  claudeFinishLogin: (pasted: string, verifier: string, state: string) =>
+    invoke<ClaudeAuthStatus>("claude_finish_login", { pasted, verifier, state }),
 };
 
 // ──────────────────────────────────────────────────────────────
 // 环境医生 module — 新用户「环境监测 + 配置安装」(claude / pwsh / PATH)
 // ──────────────────────────────────────────────────────────────
 export interface ToolStatus {
-  key: "claude" | "pwsh" | "node" | "npm";
+  key: "claude" | "pwsh" | "node" | "npm" | "uv" | "python";
   name: string;
   found: boolean;
   version: string | null;
@@ -1179,6 +1344,10 @@ export interface EnvReport {
   pwsh: ToolStatus;
   node: ToolStatus;
   npm: ToolStatus;
+  /** uv —— Python 脚本运行时的统一托管者 (脚本执行公约依赖它) */
+  uv: ToolStatus;
+  /** 系统 Python —— 仅信息展示 (脚本由 uv 按需托管, found=false 多半是只剩 Store 占位符) */
+  python: ToolStatus;
   claudeDir: string | null;
   claudeDirOnUserPath: boolean;
   /** 是否有 claude 可用的 shell (真身 PowerShell 7 / Git Bash)；false ⇒ 对话会报缺 shell */
@@ -1207,6 +1376,13 @@ export interface ClaudeUpdateInfo {
   checked: boolean;
   message: string;
 }
+/** uv 缓存占用信息 */
+export interface UvCacheInfo {
+  available: boolean;
+  dir: string | null;
+  bytes: number;
+  human: string;
+}
 
 export const envDoctor = {
   check: () => invoke<EnvReport>("env_check"),
@@ -1217,6 +1393,12 @@ export const envDoctor = {
   /** 安装 Node.js LTS (winget) —— npm 安装方式的前置依赖 */
   installNode: () => invoke<string>("env_install_node"),
   installPwsh: () => invoke<string>("env_install_pwsh"),
+  /** 安装 uv —— Python 脚本运行时托管者 (装到 ~/.local/bin, 流式日志同安装) */
+  installUv: () => invoke<string>("env_install_uv"),
+  /** uv 缓存占用 (展示 + 决定是否提示清理) */
+  uvCacheInfo: () => invoke<UvCacheInfo>("env_uv_cache_info"),
+  /** 清理 uv 缓存 (`uv cache clean`) */
+  uvCacheClean: () => invoke<string>("env_uv_cache_clean"),
   /** 检测 Claude Code 是否有新版本 (当前版本 vs npmmirror latest) */
   checkClaudeUpdate: () => invoke<ClaudeUpdateInfo>("env_claude_update_check"),
   /** 更新 Claude Code 到最新版 (走国内 npmmirror)，流式日志同安装 */
@@ -1456,13 +1638,16 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       return undefined;
     case "persona_list":
       return [
-        { id: "stock-expert", name: "股票助手", icon: "📈", description: "A 股深度分析 / 公告监控 / 行情查询。", kbScope: "raw/股票", body: "(browser stub)" },
-        { id: "content-writer", name: "内容创作", icon: "✍️", description: "公众号/自媒体写手：选题、撰写、5 种风格。", kbScope: "raw/创作", body: "(browser stub)" },
-        { id: "lesson-planner", name: "备课出卷", icon: "📚", description: "K12 教案/试卷/答案解析。", kbScope: "raw/教学", body: "(browser stub)" },
-        { id: "content-summarizer", name: "内容总结", icon: "📋", description: "网页/文档/会议纪要结构化摘要。", kbScope: "", body: "(browser stub)" },
-        { id: "health-interpreter", name: "医疗健康解读", icon: "🏥", description: "体检报告/化验单通俗解读。", kbScope: "raw/健康", body: "(browser stub)" },
-        { id: "pet-care", name: "萌宠管家", icon: "🐾", description: "猫狗行为/健康/营养。", kbScope: "raw/萌宠", body: "(browser stub)" },
-        { id: "mao", name: "毛主席", icon: "☭", description: "毛选式客观分析。", kbScope: "raw/毛主席", body: "(browser stub)" },
+        { id: "stock-expert", name: "股票助手", icon: "📈", description: "A 股深度分析 / 公告监控 / 行情查询。", kbScope: "raw/股票", body: "(browser stub)", kind: "single" },
+        { id: "content-writer", name: "内容创作", icon: "✍️", description: "公众号/自媒体写手：选题、撰写、5 种风格。", kbScope: "raw/创作", body: "(browser stub)", kind: "single" },
+        { id: "lesson-planner", name: "备课出卷", icon: "📚", description: "K12 教案/试卷/答案解析。", kbScope: "raw/教学", body: "(browser stub)", kind: "single" },
+        { id: "content-summarizer", name: "内容总结", icon: "📋", description: "网页/文档/会议纪要结构化摘要。", kbScope: "", body: "(browser stub)", kind: "single" },
+        { id: "health-interpreter", name: "医疗健康解读", icon: "🏥", description: "体检报告/化验单通俗解读。", kbScope: "raw/健康", body: "(browser stub)", kind: "single" },
+        { id: "pet-care", name: "萌宠管家", icon: "🐾", description: "猫狗行为/健康/营养。", kbScope: "raw/萌宠", body: "(browser stub)", kind: "single" },
+        { id: "mao", name: "毛主席", icon: "☭", description: "毛选式客观分析。", kbScope: "raw/毛主席", body: "(browser stub)", kind: "single" },
+        { id: "team-general", name: "全能专家团", icon: "🧭", description: "战略师领衔，按情况临时组阵；默认单 agent。", kbScope: "", body: "(browser stub)", kind: "team" },
+        { id: "team-creative", name: "创作专家团", icon: "🎨", description: "成品要美、动人、能交付。", kbScope: "raw/创作", body: "(browser stub)", kind: "team" },
+        { id: "team-research", name: "研究专家团", icon: "🔬", description: "多源检索×对抗校验×收口。", kbScope: "", body: "(browser stub)", kind: "team" },
       ];
     case "provider_list": {
       const mk = (id: string, name: string, baseUrl: string, category: string, color: string, kind: string, hasKey: boolean, authToken = "") => ({
@@ -1505,6 +1690,16 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       };
     case "codex_poll_login":
       return { status: "ok" };
+    case "claude_oauth_status":
+      return { loggedIn: false, credPath: "(browser-only)" };
+    case "claude_start_login":
+      return {
+        authorizeUrl: "https://claude.ai/oauth/authorize?code=true",
+        verifier: "stub-verifier",
+        state: "stub-state",
+      };
+    case "claude_finish_login":
+      return { loggedIn: true, credPath: "(browser stub) ~/.claude/.credentials.json" };
     case "codex_proxy_info":
       return { running: false, port: 0, lastError: "" };
     case "env_check": {
@@ -1524,12 +1719,18 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         pwsh: tool("pwsh", "PowerShell 7", false),
         node: tool("node", "Node.js", true),
         npm: tool("npm", "npm", true),
+        uv: tool("uv", "uv", false),
+        python: tool("python", "Python", false),
         claudeDir: null,
         claudeDirOnUserPath: true,
         shellReady: false,
         ready: false,
       };
     }
+    case "env_uv_cache_info":
+      return { available: false, dir: null, bytes: 0, human: "0 B" };
+    case "env_uv_cache_clean":
+      return "浏览器预览模式无法清理 uv 缓存。";
     case "env_fix_path":
       return {
         ok: false,
@@ -1540,6 +1741,7 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
     case "env_install_claude":
     case "env_install_node":
     case "env_install_pwsh":
+    case "env_install_uv":
     case "env_update_claude":
       return "env-stub-req";
     case "env_claude_update_check":
@@ -1568,6 +1770,27 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         daily,
       };
     }
+    case "expert_list":
+    case "expert_groups":
+    case "expert_match_auto":
+    case "expert_route":
+    case "expert_list_by_group":
+    case "expert_team_spawn":
+    case "expert_agents_status":
+    case "expert_teams":
+    case "expert_route_debug":
+      return [];
+    case "expert_avatar_slots":
+      return [];
+    case "expert_avatar":
+    case "expert_get":
+    case "expert_team_get":
+      return null;
+    case "expert_export":
+    case "team_export":
+      return "";
+    case "expert_recommend_from_kb":
+      return { team: null, reason: "(browser stub)", topExperts: [], matchedTopics: [], corpusSize: 0 };
     default:
       return null;
   }

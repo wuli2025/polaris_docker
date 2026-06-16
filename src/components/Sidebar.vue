@@ -53,8 +53,8 @@ const primaryNav: NavItem[] = [
   // 沙箱入口已隐藏：进入沙箱视图首挂载较重、点击有卡顿，且当前非核心路径。
   // 视图与路由（App.vue / SandboxStatus）保留，未来需要时把这一项加回即可。
   { key: "skill_center", label: "技能中心", icon: Puzzle },
-  // 板块⑫: 「人格」升至顶层（原「目录说明」改造而来），与「更新」对调
-  { key: "claude_md", label: "人格", icon: Drama },
+  // 「专家团」中心（原「人格」升级）：点开看全部专家 + 业务团 + 按知识库智能推荐
+  { key: "claude_md", label: "专家团", icon: Users },
 ];
 // 收纳进「更多」的次要项（更新 / 飞书 / 环境 / MCP / 设置）
 const moreNav: NavItem[] = [

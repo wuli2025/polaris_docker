@@ -30,6 +30,10 @@ const MAX_LEX_FILE_BYTES: i64 = 4_000_000;
 const MAX_CHUNKS_PER_FILE: usize = 2000;
 /// 每请求批量条数(硅基免费档友好值)。
 const EMBED_BATCH: usize = 16;
+/// 单文件多个 chunk 批的并发嵌入度。嵌入是网络往返(每批可达数百 ms~数秒),长文档会切成
+/// 几十上百批,旧实现严格串行 → 总耗时 ≈ 批数 × 单批延迟。embed_texts 是纯网络调用、无共享
+/// 态 → 可并发;限到 3 路兼顾吞吐与免费档限速(每批内部仍有 429 指数退避兜底)。
+const EMBED_CONCURRENCY: usize = 3;
 /// 单次 build 处理的文件数上限(FTS-only 文件不耗嵌入预算,需独立护栏,幂等续跑)。
 const MAX_FILES_PER_BUILD: u64 = 8000;
 /// P1-4 文件类型分流:这些扩展名是大体量、低语义价值的数据/日志类,**不花钱做向量**
@@ -397,19 +401,49 @@ pub fn build_index(
                         // 重嵌入前清旧 chunk(mtime 变更后 chunked 被重置的场景)
                         conn.execute("DELETE FROM chunks WHERE file_id=?1", [file_id])
                             .map_err(|e| e.to_string())?;
-                        for (batch_i, group) in chunks.chunks(EMBED_BATCH).enumerate() {
-                            let mut vecs = embed_texts(group)?;
-                            for v in vecs.iter_mut() {
-                                normalize(v); // P1-3:入库归一化一次 → 查询退化成纯点积
+                        let groups: Vec<&[String]> = chunks.chunks(EMBED_BATCH).collect();
+                        // ── 并发嵌入各批 ──
+                        // embed_texts 纯网络调用、无共享态 → 多批可并发取证。长文档(几十上百批)
+                        // 由「批数 × 单批延迟」降到「批数/并发 × 单批延迟」;小文档单批时退化为原行为。
+                        // 任一批出错即整体上抛(与旧逐批 `?` 同语义):此前已 DELETE 旧 chunk、
+                        // 且未标记 chunked=1,下轮重扫会重试,不留半截向量。
+                        let mut all_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); groups.len()];
+                        {
+                            let next = std::sync::atomic::AtomicUsize::new(0);
+                            let collected: Mutex<Vec<(usize, Result<Vec<Vec<f32>>, String>)>> =
+                                Mutex::new(Vec::with_capacity(groups.len()));
+                            let nthreads = EMBED_CONCURRENCY.min(groups.len()).max(1);
+                            std::thread::scope(|s| {
+                                for _ in 0..nthreads {
+                                    s.spawn(|| loop {
+                                        let i = next.fetch_add(1, Ordering::Relaxed);
+                                        if i >= groups.len() {
+                                            break;
+                                        }
+                                        let r = embed_texts(groups[i]);
+                                        collected.lock().unwrap().push((i, r));
+                                    });
+                                }
+                            });
+                            for (i, r) in collected.into_inner().unwrap() {
+                                let mut vecs = r?;
+                                for v in vecs.iter_mut() {
+                                    normalize(v); // P1-3:入库归一化一次 → 查询退化成纯点积
+                                }
+                                all_vecs[i] = vecs;
                             }
-                            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-                            {
-                                let mut stmt = conn
-                                    .prepare_cached(
-                                        "INSERT OR REPLACE INTO chunks(file_id,seq,text,dim,vec,model,bits)
-                                         VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                                    )
-                                    .map_err(|e| e.to_string())?;
+                        }
+                        // 写库:整文件单事务批量插入(seq = batch_i*EMBED_BATCH+i,顺序稳定)。
+                        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+                        {
+                            let mut stmt = conn
+                                .prepare_cached(
+                                    "INSERT OR REPLACE INTO chunks(file_id,seq,text,dim,vec,model,bits)
+                                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                                )
+                                .map_err(|e| e.to_string())?;
+                            for (batch_i, group) in groups.iter().enumerate() {
+                                let vecs = &all_vecs[batch_i];
                                 for (i, (t, v)) in group.iter().zip(vecs.iter()).enumerate() {
                                     stmt.execute(rusqlite::params![
                                         file_id,
@@ -423,9 +457,9 @@ pub fn build_index(
                                     .map_err(|e| e.to_string())?;
                                 }
                             }
-                            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-                            chunks_added += group.len() as u64;
                         }
+                        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                        chunks_added += chunks.len() as u64;
                     }
                 }
                 // 不论是否嵌入(被分流跳过的也算「向量决策已完成」),标记 chunked=1 防重复选中。

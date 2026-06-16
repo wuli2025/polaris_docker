@@ -706,8 +706,9 @@ fn hash_token(s: &str) -> u64 {
     h.finish()
 }
 
-/// 文件的词法特征向量:文件夹段(权重 1.5)+ 文件名分词(1.0)+ 扩展名(0.8)哈希进 LEX_DIM 维。
-/// 共享同一目录/相近命名/同类型的文件在余弦下自然靠拢。
+/// 文件的词法特征向量:**名字优先**——文件名分词(权重 2.4)主导,文件夹段(0.7)次之,
+/// 扩展名(0.35)只作微调。这样有名字的文件按名字归(用户最熟悉、最快),目录只起辅助;
+/// 相近命名的文件在余弦下自然靠拢。哈希进 LEX_DIM 维。
 fn lexical_vec(relpath: &str, name: &str, ext: &str) -> Vec<f32> {
     let mut v = vec![0f32; LEX_DIM];
     let segs: Vec<&str> = relpath.split('/').collect();
@@ -716,13 +717,13 @@ fn lexical_vec(relpath: &str, name: &str, ext: &str) -> Vec<f32> {
         if low.is_empty() || GENERIC_DIRS.contains(&low.as_str()) {
             continue;
         }
-        v[(hash_token(&low) % LEX_DIM as u64) as usize] += 1.5;
+        v[(hash_token(&low) % LEX_DIM as u64) as usize] += 0.7;
     }
     for tok in tokenize(name) {
-        v[(hash_token(&tok) % LEX_DIM as u64) as usize] += 1.0;
+        v[(hash_token(&tok) % LEX_DIM as u64) as usize] += 2.4;
     }
     if !ext.is_empty() {
-        v[(hash_token(&ext.to_lowercase()) % LEX_DIM as u64) as usize] += 0.8;
+        v[(hash_token(&ext.to_lowercase()) % LEX_DIM as u64) as usize] += 0.35;
     }
     v
 }
@@ -831,8 +832,8 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
 
     let n = files.len();
     let file_vecs: Vec<Vec<f32>> = files.iter().map(|f| f.vec.clone()).collect();
-    // 一级(叶):细粒度语义簇
-    let k = ((n as f64).sqrt().round() as usize).clamp(3, 18).min(n);
+    // 一级(叶):细粒度语义簇 —— 比 √n 再细一点(×1.4),让主题分得更碎、星图更有层次。
+    let k = (((n as f64).sqrt() * 1.4).round() as usize).clamp(4, 32).min(n);
     let (assign, leaf_centroids) = spherical_kmeans(&file_vecs, k);
 
     // 叶簇成员(剔空簇)
@@ -847,7 +848,7 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
     // 二级(父):叶簇质心再聚合成「顶层主题」。叶簇 ≥4 才分两级,否则全部顶层。
     let two_level = n_leaf >= 4;
     let parent_of_leaf: Vec<usize> = if two_level {
-        let k_parent = ((n_leaf as f64).sqrt().ceil() as usize).clamp(2, 6).min(n_leaf);
+        let k_parent = ((n_leaf as f64).sqrt().ceil() as usize).clamp(3, 9).min(n_leaf);
         let cvecs: Vec<Vec<f32>> = leaf_idx.iter().map(|&c| leaf_centroids[c].clone()).collect();
         spherical_kmeans(&cvecs, k_parent).0
     } else {
@@ -935,6 +936,109 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
             )
         },
     })
+}
+
+/// 文件中心「星图」数据:把语义簇 + 抽样文件组织成与知识图谱同构的 [`crate::kb::KbGraph`]
+/// (root=我的资料 / folder=主题簇 / doc=文件星点),让 KnowledgeGraph.vue 的星河渲染直接复用。
+/// 抽样防止上万文件拖垮 cytoscape:每簇最多 PER 个文件星点,总计最多 CAP。
+fn build_file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> {
+    use crate::kb::{KbEdge, KbGraph, KbNode};
+    let conn = open_db()?;
+    let ids = resolve_root_ids(&conn, &root);
+    let cfilter = if ids.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        format!(" WHERE root_id IN ({})", list.join(","))
+    };
+    let mut nodes: Vec<KbNode> = Vec::new();
+    let mut edges: Vec<KbEdge> = Vec::new();
+    const ROOT_ID: &str = "__me__";
+    nodes.push(KbNode {
+        id: ROOT_ID.into(),
+        title: "我的资料".into(),
+        category: String::new(),
+        kind: "root".into(),
+    });
+
+    // 主题簇节点 + 层级边(顶层接 root,子主题接父簇)。category 携带**簇色** → 前端按语义簇着色,
+    // 一眼看出电脑上分了几个语义聚类(每个簇一种颜色,旗下文件同色)。
+    let mut cluster_ids: Vec<i64> = Vec::new();
+    let mut colors: HashMap<i64, String> = HashMap::new();
+    {
+        let sql = format!("SELECT id, label, color, parent FROM clusters{cfilter} ORDER BY size DESC");
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for (id, label, color, parent) in rows.flatten() {
+            cluster_ids.push(id);
+            colors.insert(id, color.clone());
+            nodes.push(KbNode {
+                id: format!("c{id}"),
+                title: label,
+                category: color,
+                kind: "folder".into(),
+            });
+            let src = if parent == 0 { ROOT_ID.to_string() } else { format!("c{parent}") };
+            edges.push(KbEdge { source: src, target: format!("c{id}") });
+        }
+    }
+    if cluster_ids.is_empty() {
+        return Ok(KbGraph { nodes, edges });
+    }
+
+    // 抽样文件星点(挂到各自 cluster_id;每簇 ≤PER,总计 ≤CAP),标题优先用 AI 名。
+    // 排序**优先报告性文件(文档/文本)与视频**,让星图主要呈现这些有内容、用户最在意的资料。
+    const PER: usize = 40;
+    const CAP: usize = 1200;
+    let ffilter = if ids.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        format!(" AND f.root_id IN ({})", list.join(","))
+    };
+    let sql = format!(
+        "SELECT f.id, f.cluster_id, COALESCE(t.title, f.name) AS title
+         FROM files f LEFT JOIN titles t ON t.file_id=f.id
+         WHERE f.cluster_id>0{ffilter}
+         ORDER BY CASE WHEN f.kind IN ('doc','text') THEN 0 WHEN f.kind='video' THEN 1 ELSE 2 END,
+                  f.mtime DESC"
+    );
+    let mut per_count: HashMap<i64, usize> = HashMap::new();
+    let mut total = 0usize;
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        }) {
+            for (fid, cid, title) in rows.flatten() {
+                if total >= CAP {
+                    break;
+                }
+                let c = per_count.entry(cid).or_insert(0);
+                if *c >= PER {
+                    continue;
+                }
+                *c += 1;
+                total += 1;
+                nodes.push(KbNode {
+                    id: format!("f{fid}"),
+                    title,
+                    category: colors.get(&cid).cloned().unwrap_or_default(),
+                    kind: "doc".into(),
+                });
+                edges.push(KbEdge { source: format!("c{cid}"), target: format!("f{fid}") });
+            }
+        }
+    }
+    Ok(KbGraph { nodes, edges })
 }
 
 /// 确定性球面 k-means(余弦):farthest-first 初始化 + Lloyd 迭代。
@@ -1646,6 +1750,269 @@ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
     Ok(path.to_string_lossy().into_owned())
 }
 
+// ───────────────────────── 「让 AI 更懂你」桌面画像 ─────────────────────────
+//
+// 引导流程收尾:盘点 + 归类 + 索引跑完后,根据 fable.db 现有统计(类型分布 / 语义主题 / 体量)
+// **确定性地**生成一张自包含 HTML「知识画像」落到桌面 —— 不调大模型,秒级、必成、可离线打开。
+// 让用户直观看到「AI 已经大概懂我了」:你有什么、AI 怎么理解、接下来能替你做什么。
+
+fn human_bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+fn pf_kind_label(k: &str) -> &'static str {
+    match k {
+        "text" => "文本",
+        "doc" => "文档",
+        "image" => "图片",
+        "audio" => "音频",
+        "video" => "视频",
+        "archive" => "压缩包",
+        _ => "其它",
+    }
+}
+
+fn kind_color(k: &str) -> &'static str {
+    match k {
+        "text" => "#5fa8e6",
+        "doc" => "#8b6cff",
+        "image" => "#6fcf97",
+        "audio" => "#e0a24b",
+        "video" => "#e0736b",
+        "archive" => "#93a0b4",
+        _ => "#8a8f98",
+    }
+}
+
+/// 一条「建议工作流」:据用户文件构成推断的、AI 能立刻替他做的事。
+struct WorkflowHint {
+    title: String,
+    detail: String,
+}
+
+/// 据类型分布派生建议工作流(命中阈值才给,避免无中生有)。
+fn workflow_hints(ov: &FileOverview) -> Vec<WorkflowHint> {
+    let cnt = |k: &str| -> u64 { ov.by_kind.iter().find(|x| x.kind == k).map(|x| x.count).unwrap_or(0) };
+    let mut out: Vec<WorkflowHint> = Vec::new();
+    if cnt("video") >= 5 {
+        out.push(WorkflowHint {
+            title: "把影像素材做成作品集".into(),
+            detail: format!(
+                "你有 {} 个视频。我可以挑出代表作、配上文案与封面,生成一份可分享的作品集页面。",
+                cnt("video")
+            ),
+        });
+    }
+    if cnt("doc") + cnt("text") >= 8 {
+        out.push(WorkflowHint {
+            title: "为你的文档写一篇结构化总结".into(),
+            detail: format!(
+                "你有 {} 份文档/文本。我可以通读后按主题归纳要点、抽取待办与关键结论,出一份总览。",
+                cnt("doc") + cnt("text")
+            ),
+        });
+    }
+    if cnt("image") >= 20 {
+        out.push(WorkflowHint {
+            title: "整理图片成相册 / 图集".into(),
+            detail: format!(
+                "你有 {} 张图片。我可以按场景/时间归类,挑出精选,排成图集或九宫格。",
+                cnt("image")
+            ),
+        });
+    }
+    if cnt("audio") >= 3 {
+        out.push(WorkflowHint {
+            title: "把录音转写并归档".into(),
+            detail: format!(
+                "你有 {} 段音频。我可以转写成文字、提炼摘要,沉淀进知识库随时可搜。",
+                cnt("audio")
+            ),
+        });
+    }
+    if cnt("archive") >= 3 {
+        out.push(WorkflowHint {
+            title: "解包并整理压缩资料".into(),
+            detail: format!("你有 {} 个压缩包。我可以梳理里面有什么,把有用的内容归进资源库。", cnt("archive")),
+        });
+    }
+    if out.is_empty() {
+        out.push(WorkflowHint {
+            title: "从一个问题开始".into(),
+            detail: "告诉我你最近在忙的事,我会沿着你的文件库找证据、帮你往前推进。".into(),
+        });
+    }
+    out
+}
+
+/// AI 对用户的「一句话理解」(据主导类型 + 体量,口吻像助理读完资料后的感受)。
+fn understanding_lines(ov: &FileOverview) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let top = ov.by_kind.first();
+    if let Some(t) = top {
+        out.push(format!(
+            "我盘了你 {} 个文件、共 {},其中以「{}」最多。",
+            ov.total_files,
+            human_bytes(ov.total_bytes),
+            pf_kind_label(&t.kind)
+        ));
+    }
+    let leaf_themes = ov.clusters.iter().filter(|c| c.parent != 0).count();
+    let top_themes = ov.clusters.iter().filter(|c| c.parent == 0).count();
+    if top_themes > 0 {
+        out.push(format!("我把它们归成了 {top_themes} 个大主题、{leaf_themes} 个子主题 —— 大致摸清了你关心什么。"));
+    }
+    if ov.embedded_files > 0 {
+        out.push(format!(
+            "已为 {}/{} 份文本建好语义索引,你可以直接问我「我那份关于⋯的资料在哪」。",
+            ov.embedded_files, ov.text_files
+        ));
+    } else if ov.text_files > 0 {
+        out.push("文本的语义索引正在后台建,建好后我就能按意思(而不只是文件名)帮你找东西了。".into());
+    }
+    out
+}
+
+/// 生成「让 AI 更懂你」自包含 HTML → 桌面,返回文件路径。
+fn profile_html(root: Option<String>) -> Result<String, String> {
+    let ov = overview(root)?;
+    if ov.total_files == 0 {
+        return Err("文件库还是空的,先「盘点」扫描磁盘文件再生成画像".into());
+    }
+    let now = chrono::Local::now();
+    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let human = now.format("%Y-%m-%d %H:%M").to_string();
+
+    // 类型分布条
+    let max_count = ov.by_kind.iter().map(|k| k.count).max().unwrap_or(1).max(1);
+    let mut kinds = String::new();
+    for k in &ov.by_kind {
+        let w = (k.count as f64 / max_count as f64 * 100.0).max(3.0);
+        kinds.push_str(&format!(
+            r#"<div class="krow"><span class="kl"><span class="kdot" style="background:{c}"></span>{lab}</span><span class="kbar"><span class="kfill" style="width:{w:.1}%;background:{c}"></span></span><span class="kn">{n}</span><span class="kb">{b}</span></div>"#,
+            c = kind_color(&k.kind),
+            lab = esc(pf_kind_label(&k.kind)),
+            w = w,
+            n = k.count,
+            b = esc(&human_bytes(k.bytes)),
+        ));
+    }
+
+    // 语义主题(顶层主题,按 size 已倒序)
+    let mut themes = String::new();
+    for c in ov.clusters.iter().filter(|c| c.parent == 0).take(24) {
+        themes.push_str(&format!(
+            r#"<span class="theme" style="--c:{c}"><span class="tdot"></span>{lab}<span class="tn">{n}</span></span>"#,
+            c = esc(&c.color),
+            lab = esc(&c.label),
+            n = c.size,
+        ));
+    }
+    if themes.is_empty() {
+        themes.push_str(r#"<span class="theme dim">还没归主题 —— 在文件中心点「智能归类」即可</span>"#);
+    }
+
+    let mut understanding = String::new();
+    for l in understanding_lines(&ov) {
+        understanding.push_str(&format!("<li>{}</li>", esc(&l)));
+    }
+    let mut flows = String::new();
+    for w in workflow_hints(&ov) {
+        flows.push_str(&format!(
+            r#"<div class="flow"><div class="ft">{t}</div><div class="fd">{d}</div></div>"#,
+            t = esc(&w.title),
+            d = esc(&w.detail),
+        ));
+    }
+
+    let html = format!(
+        r##"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>让 AI 更懂你 · 你的知识画像</title>
+<style>
+:root{{--bg:#0f1115;--panel:#171a21;--line:#252a33;--ink:#e8e8e6;--mut:#9aa0ab;--gold:#d4b06a}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:radial-gradient(140% 100% at 50% 0%,#171b24,#0f1115);color:var(--ink);
+font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.65}}
+.wrap{{max-width:980px;margin:0 auto;padding:56px 32px 110px}}
+.eyebrow{{color:var(--gold);font-size:12px;letter-spacing:3px;text-transform:uppercase}}
+h1{{font-size:30px;margin:8px 0 6px;letter-spacing:.5px}}
+.sub{{color:var(--mut);font-size:13px}}
+.stats{{display:flex;flex-wrap:wrap;gap:26px;margin:26px 0 30px;padding:20px 24px;background:var(--panel);
+border:1px solid var(--line);border-radius:16px}}
+.stat .v{{font-size:26px;font-weight:680;font-variant-numeric:tabular-nums}}.stat .l{{color:var(--mut);font-size:12px}}
+.card{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px 24px;margin:16px 0}}
+.card h2{{font-size:15px;margin:0 0 14px;display:flex;align-items:center;gap:8px}}
+.card h2::before{{content:"";width:8px;height:8px;border-radius:50%;background:var(--gold);box-shadow:0 0 8px var(--gold)}}
+.understand{{list-style:none;margin:0;padding:0}}
+.understand li{{padding:7px 0 7px 22px;position:relative;color:var(--ink);font-size:14px}}
+.understand li::before{{content:"›";position:absolute;left:4px;color:var(--gold)}}
+.krow{{display:grid;grid-template-columns:78px 1fr auto auto;align-items:center;gap:12px;padding:5px 0;font-size:13px}}
+.kl{{display:flex;align-items:center;gap:7px;color:var(--ink)}}
+.kdot{{width:8px;height:8px;border-radius:50%}}
+.kbar{{height:8px;background:rgba(255,255,255,.05);border-radius:99px;overflow:hidden}}
+.kfill{{display:block;height:100%;border-radius:99px}}
+.kn{{color:var(--ink);font-variant-numeric:tabular-nums;min-width:48px;text-align:right}}
+.kb{{color:var(--mut);font-size:11.5px;min-width:64px;text-align:right}}
+.themes{{display:flex;flex-wrap:wrap;gap:8px}}
+.theme{{--c:#8b6cff;display:inline-flex;align-items:center;gap:7px;padding:5px 12px;font-size:12.5px;
+background:color-mix(in srgb,var(--c) 14%,transparent);border:1px solid color-mix(in srgb,var(--c) 32%,transparent);
+border-radius:99px}}
+.theme.dim{{color:var(--mut);background:none;border-color:var(--line)}}
+.tdot{{width:7px;height:7px;border-radius:50%;background:var(--c);box-shadow:0 0 7px var(--c)}}
+.tn{{color:var(--mut);font-size:11px}}
+.flows{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}}
+.flow{{padding:16px 18px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:14px}}
+.ft{{font-size:14px;font-weight:620;margin-bottom:6px}}
+.fd{{color:var(--mut);font-size:12.5px}}
+.foot{{margin-top:44px;color:#5a606b;font-size:12px;text-align:center}}
+</style></head><body><div class="wrap">
+<div class="eyebrow">Polaris · 知识画像</div>
+<h1>让 AI 更懂你</h1>
+<div class="sub">基于本机盘点结果生成 · {human} · 完全离线,内容不出本机</div>
+<div class="stats">
+<div class="stat"><div class="v">{tf}</div><div class="l">个文件</div></div>
+<div class="stat"><div class="v">{tb}</div><div class="l">总体量</div></div>
+<div class="stat"><div class="v">{nk}</div><div class="l">种类型</div></div>
+<div class="stat"><div class="v">{nt}</div><div class="l">个主题</div></div>
+</div>
+<div class="card"><h2>AI 对你的理解</h2><ul class="understand">{understand}</ul></div>
+<div class="card"><h2>你的文件构成</h2>{kinds}</div>
+<div class="card"><h2>你关心的主题</h2><div class="themes">{themes}</div></div>
+<div class="card"><h2>我能立刻替你做的事</h2><div class="flows">{flows}</div></div>
+<div class="foot">Polaris 文件中心 · 据 fable.db 统计确定性生成,不调用大模型 · 想深入就回到对话里直接问我</div>
+</div></body></html>"##,
+        human = esc(&human),
+        tf = ov.total_files,
+        tb = esc(&human_bytes(ov.total_bytes)),
+        nk = ov.by_kind.len(),
+        nt = ov.clusters.iter().filter(|c| c.parent == 0).count(),
+        understand = understanding,
+        kinds = kinds,
+        themes = themes,
+        flows = flows,
+    );
+
+    let desktop = directories::UserDirs::new()
+        .and_then(|u| u.desktop_dir().map(|d| d.to_path_buf()))
+        .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+        .ok_or("找不到桌面目录")?;
+    let path = desktop.join(format!("让AI更懂你-知识画像-{stamp}.html"));
+    std::fs::write(&path, html).map_err(|e| format!("写画像失败: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 // ───────────────────────── AI 智能命名(可选;免嵌入 key) ─────────────────────────
 //
 // 「本地档」清洗名(clean_title)救不了的(纯哈希/纯乱码/纯时间戳图片名),交给已连接的大模型
@@ -1795,9 +2162,51 @@ pub fn file_gist(abspath: String) -> Result<String, String> {
     gist(abspath)
 }
 
+/// 归类(纯数学聚类)进行中闸 —— 防双发,panic 栈展开也释放(见 [`FlagGuard`])。
+static CLUSTERING: AtomicBool = AtomicBool::new(false);
+
+fn emit_cluster(app: &AppHandle, payload: Value) {
+    let _ = app.emit("file:cluster", payload);
+}
+
+/// 重建语义/结构聚类(复用已存向量,纯数学,不调嵌入 API)。**后台线程跑**,进度走
+/// `file:cluster` 事件(phase/done/error)—— 切走文件中心也不中断,回来仍见结果。
+///
+/// 改自旧同步命令:上千文件时均值池化(逐 chunk 反序列化)+ 球面 k-means(16 轮 Lloyd)
+/// 是 0.1–0.5s 的纯 CPU 阻塞,放在 Tauri 同步命令里会冻结 WebView 主线程。挪到后台线程后
+/// 界面全程可点,与 [`file_cluster_llm`] / [`fable_inventory_start`] 同构。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn file_cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String> {
-    cluster_build(root)
+pub fn file_cluster_build(app: AppHandle, root: Option<String>) -> Result<(), String> {
+    let Some(guard) = FlagGuard::acquire(&CLUSTERING) else {
+        return Err("归类正在进行中".into());
+    };
+    emit_cluster(&app, json!({ "kind": "phase", "text": "正在把相似文件归类…" }));
+    std::thread::spawn(move || {
+        let _guard = guard; // panic 栈展开也释放闸,防永久锁死
+        match cluster_build(root) {
+            Ok(s) => emit_cluster(
+                &app,
+                json!({
+                    "kind": "done", "clusters": s.clusters, "files": s.files,
+                    "seconds": s.seconds, "note": s.note,
+                }),
+            ),
+            Err(e) => emit_cluster(&app, json!({ "kind": "error", "message": e })),
+        }
+    });
+    Ok(())
+}
+
+/// 「让 AI 更懂你」:据盘点统计确定性生成知识画像 HTML → 桌面,返回文件路径(同步;不调大模型)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_profile_html(root: Option<String>) -> Result<String, String> {
+    profile_html(root)
+}
+
+/// 文件中心「星图」:语义簇 + 抽样文件 → 与知识图谱同构的 KbGraph(供 KnowledgeGraph.vue 星河渲染)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> {
+    build_file_graph(root)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]

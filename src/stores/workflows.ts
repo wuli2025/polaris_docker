@@ -448,6 +448,11 @@ export const useWorkflowsStore = defineStore("workflows", () => {
     insertRequest.value = { text: assemblePack(p), n: ++insertSeq };
   }
 
+  /** 直接请求把一段文字填入对话框(引导向导收尾推荐工作流用) */
+  function insertText(text: string) {
+    insertRequest.value = { text, n: ++insertSeq };
+  }
+
   function clearInsert() {
     insertRequest.value = null;
   }
@@ -465,6 +470,7 @@ export const useWorkflowsStore = defineStore("workflows", () => {
     savePack,
     removePack,
     usePack,
+    insertText,
     clearInsert,
   };
 });

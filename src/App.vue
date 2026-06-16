@@ -19,6 +19,7 @@ import UpdateBanner from "./components/UpdateBanner.vue";
 import ToastHost from "./components/ToastHost.vue";
 import VoiceOverlay from "./components/VoiceOverlay.vue";
 import CommandPalette from "./components/CommandPalette.vue";
+import TaskCenter from "./components/TaskCenter.vue";
 import { useHotkeys } from "./composables/useHotkeys";
 import { installMarkdownDelegation } from "./lib/markdown";
 import { openUrl, onWsStatus, isTauri } from "./tauri";
@@ -32,7 +33,7 @@ const WikiBrowse = defineAsyncComponent(() => import("./components/WikiBrowse.vu
 const FileCenter = defineAsyncComponent(() => import("./components/FileCenter.vue"));
 const Automation = defineAsyncComponent(() => import("./components/Automation.vue"));
 const AutomationModal = defineAsyncComponent(() => import("./components/AutomationModal.vue"));
-const ClaudeMdPanel = defineAsyncComponent(() => import("./components/ClaudeMdPanel.vue"));
+const ExpertCenter = defineAsyncComponent(() => import("./components/ExpertCenter.vue"));
 const Settings = defineAsyncComponent(() => import("./components/Settings.vue"));
 const SenseApi = defineAsyncComponent(() => import("./components/SenseApi.vue"));
 const VoiceSettings = defineAsyncComponent(() => import("./components/VoiceSettings.vue"));
@@ -47,6 +48,9 @@ const VideoCourseStudio = defineAsyncComponent(() => import("./components/VideoC
 const MediaOps = defineAsyncComponent(() => import("./components/MediaOps.vue"));
 const DeckStudio = defineAsyncComponent(() => import("./components/DeckStudio.vue"));
 const WebStudio = defineAsyncComponent(() => import("./components/WebStudio.vue"));
+// 「让 AI 更懂你」向导常驻 App 级:首次打开才拉 chunk,之后保持挂载 → 扫描/归类跑着时
+// 用户可转后台、切视图、最小化窗口都不丢进度(组件不卸载,事件监听与状态都还在)。
+const OnboardingWizard = defineAsyncComponent(() => import("./components/OnboardingWizard.vue"));
 import { checkForUpdate } from "./composables/useUpdater";
 import { useAppStore, type ViewKey } from "./stores/app";
 import { useArtifactsStore } from "./stores/artifacts";
@@ -54,6 +58,8 @@ import { useProvidersStore } from "./stores/providers";
 import { useChatStore } from "./stores/chat";
 import { useWorkflowsStore } from "./stores/workflows";
 import { useAutomationStore } from "./stores/automation";
+import { useWizardStore } from "./stores/wizard";
+import { useFileTasksStore } from "./stores/fileTasks";
 
 const app = useAppStore();
 const artifacts = useArtifactsStore();
@@ -61,6 +67,16 @@ const providers = useProvidersStore();
 const chatStore = useChatStore();
 const workflows = useWorkflowsStore();
 const automation = useAutomationStore();
+const wiz = useWizardStore();
+const tasks = useFileTasksStore();
+// 首次打开向导后就保持挂载(不再卸载),让后台扫描/归类跨视图、跨最小化持续推进。
+const wizMounted = ref(false);
+watch(
+  () => wiz.open,
+  (o) => {
+    if (o) wizMounted.value = true;
+  },
+);
 
 // ─────────── 重视图切换的"点击即缓冲"加载条 ───────────
 // 点击图谱/沙箱(且首次=未被 KeepAlive 暖过)时：先立刻亮加载条(此刻重组件尚未挂载，
@@ -105,6 +121,10 @@ let unMdDelegate: (() => void) | null = null;
 let unWsStatus: (() => void) | null = null;
 onMounted(() => {
   chatStore.init();
+  // 文件中心长任务(盘点/建索引/智能归类/AI 整理名称)的全局事件监听:App 级注册一次,
+  // 脱离任何视图生命周期 → 在文件中心点了任务后切走/关掉该视图,进度照常推进、回来即见,
+  // 全局任务中心浮层也据此随处显示「还在跑」。
+  tasks.ensureListeners();
   // markdown 区域事件委托(代码复制/展开/外链系统浏览器打开),全 v-html 区域一次覆盖
   unMdDelegate = installMarkdownDelegation(document, (url) => {
     openUrl(url).catch(() => {});
@@ -265,7 +285,7 @@ function startSbDrag(e: MouseEvent) {
           v-else-if="mountedView === 'sandbox'"
           @ready="onViewReady('sandbox')"
         />
-        <ClaudeMdPanel v-else-if="mountedView === 'claude_md'" />
+        <ExpertCenter v-else-if="mountedView === 'claude_md'" />
         <SkillCenter v-else-if="mountedView === 'skill_center'" />
         <EnvDoctor v-else-if="mountedView === 'env_doctor'" />
         <UpdatePanel v-else-if="mountedView === 'update'" />
@@ -299,8 +319,14 @@ function startSbDrag(e: MouseEvent) {
     <VoiceOverlay />
     <CommandPalette />
 
+    <!-- 全局任务中心:盘点/建索引/智能归类等后台任务,无论切到哪个视图都常驻可见、可点回去 -->
+    <TaskCenter />
+
     <!-- Docker/Web 模式断线提示条 -->
     <div v-if="wsDown" class="ws-down">连接已断开,正在自动重连…</div>
+
+    <!-- 「让 AI 更懂你」引导向导(常驻;首次打开后保持挂载,转后台/切视图不丢进度) -->
+    <OnboardingWizard v-if="wizMounted" />
 
     <AddProviderModal v-if="providers.showAddModal" />
     <WorkflowPackModal v-if="workflows.editorOpen" />

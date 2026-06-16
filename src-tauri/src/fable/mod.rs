@@ -504,4 +504,116 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(two, 0, "2 字符 term 在 trigram 下不命中(已知下限)");
     }
+
+    /// 并行度封顶,防多后台任务一起跑时 CPU 超订把界面拖卡(留一核给 UI,封顶 12)。
+    #[test]
+    fn worker_count_bounded_against_oversubscription() {
+        let w = super::worker_count();
+        assert!(
+            (2..=12).contains(&w),
+            "worker_count 须封顶在 [2,12] 防 CPU 超订(留核给 UI/主循环),实测 {w}"
+        );
+    }
+
+    /// 「多后台进程也不卡顿」的数据层硬证据:盘点 / 建索引 / 智能归类等后台任务都各开
+    /// 自己的连接并发读写同一个 `fable.db`。本测试照搬 [`open_db`] 的 WAL + busy_timeout
+    /// 配置,起多写多读线程狂打同一库,断言:① 一次锁错误都不出(WAL 单写者 + 20s 退避
+    /// 把并发写串行化、不报 "database is locked")② 不丢行 ③ 远快于 busy_timeout(无长期
+    /// 阻塞)。这正是多任务并发的真正争用点 —— UI 本就跑在独立线程不受影响。
+    #[test]
+    fn concurrent_background_writers_no_lock_errors() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        // 与 open_db() 同款连接配置(WAL + NORMAL + 20s busy_timeout)。
+        fn open_like_fable(path: &std::path::Path) -> Connection {
+            let c = Connection::open(path).unwrap();
+            c.pragma_update(None, "journal_mode", "WAL").ok();
+            c.pragma_update(None, "synchronous", "NORMAL").ok();
+            c.busy_timeout(std::time::Duration::from_secs(20)).unwrap();
+            c
+        }
+
+        let dir = std::env::temp_dir().join(format!("polaris_fable_conc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conc.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let c = open_like_fable(&db);
+            c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, who INTEGER, v TEXT);")
+                .unwrap();
+        }
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        const WRITERS: usize = 4; // 模拟盘点 + 建索引 + 归类 + 第四个后台写并发
+        const ROWS: usize = 400;
+        const BATCH: usize = 50; // 与 inventory 写线程同构:小批量 BEGIN/COMMIT
+
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let db = db.clone();
+                let errors = Arc::clone(&errors);
+                s.spawn(move || {
+                    let c = open_like_fable(&db);
+                    let mut written = 0usize;
+                    while written < ROWS {
+                        let n = BATCH.min(ROWS - written);
+                        // 事务里只写、不先读 → 不会触发 WAL 的 snapshot 升级冲突;
+                        // 与另一写者竞争时由 busy_timeout 退避重试,不报错。
+                        let r: rusqlite::Result<()> = (|| {
+                            c.execute_batch("BEGIN")?;
+                            {
+                                let mut stmt =
+                                    c.prepare_cached("INSERT INTO t(who, v) VALUES(?1, ?2)")?;
+                                for i in 0..n {
+                                    stmt.execute(rusqlite::params![
+                                        w as i64,
+                                        format!("w{w}-{}", written + i)
+                                    ])?;
+                                }
+                            }
+                            c.execute_batch("COMMIT")?;
+                            Ok(())
+                        })();
+                        if r.is_err() {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            let _ = c.execute_batch("ROLLBACK");
+                        }
+                        written += n;
+                    }
+                });
+            }
+            // 并发读者:模拟 overview/grid/检索在后台任务跑时照常查询(读不应被写阻死)。
+            for _ in 0..2 {
+                let db = db.clone();
+                let errors = Arc::clone(&errors);
+                s.spawn(move || {
+                    let c = open_like_fable(&db);
+                    for _ in 0..300 {
+                        if c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get::<_, i64>(0)).is_err()
+                        {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "WAL + busy_timeout 下并发后台读写不应出现任何锁错误"
+        );
+        let c = open_like_fable(&db);
+        let total: i64 = c.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(total as usize, WRITERS * ROWS, "并发写入不应丢行");
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            elapsed.as_secs() < 15,
+            "并发写入应远快于 20s busy_timeout(无长期阻塞),实测 {elapsed:?}"
+        );
+    }
 }

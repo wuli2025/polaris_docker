@@ -638,12 +638,14 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
         };
         out.push(ScanRootInfo { path: r, label, default_on: true });
     }
-    // 默认不勾:本机盘符 / 桌面 / 外置卷 / 挂载点(复用全盘资源归集的跨平台根)。
+    // 本机盘符 / 桌面 / 外置卷 / 挂载点(复用全盘资源归集的跨平台根)。
+    // default_on 直接沿用 scan_roots 的判断(现在「一个不落」——所有真实存在的盘符/卷默认都勾),
+    // 这样首次盘点就能把整机所有可达的盘都纳入,用户想缩小范围再手动取消。
     for sr in crate::scan::scan_roots() {
         if !Path::new(&sr.path).is_dir() || !seen.insert(sr.path.clone()) {
             continue;
         }
-        out.push(ScanRootInfo { path: sr.path, label: sr.label, default_on: false });
+        out.push(ScanRootInfo { path: sr.path, label: sr.label, default_on: sr.default_on });
     }
     out
 }

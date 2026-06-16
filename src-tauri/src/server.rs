@@ -464,11 +464,19 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             bool_def(a, "archived", true),
         )?),
         "echo_status" => ok(echo::echo_status()),
-        "echo_set" => ok(echo::echo_set(opt_bool(a, "enabled"), opt_u8(a, "hour"))),
+        "echo_set" => ok(echo::echo_set(
+            opt_bool(a, "enabled"),
+            opt_u8(a, "hour"),
+            opt_bool(a, "runOnBoot"),
+        )),
         "echo_dream_now" => ok(echo::echo_dream_now(app)?),
         "echo_distill_conversation" => {
             ok(echo::echo_distill_conversation(app, req_str(a, "convId")?)?)
         }
+        "echo_briefing_today" => ok(echo::echo_briefing_today()),
+        "echo_briefing_dismiss" => ok(echo::echo_briefing_dismiss(req_str(a, "id")?)),
+        "echo_briefing_run" => ok(echo::echo_briefing_run(app)?),
+        "kb_overview_get" => ok(kb::kb_overview_get()),
 
         // ── 寓言计划 · 检索枢纽(盘点 L1a + 向量索引 + 塌平混检)──
         "fable_status" => ok(fable::fable_status()?),
@@ -492,6 +500,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             req_str(a, "query")?,
             opt_usize(a, "topK"),
             opt_str(a, "mode"),
+            opt_str(a, "scope"),
         )?),
         "fable_eval" => ok(fable::eval::fable_eval(
             opt_str(a, "path"),
@@ -516,7 +525,9 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
         )?),
         "file_gist" => ok(fable::files::file_gist(req_str(a, "abspath")?)?),
-        "file_cluster_build" => ok(fable::files::file_cluster_build(opt_str(a, "root"))?),
+        "file_cluster_build" => ok(fable::files::file_cluster_build(app, opt_str(a, "root"))?),
+        "file_profile_html" => ok(fable::files::file_profile_html(opt_str(a, "root"))?),
+        "file_graph" => ok(fable::files::file_graph(opt_str(a, "root"))?),
         "file_warm_thumbs" => ok(fable::files::file_warm_thumbs(
             vec_str(a, "paths"),
             a.get("max").and_then(|v| v.as_u64()).map(|n| n as u32),
@@ -559,6 +570,42 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             req_str(a, "personaId")?,
             bool_def(a, "overwrite", false),
         )?),
+
+        // ── Expert / 专家团（Docker/web 版同样要能用专家市场、向导推荐、一键入驻）──
+        "expert_list" => ok(expert::expert_list()),
+        "expert_list_by_group" => ok(expert::expert_list_by_group(req_str(a, "group")?)),
+        "expert_groups" => ok(expert::expert_groups()),
+        "expert_route" => {
+            let req: expert::RouteRequest =
+                serde_json::from_value(a.get("req").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| format!("expert_route 参数解析失败: {e}"))?;
+            ok(expert::expert_route(req))
+        }
+        "expert_get" => ok(expert::expert_get(req_str(a, "id")?)),
+        "expert_match_auto" => ok(expert::expert_match_auto(req_str(a, "query")?)),
+        "expert_apply" => ok(expert::expert_apply(
+            req_str(a, "projectId")?,
+            req_str(a, "expertId")?,
+            bool_def(a, "overwrite", false),
+        )?),
+        "expert_avatar" => ok(expert::expert_avatar(req_str(a, "id")?)),
+        "expert_avatar_slots" => ok(expert::expert_avatar_slots()),
+        "expert_team_spawn" => ok(expert::expert_team_spawn(
+            req_str(a, "projectId")?,
+            req_str(a, "taskDescription")?,
+        )),
+        "expert_agents_status" => ok(expert::expert_agents_status(req_str(a, "projectId")?)),
+        "expert_teams" => ok(expert::expert_teams()),
+        "expert_team_get" => ok(expert::expert_team_get(req_str(a, "id")?)),
+        "team_apply" => ok(expert::team_apply(
+            req_str(a, "projectId")?,
+            req_str(a, "teamId")?,
+            bool_def(a, "overwrite", false),
+        )?),
+        "expert_export" => ok(expert::expert_export(req_str(a, "id")?)?),
+        "team_export" => ok(expert::team_export(req_str(a, "id")?)?),
+        "expert_route_debug" => ok(expert::expert_route_debug(req_str(a, "query")?)),
+        "expert_recommend_from_kb" => ok(expert::expert_recommend_from_kb(opt_str(a, "scope"))),
 
         // ── Chat (sync 部分) ──
         "chat_cancel" => ok(chat::chat_cancel(req_str(a, "reqId")?)?),

@@ -6,7 +6,7 @@
  * 琉璃质感 + 苹果式透明:毛玻璃面板、accent 光环、悬浮升起、缩略图懒加载。
  * 数据全部复用检索枢纽 fable.db,聚类复用已存向量(零新增嵌入),缩略图磁盘缓存。
  */
-import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, defineAsyncComponent } from "vue";
 import {
   Search,
   LayoutGrid,
@@ -37,7 +37,6 @@ import {
 import {
   files as fc,
   artifacts as artifactsApi,
-  listen,
   type FileOverview,
   type FileCard,
   type FcCluster,
@@ -45,8 +44,38 @@ import {
   type ScanRootInfo,
 } from "../tauri";
 import { useAppStore } from "../stores/app";
+import { useWizardStore } from "../stores/wizard";
+import { useFileTasksStore } from "../stores/fileTasks";
+// 星图(星河图谱)按需加载:依赖 cytoscape(~562KB),只在点开「星图」时才拉。
+const KnowledgeGraph = defineAsyncComponent(() => import("./KnowledgeGraph.vue"));
 
 const app = useAppStore();
+const wiz = useWizardStore();
+
+// ── 星图:直接把文件库渲染成星河图谱(复用 KnowledgeGraph,source=files),随时可看 ──
+const galaxyOpen = ref(false);
+
+// ── 智能向导「让 AI 更懂你」:盘点→归类→图谱→索引→进对话 一条龙 ──
+// 向导本体常驻 App.vue(扫描/归类跑着时可转后台、切视图都不丢),这里只负责开它 + 关掉后刷新。
+const WIZ_SEEN_KEY = "polaris.fc.wizard.v1";
+function openWizard() {
+  try {
+    localStorage.setItem(WIZ_SEEN_KEY, "1");
+  } catch {
+    /* ignore */
+  }
+  wiz.openWizard();
+}
+// 向导收起(转后台/完成)后刷新文件中心,把新盘点/新归类的结果显示出来。
+watch(
+  () => wiz.open,
+  (o, prev) => {
+    if (!o && prev) {
+      loadOverview();
+      loadGrid(true);
+    }
+  },
+);
 
 // ───────────────────────── 状态 ─────────────────────────
 type ViewKind = "gallery" | "clusters" | "list";
@@ -63,8 +92,15 @@ const activeCluster = ref<number | null>(null);
 const sort = ref<"recent" | "name" | "size" | "kind">("recent");
 const searchText = ref("");
 
-const scanning = ref(false);
-const scanMsg = ref("");
+// 长任务(盘点/建索引/智能归类/AI 整理名称)状态全部托管到全局 fileTasks store。
+// 关键:这些活儿的真身是后端后台线程 + 全局事件,旧实现把状态/监听锁在本组件里,
+// 一切走文件中心(组件卸载)就退订 + 清零、看着像停了。改读 store 后 →
+// 切走切回甚至从没打开过文件中心,进度都在后台持续累积、回来即见(全局任务中心浮层亦据此显示)。
+const tasks = useFileTasksStore();
+const scanning = computed(() => tasks.running.inventory);
+const scanMsg = computed(() => tasks.detail.inventory);
+// 即时操作(检索/打开/定位/撤销)的轻提示位,独立于上面的任务进度文案。
+const opMsg = ref("");
 
 // ── 「盘点」= 先扫一眼文件夹结构 → 勾选要盘点的目录(不限知识库)→ 建库 ──
 const pickerOpen = ref(false);
@@ -86,17 +122,17 @@ const checked = reactive(new Set<string>());
 const unchecked = reactive(new Set<string>());
 // 展开了子目录的文件夹/根路径。
 const expanded = reactive(new Set<string>());
+// 选择器里同级文件夹的排序:size=按大小从大到小(默认,大文件夹先露脸)/ name=按名称。
+const pickerSort = ref<"size" | "name">("size");
 
-const clustering = ref(false);
-const clusterMsg = ref("");
-const building = ref(false);
-const buildMsg = ref("");
-let unlistenIndex: (() => void) | null = null;
-// 大模型语义归类(免 key)+ 桌面报告
-const llmClustering = ref(false);
-const llmMsg = ref("");
-const reportPath = ref("");
-let unlistenLlm: (() => void) | null = null;
+// 归类(离线纯数学)/ AI 语义归类 / 建索引 —— 全读 store(运行态 + 进度文案)。
+const clustering = computed(() => tasks.running.cluster);
+const clusterMsg = computed(() => tasks.detail.cluster);
+const building = computed(() => tasks.running.index);
+const buildMsg = computed(() => tasks.detail.index);
+const llmClustering = computed(() => tasks.running.clusterLlm);
+const llmMsg = computed(() => tasks.detail.clusterLlm);
+const reportPath = computed(() => tasks.reportPath.clusterLlm);
 
 // 折叠状态(均持久化记住用户选择):头部横幅(体积/数量/统计)· 语义分类 · 类型筛选。
 // 默认把横幅收起 → 功能键整体上移、把纵向空间让给下方可观看的文件网格。
@@ -154,11 +190,14 @@ function closeTip() {
   if (tipTimer) clearTimeout(tipTimer);
 }
 
-// AI 智能命名(给乱码/杂乱文件名起可读标题)
-const llmTitling = ref(false);
-const titleMsg = ref("");
-const titleDone = ref(false);
-let unlistenTitle: (() => void) | null = null;
+// AI 智能命名(给乱码/杂乱文件名起可读标题)—— 运行态/进度读 store。
+const llmTitling = computed(() => tasks.running.titles);
+const titleMsg = computed(() => tasks.detail.titles);
+// 撤销后本地标记,把「撤销 AI 名称」按钮收起(store 的 doneTick 仍记着这次完成)。
+const titlesReverted = ref(false);
+const titleDone = computed(
+  () => tasks.doneTick.titles > 0 && !tasks.running.titles && !tasks.failed.titles && !titlesReverted.value,
+);
 
 // 语义检索结果(独立于网格的一条结果带)
 interface SemHit {
@@ -185,8 +224,17 @@ let thumbObs: IntersectionObserver | null = null;
 let moreObs: IntersectionObserver | null = null;
 const sentinel = ref<HTMLElement | null>(null);
 const elCard = new WeakMap<Element, FileCard>();
-let unlistenScan: (() => void) | null = null;
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+// 任务完成(store doneTick 自增)→ 刷新文件中心数据,让新盘点/新索引/新归类结果显示出来。
+// 监听全局 store,故即便任务是在别的视图发起、本组件后挂载,回来也会因 tick 变化而刷新。
+watch(() => tasks.doneTick.inventory, () => { loadOverview(); loadGrid(true); });
+watch(() => tasks.doneTick.index, () => { loadOverview(); });
+watch(
+  () => tasks.doneTick.cluster + tasks.doneTick.clusterLlm,
+  () => { folderPath.value = []; activeCluster.value = null; loadOverview(); loadGrid(true); },
+);
+watch(() => tasks.doneTick.titles, () => { loadGrid(true); });
 
 // ───────────────────────── 配色 / 字形 ─────────────────────────
 const KIND_COLOR: Record<string, string> = {
@@ -373,34 +421,9 @@ function onSearchInput() {
 // ───────────────────────── 盘点(扫描 + 选目录 + 建库)─────────────────────────
 // 「盘点」点开 → 扫一眼文件夹结构 → 勾选要盘点的目录 → 开始建库。
 async function doScan(roots: string[], exclude: string[]) {
-  if (scanning.value) return;
-  scanning.value = true;
-  scanMsg.value = exclude.length
-    ? `正在盘点(已跳过 ${exclude.length} 个文件夹)…`
-    : "正在盘点磁盘…";
-  try {
-    if (!unlistenScan) {
-      unlistenScan = await listen<{ kind: string; files?: number; message?: string }>(
-        "fable:inventory",
-        (p) => {
-          if (p.kind === "progress") scanMsg.value = `已盘点 ${p.files ?? 0} 个文件…`;
-          else if (p.kind === "done") {
-            scanMsg.value = `盘点完成 · ${p.files ?? 0} 个文件`;
-            scanning.value = false;
-            loadOverview();
-            loadGrid(true);
-          } else if (p.kind === "error") {
-            scanMsg.value = `盘点失败:${p.message ?? ""}`;
-            scanning.value = false;
-          }
-        },
-      );
-    }
-    await fc.inventoryStart(roots, exclude);
-  } catch (e: any) {
-    scanMsg.value = `盘点失败:${e?.message ?? e}`;
-    scanning.value = false;
-  }
+  // 真身在全局 store:后台线程跑、事件 App 级监听。切走文件中心也不中断,完成由
+  // watch(doneTick.inventory) 刷新本页;全局任务中心浮层全程显示进度。
+  await tasks.startInventory(roots, exclude);
 }
 
 // ── 打开「盘点」:先扫文件夹结构(根+第一层),让用户勾选 / 逐层点开要盘点的目录 ──
@@ -613,7 +636,12 @@ const visibleRows = computed<PickerRow[]>(() => {
       rows.push({ key: parentPath + "#empty", kind: "empty", level });
       return;
     }
-    for (const k of kids) {
+    // 同级排序:按大小从大到小(未知大小排末尾),或按名称(后端已按名排好)。
+    const ordered =
+      pickerSort.value === "size"
+        ? [...kids].sort((a, b) => (sizeCache.get(b.path)?.bytes ?? -1) - (sizeCache.get(a.path)?.bytes ?? -1))
+        : kids;
+    for (const k of ordered) {
       rows.push({ key: k.path, kind: "folder", level, node: k });
       if (expanded.has(k.path)) pushChildren(k.path, level + 1);
     }
@@ -648,160 +676,52 @@ async function startInventoryFromPicker() {
   await doScan(roots, exclude);
 }
 
+// 以下任务全部委托给全局 store(后台线程 + App 级事件监听):切走文件中心也不中断,
+// 完成由顶部 watch(doneTick.*) 刷新本页;全局任务中心浮层全程显示「还在跑 + 进度」。
 async function doCluster() {
-  if (clustering.value) return;
   flashTip("cluster");
-  clustering.value = true;
-  const semantic = (overview.value?.embeddedFiles ?? 0) > 0;
-  clusterMsg.value = semantic
-    ? "正在按语义归类(复用已有向量,零新增嵌入)…"
-    : "正在按文件夹/名称把相似文件归类(离线,无需 key)…";
-  try {
-    const r = await fc.clusterBuild(null);
-    clusterMsg.value = r.note;
-    folderPath.value = [];
-    activeCluster.value = null;
-    await loadOverview();
-    await loadGrid(true);
-  } catch (e: any) {
-    clusterMsg.value = `归类失败:${e?.message ?? e}`;
-  } finally {
-    clustering.value = false;
-  }
+  await tasks.startCluster();
 }
 
 // 构建向量索引(文本 → 硅基 BGE-M3 嵌入),让「智能归类」从词法升级到语义。
 async function buildIndex() {
-  if (building.value) return;
   if (!overview.value?.hasEmbedProvider) {
     app.setView("sense_api"); // 没配嵌入 key → 跳设置页配硅基(免费)
     return;
   }
-  building.value = true;
-  buildMsg.value = "正在构建向量索引(硅基 BGE-M3 滴灌嵌入)…";
-  try {
-    if (!unlistenIndex) {
-      unlistenIndex = await listen<{
-        kind: string;
-        files?: number;
-        chunks?: number;
-        stopped?: string;
-        message?: string;
-      }>("fable:index", (p) => {
-        if (p.kind === "progress") {
-          buildMsg.value = `已嵌入 ${p.files ?? 0} 文件 · ${p.chunks ?? 0} chunk…`;
-        } else if (p.kind === "done") {
-          buildMsg.value = `索引完成 · 本轮 ${p.files ?? 0} 文件 · ${p.stopped ?? ""}`;
-          building.value = false;
-          loadOverview();
-        } else if (p.kind === "error") {
-          buildMsg.value = `索引失败:${p.message ?? ""}`;
-          building.value = false;
-        }
-      });
-    }
-    await fc.indexStart();
-  } catch (e: any) {
-    buildMsg.value = `索引失败:${e?.message ?? e}`;
-    building.value = false;
-  }
+  await tasks.startIndex();
 }
 
 // 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告。
 async function doClusterLlm() {
-  if (llmClustering.value) return;
   flashTip("ai");
-  llmClustering.value = true;
-  reportPath.value = "";
-  llmMsg.value = "正在用大模型按语义归类(读文件清单 → 主题分组)…";
-  try {
-    if (!unlistenLlm) {
-      unlistenLlm = await listen<{
-        kind: string;
-        text?: string;
-        clusters?: number;
-        assigned?: number;
-        report?: string;
-        message?: string;
-      }>("file:cluster_llm", (p) => {
-        if (p.kind === "phase") {
-          llmMsg.value = p.text ?? "";
-        } else if (p.kind === "done") {
-          llmMsg.value = `AI 归类完成 · ${p.clusters ?? 0} 个子主题 · ${p.assigned ?? 0} 个文件已归类 · 报告已存桌面`;
-          reportPath.value = p.report ?? "";
-          llmClustering.value = false;
-          folderPath.value = [];
-          activeCluster.value = null;
-          loadOverview();
-          loadGrid(true);
-        } else if (p.kind === "error") {
-          llmMsg.value = `AI 归类失败:${p.message ?? ""}`;
-          llmClustering.value = false;
-        }
-      });
-    }
-    await fc.clusterLlm(null);
-  } catch (e: any) {
-    llmMsg.value = `AI 归类失败:${e?.message ?? e}`;
-    llmClustering.value = false;
-  }
+  await tasks.startClusterLlm();
 }
 function openReport() {
   if (reportPath.value) openPath(reportPath.value);
 }
 
 // 合并后的统一「智能归类」入口:
-//  · 配了硅基流动嵌入 key(hasEmbedProvider)→ 自动按语义 / AI 归类(复用已有向量并在桌面出报告),
-//    doClusterLlm 内部会弹提示条提醒用户正在做 AI 归类。
-//  · 没配 key → doCluster 走离线「文件夹 / 名称」启发式(即之前的智能归类),
-//    其弹出的提示条会提醒「未配置 API key」并给出配 key 入口。
+//  · 配了硅基流动嵌入 key(hasEmbedProvider)→ AI 语义归类(复用已有向量并在桌面出报告);
+//  · 没配 key → 离线「文件夹 / 名称」启发式归类。提示条据是否配 key 给出对应说明 / 配 key 入口。
 async function doSmartCluster() {
   if (clustering.value || llmClustering.value) return;
-  if (overview.value?.hasEmbedProvider) {
-    await doClusterLlm();
-  } else {
-    await doCluster();
-  }
+  flashTip(overview.value?.hasEmbedProvider ? "ai" : "cluster");
+  await tasks.startSmartCluster(!!overview.value?.hasEmbedProvider);
 }
 
 async function doTitlesLlm() {
-  if (llmTitling.value) return;
-  llmTitling.value = true;
-  titleDone.value = false;
-  titleMsg.value = "正在用大模型给文件起可读标题(读文件清单 → 起名)…";
-  try {
-    if (!unlistenTitle) {
-      unlistenTitle = await listen<{ kind: string; text?: string; count?: number; message?: string }>(
-        "file:title_llm",
-        (p) => {
-          if (p.kind === "phase") {
-            titleMsg.value = p.text ?? "";
-          } else if (p.kind === "done") {
-            titleMsg.value = `AI 整理完成 · 已为 ${p.count ?? 0} 个文件生成智能标题`;
-            titleDone.value = true;
-            llmTitling.value = false;
-            loadGrid(true);
-          } else if (p.kind === "error") {
-            titleMsg.value = `AI 整理失败:${p.message ?? ""}`;
-            llmTitling.value = false;
-          }
-        }
-      );
-    }
-    await fc.titlesLlm(null);
-  } catch (e: any) {
-    titleMsg.value = `AI 整理失败:${e?.message ?? e}`;
-    llmTitling.value = false;
-  }
+  titlesReverted.value = false;
+  await tasks.startTitles();
 }
 async function resetTitles() {
   try {
     await fc.titlesClear();
-    titleMsg.value = "已撤销 AI 名称,回落到本地清洗名";
-    titleDone.value = false;
+    titlesReverted.value = true;
+    opMsg.value = "已撤销 AI 名称,回落到本地清洗名";
     loadGrid(true);
   } catch (e: any) {
-    titleMsg.value = `撤销失败:${e?.message ?? e}`;
+    opMsg.value = `撤销失败:${e?.message ?? e}`;
   }
 }
 
@@ -834,7 +754,7 @@ async function runSemantic() {
     semHits.value = Array.from(byPath.values()).slice(0, 16);
   } catch (e: any) {
     semHits.value = [];
-    clusterMsg.value = `检索失败:${e?.message ?? e}`;
+    opMsg.value = `检索失败:${e?.message ?? e}`;
   } finally {
     semBusy.value = false;
   }
@@ -927,14 +847,14 @@ async function openPath(abspath: string) {
   try {
     await artifactsApi.openExternal(abspath);
   } catch (e: any) {
-    clusterMsg.value = `打开失败:${e?.message ?? e}`;
+    opMsg.value = `打开失败:${e?.message ?? e}`;
   }
 }
 async function revealCard(card: FileCard) {
   try {
     await artifactsApi.reveal(card.abspath);
   } catch (e: any) {
-    clusterMsg.value = `定位失败:${e?.message ?? e}`;
+    opMsg.value = `定位失败:${e?.message ?? e}`;
   }
 }
 
@@ -978,15 +898,21 @@ onMounted(async () => {
   await loadOverview();
   await loadGrid(true);
   await nextTick();
+  // 首次进入文件中心且库为空 → 自动弹出「让 AI 更懂你」引导向导。
+  let seen = false;
+  try {
+    seen = localStorage.getItem(WIZ_SEEN_KEY) === "1";
+  } catch {
+    /* ignore */
+  }
+  if (!seen && (overview.value?.totalFiles ?? 0) === 0) openWizard();
 });
 
 onBeforeUnmount(() => {
   thumbObs?.disconnect();
   moreObs?.disconnect();
-  if (unlistenScan) unlistenScan();
-  if (unlistenIndex) unlistenIndex();
-  if (unlistenLlm) unlistenLlm();
-  if (unlistenTitle) unlistenTitle();
+  // 任务事件监听已托管给全局 fileTasks store(App 级注册一次,永不在此退订)——
+  // 这正是「切走文件中心,盘点/建索引/归类仍在后台跑、进度不丢」的关键。
   if (tipTimer) clearTimeout(tipTimer);
 });
 </script>
@@ -1057,6 +983,23 @@ onBeforeUnmount(() => {
 
       <div class="actions">
         <button
+          class="tool-btn wizard"
+          title="让 AI 更懂你:盘点 → 智能归类 → 知识图谱 → 建索引 → 进对话,一条龙引导"
+          @click="openWizard"
+        >
+          <Sparkles :size="14" :stroke-width="1.8" />
+          <span>智能向导</span>
+        </button>
+        <button
+          class="tool-btn"
+          :disabled="!overview?.totalFiles"
+          title="星图:把你的文件库渲染成星河图谱(归过类更好看)——一眼看清你都有些什么"
+          @click="galaxyOpen = true"
+        >
+          <Orbit :size="14" :stroke-width="1.8" />
+          <span>星图</span>
+        </button>
+        <button
           class="tool-btn"
           :disabled="scanning || pickerLoading"
           title="盘点:先扫一眼文件夹结构,勾选要盘点的目录(可选知识库之外的盘符/文件夹),再建库"
@@ -1077,6 +1020,18 @@ onBeforeUnmount(() => {
           <LoaderCircle v-if="clustering || llmClustering" :size="14" class="spin" />
           <Wand2 v-else :size="14" :stroke-width="1.8" />
           <span>{{ clustering || llmClustering ? "归类中" : "智能归类" }}</span>
+        </button>
+        <button
+          class="tool-btn"
+          :disabled="building || !overview?.totalFiles"
+          :title="overview?.hasEmbedProvider
+            ? '为文本建/续建向量索引(硅基 BGE-M3,后台跑),建好后能按「意思」搜文件'
+            : '建索引需要嵌入 key:点这里到设置页配硅基 key(免费),全文索引则照常后台建'"
+          @click="buildIndex"
+        >
+          <LoaderCircle v-if="building" :size="14" class="spin" />
+          <Radar v-else :size="14" :stroke-width="1.8" />
+          <span>{{ building ? "建索引中" : overview && overview.embeddedFiles > 0 ? "续建索引" : "建索引" }}</span>
         </button>
         <button
           class="tool-btn ai"
@@ -1144,7 +1099,7 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <div v-if="scanMsg || clusterMsg" class="fc-note">{{ clusterMsg || scanMsg }}</div>
+    <div v-if="scanMsg || clusterMsg || buildMsg || opMsg" class="fc-note">{{ buildMsg || clusterMsg || scanMsg || opMsg }}</div>
 
     <!-- 语义文件夹:同主题归一格,点开看子主题,再点筛选画廊 -->
     <div v-if="hasFiles && hasClusters" class="fc-folders">
@@ -1291,6 +1246,7 @@ onBeforeUnmount(() => {
               <div v-if="card.thumbable && !thumbCache.has(card.abspath)" class="shimmer" />
             </div>
             <span class="ext-badge">{{ card.ext || card.kind }}</span>
+            <span v-if="card.source" class="src-badge">{{ card.source }}</span>
             <span v-if="card.kind === 'video'" class="play-badge">▶</span>
           </div>
           <div class="tile-meta">
@@ -1469,8 +1425,13 @@ onBeforeUnmount(() => {
             <button class="picker-close" @click="closeFolderPicker"><X :size="16" :stroke-width="2" /></button>
           </div>
           <div class="picker-sub">
-            勾选<b>要盘点的目录</b>(可勾知识库之外的盘符 / 文件夹),再开始建库。知识库默认已勾,
-            盘符默认不勾 —— 展开后勾上你想纳入的文件夹即可。
+            勾选<b>要盘点的目录</b>(可勾知识库之外的盘符 / 文件夹),再开始建库。
+            所有盘 / 卷<b>默认已全部勾上</b>(系统、缓存目录自动跳过)—— 想缩小范围展开后取消即可。
+          </div>
+          <div v-if="!pickerLoading && scanRoots.length" class="picker-sortbar">
+            <span class="ps-lab"><ArrowDownWideNarrow :size="13" :stroke-width="1.7" /> 同级排序</span>
+            <button class="ps-btn" :class="{ on: pickerSort === 'size' }" @click="pickerSort = 'size'">大小(大→小)</button>
+            <button class="ps-btn" :class="{ on: pickerSort === 'name' }" @click="pickerSort = 'name'">名称</button>
           </div>
 
           <div v-if="pickerLoading" class="picker-loading">
@@ -1551,6 +1512,17 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
+      </div>
+    </transition>
+
+    <!-- 星图浮层:文件库 → 星河图谱(全屏沉浸) -->
+    <transition name="fade">
+      <div v-if="galaxyOpen" class="galaxy-overlay">
+        <div class="galaxy-head">
+          <span class="galaxy-title"><Orbit :size="16" :stroke-width="1.7" /> 我的资料 · 星图</span>
+          <button class="galaxy-close" title="关闭" @click="galaxyOpen = false"><X :size="18" :stroke-width="2" /></button>
+        </div>
+        <KnowledgeGraph source="files" :embedded="true" />
       </div>
     </transition>
   </div>
@@ -2025,6 +1997,50 @@ onBeforeUnmount(() => {
   background: color-mix(in srgb, #8b6cff 16%, transparent);
 }
 .tool-btn:disabled { opacity: 0.5; cursor: default; }
+.tool-btn.wizard {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+.tool-btn.wizard:hover:not(:disabled) { filter: brightness(1.08); color: #fff; }
+
+/* 星图浮层 */
+.galaxy-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  background: #04060e;
+}
+.galaxy-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 18px;
+  flex: none;
+  z-index: 5;
+}
+.galaxy-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #e8eefc;
+  font-family: var(--serif);
+  font-size: 15px;
+  letter-spacing: 1px;
+}
+.galaxy-close {
+  display: inline-flex;
+  border: 1px solid rgba(150, 180, 255, 0.22);
+  background: rgba(20, 26, 44, 0.6);
+  color: #cfe0ff;
+  border-radius: 9px;
+  padding: 6px;
+  cursor: pointer;
+}
+.galaxy-close:hover { background: rgba(40, 52, 84, 0.7); }
+.galaxy-overlay :deep(.graph) { flex: 1; min-height: 0; }
 
 /* AI 归类进度 / 报告条 */
 .fc-llm {
@@ -2330,6 +2346,20 @@ onBeforeUnmount(() => {
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
   box-shadow: 0 2px 8px -2px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.src-badge {
+  position: absolute;
+  left: 9px;
+  top: 9px;
+  font-size: 9.5px;
+  letter-spacing: 0.3px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: color-mix(in srgb, #6fcf97 80%, #000 12%);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 8px -2px color-mix(in srgb, #6fcf97 60%, transparent);
 }
 .play-badge {
   position: absolute;
@@ -2903,6 +2933,14 @@ onBeforeUnmount(() => {
 .picker-close:hover { color: var(--text); background: var(--selection-bg); }
 .picker-sub { margin: 6px 0 12px; font-size: 12.5px; line-height: 1.6; color: var(--muted); }
 .picker-sub b { color: var(--text); }
+.picker-sortbar { display: flex; align-items: center; gap: 7px; margin: 0 0 10px; }
+.ps-lab { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); margin-right: 2px; }
+.ps-btn {
+  height: 25px; padding: 0 10px; border-radius: 7px; font-size: 11.5px; cursor: pointer;
+  border: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel) 55%, transparent); color: var(--text-2);
+}
+.ps-btn:hover { color: var(--text); border-color: var(--border-strong); }
+.ps-btn.on { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, transparent); background: color-mix(in srgb, var(--primary) 10%, transparent); }
 .picker-loading, .picker-error {
   display: flex;
   align-items: center;

@@ -116,7 +116,7 @@ pub fn run_eval(custom: Option<String>, top_k: usize, mode: &str) -> Result<Eval
         if q.is_empty() || case.expect.is_empty() {
             continue; // 没问题或没标准答案的题不计入
         }
-        let res = super::retrieve::search(q, top_k, mode)?;
+        let res = super::retrieve::search(q, top_k, mode, None)?;
         let top_paths: Vec<String> = res.hits.iter().map(|h| h.path.clone()).collect();
         let rank = first_hit_rank(&top_paths, &case.expect);
         ranks.push(rank);

@@ -50,8 +50,12 @@ const HELP: &str = r#"polaris-forge — Polaris Forge 渲染引擎 CLI
   polaris-forge fable index [--max-chunks=4000]
       构建(或继续)向量索引:文本 chunk → 嵌入(感官坞服务商)→ 落库;幂等续跑。
 
-  polaris-forge fable search --q=<查询> [--top=12] [--mode=hybrid|grep|vector]
-      塌平混检:grep 多核车道 ∥ RAG 向量车道并行 → RRF 融合 → 重排,JSON 命中。
+  polaris-forge fable search --q=<查询> [--top=12] [--mode=hybrid|grep|vector] [--scope=wiki|!wiki]
+      塌平混检:认字腿(FTS5 倒排,不漏文件)∥ 认意思腿(向量两段式 ANN)并行
+      → 文件级 RRF 融合 → 闸门重排,JSON 命中。
+
+  polaris-forge fable eval [--set=<考卷.json>] [--top=12] [--mode=hybrid] [--init]
+      跑评测集(考卷)→ recall@k + MRR,把「准不准」变成数字;--init 先写一份样例。
 
 约定:成功 → JSON 到 stdout,退出码 0;失败 → {"ok":false,"error":…} 到 stderr,退出码 1。
 "#;
@@ -173,7 +177,17 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
                     let top = flag(rest, "top").and_then(|v| v.parse().ok()).unwrap_or(12);
                     let mode = flag(rest, "mode").unwrap_or_else(|| "hybrid".into());
                     let scope = flag(rest, "scope");
-                    serde_json::to_value(app::fable::retrieve::search(&q, top, &mode, scope.as_deref())?)
+                    serde_json::to_value(app::fable::retrieve::search(
+                        &q,
+                        top,
+                        &mode,
+                        scope.as_deref(),
+                    )?)
+                    .map_err(|e| e.to_string())
+                }
+                "optimize" => {
+                    // 重建向量 IVF 倒排单元(20TB 级 ANN「建索引」;大批入库后/巡夜跑)。
+                    serde_json::to_value(app::fable::index::optimize_vectors()?)
                         .map_err(|e| e.to_string())
                 }
                 "eval" => {

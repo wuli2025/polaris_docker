@@ -399,10 +399,8 @@ async function doResourceScan() {
   }
 }
 
-// 只渲染价值最高的前 N 项(后端已按价值降序);其余仍在 rows 里,「全选」会一并勾选。
-// 用纯列表渲染而非虚拟滚动:简单稳妥,避免 recycled 行 + v-model 双向绑定的边角崩溃。
-const DISPLAY_CAP = 600;
-const shownRows = computed(() => rows.value.slice(0, DISPLAY_CAP));
+// 扫描结果全部交给虚拟滚动渲染(见模板 RecycleScroller):不再硬截断到 600 项,
+// 几万条也只在 DOM 里保留视口内十几行,首屏渲染从「600 行铺满」降到常数级。
 const checkedCount = computed(() => rows.value.filter((r) => r.checked).length);
 const checkedBytes = computed(() =>
   rows.value.filter((r) => r.checked).reduce((s, r) => s + r.size, 0),
@@ -636,10 +634,17 @@ function sendTableCmd() {
           <span class="c-size">大小</span>
           <span class="c-score">价值</span>
         </div>
-        <div class="rg-list">
+        <!-- 虚拟滚动:行等高 46px、各列 nowrap+ellipsis(见 .rg-row CSS),DOM 里只保留视口内
+             十几行。于是几万条扫描结果也秒开、不再硬截断到 600;v-model 绑定的是数据对象
+             item.checked(非 DOM 节点),配合 key-field=id,回收复用不会串值。 -->
+        <RecycleScroller
+          class="rg-list"
+          :items="rows"
+          :item-size="46"
+          key-field="id"
+          v-slot="{ item }"
+        >
           <div
-            v-for="item in shownRows"
-            :key="item.id"
             class="rg-row"
             :class="{ dim: !item.checked }"
             @click="item.checked = !item.checked"
@@ -653,10 +658,7 @@ function sendTableCmd() {
             <span class="c-size">{{ item.sizeH }}</span>
             <span class="c-score">{{ "★".repeat(item.score) }}</span>
           </div>
-          <div v-if="rows.length > DISPLAY_CAP" class="rg-more-note">
-            仅显示价值最高的 {{ DISPLAY_CAP }} 项(共 {{ rows.length }} 项,已按价值排序)。点「全选」会勾选全部并一并归入。
-          </div>
-        </div>
+        </RecycleScroller>
         <div v-if="archiveMsg" class="rg-archmsg">{{ archiveMsg }}</div>
       </div>
       <div v-else-if="scanMeta && !resScanning" class="rg-empty muted">

@@ -418,8 +418,32 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
 
 // ───────────────────────── 融合 + 重排 ─────────────────────────
 
+/// 相对路径是否落在 scope 内(scope 按盘点根相对路径的**首段**匹配,大小写不敏感):
+/// - `None` / 空 → 全盘(零回归);
+/// - `Some("wiki")` → 仅首段为 wiki 的命中(妈妈库子树);
+/// - `Some("!wiki")` → 仅首段**不是** wiki 的命中(「外面整个库」= raw/output/memory…)。
+fn path_in_scope(path: &str, scope: Option<&str>) -> bool {
+    let scope = match scope {
+        None => return true,
+        Some(s) if s.trim().is_empty() => return true,
+        Some(s) => s.trim(),
+    };
+    let p = path.replace('\\', "/");
+    let first = p.split('/').next().unwrap_or("");
+    match scope.strip_prefix('!') {
+        Some(neg) => !first.eq_ignore_ascii_case(neg),
+        None => first.eq_ignore_ascii_case(scope),
+    }
+}
+
 /// 核心检索(三壳共用)。mode: hybrid | grep | vector。
-pub fn search(query: &str, top_k: usize, mode: &str) -> Result<FableSearchResult, String> {
+/// `scope`:可选的盘点根相对路径首段过滤(见 [`path_in_scope`]);None=全盘。
+pub fn search(
+    query: &str,
+    top_k: usize,
+    mode: &str,
+    scope: Option<&str>,
+) -> Result<FableSearchResult, String> {
     let started = std::time::Instant::now();
     let top_k = top_k.clamp(1, 50);
     let want_grep = mode != "vector";
@@ -449,6 +473,11 @@ pub fn search(query: &str, top_k: usize, mode: &str) -> Result<FableSearchResult
         Err(e) if mode == "vector" => return Err(e),
         Err(_) => Vec::new(), // hybrid 下向量车道缺 key/断网 → 静默降级成纯 grep
     };
+    // scope 过滤:命中后按相对路径首段筛(妈妈库 wiki / 外库 !wiki / 全盘 None);零回归。
+    let grep_hits: Vec<GrepHit> =
+        grep_hits.into_iter().filter(|h| path_in_scope(&h.path, scope)).collect();
+    let vec_hits: Vec<VecHit> =
+        vec_hits.into_iter().filter(|h| path_in_scope(&h.path, scope)).collect();
     let (n_grep, n_vec) = (grep_hits.len(), vec_hits.len());
 
     // ── P0-1 修:RRF 融合 key 降到**文件级** ──
@@ -654,12 +683,14 @@ pub fn fable_search(
     query: String,
     top_k: Option<usize>,
     mode: Option<String>,
+    scope: Option<String>,
 ) -> Result<FableSearchResult, String> {
     let mode = mode.unwrap_or_else(|| "hybrid".into());
     if !["hybrid", "grep", "vector"].contains(&mode.as_str()) {
         return Err("mode 只接受 hybrid | grep | vector".into());
     }
-    search(query.trim(), top_k.unwrap_or(12), &mode)
+    let scope = scope.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    search(query.trim(), top_k.unwrap_or(12), &mode, scope)
 }
 
 #[cfg(test)]
@@ -687,6 +718,26 @@ mod tests {
         // 内嵌双引号要被转义成 ""(防 FTS 语法注入/语法错)
         let expr = fts_match_expr("a\"b\"c", &[]).unwrap();
         assert_eq!(expr, "\"a\"\"b\"\"c\"");
+    }
+
+    #[test]
+    fn scope_filter_first_segment() {
+        // None / 空 → 全盘放行
+        assert!(path_in_scope("wiki/概念/x.md", None));
+        assert!(path_in_scope("raw/a.md", Some("")));
+        assert!(path_in_scope("raw/a.md", Some("  ")));
+        // 正向:仅首段命中
+        assert!(path_in_scope("wiki/概念/x.md", Some("wiki")));
+        assert!(!path_in_scope("raw/a.md", Some("wiki")));
+        assert!(!path_in_scope("output/r.md", Some("wiki")));
+        // 反向 !wiki:首段不是 wiki 的才放行(「外面整个库」)
+        assert!(!path_in_scope("wiki/概念/x.md", Some("!wiki")));
+        assert!(path_in_scope("raw/a.md", Some("!wiki")));
+        assert!(path_in_scope("output/r.md", Some("!wiki")));
+        // 反斜杠路径(Windows)也按首段判定
+        assert!(path_in_scope("wiki\\概念\\x.md", Some("wiki")));
+        // 大小写不敏感
+        assert!(path_in_scope("WIKI/x.md", Some("wiki")));
     }
 
     #[test]

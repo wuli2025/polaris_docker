@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "1.2.1"
+version = "1.3.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -76,6 +76,9 @@ ureq = { version = "2", features = ["json"] }
 # 三平台(Win/mac/Linux musl+gnu)同构编译;桌面与 server feature 都要,故无条件依赖。
 sha2 = "0.10"
 getrandom = "0.2"
+# 专家头像:base64 编码 PNG → data URL，供前端 <img src=""> 直接使用。
+# 纯 Rust 实现，三平台同构，无系统依赖。
+base64 = "0.22"
 # 「聊天机器人」板块「扫码创建机器人」: 把飞书开放平台建应用 URL 编码成二维码 (SVG)。
 # default-features=false → 不拉重型 image crate, 只保留纯 Rust 的 svg 渲染。
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

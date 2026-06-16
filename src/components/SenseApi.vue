@@ -3,13 +3,17 @@
 // 形态对标参考图:按能力分组的服务商卡片墙;本地模型卡带下载进度条;
 // 点卡片开配置弹窗(启用开关 / API Key + 获取链接 / 模型列表设默认 / 一键探活)。
 // 页尾:回声层「每日做梦」(定时收录对话蒸馏成记忆)。
-import { onMounted, onUnmounted, ref, computed } from "vue";
+import { onMounted, onUnmounted, ref, computed, watch } from "vue";
 import { invoke, listen, openUrl } from "../tauri";
 import { useAppStore } from "../stores/app";
+import { useFileTasksStore } from "../stores/fileTasks";
 
 defineOptions({ name: "SenseApi" });
 
 const app = useAppStore();
+// 盘点/建索引托管给全局任务 store(App 级监听,脱离本页生命周期)——
+// 这样在感官页点了盘点/建索引，切到别的界面也照常后台跑、全局任务中心可见。
+const tasks = useFileTasksStore();
 
 interface SenseModel {
   id: string;
@@ -204,8 +208,9 @@ async function saveClusterModel() {
 const fable = ref<FableStatus | null>(null);
 const fableErr = ref("");
 const scanRoot = ref("");
-const scanLine = ref("");
-const indexLine = ref("");
+// 进度行读全局 store —— 切走再回来仍能立刻看到当前进度(本页不再各自监听 fable 事件)。
+const scanLine = computed(() => tasks.detail.inventory);
+const indexLine = computed(() => tasks.detail.index);
 const searchQ = ref("");
 const searchBusy = ref(false);
 const searchRes = ref<FableSearchResult | null>(null);
@@ -219,27 +224,23 @@ function fmtBytes(n: number): string {
 
 async function startInventory() {
   fableErr.value = "";
-  scanLine.value = "启动盘点…";
   try {
-    await invoke("fable_inventory_start", {
-      roots: scanRoot.value.trim() ? [scanRoot.value.trim()] : [],
-    });
+    // 托管给全局任务 store:后台跑 + 全局任务中心可见 + 切界面不丢进度。
+    await tasks.startInventory(scanRoot.value.trim() ? [scanRoot.value.trim()] : [], []);
     if (fable.value) fable.value = { ...fable.value, scanning: true };
   } catch (e) {
     fableErr.value = String(e);
-    scanLine.value = "";
   }
 }
 
 async function startIndex() {
   fableErr.value = "";
-  indexLine.value = "启动索引构建…";
   try {
-    await invoke("fable_index_start", {});
+    // 托管给全局任务 store:后台跑 + 全局任务中心可见 + 切界面不丢进度。
+    await tasks.startIndex();
     if (fable.value) fable.value = { ...fable.value, indexing: true };
   } catch (e) {
     fableErr.value = String(e);
-    indexLine.value = "";
   }
 }
 
@@ -295,39 +296,11 @@ onMounted(async () => {
       }
     )
   );
-  unlisteners.push(
-    await listen<{ kind: string; files?: number; bytes?: number; seconds?: number; message?: string }>(
-      "fable:inventory",
-      (p) => {
-        if (p.kind === "progress") {
-          scanLine.value = `已盘点 ${p.files ?? 0} 个文件 / ${fmtBytes(p.bytes ?? 0)}`;
-        } else if (p.kind === "done") {
-          scanLine.value = `✓ 盘点完成:${p.files ?? 0} 个文件 / ${fmtBytes(p.bytes ?? 0)}(${(p.seconds ?? 0).toFixed(1)}s)`;
-          void refresh();
-        } else if (p.kind === "error") {
-          fableErr.value = p.message ?? "盘点失败";
-          scanLine.value = "";
-          void refresh();
-        }
-      }
-    )
-  );
-  unlisteners.push(
-    await listen<{ kind: string; files?: number; chunks?: number; current?: string; stopped?: string; message?: string }>(
-      "fable:index",
-      (p) => {
-        if (p.kind === "progress") {
-          indexLine.value = `已嵌入 ${p.files ?? 0} 个文件 / ${p.chunks ?? 0} chunk — ${p.current ?? ""}`;
-        } else if (p.kind === "done") {
-          indexLine.value = `✓ ${p.stopped ?? "完成"}:本轮 ${p.files ?? 0} 文件 / ${p.chunks ?? 0} chunk`;
-          void refresh();
-        } else if (p.kind === "error") {
-          fableErr.value = p.message ?? "索引构建失败";
-          indexLine.value = "";
-          void refresh();
-        }
-      }
-    )
+  // 盘点 / 建索引的进度与监听已托管全局 fileTasks store(App 级常驻)。
+  // 这里只在它们「完成」时刷新一次本页 FableStatus(家底数字)。
+  watch(
+    () => [tasks.doneTick.inventory, tasks.doneTick.index],
+    () => void refresh(),
   );
   unlisteners.push(
     await listen<{ kind: string; text?: string; episodes?: number }>("echo:dream", (p) => {

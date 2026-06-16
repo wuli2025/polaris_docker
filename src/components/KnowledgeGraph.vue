@@ -3,12 +3,19 @@ import { ref, onMounted, onUnmounted, onActivated, onDeactivated, nextTick } fro
 import cytoscape, { type Core } from "cytoscape";
 // @ts-ignore — cytoscape-fcose 无类型声明
 import fcose from "cytoscape-fcose";
-import { kb, type KbGraph, type KbNode } from "../tauri";
+import { kb, files as filesApi, type KbGraph, type KbNode } from "../tauri";
 
 // KeepAlive 的 include 按组件 name 匹配 → 显式命名，确保本视图被缓存
 defineOptions({ name: "KnowledgeGraph" });
+// source: 'kb'=知识库 wiki 图谱(默认);'files'=文件中心星图(语义簇+文件星点)。
+// embedded: 嵌进向导/弹层时隐掉自带大标题栏(宿主自带标题)。
+const props = withDefaults(
+  defineProps<{ source?: "kb" | "files"; embedded?: boolean }>(),
+  { source: "kb", embedded: false },
+);
 // 布局稳定(或空/兜底)时通知 App 收起加载条
 const emit = defineEmits<{ ready: [] }>();
+const isFiles = props.source === "files";
 
 // fcose 力导向引擎: 中心引力 → 有机圆盘云团 (银河感), 自动打包孤立分量
 try {
@@ -145,19 +152,23 @@ function render() {
     elements: [
       ...nodes.map((n) => {
         const size = nodeSize(n.kind, deg[n.id] || 0);
-        return {
-          data: {
-            id: n.id,
-            label: n.title,
-            kind: n.kind,
-            pal: palKey(n),
-            size,
-            upad: glowPad(size),
-            uopa: glowOpacity(n.kind, size),
-            deg: deg[n.id] || 0,
-            path: n.kind === "doc" || n.kind === "feedback" ? n.id : "",
-          },
+        const data: any = {
+          id: n.id,
+          label: n.title,
+          kind: n.kind,
+          pal: palKey(n),
+          size,
+          upad: glowPad(size),
+          uopa: glowOpacity(n.kind, size),
+          deg: deg[n.id] || 0,
+          path: n.kind === "doc" || n.kind === "feedback" ? n.id : "",
         };
+        // files 源:category 携带所属语义簇的颜色(#hex)→ 按簇着色(root 仍用金核),
+        // 让画面一眼分出几个语义聚类(同簇同色)。
+        if (isFiles && n.kind !== "root" && n.category && n.category.startsWith("#")) {
+          data.gcolor = n.category;
+        }
+        return { data };
       }),
       ...edges.map((e, i) => ({
         data: { id: `e${i}`, source: e.source, target: e.target },
@@ -190,6 +201,15 @@ function render() {
         },
       },
       ...palSelectors,
+      // files 源:按语义簇色实底着色(覆盖 pal 渐变)+ 同色辉光 → 各簇颜色分明
+      {
+        selector: "node[gcolor]",
+        style: {
+          "background-fill": "solid",
+          "background-color": "data(gcolor)",
+          "underlay-color": "data(gcolor)",
+        },
+      },
       {
         selector: 'node[kind = "folder"]',
         style: { "text-opacity": 1, "font-size": 11, color: "#d8eaff" },
@@ -246,6 +266,17 @@ function render() {
   wireInteractions(cy);
   // 等入场布局动画结束再起转, 避免与 fcose 动画打架；同时通知 App 收起加载条(此时图已稳定)
   cy.one("layoutstop", () => {
+    // 拉远镜头:整张图缩在视野中央、四周大量留白,像从远处看一片星海 —— 更震撼、更有「我的
+    // 数据宇宙」的体量感。files(用户数据库)拉得更远;远景下标签自动隐去(只在放大时浮现),
+    // 正好只见星点不见字。随后建索引/归类越完善,簇结构越贴合真实数据,这片星海也越像你本人。
+    try {
+      const c = cy!;
+      c.fit(undefined, isFiles ? 120 : 80);
+      const center = { x: c.width() / 2, y: c.height() / 2 };
+      c.zoom({ level: c.zoom() * (isFiles ? 0.55 : 0.78), renderedPosition: center });
+    } catch {
+      /* 容错:fit/zoom 失败不阻断 */
+    }
     startSpinLoop();
     emit("ready");
   });
@@ -370,7 +401,7 @@ function runSearch() {
 }
 
 onMounted(async () => {
-  graphData = await kb.graph();
+  graphData = isFiles ? await filesApi.graph() : await kb.graph();
   empty.value = graphData.nodes.length === 0;
   stats.value = {
     docs: graphData.nodes.filter((n) => n.kind === "doc").length,
@@ -413,7 +444,7 @@ onUnmounted(() => {
 
 <template>
   <div class="graph" :class="{ 'bg-paused': bgPaused }">
-    <div class="head">
+    <div v-if="!embedded" class="head">
       <div class="title">知识图谱</div>
       <div class="tools" v-if="!empty">
         <input
@@ -477,9 +508,9 @@ onUnmounted(() => {
       <div class="vignette"></div>
 
       <div class="legend">
-        <span><i class="dot" style="--c: #f0b24a"></i>知识库</span>
-        <span><i class="dot sq" style="--c: #5fa8e6"></i>目录</span>
-        <span><i class="dot" style="--c: #4f7fd0"></i>文档</span>
+        <span><i class="dot" style="--c: #f0b24a"></i>{{ isFiles ? "我的资料" : "知识库" }}</span>
+        <span><i class="dot sq" style="--c: #5fa8e6"></i>{{ isFiles ? "主题" : "目录" }}</span>
+        <span><i class="dot" style="--c: #4f7fd0"></i>{{ isFiles ? "文件" : "文档" }}</span>
         <span v-if="stats.memories"
           ><i class="dot" style="--c: #f0567f"></i>记忆</span
         >

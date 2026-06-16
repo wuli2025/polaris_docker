@@ -72,7 +72,7 @@ pub fn fable_context_block(full: bool) -> String {
             "2. **全盘混检**(不知道在哪、语义模糊、跨文件):运行 `\"{c}\" fable search --q=\"<查询>\" --top=12`,内部 grep 多核车道与 RAG 向量车道并行 + 重排,返回 JSON 命中(path/abspath/location/snippet);\n"
         ));
         s.push_str(&format!(
-            "   - 多角度检索可一次并行发多条查询(机器核多):换 2-3 种说法各查一次再汇总;\n   - `--mode=grep` 纯字面 / `--mode=vector` 纯语义{};\n",
+            "   - 多角度检索可一次并行发多条查询(机器核多):换 2-3 种说法各查一次再汇总;\n   - `--mode=grep` 纯字面 / `--mode=vector` 纯语义{};\n   - `--scope=wiki` 只搜妈妈库(人工确认的权威知识)/ `--scope=!wiki` 只搜外面的原始资料库;\n",
             if vector_ready { "" } else { "(向量索引还没建,当前实际只有 grep 车道)" }
         ));
     } else {

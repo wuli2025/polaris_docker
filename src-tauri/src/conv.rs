@@ -573,6 +573,94 @@ pub(crate) fn transcript_of(id: &str) -> Option<(String, String)> {
     Some((c.title.clone(), s))
 }
 
+/// 把一条对话渲染成文字稿(只含 user/assistant),超 `cap` 字符留最新尾部。
+/// transcripts_since / transcript_of 的共用截取口径,抽出来给老项目采样复用。
+fn render_transcript(state: &State, conv_id: &str, cap: usize) -> String {
+    let mut buf = String::new();
+    for msg in state.messages.iter().filter(|m| m.conversation_id == conv_id) {
+        let who = match msg.role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            _ => continue,
+        };
+        buf.push_str(who);
+        buf.push_str(": ");
+        buf.push_str(msg.content.trim());
+        buf.push('\n');
+    }
+    if buf.chars().count() > cap {
+        let chars: Vec<char> = buf.chars().collect();
+        let tail: String = chars[chars.len() - cap..].iter().collect();
+        format!("…(前文截断)\n{tail}")
+    } else {
+        buf
+    }
+}
+
+/// 回声层晨报取材②:翻出「几个月前曾大量讨论、之后冷掉、看着没收尾」的老对话,
+/// 每天轮换采样几条 —— 让做梦不只盯着昨天,也提醒主人那些半截搁置的项目。
+///
+/// 判定「未完成的样子」(全部满足):
+///  - 未归档;
+///  - 已冷却:最后活跃在 14 天前,不跟当下热对话(由 transcripts_since 处理)抢;
+///  - 不太久远:在 ~8 个月内,够得上「几个月前」而非远古;
+///  - 有分量:user/assistant 消息数 ≥ 6,即当时「大量出现」过;
+///  - 收尾信号弱:最后一条是用户发言(助手没接上),或尾部出现 待办/继续/下一步/未完成/回头/稍后/下次/TODO 等续作词。
+///
+/// 命中后按消息多寡排序,再以「今天的日序」为偏移轮换取 `max_convs` 条(每天换一批,故曰随机)。
+pub(crate) fn stale_unfinished_transcripts(
+    now_ms: i64,
+    max_convs: usize,
+    per_conv_chars: usize,
+) -> Vec<(String, String)> {
+    const DAY: i64 = 24 * 3600 * 1000;
+    const CUES: [&str; 8] =
+        ["待办", "继续", "下一步", "未完成", "回头", "稍后", "下次", "todo"];
+    let cold_after = now_ms - 14 * DAY; // 14 天没动过才算冷
+    let lookback_from = now_ms - 240 * DAY; // ~8 个月内才算「几个月前」
+
+    let state = STATE.read();
+    // (conv, user/assistant 消息数)
+    let mut cand: Vec<(&Conversation, usize)> = Vec::new();
+    for c in state.conversations.iter() {
+        if c.archived || c.updated_at >= cold_after || c.updated_at < lookback_from {
+            continue;
+        }
+        let msgs: Vec<&Message> = state
+            .messages
+            .iter()
+            .filter(|m| m.conversation_id == c.id && (m.role == "user" || m.role == "assistant"))
+            .collect();
+        if msgs.len() < 6 {
+            continue;
+        }
+        let last_is_user = msgs.last().map(|m| m.role == "user").unwrap_or(false);
+        let has_cue = msgs.iter().rev().take(8).any(|m| {
+            let lc = m.content.to_lowercase();
+            CUES.iter().any(|w| lc.contains(w))
+        });
+        if last_is_user || has_cue {
+            cand.push((c, msgs.len()));
+        }
+    }
+    if cand.is_empty() {
+        return Vec::new();
+    }
+    // 讨论得多的优先,同等再看谁更近
+    cand.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.updated_at.cmp(&a.0.updated_at)));
+
+    // 每天轮换一个起点,避免天天提同几个搁置项目
+    let n = cand.len();
+    let offset = if n > max_convs { (now_ms / DAY) as usize % n } else { 0 };
+    (0..max_convs.min(n))
+        .map(|i| {
+            let (c, _) = cand[(offset + i) % n];
+            let body = render_transcript(&state, &c.id, per_conv_chars);
+            (format!("{}(几个月前 · 疑未收尾)", c.title), body)
+        })
+        .collect()
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn conv_delete_conversation(conversation_id: String) -> Result<(), String> {
     let mut st = STATE.write();

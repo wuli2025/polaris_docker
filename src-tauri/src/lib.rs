@@ -18,6 +18,7 @@ pub mod fable;
 pub mod infer;
 pub mod kb;
 pub mod persona;
+pub mod expert;
 pub mod echo;
 pub mod project;
 pub mod provider;
@@ -172,6 +173,25 @@ pub fn run() {
             // 人格模块 (板块⑫)
             persona::persona_list,
             persona::persona_apply,
+            // 百人专家团
+            expert::expert_list,
+            expert::expert_list_by_group,
+            expert::expert_groups,
+            expert::expert_route,
+            expert::expert_get,
+            expert::expert_match_auto,
+            expert::expert_apply,
+            expert::expert_avatar,
+            expert::expert_avatar_slots,
+            expert::expert_team_spawn,
+            expert::expert_agents_status,
+            expert::expert_teams,
+            expert::expert_team_get,
+            expert::team_apply,
+            expert::expert_export,
+            expert::team_export,
+            expert::expert_route_debug,
+            expert::expert_recommend_from_kb,
             // 飞书网关 (板块⑭ 阶段 A)
             feishu::feishu_get_config,
             feishu::feishu_set_config,
@@ -289,6 +309,10 @@ pub fn run() {
             echo::echo_set,
             echo::echo_dream_now,
             echo::echo_distill_conversation,
+            echo::echo_briefing_today,
+            echo::echo_briefing_dismiss,
+            echo::echo_briefing_run,
+            kb::kb_overview_get,
             // 寓言计划 · 检索枢纽(盘点 L1a + 向量索引 + 塌平混检)
             fable::fable_status,
             fable::fable_cancel,
@@ -307,6 +331,8 @@ pub fn run() {
             fable::files::file_thumb,
             fable::files::file_gist,
             fable::files::file_cluster_build,
+            fable::files::file_profile_html,
+            fable::files::file_graph,
             fable::files::file_warm_thumbs,
             fable::files::file_cluster_llm,
             fable::files::file_titles_llm,

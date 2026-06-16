@@ -284,10 +284,13 @@ fn ensure_skeleton(root: &Path) -> Result<()> {
 // ───────────────────────── Scan + Parse ──────────────────
 
 fn scan_all(root: &Path) -> Vec<KbDoc> {
-    let mut docs = Vec::new();
     if !root.exists() {
-        return docs;
+        return Vec::new();
     }
+    // ① 廉价遍历目录项,收集待解析的 .md 路径(只读目录、不读内容,快)。
+    //    conversations/ 不纳入知识库索引/图谱(保护板块②不被对话产物污染);
+    //    这些文件改由 chat::artifact_search 单独检索。
+    let mut paths: Vec<PathBuf> = Vec::new();
     for entry in WalkDir::new(root).into_iter().flatten() {
         let p = entry.path();
         if !p.is_file() {
@@ -298,8 +301,6 @@ fn scan_all(root: &Path) -> Vec<KbDoc> {
             continue;
         }
         if let Ok(rel) = p.strip_prefix(root) {
-            // 对话产物目录 conversations/ 不纳入知识库索引/图谱 (保护板块②不被对话产物污染);
-            // 这些文件改由 chat::artifact_search 单独检索。
             if rel
                 .components()
                 .next()
@@ -308,11 +309,52 @@ fn scan_all(root: &Path) -> Vec<KbDoc> {
             {
                 continue;
             }
-            if let Some(d) = parse_doc(p, rel) {
-                docs.push(d);
-            }
+            paths.push(p.to_path_buf());
         }
     }
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    // 路径排序 → 解析结果顺序确定(与多线程分片无关),便于复现。
+    paths.sort();
+
+    // ② 多线程并行解析:parse_doc 要读全文 + 跑多条正则,是真瓶颈(KB 几百篇时
+    //    旧的单线程顺序解析会卡主线程数百 ms~数秒)。parse_doc 是纯函数、共享的只有
+    //    Lazy 正则(Sync),把路径切成 N 份各线程处理一段、主线程按序合并 → 近线性加速。
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(paths.len());
+    if workers <= 1 {
+        return paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(root).ok().and_then(|rel| parse_doc(p, rel)))
+            .collect();
+    }
+    let chunk_size = paths.len().div_ceil(workers);
+    let mut docs: Vec<KbDoc> = Vec::with_capacity(paths.len());
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for chunk in paths.chunks(chunk_size) {
+            handles.push(s.spawn(move || {
+                let mut local = Vec::with_capacity(chunk.len());
+                for p in chunk {
+                    if let Ok(rel) = p.strip_prefix(root) {
+                        if let Some(d) = parse_doc(p, rel) {
+                            local.push(d);
+                        }
+                    }
+                }
+                local
+            }));
+        }
+        for h in handles {
+            if let Ok(mut local) = h.join() {
+                docs.append(&mut local);
+            }
+        }
+    });
     docs
 }
 
@@ -1481,6 +1523,29 @@ pub fn kb_list(subdir: Option<String>) -> Vec<String> {
         .collect()
 }
 
+/// 封顶取样：单遍既返回前 `limit` 条路径，又给出匹配总数。
+/// 给「按知识库反推专家团」这类只需少量样本 + 总量的调用用 ——
+/// 大库上避免 `kb_list` 把几百万条 rel_path 全克隆出来再被 `.take(N)` 丢掉。
+pub fn kb_list_sample(subdir: Option<String>, limit: usize) -> (Vec<String>, usize) {
+    let idx = INDEX.read();
+    let mut total = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    for d in idx.iter() {
+        let hit = subdir
+            .as_deref()
+            .map(|s| d.rel_path.starts_with(s))
+            .unwrap_or(true);
+        if !hit {
+            continue;
+        }
+        total += 1;
+        if out.len() < limit {
+            out.push(d.rel_path.clone());
+        }
+    }
+    (out, total)
+}
+
 // ───────────────────────── 上下文预算 (借鉴 llm_wiki context-budget) ─────────────────────────
 //
 // 痛点: wiki/ 全文注入 42k 字符曾撞 Windows 命令行 32k 上限(206)。即便改走 stdin, 无节制
@@ -1873,6 +1938,58 @@ pub fn kb_search(query: String, top_k: Option<usize>) -> Vec<KbHit> {
             score,
         })
         .collect()
+}
+
+/// 知识库「家底」总览:四车道各有多少。用于对话框始终注入的概览块,
+/// 让模型一开口就答得清「你的库在哪 / 有什么」,而不是只会复述 wiki 结构。
+/// 全部从内存 INDEX(scan_all 已索引全库 markdown)派生,零盘点依赖、O(n) 极快。
+#[derive(Serialize, Clone, Default)]
+pub struct KbOverview {
+    pub root: String,
+    /// 妈妈库 wiki 知识页数(排除 index/_index 导航页)
+    pub wiki: usize,
+    /// 原始资料层 raw 的 markdown 篇数(非 md 资料只在盘点库里计数)
+    pub raw_md: usize,
+    /// 成品层 output 篇数
+    pub output: usize,
+    /// 记忆层 memory 条数(排除 index.md)
+    pub memory: usize,
+    /// 全部已索引 markdown 文档数
+    pub total_docs: usize,
+}
+
+pub fn kb_overview() -> KbOverview {
+    let idx = INDEX.read();
+    let mut ov = KbOverview { root: kb_root(), ..Default::default() };
+    for d in idx.iter() {
+        ov.total_docs += 1;
+        let p = d.rel_path.as_str();
+        let seg = p.split('/').next().unwrap_or("");
+        let fname = p.rsplit('/').next().unwrap_or("");
+        let is_nav = fname == "index.md" || fname.starts_with("_index");
+        match seg {
+            "wiki" => {
+                if !is_nav {
+                    ov.wiki += 1;
+                }
+            }
+            "raw" => ov.raw_md += 1,
+            "output" => ov.output += 1,
+            "memory" => {
+                if fname != "index.md" {
+                    ov.memory += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    ov
+}
+
+/// 对话命令:供前端/调试查看家底(纯读,便宜)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn kb_overview_get() -> KbOverview {
+    kb_overview()
 }
 
 fn first_snippet(body: &str, terms: &[&str], max_len: usize) -> String {
@@ -3018,6 +3135,51 @@ mod tests {
         assert!(resolve_within_kb(&root, "../../Windows/System32/drivers/etc/hosts").is_err());
         // 不存在的文件: 报错而非 panic
         assert!(resolve_within_kb(&root, "nope.md").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// 并行 scan_all 正确性:多线程分片解析不丢、不重、不串,合并后按 rel_path 稳定有序,
+    /// 且 conversations/ 被排除、非 md 不收。文件数远大于 worker 上限,确保真的走多线程那条路
+    /// (这也间接验证它不会死锁/卡住 —— thread::scope 必等所有子线程 join 才返回)。
+    #[test]
+    fn parallel_scan_all_complete_ordered_no_dupes() {
+        let base = std::env::temp_dir().join(format!("polaris_scanall_{}", std::process::id()));
+        let root = base.join("kb");
+        let wiki = root.join("wiki");
+        let conv = root.join("conversations");
+        let _ = fs::create_dir_all(&wiki);
+        let _ = fs::create_dir_all(&conv);
+
+        const N: usize = 64; // ≫ worker 上限(8),逼出多线程分片合并路径
+        for i in 0..N {
+            let body = format!(
+                "---\ntitle: 标题{i}\ntype: concept\n---\n# H{i}\n见 [[标题{}]]\n",
+                (i + 1) % N
+            );
+            fs::write(wiki.join(format!("p{i:03}.md")), body).unwrap();
+        }
+        fs::write(wiki.join("note.txt"), "ignore").unwrap(); // 非 md:不收
+        fs::write(conv.join("c.md"), "# 对话产物\n").unwrap(); // conversations/:排除
+
+        let docs = scan_all(&root);
+        assert_eq!(docs.len(), N, "应收全部 {N} 篇 wiki(不含 txt / conversations)");
+
+        let paths: Vec<&str> = docs.iter().map(|d| d.rel_path.as_str()).collect();
+        let uniq: std::collections::HashSet<&str> = paths.iter().copied().collect();
+        assert_eq!(uniq.len(), N, "并行分片合并不应产生重复");
+        assert!(
+            !docs.iter().any(|d| d.rel_path.contains("conversations")),
+            "对话产物目录必须被排除"
+        );
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted, "结果应按 rel_path 稳定有序(分片合并不打乱顺序)");
+
+        // 抽查解析正确性(frontmatter 标题 + 双链)
+        let p0 = docs.iter().find(|d| d.rel_path.ends_with("p000.md")).unwrap();
+        assert_eq!(p0.title, "标题0");
+        assert!(p0.wikilinks.iter().any(|w| w == "标题1"), "双链应被解析出");
 
         let _ = fs::remove_dir_all(&base);
     }

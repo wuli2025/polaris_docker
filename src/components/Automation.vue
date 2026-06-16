@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref } from "vue";
 import {
   Clock,
   Plus,
@@ -19,18 +19,73 @@ import {
   X,
   CircleStop,
   Square,
+  Moon,
+  Power,
 } from "@lucide/vue";
 import { useAutomationStore, type AutomationFlow } from "../stores/automation";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
+import { invoke, listen, isTauri } from "../tauri";
 
 const auto = useAutomationStore();
 const app = useAppStore();
 const chat = useChatStore();
 
+// ── 自动做梦 · 每日晨报（回声层）──
+interface DreamLog { ts: number; day: string; episodes: number; summary: string }
+interface EchoStatus {
+  enabled: boolean;
+  hour: number;
+  run_on_boot: boolean;
+  last_dream_day: string;
+  dreaming: boolean;
+  memory_count: number;
+  briefing_today: number;
+  log: DreamLog[];
+}
+const echo = ref<EchoStatus | null>(null);
+async function loadEcho() {
+  if (!isTauri) return;
+  try {
+    echo.value = await invoke<EchoStatus>("echo_status");
+  } catch (e) {
+    console.error("加载回声层状态失败", e);
+  }
+}
+async function setEcho(args: { enabled?: boolean; hour?: number; runOnBoot?: boolean }) {
+  try {
+    echo.value = await invoke<EchoStatus>("echo_set", args);
+  } catch (e) {
+    console.error("保存回声层设置失败", e);
+  }
+}
+async function dreamNow() {
+  try {
+    await invoke("echo_dream_now");
+    if (echo.value) echo.value.dreaming = true;
+  } catch (e) {
+    console.error(e);
+  }
+}
+async function briefNow() {
+  try {
+    await invoke("echo_briefing_run");
+    if (echo.value) echo.value.dreaming = true;
+  } catch (e) {
+    console.error(e);
+  }
+}
+const dreamHours = Array.from({ length: 24 }, (_, i) => i);
+
 onMounted(() => {
   if (!app.projects.length) app.refreshProjects();
   auto.startScheduler();
+  loadEcho();
+  if (isTauri) {
+    listen("echo:dream", (p: any) => {
+      if (p?.payload?.kind === "done" || p?.payload?.kind === "error") loadEcho();
+    });
+  }
 });
 
 const ICONS: Record<string, any> = {
@@ -99,6 +154,77 @@ function stopFlow(f: AutomationFlow) {
           仿知识库风格成稿 → 多维评审 → 落到草稿箱（不自动发布，由你过目后再发）。
         </p>
       </header>
+
+      <!-- 自动做梦 · 每日晨报（回声层）-->
+      <section v-if="echo" class="dream-card">
+        <div class="dc-head">
+          <span class="dc-ic"><Moon :size="15" :stroke-width="1.8" color="#fff" /></span>
+          <div class="dc-tt">
+            <span class="dc-name">自动做梦 · 每日晨报</span>
+            <span class="dc-sub"
+              >每天自动整理你的对话与新资料，归类进记忆，并据新内容给出工程化建议 —— 别的 AI 把功能做得更强，我们让 AI 更懂你。</span
+            >
+          </div>
+          <label class="dc-switch" :title="echo.enabled ? '已开启' : '已关闭'">
+            <input
+              type="checkbox"
+              :checked="echo.enabled"
+              @change="setEcho({ enabled: ($event.target as HTMLInputElement).checked })"
+            />
+            <span class="dc-track"></span>
+          </label>
+        </div>
+
+        <div v-if="echo.enabled" class="dc-body">
+          <div class="dc-row">
+            <span class="dc-label"><Clock :size="13" :stroke-width="1.7" /> 每天执行时间</span>
+            <select
+              class="dc-select"
+              :value="echo.hour"
+              @change="setEcho({ hour: Number(($event.target as HTMLSelectElement).value) })"
+            >
+              <option v-for="h in dreamHours" :key="h" :value="h">
+                {{ String(h).padStart(2, "0") }}:00
+              </option>
+            </select>
+          </div>
+          <div class="dc-row">
+            <span class="dc-label"><Power :size="13" :stroke-width="1.7" /> 开机补做</span>
+            <label class="dc-mini-switch" title="错过固定时间（如开机前）则开机后自动补一次">
+              <input
+                type="checkbox"
+                :checked="echo.run_on_boot"
+                @change="setEcho({ runOnBoot: ($event.target as HTMLInputElement).checked })"
+              />
+              <span class="dc-track sm"></span>
+            </label>
+          </div>
+          <div class="dc-stats">
+            <span class="dc-stat">记忆 <b>{{ echo.memory_count }}</b> 条</span>
+            <span class="dc-stat">今日建议 <b>{{ echo.briefing_today }}</b> 条</span>
+            <span v-if="echo.last_dream_day" class="dc-stat">上次 {{ echo.last_dream_day }}</span>
+          </div>
+          <div class="dc-act">
+            <button class="dc-btn" :disabled="echo.dreaming" @click="dreamNow">
+              <component
+                :is="echo.dreaming ? LoaderCircle : Moon"
+                :size="13"
+                :stroke-width="1.9"
+                :class="{ spin: echo.dreaming }"
+              />
+              {{ echo.dreaming ? "处理中…" : "现在做一次梦" }}
+            </button>
+            <button class="dc-btn ghost" :disabled="echo.dreaming" @click="briefNow">
+              <Sparkles :size="13" :stroke-width="1.9" /> 现在生成晨报
+            </button>
+          </div>
+          <div v-if="echo.log.length" class="dc-log">
+            <div v-for="(l, i) in echo.log.slice(0, 3)" :key="i" class="dc-log-line">
+              <span class="dll-day">{{ l.day }}</span>{{ l.summary }}
+            </div>
+          </div>
+        </div>
+      </section>
 
       <!-- 流程卡片 -->
       <div class="grid">
@@ -220,6 +346,84 @@ function stopFlow(f: AutomationFlow) {
   max-width: 720px;
   letter-spacing: 0.3px;
 }
+
+/* ── 自动做梦 · 每日晨报卡 ── */
+.dream-card {
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--panel);
+  padding: 16px 18px;
+  margin-bottom: 18px;
+}
+.dc-head { display: flex; align-items: flex-start; gap: 12px; }
+.dc-ic {
+  width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #7c5cd9, #a78bfa);
+}
+.dc-tt { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.dc-name { font-size: 15px; font-weight: 600; color: var(--ink); letter-spacing: 0.5px; }
+.dc-sub { font-size: 12px; line-height: 1.7; color: var(--text-2); max-width: 640px; }
+.dc-switch { position: relative; width: 40px; height: 22px; flex-shrink: 0; cursor: pointer; }
+.dc-switch input { opacity: 0; width: 0; height: 0; }
+.dc-track {
+  position: absolute; inset: 0; border-radius: 22px;
+  background: var(--border); transition: background 0.18s;
+}
+.dc-track::before {
+  content: ""; position: absolute; top: 3px; left: 3px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; transition: transform 0.18s;
+}
+.dc-switch input:checked + .dc-track { background: var(--primary, #7c5cd9); }
+.dc-switch input:checked + .dc-track::before { transform: translateX(18px); }
+.dc-track.sm { border-radius: 18px; }
+.dc-mini-switch { position: relative; width: 34px; height: 19px; cursor: pointer; }
+.dc-mini-switch input { opacity: 0; width: 0; height: 0; }
+.dc-mini-switch .dc-track::before { width: 13px; height: 13px; }
+.dc-mini-switch input:checked + .dc-track { background: var(--primary, #7c5cd9); }
+.dc-mini-switch input:checked + .dc-track::before { transform: translateX(15px); }
+
+.dc-body { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.dc-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.dc-label {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; color: var(--text-2); min-width: 110px;
+}
+.dc-label svg { color: var(--muted); }
+.dc-select {
+  border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg); color: var(--ink);
+  font-size: 12.5px; padding: 5px 9px; cursor: pointer;
+}
+.dc-stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.dc-stat {
+  font-size: 11.5px; color: var(--muted);
+  background: var(--selection-bg); padding: 4px 9px; border-radius: 6px;
+}
+.dc-stat b { color: var(--ink); font-weight: 600; }
+.dc-act { display: flex; flex-wrap: wrap; gap: 8px; }
+.dc-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: none; cursor: pointer;
+  background: var(--btn-solid-bg); color: var(--btn-solid-text);
+  font-size: 12.5px; letter-spacing: 0.5px;
+  padding: 7px 13px; border-radius: 8px;
+}
+.dc-btn:hover:not(:disabled) { background: var(--primary, var(--btn-solid-bg)); }
+.dc-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.dc-btn.ghost {
+  background: transparent; color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.dc-btn.ghost:hover:not(:disabled) { border-color: var(--ink); color: var(--ink); background: transparent; }
+.dc-log {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px dashed var(--border-soft);
+  display: flex; flex-direction: column; gap: 5px;
+}
+.dc-log-line { font-size: 11.5px; color: var(--text-2); line-height: 1.6; }
+.dll-day { color: var(--muted); margin-right: 8px; font-variant-numeric: tabular-nums; }
 
 .grid {
   display: grid;

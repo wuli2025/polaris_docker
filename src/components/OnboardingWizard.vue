@@ -1,0 +1,852 @@
+<script setup lang="ts">
+/**
+ * 智能向导「让 AI 更懂你」—— 一条龙引导:盘点 → 配模型 → 归类 → 图谱 → 索引 → 进对话。
+ *
+ * 全程复用既有命令(零新后端轮子):
+ *   盘点  fc.scanFolders / fc.inventoryStart(fable:inventory)
+ *   归类  fc.clusterLlm(AI 读清单分主题, file:cluster_llm) ‖ fc.clusterBuild(离线词法)
+ *   索引  fc.indexStart(后台向量索引, fable:index)
+ *   画像  fc.profileHtml(确定性桌面 HTML)
+ * 收尾据文件构成给「建议工作流」卡片,点一下带着任务跳进对话框。
+ */
+import { ref, reactive, computed, onBeforeUnmount, defineAsyncComponent } from "vue";
+import {
+  Sparkles,
+  FolderSearch,
+  Wand2,
+  Radar,
+  Orbit,
+  X,
+  Check,
+  KeyRound,
+  Brain,
+  FileText,
+  LoaderCircle,
+  ChevronRight,
+  Layers,
+  Folder,
+} from "@lucide/vue";
+import {
+  files as fc,
+  artifacts as artifactsApi,
+  listen,
+  invoke,
+  openUrl,
+  type ScanRootInfo,
+  type FileOverview,
+} from "../tauri";
+import { useAppStore } from "../stores/app";
+import { useWorkflowsStore } from "../stores/workflows";
+import { useWizardStore } from "../stores/wizard";
+import { useFileTasksStore } from "../stores/fileTasks";
+// 星河图谱依赖 cytoscape(~562KB),只在「知识图谱」步骤(v-if 网住)才渲染 → 按需加载。
+const KnowledgeGraph = defineAsyncComponent(() => import("./KnowledgeGraph.vue"));
+
+const app = useAppStore();
+const workflows = useWorkflowsStore();
+const wiz = useWizardStore();
+const tasks = useFileTasksStore();
+
+type Step = "intro" | "scope" | "scan" | "model" | "organize" | "graph" | "finish";
+const STEPS: { key: Step; label: string }[] = [
+  { key: "scope", label: "盘点范围" },
+  { key: "scan", label: "全盘扫描" },
+  { key: "model", label: "配模型" },
+  { key: "organize", label: "智能归类" },
+  { key: "graph", label: "知识图谱" },
+  { key: "finish", label: "进对话" },
+];
+const step = ref<Step>("intro");
+const stepIndex = computed(() => STEPS.findIndex((s) => s.key === step.value));
+
+// ── 盘点范围 ──
+const roots = ref<ScanRootInfo[]>([]);
+const loadingRoots = ref(false);
+const rootsErr = ref("");
+const uncheckedRoots = reactive(new Set<string>());
+const excludeKeywords = ref("");
+function loadRoots() {
+  loadingRoots.value = true;
+  rootsErr.value = "";
+  fc.scanFolders(null)
+    .then((r) => {
+      roots.value = r.roots;
+      uncheckedRoots.clear();
+      // 默认全勾(后端现在「一个不落」把所有盘/卷 defaultOn=true);只把 defaultOn=false 的预置为不勾。
+      for (const x of r.roots) if (!x.defaultOn) uncheckedRoots.add(x.path);
+    })
+    .catch((e: any) => (rootsErr.value = `扫描失败:${e?.message ?? e}`))
+    .finally(() => (loadingRoots.value = false));
+}
+const keywordList = computed(() =>
+  excludeKeywords.value
+    .split(/[,，;；\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+);
+function matchesKeyword(r: ScanRootInfo): boolean {
+  if (!keywordList.value.length) return false;
+  const hay = (r.path + " " + r.label).toLowerCase();
+  return keywordList.value.some((k) => hay.includes(k));
+}
+function isRootOn(r: ScanRootInfo): boolean {
+  return !uncheckedRoots.has(r.path) && !matchesKeyword(r);
+}
+function toggleRoot(r: ScanRootInfo) {
+  if (uncheckedRoots.has(r.path)) uncheckedRoots.delete(r.path);
+  else uncheckedRoots.add(r.path);
+}
+function selectAll(on: boolean) {
+  uncheckedRoots.clear();
+  if (!on) for (const r of roots.value) uncheckedRoots.add(r.path);
+}
+const selectedRoots = computed(() => roots.value.filter(isRootOn).map((r) => r.path));
+
+// ── 扫描 ──
+const scanFiles = ref(0);
+const scanMsg = ref("");
+let unScan: (() => void) | null = null;
+async function startScan() {
+  step.value = "scan";
+  scanFiles.value = 0;
+  scanMsg.value = "正在扫描你电脑上的文件…";
+  try {
+    if (!unScan) {
+      unScan = await listen<{ kind: string; files?: number; message?: string }>(
+        "fable:inventory",
+        (p) => {
+          if (p.kind === "progress") {
+            scanFiles.value = p.files ?? 0;
+            scanMsg.value = `已扫描 ${scanFiles.value.toLocaleString()} 个文件…`;
+          } else if (p.kind === "done") {
+            scanFiles.value = p.files ?? scanFiles.value;
+            scanMsg.value = `扫描完成 · 共 ${scanFiles.value.toLocaleString()} 个文件`;
+            void afterScan();
+          } else if (p.kind === "error") {
+            scanMsg.value = `扫描失败:${p.message ?? ""}`;
+          }
+        },
+      );
+    }
+    // 托管全局任务 store(全局任务中心可见 + 后台跑);向导自身的 fable:inventory 监听仍负责推进步骤。
+    await tasks.startInventory(selectedRoots.value, []);
+  } catch (e: any) {
+    scanMsg.value = `扫描失败:${e?.message ?? e}`;
+  }
+}
+async function afterScan() {
+  await loadOverview();
+  await loadSense();
+  step.value = "model";
+}
+
+// ── 总览 ──
+const overview = ref<FileOverview | null>(null);
+async function loadOverview() {
+  try {
+    overview.value = await fc.overview(null);
+  } catch {
+    overview.value = null;
+  }
+}
+
+// ── 模型 / 归类方式 ──
+const mode = ref<"ai" | "offline">("ai");
+function goConfigEmbed() {
+  app.setView("sense_api");
+  wiz.closeWizard();
+}
+
+// ── 前置「寓言计划」感官模型配置:嵌入 key(决定语义聚类/检索质量)+ 本地模型下载 ──
+interface SenseProv {
+  id: string;
+  name: string;
+  kind: string;
+  key_ready: boolean;
+  enabled: boolean;
+  get_key_url: string;
+  installed: boolean;
+  pack_id: string | null;
+  free: boolean;
+}
+const embedProv = ref<SenseProv | null>(null);
+const localPacks = ref<SenseProv[]>([]);
+const embedKey = ref("");
+const embedSaving = ref(false);
+const embedMsg = ref("");
+const packPct = reactive<Record<string, number>>({});
+let unPack: (() => void) | null = null;
+async function loadSense() {
+  try {
+    const ov: any = await invoke("sense_list");
+    const provs: SenseProv[] = (ov.groups || []).flatMap((g: any) => g.providers || []);
+    embedProv.value = provs.find((p) => p.id === "siliconflow-embed") ?? null;
+    localPacks.value = provs.filter((p) => p.kind === "local");
+  } catch {
+    /* 浏览器/降级模式忽略 */
+  }
+}
+async function saveEmbedKey() {
+  if (!embedProv.value || embedSaving.value || !embedKey.value.trim()) return;
+  embedSaving.value = true;
+  embedMsg.value = "";
+  try {
+    await invoke("sense_set", { id: embedProv.value.id, apiKey: embedKey.value.trim(), enabled: true });
+    embedKey.value = "";
+    await loadSense();
+    await loadOverview();
+    embedMsg.value = embedProv.value?.key_ready ? "已配置 ✓ 语义检索就绪" : "已保存";
+  } catch (e: any) {
+    embedMsg.value = `保存失败:${e?.message ?? e}`;
+  } finally {
+    embedSaving.value = false;
+  }
+}
+async function downloadPack(p: SenseProv) {
+  if (!p.pack_id) return;
+  if (!unPack) {
+    unPack = await listen<{ id: string; kind: string; pct?: number; message?: string }>(
+      "sense:pack",
+      (ev) => {
+        if (ev.kind === "progress" || ev.kind === "phase") {
+          packPct[ev.id] = ev.pct ?? packPct[ev.id] ?? 0;
+        } else {
+          delete packPct[ev.id];
+          void loadSense();
+        }
+      },
+    );
+  }
+  packPct[p.pack_id] = 0;
+  invoke("sense_pack_install", { id: p.pack_id }).catch(() => {
+    if (p.pack_id) delete packPct[p.pack_id];
+  });
+}
+function openKeyUrl() {
+  if (embedProv.value?.get_key_url) openUrl(embedProv.value.get_key_url).catch(() => {});
+}
+
+// ── 归类 ──
+const organizing = ref(false);
+const organizeMsg = ref("");
+const reportPath = ref("");
+let unLlm: (() => void) | null = null;
+let unCluster: (() => void) | null = null;
+// 离线词法归类:file_cluster_build 现为后台事件式(fire-and-forget),进度/完成走 file:cluster
+// 事件(phase/done/error)。必须等 done 再进图谱,否则聚类还没落库、星图会是空的。
+async function runOfflineCluster() {
+  if (!unCluster) {
+    unCluster = await listen<{ kind: string; text?: string; note?: string; message?: string }>(
+      "file:cluster",
+      (p) => {
+        if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
+        else if (p.kind === "done") {
+          organizeMsg.value = p.note ?? "归类完成";
+          void afterOrganize();
+        } else if (p.kind === "error") {
+          organizeMsg.value = `归类失败:${p.message ?? ""}`;
+          organizing.value = false;
+        }
+      },
+    );
+  }
+  await fc.clusterBuild(null);
+}
+async function startOrganize() {
+  step.value = "organize";
+  organizing.value = true;
+  reportPath.value = "";
+  if (mode.value === "offline") {
+    organizeMsg.value = "正在按文件夹 / 名称离线归类(无需联网)…";
+    try {
+      await runOfflineCluster();
+    } catch (e: any) {
+      organizeMsg.value = `归类失败:${e?.message ?? e}`;
+      organizing.value = false;
+    }
+    return;
+  }
+  // AI 语义归类:大模型读文件清单 → 分两级主题(免嵌入 key,走对话模型)。
+  organizeMsg.value = "正在用 AI 读你的文件清单、分主题…";
+  try {
+    if (!unLlm) {
+      unLlm = await listen<{ kind: string; text?: string; report?: string; message?: string }>(
+        "file:cluster_llm",
+        (p) => {
+          if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
+          else if (p.kind === "done") {
+            reportPath.value = p.report ?? "";
+            void afterOrganize();
+          } else if (p.kind === "error") {
+            // AI 失败 → 自动回落离线词法,绝不卡住引导。
+            organizeMsg.value = "AI 归类暂不可用,改用离线归类…";
+            runOfflineCluster().catch((e: any) => {
+              organizeMsg.value = `归类失败:${e?.message ?? e}`;
+              organizing.value = false;
+            });
+          }
+        },
+      );
+    }
+    await fc.clusterLlm(null);
+  } catch (e: any) {
+    organizeMsg.value = `归类失败:${e?.message ?? e}`;
+    organizing.value = false;
+  }
+}
+async function afterOrganize() {
+  await loadOverview();
+  organizing.value = false;
+  step.value = "graph";
+}
+
+// ── 知识图谱:复用 KnowledgeGraph.vue 的星河渲染(source=files),数据来自后端 file_graph ──
+const topThemeCount = computed(() => (overview.value?.clusters ?? []).filter((c) => c.parent === 0).length);
+
+// ── 收尾:后台建索引 + 生成桌面画像 + 推荐工作流 ──
+const finishing = ref(false);
+const profilePath = ref("");
+const indexKicked = ref(false);
+async function finishUp() {
+  step.value = "finish";
+  finishing.value = true;
+  // 1) 后台建向量索引,托管全局任务 store(全局任务中心可见 + 关掉向导/切界面照常后台跑)。
+  tasks.startIndex().then(() => (indexKicked.value = true)).catch(() => {});
+  // 2) 确定性生成桌面画像(秒级,不调大模型)。
+  try {
+    profilePath.value = await fc.profileHtml(null);
+  } catch {
+    profilePath.value = "";
+  }
+  finishing.value = false;
+}
+function openProfile() {
+  if (profilePath.value) artifactsApi.openExternal(profilePath.value).catch(() => {});
+}
+
+interface FlowCard {
+  title: string;
+  prompt: string;
+}
+const suggested = computed<FlowCard[]>(() => {
+  const ov = overview.value;
+  if (!ov) return [];
+  const cnt = (k: string) => ov.byKind.find((x) => x.kind === k)?.count ?? 0;
+  const out: FlowCard[] = [];
+  if (cnt("video") >= 5)
+    out.push({
+      title: "把影视素材做成作品集",
+      prompt:
+        "我电脑里有不少视频素材(已盘点进文件中心)。请帮我从中挑出代表作,配上简介与封面思路,生成一个可分享的作品集网页。先列出你打算收录哪些、为什么。",
+    });
+  if (cnt("doc") + cnt("text") >= 8)
+    out.push({
+      title: "为我的文档写一篇结构化总结",
+      prompt:
+        "我的文档/资料已经盘点进知识库。请沿知识库通读后,按主题归纳要点、待办与关键结论,产出一份结构化总览(Markdown)。",
+    });
+  if (cnt("image") >= 20)
+    out.push({
+      title: "整理图片成图集",
+      prompt: "我有很多图片已盘点进文件中心。请按场景/时间帮我归类,挑出精选,排成一个图集页面。",
+    });
+  if (cnt("audio") >= 3)
+    out.push({
+      title: "把录音转写并归档",
+      prompt: "我有一些录音/音频已盘点进文件中心。请帮我规划把它们转写成文字、提炼摘要并沉淀进知识库的流程。",
+    });
+  if (!out.length)
+    out.push({
+      title: "从一个问题开始",
+      prompt: "看了我的文件,你觉得我最近在忙什么?请基于知识库给我三条具体的下一步建议。",
+    });
+  return out;
+});
+function useFlow(f: FlowCard) {
+  app.setView("chat");
+  // ChatPanel 挂载后其 insertRequest watch 才生效,稍延迟再注入。
+  window.setTimeout(() => workflows.insertText(f.prompt), 180);
+  finishDone();
+}
+
+// ── 生命周期 ──
+function begin() {
+  step.value = "scope";
+  loadRoots();
+}
+// 转入后台 / X / 点遮罩:只隐藏浮层,**不动 step**,后台扫描/归类继续 —— 回来还在原地。
+function close() {
+  wiz.closeWizard();
+}
+// 「完成」/进对话:一段流程收尾,下次打开从头开始。
+function finishDone() {
+  wiz.closeWizard();
+  step.value = "intro";
+}
+// 长任务进行中(扫描/归类),给「转入后台」一个更明确的语义入口。
+const inLongStep = computed(() => step.value === "scan" || step.value === "organize");
+// 整个组件常驻 App,不随视图切换卸载;onBeforeUnmount 基本只在 App 退出时触发。
+onBeforeUnmount(() => {
+  if (unScan) unScan();
+  if (unLlm) unLlm();
+  if (unCluster) unCluster();
+  if (unPack) unPack();
+});
+</script>
+
+<template>
+  <transition name="wiz-fade">
+    <div v-show="wiz.open" class="wiz-scrim" @click.self="close">
+      <div class="wiz glass" :class="{ big: step === 'graph' }">
+        <button class="wiz-x" :title="inLongStep ? '转入后台(任务继续跑)' : '关闭'" @click="close"><X :size="17" :stroke-width="2" /></button>
+
+        <!-- 进度条(intro 不显示) -->
+        <div v-if="step !== 'intro'" class="wiz-steps">
+          <div
+            v-for="(s, i) in STEPS"
+            :key="s.key"
+            class="ws"
+            :class="{ on: i === stepIndex, done: i < stepIndex }"
+          >
+            <span class="ws-dot"><Check v-if="i < stepIndex" :size="11" :stroke-width="3" /><template v-else>{{ i + 1 }}</template></span>
+            <span class="ws-lab">{{ s.label }}</span>
+          </div>
+        </div>
+
+        <!-- 0 · 欢迎 -->
+        <div v-if="step === 'intro'" class="wiz-body intro">
+          <div class="intro-orb"><Sparkles :size="34" :stroke-width="1.3" /></div>
+          <h2>让 AI 更懂你</h2>
+          <p class="intro-sub">
+            三步、几分钟,把你电脑里的文件盘点一遍,自动归类成知识图谱,
+            建好可搜索的索引 —— 之后 AI 就能沿着你的资料替你干活。
+          </p>
+          <ol class="intro-flow">
+            <li><FolderSearch :size="15" :stroke-width="1.7" /> 全盘扫描:一个文件都不落下</li>
+            <li><Wand2 :size="15" :stroke-width="1.7" /> 智能归类:自动分主题、画图谱</li>
+            <li><Radar :size="15" :stroke-width="1.7" /> 建索引 + 进对话:让 AI 懂你想干的事</li>
+          </ol>
+          <button class="wiz-go" @click="begin"><Sparkles :size="16" :stroke-width="1.8" /> 开始</button>
+        </div>
+
+        <!-- 1 · 盘点范围 -->
+        <div v-else-if="step === 'scope'" class="wiz-body">
+          <h3 class="wiz-h">选择要盘点的范围</h3>
+          <p class="wiz-tip">
+            已<b>默认全选</b>你电脑上所有可访问的盘 / 目录(系统、缓存目录会自动跳过)。
+            想缩小范围就取消勾选,或在下方填关键词排除。
+          </p>
+          <div v-if="loadingRoots" class="wiz-loading"><LoaderCircle :size="18" class="spin" /> 正在列出可盘点的盘…</div>
+          <div v-else-if="rootsErr" class="wiz-err">{{ rootsErr }}</div>
+          <template v-else>
+            <div class="root-tools">
+              <button class="mini" @click="selectAll(true)">全选</button>
+              <button class="mini" @click="selectAll(false)">全不选</button>
+              <input v-model="excludeKeywords" class="kw" placeholder="排除含这些词的目录(逗号分隔,如 备份, temp)" />
+            </div>
+            <div class="root-list">
+              <button
+                v-for="r in roots"
+                :key="r.path"
+                class="root-row"
+                :class="{ off: !isRootOn(r) }"
+                @click="toggleRoot(r)"
+              >
+                <span class="root-check" :class="{ on: isRootOn(r) }"><Check v-if="isRootOn(r)" :size="12" :stroke-width="2.6" /></span>
+                <Layers v-if="r.defaultOn" :size="15" :stroke-width="1.7" class="root-ic" />
+                <Folder v-else :size="15" :stroke-width="1.7" class="root-ic" />
+                <span class="root-name">{{ r.label }}</span>
+                <span class="root-path">{{ r.path }}</span>
+              </button>
+            </div>
+            <p class="wiz-fine">
+              想逐个文件夹精挑?盘点后到「文件中心 · 盘点」里还能更细地选。
+            </p>
+          </template>
+          <div class="wiz-foot">
+            <span class="foot-count">已选 <b>{{ selectedRoots.length }}</b> 个范围</span>
+            <button class="wiz-go" :disabled="loadingRoots || !selectedRoots.length" @click="startScan">
+              <FolderSearch :size="15" :stroke-width="1.8" /> 开始盘点
+            </button>
+          </div>
+        </div>
+
+        <!-- 2 · 扫描中 -->
+        <div v-else-if="step === 'scan'" class="wiz-body center">
+          <div class="scan-orb"><FolderSearch :size="30" :stroke-width="1.3" /><div class="scan-ring" /></div>
+          <div class="scan-num">{{ scanFiles.toLocaleString() }}</div>
+          <div class="scan-lab">{{ scanMsg }}</div>
+          <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
+          <div class="scan-fine">扫描在后台继续,可最小化窗口或去用别的功能;扫完再点「智能向导」回来。</div>
+        </div>
+
+        <!-- 3 · 配模型 -->
+        <div v-else-if="step === 'model'" class="wiz-body">
+          <h3 class="wiz-h">让 AI 怎么理解你的文件</h3>
+          <p class="wiz-tip">扫到 <b>{{ (overview?.totalFiles ?? 0).toLocaleString() }}</b> 个文件。选一种归类方式,马上分主题、画图谱。</p>
+          <div class="mode-cards">
+            <button class="mode-card" :class="{ on: mode === 'ai' }" @click="mode = 'ai'">
+              <Brain :size="20" :stroke-width="1.6" />
+              <span class="mc-t">AI 语义归类 <em>推荐</em></span>
+              <span class="mc-d">用已连接的对话大模型读文件清单,按内容主题分两级。免嵌入 key,几分钟出结果。</span>
+            </button>
+            <button class="mode-card" :class="{ on: mode === 'offline' }" @click="mode = 'offline'">
+              <Wand2 :size="20" :stroke-width="1.6" />
+              <span class="mc-t">离线快速</span>
+              <span class="mc-d">按文件夹 / 名称就地归类,不联网、秒出。之后随时能升级成 AI 归类。</span>
+            </button>
+          </div>
+          <!-- 前置「寓言计划」感官模型:嵌入 key + 本地模型,决定语义聚类与检索质量 -->
+          <div class="sense-box">
+            <div class="sense-head">
+              <Radar :size="14" :stroke-width="1.7" />
+              <b>配模型(强烈建议)</b>
+              <button class="sense-more" title="打开完整的「寓言计划 · 感官 API」设置页" @click="goConfigEmbed">完整设置↗</button>
+              <span v-if="overview?.hasEmbedProvider" class="sense-ok"><Check :size="12" :stroke-width="2.6" /> 嵌入已就绪</span>
+              <span v-else class="sense-warn">不配只能按文件名粗分 · 语义聚类 / 检索效果差很多</span>
+            </div>
+            <!-- 嵌入 key(硅基 BGE-M3,免费):语义聚类 + 向量检索的关键 -->
+            <div v-if="embedProv" class="sense-row">
+              <span class="sr-name">
+                <span class="sr-dot" :class="{ on: embedProv.key_ready }" />
+                {{ embedProv.name }}<em v-if="embedProv.free">免费</em>
+              </span>
+              <template v-if="embedProv.key_ready">
+                <span class="sr-ready"><Check :size="12" :stroke-width="2.6" /> 已配置</span>
+              </template>
+              <template v-else>
+                <input v-model="embedKey" type="password" class="sr-key" placeholder="粘贴硅基流动 API Key(sk-…)" />
+                <button class="mini" @click="openKeyUrl"><KeyRound :size="12" :stroke-width="1.8" /> 获取 key↗</button>
+                <button class="mini key" :disabled="embedSaving || !embedKey.trim()" @click="saveEmbedKey">
+                  {{ embedSaving ? "保存中" : "保存" }}
+                </button>
+              </template>
+              <span v-if="embedMsg" class="sr-msg">{{ embedMsg }}</span>
+            </div>
+            <!-- 本地模型下载(转写音视频 → 内容可被聚类/检索)-->
+            <div v-for="p in localPacks" :key="p.id" class="sense-row">
+              <span class="sr-name">
+                <span class="sr-dot" :class="{ on: p.installed }" />
+                {{ p.name }}<em>本地</em>
+              </span>
+              <span v-if="p.installed" class="sr-ready"><Check :size="12" :stroke-width="2.6" /> 已下载</span>
+              <template v-else-if="p.pack_id && packPct[p.pack_id] !== undefined">
+                <span class="sr-prog"><span class="sr-fill" :style="{ width: packPct[p.pack_id] + '%' }" /></span>
+                <span class="sr-msg">{{ packPct[p.pack_id] }}%</span>
+              </template>
+              <button v-else class="mini" @click="downloadPack(p)"><FileText :size="12" :stroke-width="1.8" /> 下载模型</button>
+            </div>
+          </div>
+          <div class="wiz-foot end">
+            <button v-if="!overview?.hasEmbedProvider" class="wiz-go ghost bg" @click="startOrganize">先跳过,直接归类</button>
+            <button class="wiz-go" @click="startOrganize"><Wand2 :size="15" :stroke-width="1.8" /> 开始归类</button>
+          </div>
+        </div>
+
+        <!-- 4 · 归类中 -->
+        <div v-else-if="step === 'organize'" class="wiz-body center">
+          <div class="scan-orb"><Wand2 :size="28" :stroke-width="1.3" /><div class="scan-ring" /></div>
+          <div class="scan-lab big">{{ organizeMsg }}</div>
+          <div class="scan-fine">AI 正在读你的文件清单分主题,稍候…</div>
+          <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
+        </div>
+
+        <!-- 5 · 知识图谱 -->
+        <div v-else-if="step === 'graph'" class="wiz-body">
+          <h3 class="wiz-h"><Orbit :size="16" :stroke-width="1.7" /> 这是 AI 眼里的你</h3>
+          <p class="wiz-tip">把你的文件归成了 <b>{{ topThemeCount }}</b> 个大主题。拖一拖、缩放看看,点「继续」我会后台建好检索索引,带你进对话。</p>
+          <div class="graph-wrap">
+            <KnowledgeGraph source="files" :embedded="true" />
+          </div>
+          <div class="wiz-foot end">
+            <button v-if="reportPath" class="mini" @click="artifactsApi.openExternal(reportPath).catch(() => {})"><FileText :size="12" :stroke-width="1.8" /> 看归类报告</button>
+            <button class="wiz-go" @click="finishUp"><ChevronRight :size="15" :stroke-width="1.8" /> 继续:建索引 & 进对话</button>
+          </div>
+        </div>
+
+        <!-- 6 · 收尾 -->
+        <div v-else-if="step === 'finish'" class="wiz-body">
+          <h3 class="wiz-h"><Sparkles :size="16" :stroke-width="1.7" /> 全部就绪 · AI 已经懂你了</h3>
+          <p class="wiz-tip">
+            向量 / 全文索引正在<b>后台</b>建(可以放着不管)。已在桌面生成你的「知识画像」。
+            挑一个我能立刻替你做的事开始吧:
+          </p>
+          <div class="flow-cards">
+            <button v-for="(f, i) in suggested" :key="i" class="flow-card" @click="useFlow(f)">
+              <span class="fc-t">{{ f.title }}</span>
+              <ChevronRight :size="15" :stroke-width="1.8" class="fc-arr" />
+            </button>
+          </div>
+          <div class="finish-row">
+            <button class="mini" :disabled="!profilePath" @click="openProfile"><FileText :size="12" :stroke-width="1.8" /> 打开桌面画像</button>
+            <span v-if="finishing" class="fine-busy"><LoaderCircle :size="12" class="spin" /> 生成画像中…</span>
+            <span v-else-if="profilePath" class="fine-ok"><Check :size="12" :stroke-width="2.4" /> 画像已存桌面</span>
+          </div>
+          <div class="wiz-foot end">
+            <button class="wiz-go ghost" @click="finishDone">完成</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </transition>
+</template>
+
+<style scoped>
+.wiz-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 62%, transparent);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  padding: 24px;
+}
+.glass {
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+  -webkit-backdrop-filter: blur(26px) saturate(1.5);
+  backdrop-filter: blur(26px) saturate(1.5);
+  border: 1px solid var(--border-soft);
+  border-radius: 18px;
+}
+.wiz {
+  position: relative;
+  width: min(1040px, 94vw);
+  max-height: 92vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-lg, 0 24px 80px rgba(0, 0, 0, 0.4));
+  transition: width 0.2s ease;
+}
+/* 知识图谱步:整块放大成「大屏」,星图铺满更震撼 */
+.wiz.big { width: min(1280px, 97vw); }
+.wiz-x {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 3;
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 8px;
+}
+.wiz-x:hover { color: var(--text); background: var(--selection-bg); }
+
+/* 步骤条 */
+.wiz-steps {
+  display: flex;
+  gap: 4px;
+  padding: 16px 22px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  overflow-x: auto;
+}
+.ws { display: flex; align-items: center; gap: 7px; padding: 0 10px 0 0; opacity: 0.5; flex: none; }
+.ws.on, .ws.done { opacity: 1; }
+.ws-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  font-size: 11px;
+  color: var(--muted);
+  flex: none;
+}
+.ws.on .ws-dot { background: var(--primary); border-color: var(--primary); color: #fff; }
+.ws.done .ws-dot { background: color-mix(in srgb, var(--primary) 22%, transparent); border-color: var(--primary); color: var(--primary); }
+.ws-lab { font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.ws.on .ws-lab { color: var(--text); font-weight: 600; }
+
+/* 主体 */
+.wiz-body { padding: 22px 26px 24px; overflow-y: auto; }
+.wiz-body.center { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; min-height: 320px; gap: 14px; }
+.wiz-h { display: flex; align-items: center; gap: 8px; font-size: 16px; margin: 0 0 8px; color: var(--ink); }
+.wiz-tip { font-size: 13px; color: var(--muted); line-height: 1.6; margin: 0 0 16px; }
+.wiz-tip b, .wiz-fine b { color: var(--text); }
+.wiz-fine { font-size: 12px; color: var(--dim); margin: 10px 0 0; }
+.wiz-loading, .wiz-err { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); padding: 20px 0; }
+.wiz-err { color: var(--danger, #e0736b); }
+
+/* 欢迎 */
+.intro { text-align: center; }
+.intro-orb {
+  width: 76px; height: 76px; margin: 6px auto 14px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; color: var(--gold);
+  background: radial-gradient(circle, color-mix(in srgb, var(--gold) 22%, transparent), transparent 70%);
+}
+.intro h2 { font-family: var(--serif); font-size: 24px; margin: 0 0 10px; letter-spacing: 1px; color: var(--ink); }
+.intro-sub { font-size: 13.5px; color: var(--muted); line-height: 1.7; max-width: 520px; margin: 0 auto 20px; }
+.intro-flow { list-style: none; margin: 0 auto 24px; padding: 0; max-width: 380px; text-align: left; display: flex; flex-direction: column; gap: 11px; }
+.intro-flow li { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-2); }
+.intro-flow li :deep(svg) { color: var(--primary); flex: none; }
+
+/* 按钮 */
+.wiz-go {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 38px; padding: 0 20px;
+  border: 1px solid var(--primary);
+  background: var(--primary); color: #fff;
+  border-radius: 10px; font-size: 13.5px; cursor: pointer;
+  transition: filter 0.16s, opacity 0.16s;
+}
+.wiz-go:hover:not(:disabled) { filter: brightness(1.08); }
+.wiz-go:disabled { opacity: 0.5; cursor: default; }
+.wiz-go.ghost { background: transparent; color: var(--text); border-color: var(--border-strong); }
+.wiz-go.bg { height: 32px; font-size: 12.5px; margin-top: 6px; color: var(--text-2); }
+.wiz-go.bg:hover { color: var(--text); }
+.mini {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 28px; padding: 0 11px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+  color: var(--text-2); border-radius: 8px; font-size: 12px; cursor: pointer;
+}
+.mini:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.mini:disabled { opacity: 0.5; cursor: default; }
+.mini.key { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 40%, transparent); }
+
+/* 盘点范围 */
+.root-tools { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.kw {
+  flex: 1; min-width: 200px; height: 30px; padding: 0 11px;
+  border: 1px solid var(--border-soft); border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text); font-size: 12.5px;
+}
+.kw:focus { outline: none; border-color: var(--primary); }
+.root-list { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.root-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 11px; border-radius: 9px;
+  border: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--panel) 45%, transparent);
+  cursor: pointer; text-align: left; width: 100%;
+  transition: border-color 0.14s, opacity 0.14s;
+}
+.root-row:hover { border-color: var(--border-strong); }
+.root-row.off { opacity: 0.42; }
+.root-check {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 5px; flex: none;
+  border: 1.5px solid var(--border-strong); color: #fff;
+}
+.root-check.on { background: var(--primary); border-color: var(--primary); }
+.root-ic { color: var(--muted); flex: none; }
+.root-name { font-size: 13px; color: var(--text); flex: none; }
+.root-path { font-size: 11px; color: var(--dim); font-family: ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.wiz-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 20px; }
+.wiz-foot.end { justify-content: flex-end; }
+.foot-count { font-size: 12.5px; color: var(--muted); }
+.foot-count b { color: var(--text); }
+
+/* 扫描 / 归类动画 */
+.scan-orb { position: relative; width: 84px; height: 84px; display: flex; align-items: center; justify-content: center; color: var(--primary); }
+.scan-ring { position: absolute; inset: 0; border: 2px solid color-mix(in srgb, var(--primary) 40%, transparent); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+.scan-num { font-size: 34px; font-weight: 680; font-variant-numeric: tabular-nums; color: var(--ink); }
+.scan-lab { font-size: 13px; color: var(--muted); }
+.scan-lab.big { font-size: 14px; color: var(--text); }
+.scan-fine { font-size: 12px; color: var(--dim); }
+
+/* 模型卡 */
+.mode-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.mode-card {
+  display: flex; flex-direction: column; gap: 6px; text-align: left;
+  padding: 16px; border-radius: 13px; cursor: pointer;
+  border: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel) 45%, transparent);
+  color: var(--text-2); transition: border-color 0.14s, background 0.14s;
+}
+.mode-card:hover { border-color: var(--border-strong); }
+.mode-card.on { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 8%, transparent); }
+.mode-card :deep(svg) { color: var(--primary); }
+.mc-t { font-size: 14px; font-weight: 620; color: var(--ink); display: flex; align-items: center; gap: 7px; }
+.mc-t em { font-style: normal; font-size: 10.5px; color: #fff; background: var(--primary); padding: 1px 7px; border-radius: 99px; }
+.mc-d { font-size: 12px; color: var(--muted); line-height: 1.55; }
+.embed-note {
+  display: flex; align-items: center; gap: 9px; margin-top: 16px;
+  padding: 11px 14px; border-radius: 11px; font-size: 12.5px; color: var(--text-2);
+  background: color-mix(in srgb, var(--primary) 6%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, transparent);
+}
+.embed-note :deep(svg) { color: var(--primary); flex: none; }
+.embed-note span { flex: 1; line-height: 1.5; }
+.embed-note b { color: var(--text); }
+
+/* 前置感官模型配置 */
+.sense-box {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 50%, transparent);
+  border: 1px solid var(--border-soft);
+}
+.sense-head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--text); margin-bottom: 10px;
+}
+.sense-head :deep(svg) { color: var(--primary); flex: none; }
+.sense-more { border: none; background: transparent; color: var(--primary); font-size: 11.5px; cursor: pointer; padding: 0; }
+.sense-more:hover { text-decoration: underline; }
+.sense-warn {
+  margin-left: auto; font-size: 11.5px; color: #e0736b;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.sense-ok {
+  margin-left: auto; font-size: 11.5px; color: #6fcf97;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.sense-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 7px 0; border-top: 1px solid var(--border-soft);
+}
+.sr-name {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: var(--text); min-width: 150px;
+}
+.sr-name em { font-style: normal; font-size: 10px; color: var(--primary); border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent); border-radius: 99px; padding: 0 6px; margin-left: 4px; }
+.sr-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border-strong); flex: none; }
+.sr-dot.on { background: #6fcf97; box-shadow: 0 0 6px #6fcf97; }
+.sr-key {
+  flex: 1; min-width: 200px; height: 30px; padding: 0 11px;
+  border: 1px solid var(--border-soft); border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 60%, transparent); color: var(--text); font-size: 12.5px;
+}
+.sr-key:focus { outline: none; border-color: var(--primary); }
+.sr-ready { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #6fcf97; }
+.sr-msg { font-size: 11.5px; color: var(--muted); }
+.sr-prog { flex: 1; min-width: 120px; height: 6px; background: color-mix(in srgb, var(--panel) 80%, transparent); border-radius: 99px; overflow: hidden; }
+.sr-fill { display: block; height: 100%; background: var(--primary); border-radius: 99px; transition: width 0.3s; }
+
+/* 图谱:嵌入 KnowledgeGraph 星河,给定高度即可铺满。graph 步整块放大成「大屏」。 */
+.graph-wrap { position: relative; height: min(66vh, 640px); border-radius: 14px; overflow: hidden; border: 1px solid var(--border-soft); }
+.graph-wrap :deep(.graph) { height: 100%; }
+
+/* 收尾 */
+.flow-cards { display: flex; flex-direction: column; gap: 9px; }
+.flow-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 14px 16px; border-radius: 12px; cursor: pointer; width: 100%;
+  border: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel) 50%, transparent);
+  transition: border-color 0.14s, background 0.14s;
+}
+.flow-card:hover { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 7%, transparent); }
+.fc-t { font-size: 13.5px; color: var(--ink); font-weight: 560; }
+.fc-arr { color: var(--primary); flex: none; }
+.finish-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+.fine-busy, .fine-ok { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.fine-ok { color: var(--primary); }
+
+.spin { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.wiz-fade-enter-active, .wiz-fade-leave-active { transition: opacity 0.2s; }
+.wiz-fade-enter-from, .wiz-fade-leave-to { opacity: 0; }
+</style>

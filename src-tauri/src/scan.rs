@@ -102,8 +102,9 @@ fn roots_impl() -> Vec<ScanRoot> {
                     label: format!("{}: 盘", c as char),
                     path: drive.clone(),
                     kind: "drive".into(),
-                    // C/D 默认勾,其余(可能是 U 盘/光驱)默认不勾
-                    default_on: c == b'C' || c == b'D',
+                    // 「一个不落」:所有真实存在的盘符默认都勾上,用户想排除再手动取消。
+                    // (系统/缓存目录由 skip_dir_scan 整棵跳过,不会因此把 Windows 卷进来。)
+                    default_on: true,
                 });
             }
         }
@@ -140,7 +141,8 @@ fn roots_impl() -> Vec<ScanRoot> {
                         label: format!("卷 · {name}"),
                         path: p.to_string_lossy().to_string(),
                         kind: "volume".into(),
-                        default_on: false,
+                        // mac 外置卷 / 网络卷也默认勾上,跟盘符一视同仁(一个不落)。
+                        default_on: true,
                     });
                 }
             }
@@ -167,7 +169,8 @@ fn roots_impl() -> Vec<ScanRoot> {
                     label: format!("挂载 · {cand}"),
                     path: cand.into(),
                     kind: "mounted".into(),
-                    default_on: cand == "/root/Polaris/nas",
+                    // Docker / Linux:凡 bind 进来的卷都默认勾上(容器只看得到挂载进来的盘)。
+                    default_on: true,
                 });
             }
         }
