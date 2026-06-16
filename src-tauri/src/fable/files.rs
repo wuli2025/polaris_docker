@@ -138,27 +138,58 @@ pub struct FileOverview {
 }
 
 /// 把 root 参数解析成 root_id 过滤子句(None = 全部根)。
+///
+/// 「全部根」时只保留**极大根**——剔除嵌套在另一个根之下的根。盘点会把用户选过的每个
+/// 文件夹都各记成一个 root,日积月累常出现 `D:\` 与 `D:\polaris\...`、`C:\` 与
+/// `C:\Windows\System32` 这种父子并存。父根扫描时已把子根的文件全收过一遍,若把两边的
+/// 文件数/体积直接相加,同一批文件会被数 2~3 遍(实测把真实量抬成约 8 倍虚高)。只统计
+/// 极大根即可去重,且非破坏性(不动库,父根被删后子根自然重新参与)。
 fn resolve_root_ids(conn: &rusqlite::Connection, root: &Option<String>) -> Vec<i64> {
-    let mut ids = Vec::new();
-    let sql = if root.as_ref().map(|r| !r.trim().is_empty()).unwrap_or(false) {
-        "SELECT id FROM roots WHERE path=?1"
-    } else {
-        "SELECT id FROM roots"
-    };
-    if let Ok(mut stmt) = conn.prepare(sql) {
-        let map = |r: &rusqlite::Row| r.get::<_, i64>(0);
-        let rows = if sql.contains("?1") {
-            stmt.query_map([root.clone().unwrap_or_default()], map)
-        } else {
-            stmt.query_map([], map)
-        };
-        if let Ok(rows) = rows {
-            for id in rows.flatten() {
-                ids.push(id);
+    // 显式指定单根 → 精确匹配。
+    if let Some(r) = root.as_ref().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        let mut ids = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT id FROM roots WHERE path=?1") {
+            if let Ok(rows) = stmt.query_map([r], |row| row.get::<_, i64>(0)) {
+                ids.extend(rows.flatten());
             }
         }
+        return ids;
     }
-    ids
+    // 全部根 → 取极大根去重叠。
+    let mut all: Vec<(i64, String)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, path FROM roots") {
+        if let Ok(rows) =
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        {
+            all.extend(rows.flatten());
+        }
+    }
+    maximal_root_ids(&all)
+}
+
+/// 从 (id, path) 列表里挑出极大根:凡 path 嵌套在另一条 path 之下的都剔除。
+/// 拆成纯函数便于单测。Windows 路径不分大小写、分隔符统一成 `/` 再比。
+fn maximal_root_ids(all: &[(i64, String)]) -> Vec<i64> {
+    fn norm(p: &str) -> String {
+        let s = p.replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    }
+    let normed: Vec<(i64, String)> = all.iter().map(|(id, p)| (*id, norm(p))).collect();
+    normed
+        .iter()
+        .filter(|(id, p)| {
+            // 若存在另一条根 op 是 p 的祖先(p 以 "op/" 开头)→ p 是子根,剔除。
+            !normed.iter().any(|(oid, op)| {
+                oid != id && p.len() > op.len() && p.starts_with(&format!("{op}/"))
+            })
+        })
+        .map(|(id, _)| *id)
+        .collect()
 }
 
 /// IN (...) 子句 + 是否有效。空 = 不加过滤(全部)。
@@ -2309,6 +2340,38 @@ mod tests {
         assert_eq!(b64(b"Man"), "TWFu");
         assert_eq!(b64(b"Ma"), "TWE=");
         assert_eq!(b64(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn maximal_roots_drops_nested() {
+        // 还原线上那台机的真实根集合:D:\ 与 C:\ 之下各挂了一堆子根。
+        let all = vec![
+            (1, r"D:\polaris\polaris-app\src".to_string()),
+            (2, r"D:\polaris\专家团队".to_string()),
+            (3, r"C:\".to_string()),
+            (4, r"D:\polaris\polaris-app\src-tauri".to_string()),
+            (5, r"C:\Windows\System32".to_string()),
+            (6, r"D:\".to_string()),
+            (8, r"D:\polaris\polaris-app".to_string()),
+        ];
+        let mut keep = maximal_root_ids(&all);
+        keep.sort();
+        // 只剩两个极大根:C:\(3) 与 D:\(6);其余全是它们的子根。
+        assert_eq!(keep, vec![3, 6]);
+    }
+
+    #[test]
+    fn maximal_roots_keeps_siblings_and_prefix_lookalikes() {
+        // 同级、以及「前缀像但不是子目录」的根都要保留(D:\foo 不是 D:\foobar 的祖先)。
+        let all = vec![
+            (1, r"D:\foo".to_string()),
+            (2, r"D:\foobar".to_string()),
+            (3, r"E:\data".to_string()),
+            (4, r"D:\foo\child".to_string()),
+        ];
+        let mut keep = maximal_root_ids(&all);
+        keep.sort();
+        assert_eq!(keep, vec![1, 2, 3]); // 仅 D:\foo\child(4) 被剔除
     }
 
     #[test]

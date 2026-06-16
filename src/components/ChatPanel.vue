@@ -117,6 +117,9 @@ function openArtifact(path: string) {
 }
 
 const input = ref("");
+// 每个对话各自的未发送草稿:切走/切回都保留本对话的草稿,且绝不把 A 的半句话
+// 带进 B(全局单 ref 会串台、还可能误发到别的对话)。键用 convId,新对话(null)用 ""。
+const drafts = new Map<string, string>();
 // 多开：当前对话的气泡 / 运行态来自 chat store（按对话 id 维护，切走不丢、后台续流）
 const bubbles = computed(() => chatStore.bubblesFor(app.currentConvId));
 const sending = computed(() => chatStore.isSending(app.currentConvId));
@@ -876,7 +879,12 @@ async function retryHistory() {
 // 切换对话：加载该对话历史（运行中的对话不会被历史覆盖），滚到底
 watch(
   () => app.currentConvId,
-  async (cid) => {
+  async (cid, prev) => {
+    // 草稿按对话隔离:先存上一对话的草稿,再载入新对话的草稿(没有则空)。
+    drafts.set(prev ?? "", input.value);
+    input.value = drafts.get(cid ?? "") ?? "";
+    histIdx = -1; // 输入历史召回索引也跟着对话走,别串台
+    nextTick(autoGrow); // 草稿可能多行,水合后重算高度
     visibleLimit.value = FOLD_STEP;
     expandedTool.value = null;
     historyLoading.value = true;
@@ -934,8 +942,18 @@ async function send() {
   // 多开：只拦「当前对话」正在发送，不阻止在别的对话并行发起
   if ((!text && !hasAttach) || sending.value) return;
 
+  // 先清空输入/草稿,再 ensureConversation（它创建新对话会切换 currentConvId、
+  // 触发上面的草稿水合）—— 否则刚打的字会被当成新对话的草稿残留。失败再还回去。
+  drafts.delete(app.currentConvId ?? "");
+  input.value = "";
+  attachments.value = [];
+  histIdx = -1;
+
   const convId = await ensureConversation();
-  if (!convId) return;
+  if (!convId) {
+    input.value = text; // 创建对话失败:把文字还给用户,别让人白打一通
+    return;
+  }
 
   // 把附件绝对路径拼进 prompt，让 claude 能用 Read 等工具读取
   let prompt = text || "请查看我上传的附件。";
@@ -945,10 +963,6 @@ async function send() {
   }
 
   const display = text || "（仅附件）";
-
-  input.value = "";
-  attachments.value = [];
-  histIdx = -1;
 
   // 分批长任务：显式开关 或 启发式判定（「N 页/张/章」且 N ≥ 阈值）→ 走分批编排循环，
   // 先规划成清单再每轮只建一小批，断线从清单续跑，规避单轮过长把连接拖死。
@@ -1036,6 +1050,12 @@ function onKeydown(e: KeyboardEvent) {
         return;
       }
     }
+  }
+  // Esc 中断本轮生成 —— 对齐 CLI 肌肉记忆:不用挪鼠标去点停止按钮。
+  if (e.key === "Escape" && sending.value) {
+    e.preventDefault();
+    cancel();
+    return;
   }
   if (e.key !== "Enter") return;
   // Shift+Enter 仍然换行
@@ -1658,7 +1678,9 @@ async function deleteCurrentConv() {
           ref="inputEl"
           v-model="input"
           :placeholder="
-            goalMode
+            sending
+              ? '生成中 …（按 Esc 或点 ■ 停止本轮）'
+              : goalMode
               ? '目标模式：在此写下完成条件，Claude 会持续推进直到达成 (Enter 发送) …'
               : '请输入消息 (Enter 发送 · Shift + Enter 换行，可拖文件进来作为附件) …'
           "
@@ -1744,7 +1766,7 @@ async function deleteCurrentConv() {
             <button
               v-if="sending"
               class="send-btn stop"
-              title="停止"
+              title="停止 (Esc)"
               @click="cancel"
             >
               <Square :size="14" :stroke-width="2" fill="currentColor" />

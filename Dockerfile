@@ -79,12 +79,22 @@ RUN touch src-tauri/src/main.rs src-tauri/src/lib.rs \
 FROM node:20-slim AS runtime
 # claude CLI 跑 Bash/脚本工具需要：bash、git、python3(pptx/xlsx 等技能)、ripgrep、ca 证书。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash git ca-certificates curl python3 python3-pip python3-venv ripgrep \
+        bash git ca-certificates curl python3 python3-pip python3-venv python-is-python3 ripgrep \
         tini gosu \
     && rm -rf /var/lib/apt/lists/* \
     && npm config set registry https://registry.npmmirror.com \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
+
+# ── 预装 python-pptx + pypdf：PPTX 技能运行时直出真 .pptx，而非退化成 HTML 兜底 ──
+#   照「飞书桥」同款思路:构建期(Windows/CI 有网)就把包装好。
+#   运行时 NAS 容器出网受限,pptx.md 技能里的 `pip install python-pptx` 会超时失败
+#   → 现状只能走单文件 HTML 兜底,出不了真 .pptx。构建期预装即可消除这次联网。
+#   Debian bookworm 的 python3 是 externally-managed(PEP 668),需 --break-system-packages
+#   (与下方字体子集层 pip 用法一致);清华 TUNA 镜像主用,失败退默认源。
+RUN pip install --no-cache-dir --break-system-packages \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple python-pptx pypdf \
+    || pip install --no-cache-dir --break-system-packages python-pptx pypdf
 
 # ── 渲染栈(可选 flavor)——Polaris Forge 跨平台 PRD §05：容器「零安装」=渲染栈打进镜像 ──
 #   POLARIS_RENDER=0 → polaris:slim   现状(聊天/KB/网站生成，网站本就不需渲染栈)

@@ -17,6 +17,7 @@ pub mod forge_video;
 pub mod fable;
 pub mod infer;
 pub mod kb;
+pub mod palette;
 pub mod persona;
 pub mod expert;
 pub mod echo;
@@ -192,6 +193,8 @@ pub fn run() {
             expert::team_export,
             expert::expert_route_debug,
             expert::expert_recommend_from_kb,
+            // 色彩调配引擎 (全 app 配色唯一真源)
+            palette::palette_generate,
             // 飞书网关 (板块⑭ 阶段 A)
             feishu::feishu_get_config,
             feishu::feishu_set_config,

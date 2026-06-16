@@ -272,7 +272,7 @@ pub fn scan_root(
                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                     .map(|d| d.as_secs() as i64)
                                     .unwrap_or(0);
-                                let size = meta.len();
+                                let size = on_disk_size(&p, &meta);
                                 let total = n_files.fetch_add(1, Ordering::Relaxed) + 1;
                                 let bytes = n_bytes.fetch_add(size, Ordering::Relaxed) + size;
                                 let _ = tx.send(FileRow {
@@ -357,6 +357,41 @@ fn dunce_canonical(p: &Path) -> String {
     let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let s = c.to_string_lossy().into_owned();
     s.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or(s)
+}
+
+/// 文件「磁盘实占」字节数,而非 `metadata().len()` 报的逻辑大小。
+///
+/// 为什么必须用实占:稀疏文件(WSL/Docker 的 `*.vhdx`、虚拟机盘、测试用占位大文件)
+/// 的逻辑大小可达声称的几十 GB,但磁盘上几乎不占空间。照逻辑大小累加会让「总量」
+/// 虚高好几倍(实测一台机 D:\ 真实 371 GB 被算成 2.8 TB,光 60 个稀疏 .mkv 就虚报 2.3 TB)。
+/// NTFS 压缩卷同理——实占小于逻辑。这里统一取磁盘实占,口径才与资源管理器的「占用」一致。
+fn on_disk_size(path: &Path, meta: &std::fs::Metadata) -> u64 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut high: u32 = 0;
+        // SAFETY: wide 是以 NUL 结尾的合法宽字符串;high 是有效可写指针。
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        // INVALID_FILE_SIZE(0xFFFFFFFF)既可能是出错,也可能是合法低位 → 需查 GetLastError 区分。
+        if low == INVALID_FILE_SIZE {
+            let err = unsafe { GetLastError() };
+            if err != 0 {
+                return meta.len(); // 取不到实占(网络盘/权限)→ 保守回退逻辑大小
+            }
+        }
+        return ((high as u64) << 32) | (low as u64);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        return meta.blocks().saturating_mul(512);
+    }
+    #[allow(unreachable_code)]
+    meta.len()
 }
 
 // ───────────────────────── 命令(后台线程 + 事件)─────────────────────────
@@ -770,7 +805,7 @@ fn folder_size_rec(dir: &Path, files: &mut u64, bytes: &mut u64) {
             folder_size_rec(&entry.path(), files, bytes);
         } else if ft.is_file() {
             if let Ok(m) = entry.metadata() {
-                *bytes += m.len();
+                *bytes += on_disk_size(&entry.path(), &m);
                 *files += 1;
             }
         }

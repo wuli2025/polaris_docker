@@ -313,6 +313,26 @@ export const useAppStore = defineStore("app", () => {
     setView("chat");
   }
 
+  /** 按 id 找对话标题(任务中心给后台 AI 任务起可读名用);找不到返回空串。 */
+  function convTitle(convId: string | null): string {
+    if (!convId) return "";
+    for (const list of Object.values(conversationsByProject.value)) {
+      const c = list.find((x) => x.id === convId);
+      if (c) return c.title;
+    }
+    return "";
+  }
+  /** 按 id 跳转到某对话(任务中心点击后台任务用)。 */
+  function openConversationById(convId: string) {
+    for (const list of Object.values(conversationsByProject.value)) {
+      const c = list.find((x) => x.id === convId);
+      if (c) {
+        selectConversation(c);
+        return;
+      }
+    }
+  }
+
   return {
     // ui
     view,
@@ -351,5 +371,7 @@ export const useAppStore = defineStore("app", () => {
     archiveConversation,
     renameConversation,
     selectConversation,
+    convTitle,
+    openConversationById,
   };
 });

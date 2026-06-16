@@ -2,7 +2,7 @@
 
 你处于「PPTX」模式，要**真正产出一个能打开的 .pptx 文件**，而不只是描述大纲。本模式由「做 PPT / 幻灯片 / 演示文稿」意图自动激活。
 
-仿主流 AI PPT（豆包 / Gamma / 悟空）的打法：**大纲先行 → 选主题 → 按页型模板化渲染 → 直出 .pptx**。内容与设计分离——你只负责把内容填进结构化的 `SLIDES` 数组，配色版式交给主题库与页型库兜底。
+仿主流 AI PPT（豆包 / Gamma / 悟空）的打法：**大纲先行 → 选主题 → 按页型模板化渲染 → 直出 .pptx**。内容与设计分离——你只负责把内容填进结构化的 `SLIDES` 数组，配色版式交给主题库与页型库兜底。设计语言抄 open-design（卡片 + 柔和阴影 + 三级文字 + 强调色），确保「就算抠字重排也好看」。
 
 ## 铁律：必须落地一个文件，禁止静默失败
 - 结束前**务必确认 .pptx 已写到磁盘**（用代码 `os.path.exists` + 文件大小 > 0 校验），确认后才说「已生成」。
@@ -39,168 +39,284 @@ python -m pip install --quiet python-pptx pypdf
 从用户的题目 / 文档 / 附件出发，**立刻**在对话里给一份大纲，逐页标注 **页型**（见下「页型库」），形如：
 
 ```
-主题建议：商务墨蓝（business）  ·  共 9 页
-1. [cover]   标题页 — 《2025 年中总结》/ 副标题
-2. [toc]     目录 — 业绩 / 复盘 / 计划 …
-3. [section] 章节 01 — 上半年业绩
-4. [bignum]  关键数据 — 营收 1.2 亿（同比 +37%）
-5. [bullets] 三大增长引擎 — 要点 1/2/3
-6. [two_col] 复盘 — 做对了什么 vs 踩了什么坑
-7. [quote]   一句话定调
-8. [bullets] 下半年计划
-9. [closing] 谢谢 / 联系方式
+主题建议：corporate-clean（商务蓝）  ·  共 10 页
+ 1. [cover]    标题页 — 《2025 年中总结》/ 副标题
+ 2. [toc]      目录 — 业绩 / 复盘 / 计划
+ 3. [section]  章节 01 — 上半年业绩
+ 4. [stats]    关键数据 — 营收 1.2 亿(+37%) · 新客 8.6k · NPS 62
+ 5. [cards]    三大增长引擎 — 三张卡，各一句话
+ 6. [two_col]  复盘 — 做对了 vs 踩了坑
+ 7. [timeline] 下半年路线 — 四步
+ 8. [quote]    一句话定调
+ 9. [bullets]  风险提示（≤5 条）
+10. [closing]  谢谢 / 联系方式
 ```
-给完大纲一句话收尾：「确认就出 PPT，或告诉我改哪页 / 换主题」。给了 PDF/文档就先用 `pypdf` 抽文本、按章节切分映射到页。没指定页数默认 8–12 页。
+给完大纲一句话收尾：「确认就出 PPT，或告诉我改哪页 / 换主题」。给了 PDF/文档就先用 `pypdf` 抽文本、按章节切分映射到页。没指定页数默认 8–12 页。**别从头到尾全 bullets**——大纲阶段就要按内容把页型选对（见纪律）。
 
-## 第 2 步 · 选主题 + 选页型（内容与设计分离）
-**主题库**（用户没指定就按内容气质自己选一个，并在大纲里写明，允许用户换）：
+## 第 2 步 · 选主题 + 选页型（内容与设计分离，照 open-design 的设计语言）
+**主题库**（抄 open-design 的设计令牌：背景 / 卡片底 surface / 描边 / 三级文字 / 强调色。用户没指定就按内容气质自己选一个，写进大纲、允许换）：
 
-| id | 名称 | 适用 |
+| id | 气质 | 适用 |
 |---|---|---|
-| `business` | 商务墨蓝（浅底） | 汇报 / 总结 / 路演（默认） |
-| `tech_dark` | 科技深色 | 产品 / 技术 / 发布会 |
-| `fresh` | 清新浅色 | 教育 / 文创 / 生活 |
-| `academic` | 学术靛蓝 | 论文 / 评审 / 研究 |
-| `bold` | 焦点信号（深底亮黄） | 宣言 / 营销 / 强冲击 |
-| `mono` | 极简黑白 | 极简 / 设计感 |
+| `corporate-clean` | 商务蓝·浅底干净（默认） | 汇报 / 总结 / 路演 |
+| `pitch-deck-vc` | 科技深蓝·发布会感 | 产品 / 技术 / 融资路演 |
+| `minimal-white` | 极简纯白 | 设计感 / 通用 |
+| `tokyo-night` | 深色霓虹蓝紫 | 技术 / 酷感 |
+| `corporate-warm` | 暖橘浅底 | 文创 / 生活 / 教育 |
+| `aurora` | 极光深色·青紫 | 前沿 / 愿景 / 强冲击 |
 
-**页型库**（每块内容挑最合适的页型，别全用 bullets 堆字）：
-`cover` 封面 · `toc` 目录 · `section` 章节分隔 · `bullets` 要点页 · `two_col` 双栏对比 · `bignum` 数据大字 · `quote` 金句 · `closing` 结尾。
+**页型库**（**每块内容挑最贴合的页型，这是「好看」的第一杠杆**）：
+`cover` 封面 · `toc` 目录 · `section` 章节分隔 · `bullets` 要点页 · `cards` 并列卡片 · `stats` 数据大字 · `two_col` 双栏对比 · `timeline` 步骤时间轴 · `quote` 金句 · `closing` 结尾。
+
+### 排版纪律（铁律，违反就是「低端 PPT」——必须遵守）
+1. **一页一个核心**。讲不下就拆页，绝不堆。
+2. **大字少字**。每页正文 ≤ 6 行；标题大、关键数字/短句超大。字小密 = 烂。
+3. **能不用 bullets 就不用**：
+   - 3–4 个**并列点** → 用 `cards`（带柔和阴影的卡片），**不要**罗列圆点。
+   - 数字 / 指标 / 成果 → `stats`（超大数字）。
+   - 步骤 / 流程 / 路线 → `timeline`。
+   - 对比 / 前后 / 优劣 → `two_col`。
+   - 一句重点 → `quote`，整页就这一句。
+   - 实在是平铺要点才用 `bullets`，且 **≤ 5 条、每条 ≤ 14 字**。
+4. **留白是设计**。引擎已给足边距，别再自己塞满。
+5. 结构示例（10–14 页常见骨架）：`cover → toc → section → cards → stats → two_col → timeline → quote → closing`，按内容增删，**别从头到尾全 bullets**（那正是上一版「效果烂」的根因）。
 
 ## 第 3 步 · 渲染 .pptx（可直接套用的引擎）
-下面是**经过验证、能跑通**的引擎：主题库 `THEMES` + 页型渲染器 `RENDER` + 渲染循环。**你只需改 `THEME` 和 `SLIDES` 两个变量**填入大纲内容；保存路径换成**产物目录的绝对路径**。
+下面是引擎：主题库 `THEMES`（open-design 令牌）+ 卡片/阴影/三级文字原语 + 页型渲染器 `RENDER` + 渲染循环。**你只需改 `THEME` 和 `SLIDES` 两个变量**填入大纲内容；保存路径换成**产物目录的绝对路径**。别动原语和 `fix_pptx`。
 
 ```python
 import os, zipfile, re, shutil
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from pptx.enum.lang import MSO_LANGUAGE_ID  # 1.x 在 enum.lang（不是 enum.text）
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.lang import MSO_LANGUAGE_ID        # 1.x 在 enum.lang（不是 enum.text）
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.oxml.ns import qn, nsdecls
+from pptx.oxml import parse_xml
 
 def C(h):  # 0xRRGGBB → RGBColor
     return RGBColor((h >> 16) & 0xFF, (h >> 8) & 0xFF, h & 0xFF)
 
-# ── 主题库：配色与字体的唯一来源（内容与设计分离）──
+# ── 主题库：抄 open-design 设计令牌（bg 背景 / surf 卡片底 / border 描边 / 三级文字 / accent 强调）──
 THEMES = {
-    "business":  dict(bg=None,     ink=0x1A2A3A, accent=0x2C4661, sub=0x5B6B7B, band=0xEAF0F5),
-    "tech_dark": dict(bg=0x0E1116, ink=0xF2F5F8, accent=0x4DA3FF, sub=0x9AA7B4, band=0x1A2230),
-    "fresh":     dict(bg=0xFBF7EF, ink=0x1F2D2B, accent=0x2E9E8F, sub=0x6B7B77, band=0xE7F1ED),
-    "academic":  dict(bg=0xFFFFFF, ink=0x16213A, accent=0x3A4FB0, sub=0x5B6470, band=0xEDEFF7),
-    "bold":      dict(bg=0x111111, ink=0xFFFFFF, accent=0xFFD400, sub=0xB8B8B8, band=0x1E1E1E),
-    "mono":      dict(bg=0xFFFFFF, ink=0x111111, accent=0xE5484D, sub=0x777777, band=0xF2F2F2),
+    "corporate-clean": dict(bg=0xFFFFFF, surf=0xFFFFFF, border=0xDCE6F2, t1=0x0E1726, t2=0x445268, t3=0x8A96AA, accent=0x2563EB, radius=0.09),
+    "pitch-deck-vc":   dict(bg=0x0E1116, surf=0x161B22, border=0x2A313C, t1=0xE9EDF5, t2=0xAAB4C5, t3=0x6B7686, accent=0x5B8CFF, radius=0.09),
+    "minimal-white":   dict(bg=0xFFFFFF, surf=0xFFFFFF, border=0xE7E7EA, t1=0x111216, t2=0x55596A, t3=0x8A8F9E, accent=0x3B6CFF, radius=0.12),
+    "tokyo-night":     dict(bg=0x1A1B26, surf=0x24283B, border=0x2E3350, t1=0xC0CAF5, t2=0xA9B1D6, t3=0x565F89, accent=0x7AA2F7, radius=0.08),
+    "corporate-warm":  dict(bg=0xFFF5EC, surf=0xFFFAF4, border=0xF1DBC8, t1=0x2B1D18, t2=0x5E463C, t3=0x9A8276, accent=0xFF6B4A, radius=0.12),
+    "aurora":          dict(bg=0x0B1020, surf=0x121A30, border=0x232C44, t1=0xE6F0FF, t2=0xAEBFDC, t3=0x5F6F92, accent=0x6EE7B7, radius=0.10),
 }
 
-def set_font(run, name="微软雅黑"):
-    # 同时给 latin + eastAsian 语言 id，跨平台阅读器都有字可用（Mac 无微软雅黑会回退）
-    run.font.name = name
+def set_font(run, latin="Segoe UI"):
+    # 数字/英文用 Segoe UI（好看），东亚字形用微软雅黑；两端都指定，避免数字被套中文字体显土。
+    run.font.name = latin
+    rPr = run._r.get_or_add_rPr()
+    latin_el = rPr.find(qn('a:latin'))
+    ea = rPr.find(qn('a:ea'))
+    if ea is None:
+        ea = rPr.makeelement(qn('a:ea'), {})
+        if latin_el is not None:
+            latin_el.addnext(ea)        # a:ea 必须排在 a:latin 之后，否则部分阅读器报修复
+        else:
+            rPr.append(ea)
+    ea.set('typeface', '微软雅黑')
     run.font.language_id = MSO_LANGUAGE_ID.SIMPLIFIED_CHINESE
 
-def textbox(slide, l, t, w, h, text, size, *, bold=False, color=0x111111, align=PP_ALIGN.LEFT):
-    tf = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h)).text_frame
-    tf.word_wrap = True
-    p = tf.paragraphs[0]; p.alignment = align
-    r = p.add_run(); r.text = text
-    r.font.size = Pt(size); r.font.bold = bold; r.font.color.rgb = C(color); set_font(r)
-    return tf
-
-def rect(slide, l, t, w, h, color):
-    sp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(l), Inches(t), Inches(w), Inches(h))
-    sp.fill.solid(); sp.fill.fore_color.rgb = C(color); sp.line.fill.background()
-    return sp
-
-def bullets(slide, th, items, l=1.0, t=2.1, w=11.3, h=4.6, size=22):
-    tf = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h)).text_frame
-    tf.word_wrap = True
-    for i, it in enumerate(items):
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        r = p.add_run(); r.text = "• " + it
-        r.font.size = Pt(size); r.font.color.rgb = C(th["ink"]); set_font(r)
-        p.space_after = Pt(12)
+def soft_shadow(shape, alpha=18):
+    # open-design 的灵魂：卡片柔和投影（大模糊 + 低透明度）。没有它，卡片像贴纸 = 低端。
+    spPr = shape._element.spPr
+    for e in spPr.findall(qn('a:effectLst')):
+        spPr.remove(e)
+    spPr.append(parse_xml(
+        '<a:effectLst %s><a:outerShdw blurRad="180000" dist="40000" dir="5400000" rotWithShape="0">'
+        '<a:srgbClr val="000000"><a:alpha val="%d000"/></a:srgbClr></a:outerShdw></a:effectLst>'
+        % (nsdecls('a'), alpha)))
 
 def _new(prs, th):
-    s = prs.slides.add_slide(prs.slide_layouts[6])  # 空白版式，全自排
-    if th["bg"] is not None:
-        s.background.fill.solid(); s.background.fill.fore_color.rgb = C(th["bg"])
+    s = prs.slides.add_slide(prs.slide_layouts[6])   # 空白版式，全自排
+    s.background.fill.solid(); s.background.fill.fore_color.rgb = C(th["bg"])
     return s
 
-# ── 页型渲染器：每个页型一个函数，吃 (prs, theme, dict) ──
-def page_cover(prs, th, d):
-    s = _new(prs, th); rect(s, 1.0, 3.45, 2.2, 0.12, th["accent"])
-    textbox(s, 1.0, 2.3, 11.3, 1.4, d["title"], 46, bold=True, color=th["ink"])
-    if d.get("subtitle"): textbox(s, 1.0, 3.8, 11.3, 0.8, d["subtitle"], 22, color=th["sub"])
+def bar(slide, l, t, w, h, color):                   # 强调短线 / 色条
+    sp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(l), Inches(t), Inches(w), Inches(h))
+    sp.fill.solid(); sp.fill.fore_color.rgb = C(color); sp.line.fill.background()
+    sp.shadow.inherit = False
+    return sp
 
-def page_toc(prs, th, d):
-    s = _new(prs, th)
-    textbox(s, 1.0, 0.8, 11.3, 1.0, d.get("title", "目录"), 32, bold=True, color=th["accent"])
-    tf = s.shapes.add_textbox(Inches(1.0), Inches(2.0), Inches(11.3), Inches(4.6)).text_frame
-    for i, it in enumerate(d["items"]):
+def card(slide, l, t, w, h, th):                     # open-design .card：surface 底 + 描边 + 柔和阴影 + 圆角
+    sp = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(l), Inches(t), Inches(w), Inches(h))
+    try: sp.adjustments[0] = th.get("radius", 0.09)
+    except Exception: pass
+    sp.fill.solid(); sp.fill.fore_color.rgb = C(th["surf"])
+    sp.line.color.rgb = C(th["border"]); sp.line.width = Pt(1)
+    sp.shadow.inherit = False
+    if th.get("radius", 0.09) > 0: soft_shadow(sp)
+    return sp
+
+def circle(slide, l, t, d, th, label):               # timeline 数字节点
+    sp = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(l), Inches(t), Inches(d), Inches(d))
+    sp.fill.solid(); sp.fill.fore_color.rgb = C(th["accent"]); sp.line.fill.background()
+    sp.shadow.inherit = False
+    tf = sp.text_frame
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+    p = tf.paragraphs[0]; p.alignment = PP_ALIGN.CENTER
+    r = p.add_run(); r.text = label
+    r.font.size = Pt(18); r.font.bold = True; r.font.color.rgb = C(th["bg"]); set_font(r)
+    return sp
+
+def para_box(slide, l, t, w, h, paras, anchor=MSO_ANCHOR.TOP):
+    # paras: list of dict(text, size, color, bold=False, italic=False, align=PP_ALIGN.LEFT, after=6, line=None)
+    tf = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h)).text_frame
+    tf.word_wrap = True; tf.vertical_anchor = anchor
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+    for i, d in enumerate(paras):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        r = p.add_run(); r.text = f"{i+1:02d}    {it}"
-        r.font.size = Pt(24); r.font.color.rgb = C(th["ink"]); set_font(r); p.space_after = Pt(12)
+        p.alignment = d.get("align", PP_ALIGN.LEFT)
+        p.space_after = Pt(d.get("after", 6))
+        if d.get("line"): p.line_spacing = d["line"]
+        r = p.add_run(); r.text = d["text"]
+        r.font.size = Pt(d["size"]); r.font.bold = d.get("bold", False)
+        r.font.italic = d.get("italic", False); r.font.color.rgb = C(d["color"]); set_font(r)
+    return tf
+
+def head(s, th, title):                              # 内容页公共题头：标题(t1) + accent 短线，返回内容起始 y
+    para_box(s, 1.0, 0.62, 11.3, 0.9, [dict(text=title or "", size=29, color=th["t1"], bold=True)])
+    bar(s, 1.0, 1.5, 0.7, 0.05, th["accent"])
+    return 1.95
+
+# ── 页型渲染器：每个吃 (prs, th, d) ──
+def page_cover(prs, th, d):
+    s = _new(prs, th)
+    if d.get("kicker"):
+        para_box(s, 1.0, 2.05, 11.3, 0.5, [dict(text=d["kicker"].upper(), size=14, color=th["accent"], bold=True)])
+    para_box(s, 1.0, 2.55, 11.3, 1.7, [dict(text=d["title"], size=50, color=th["t1"], bold=True, line=1.04)])
+    bar(s, 1.0, 4.4, 1.0, 0.06, th["accent"])
+    if d.get("subtitle"):
+        para_box(s, 1.0, 4.65, 11.0, 1.0, [dict(text=d["subtitle"], size=20, color=th["t2"], line=1.4)])
 
 def page_section(prs, th, d):
-    s = _new(prs, th); rect(s, 0, 2.6, 13.333, 2.3, th["band"])
-    textbox(s, 1.0, 2.7, 2.6, 2.0, d.get("no", "01"), 80, bold=True, color=th["accent"])
-    textbox(s, 3.5, 3.15, 9.0, 1.4, d["title"], 40, bold=True, color=th["ink"])
+    s = _new(prs, th)
+    para_box(s, 1.0, 2.1, 5.0, 2.0, [dict(text=d.get("no", "01"), size=84, color=th["accent"], bold=True)])
+    bar(s, 1.0, 4.25, 1.0, 0.06, th["accent"])
+    para_box(s, 1.0, 4.5, 11.0, 1.3, [dict(text=d.get("title", ""), size=36, color=th["t1"], bold=True, line=1.1)])
+    if d.get("subtitle"):
+        para_box(s, 1.0, 5.6, 11.0, 0.8, [dict(text=d["subtitle"], size=18, color=th["t2"])])
+
+def page_toc(prs, th, d):
+    s = _new(prs, th); y = head(s, th, d.get("title", "目录"))
+    for i, it in enumerate(d["items"][:7]):
+        yy = y + i * 0.62
+        para_box(s, 1.0, yy, 0.9, 0.6, [dict(text="%02d" % (i + 1), size=20, color=th["accent"], bold=True)])
+        para_box(s, 1.9, yy, 10.3, 0.6, [dict(text=str(it), size=21, color=th["t1"])])
 
 def page_bullets(prs, th, d):
-    s = _new(prs, th)
-    textbox(s, 1.0, 0.7, 11.3, 1.0, d["title"], 32, bold=True, color=th["accent"])
-    bullets(s, th, d["points"])
+    s = _new(prs, th); y = head(s, th, d.get("title", ""))
+    paras = [dict(text="•  " + str(it), size=21, color=th["t1"], after=14, line=1.25) for it in d["points"][:6]]
+    para_box(s, 1.0, y + 0.1, 11.3, 4.4, paras)
+
+def page_cards(prs, th, d):
+    s = _new(prs, th); y = head(s, th, d.get("title", ""))
+    items = d["items"][:3]; n = max(1, len(items)); gap = 0.4
+    w = (11.3 - gap * (n - 1)) / n
+    for i, it in enumerate(items):
+        x = 1.0 + i * (w + gap)
+        card(s, x, y + 0.1, w, 3.7, th)
+        para_box(s, x + 0.35, y + 0.45, w - 0.7, 0.6, [dict(text=it.get("head", ""), size=19, color=th["accent"], bold=True)])
+        bps = [dict(text=ln.strip(), size=16, color=th["t2"], after=8, line=1.35)
+               for ln in str(it.get("body", "")).split("\n") if ln.strip()]
+        if bps: para_box(s, x + 0.35, y + 1.15, w - 0.7, 2.4, bps)
+
+def page_stats(prs, th, d):
+    s = _new(prs, th); y = head(s, th, d.get("title", ""))
+    items = d["items"][:4]; n = max(1, len(items)); gap = 0.4
+    w = (11.3 - gap * (n - 1)) / n
+    for i, it in enumerate(items):
+        x = 1.0 + i * (w + gap)
+        card(s, x, y + 0.3, w, 3.0, th)
+        para_box(s, x + 0.2, y + 0.7, w - 0.4, 1.4, [dict(text=it.get("value", ""), size=58, color=th["accent"], bold=True, align=PP_ALIGN.CENTER)])
+        para_box(s, x + 0.2, y + 2.2, w - 0.4, 0.6, [dict(text=it.get("label", ""), size=17, color=th["t1"], bold=True, align=PP_ALIGN.CENTER)])
+        if it.get("desc"):
+            para_box(s, x + 0.2, y + 2.78, w - 0.4, 0.6, [dict(text=it["desc"], size=13, color=th["t3"], align=PP_ALIGN.CENTER)])
 
 def page_two_col(prs, th, d):
-    s = _new(prs, th)
-    textbox(s, 1.0, 0.7, 11.3, 1.0, d["title"], 32, bold=True, color=th["accent"])
-    textbox(s, 1.0, 1.9, 5.4, 0.7, d["left_title"], 22, bold=True, color=th["ink"])
-    bullets(s, th, d["left"], l=1.0, t=2.6, w=5.4, h=3.8, size=18)
-    textbox(s, 6.9, 1.9, 5.4, 0.7, d["right_title"], 22, bold=True, color=th["ink"])
-    bullets(s, th, d["right"], l=6.9, t=2.6, w=5.4, h=3.8, size=18)
+    s = _new(prs, th); y = head(s, th, d.get("title", ""))
+    cols = [(d.get("left_title", ""), d.get("left", [])), (d.get("right_title", ""), d.get("right", []))]
+    gap = 0.5; w = (11.3 - gap) / 2
+    for i, (h_, pts) in enumerate(cols):
+        x = 1.0 + i * (w + gap)
+        card(s, x, y + 0.1, w, 3.9, th)
+        para_box(s, x + 0.4, y + 0.5, w - 0.8, 0.6, [dict(text=h_, size=19, color=th["accent"], bold=True)])
+        bps = [dict(text="•  " + str(it), size=16, color=th["t2"], after=10, line=1.3) for it in pts[:5]]
+        if bps: para_box(s, x + 0.4, y + 1.2, w - 0.8, 2.6, bps)
 
-def page_bignum(prs, th, d):
-    s = _new(prs, th)
-    textbox(s, 1.0, 1.7, 11.3, 2.2, d["number"], 96, bold=True, color=th["accent"], align=PP_ALIGN.CENTER)
-    textbox(s, 1.0, 4.3, 11.3, 1.0, d["caption"], 26, color=th["ink"], align=PP_ALIGN.CENTER)
+def page_timeline(prs, th, d):
+    s = _new(prs, th); y = head(s, th, d.get("title", ""))
+    steps = d["steps"][:5]; n = max(1, len(steps)); gap = 0.3
+    w = (11.3 - gap * (n - 1)) / n; cy = y + 0.5; dia = 0.6
+    if n > 1:
+        x0 = 1.0 + w / 2; span = (n - 1) * (w + gap)
+        bar(s, x0, cy + dia / 2 - 0.015, span, 0.03, th["border"])
+    for i, st in enumerate(steps):
+        x = 1.0 + i * (w + gap)
+        circle(s, x + w / 2 - dia / 2, cy, dia, th, str(i + 1))
+        para_box(s, x, cy + dia + 0.2, w, 0.6, [dict(text=st.get("head", ""), size=16, color=th["t1"], bold=True, align=PP_ALIGN.CENTER)])
+        bps = [dict(text=ln.strip(), size=13, color=th["t3"], after=4, align=PP_ALIGN.CENTER, line=1.3)
+               for ln in str(st.get("body", "")).split("\n") if ln.strip()]
+        if bps: para_box(s, x, cy + dia + 0.78, w, 1.6, bps)
 
 def page_quote(prs, th, d):
     s = _new(prs, th)
-    textbox(s, 1.4, 2.4, 10.5, 2.6, "“" + d["text"] + "”", 34, bold=True, color=th["ink"], align=PP_ALIGN.CENTER)
-    if d.get("by"): textbox(s, 1.4, 5.0, 10.5, 0.7, "— " + d["by"], 20, color=th["sub"], align=PP_ALIGN.CENTER)
+    para_box(s, 1.0, 1.4, 2.0, 1.3, [dict(text="“", size=90, color=th["accent"], bold=True)])
+    para_box(s, 1.4, 2.7, 10.5, 2.4, [dict(text=d["text"], size=33, color=th["t1"], bold=True, align=PP_ALIGN.CENTER, line=1.25)])
+    if d.get("by"):
+        para_box(s, 1.4, 5.2, 10.5, 0.6, [dict(text="— " + d["by"], size=18, color=th["t2"], align=PP_ALIGN.CENTER)])
 
 def page_closing(prs, th, d):
-    s = _new(prs, th); rect(s, 1.0, 3.95, 2.2, 0.12, th["accent"])
-    textbox(s, 1.0, 2.5, 11.3, 1.4, d.get("title", "谢谢观看"), 44, bold=True, color=th["ink"])
-    if d.get("subtitle"): textbox(s, 1.0, 4.1, 11.3, 0.8, d["subtitle"], 22, color=th["sub"])
+    s = _new(prs, th)
+    para_box(s, 1.0, 2.6, 11.3, 1.6, [dict(text=d.get("title", "谢谢观看"), size=46, color=th["t1"], bold=True, align=PP_ALIGN.CENTER)])
+    bar(s, 6.17, 4.3, 1.0, 0.06, th["accent"])
+    if d.get("subtitle"):
+        para_box(s, 1.0, 4.6, 11.3, 0.8, [dict(text=d["subtitle"], size=19, color=th["t2"], align=PP_ALIGN.CENTER)])
 
 RENDER = {
     "cover": page_cover, "toc": page_toc, "section": page_section, "bullets": page_bullets,
-    "two_col": page_two_col, "bignum": page_bignum, "quote": page_quote, "closing": page_closing,
+    "cards": page_cards, "stats": page_stats, "two_col": page_two_col, "timeline": page_timeline,
+    "quote": page_quote, "closing": page_closing,
+    "bignum": page_stats,   # 兼容旧名
 }
 
 # ════════ 只改这两个变量：主题 + 大纲内容 ════════
-THEME = "business"
+THEME = "corporate-clean"
 SLIDES = [
-    {"type": "cover",   "title": "演示文稿标题", "subtitle": "副标题 / 作者 / 日期"},
-    {"type": "toc",     "items": ["第一部分", "第二部分", "第三部分"]},
-    {"type": "section", "no": "01", "title": "第一部分标题"},
-    {"type": "bignum",  "number": "1.2 亿", "caption": "关键指标说明（同比 +37%）"},
-    {"type": "bullets", "title": "要点页标题", "points": ["要点一：……", "要点二：……", "要点三：……"]},
-    {"type": "two_col", "title": "对比页标题",
-     "left_title": "做对了", "left": ["……", "……"],
-     "right_title": "待改进", "right": ["……", "……"]},
-    {"type": "quote",   "text": "一句话定调的金句", "by": "出处"},
-    {"type": "closing", "title": "谢谢观看", "subtitle": "联系方式 / 二维码"},
+    {"type": "cover",   "kicker": "2025 年中", "title": "上半年经营回顾", "subtitle": "增长 · 复盘 · 下半年计划"},
+    {"type": "toc",     "title": "目录", "items": ["业绩概览", "增长引擎", "复盘", "下半年路线"]},
+    {"type": "section", "no": "01", "title": "业绩概览", "subtitle": "三个关键数字"},
+    {"type": "stats",   "title": "关键指标", "items": [
+        {"value": "1.2亿", "label": "营收", "desc": "同比 +37%"},
+        {"value": "8.6k", "label": "新增客户", "desc": "环比 +22%"},
+        {"value": "62", "label": "NPS", "desc": "行业前 10%"}]},
+    {"type": "cards",   "title": "三大增长引擎", "items": [
+        {"head": "渠道下沉", "body": "新增 3 省代理\n县域覆盖翻倍"},
+        {"head": "产品升级", "body": "旗舰款复购 +18%\n毛利改善 4pt"},
+        {"head": "私域运营", "body": "社群 GMV 占比 27%\n获客成本 -31%"}]},
+    {"type": "two_col", "title": "复盘", "left_title": "做对了", "left": ["押对旗舰款", "私域早布局"],
+     "right_title": "踩了坑", "right": ["库存预估偏高", "新区招人慢"]},
+    {"type": "timeline", "title": "下半年路线", "steps": [
+        {"head": "Q3 拓渠道", "body": "再下沉 2 省"}, {"head": "Q3 上新", "body": "第二曲线"},
+        {"head": "Q4 冲量", "body": "大促备战"}, {"head": "Q4 复盘", "body": "年度收口"}]},
+    {"type": "quote",   "text": "把对的事做厚，而不是把多的事做薄。", "by": "年度战略定调"},
+    {"type": "closing", "title": "谢谢观看", "subtitle": "Q&A · 联系方式"},
 ]
 # ════════════════════════════════════════════════
 
 prs = Presentation()
-prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)  # 16:9
+prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)   # 16:9
 th = THEMES[THEME]
 for d in SLIDES:
-    RENDER[d["type"]](prs, th, d)
+    RENDER.get(d["type"], page_bullets)(prs, th, d)
 
-OUT = r"<产物目录绝对路径>/演示文稿.pptx"  # ← 换成已授权的产物目录
+OUT = r"<产物目录绝对路径>/演示文稿.pptx"   # ← 换成已授权的产物目录
 prs.save(OUT)
 
 # ── 后处理：修复 python-pptx 已知兼容性问题（WPS/Mac/各种阅读器拒收）──
@@ -214,7 +330,6 @@ def fix_pptx(path):
         for info in zin.infolist():
             data = zin.read(info.filename); fn = info.filename
             is_layout = fn.startswith("ppt/slideLayouts/slideLayout") and fn.endswith(".xml")
-            # 只对目标 XML 部件解码改写；其余部件（缩略图等二进制）原样拷贝，别全量 decode
             if fn in ("docProps/app.xml", "ppt/presentation.xml") or is_layout:
                 txt = data.decode("utf-8")
                 if fn == "docProps/app.xml":

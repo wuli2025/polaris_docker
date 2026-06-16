@@ -36,8 +36,10 @@ export function useFileDrop(opts: UseFileDropOptions) {
           isOver.value = true;
         }
       };
-      const onDragLeave = () => {
-        isOver.value = false;
+      const onDragLeave = (e: DragEvent) => {
+        // 只有真正离开窗口(relatedTarget 为 null)才熄灭高亮 —— 否则光标掠过
+        // 任意子元素都会触发 leave,导致落区高亮疯狂闪烁。
+        if (e.relatedTarget === null) isOver.value = false;
       };
       const onDropEv = async (e: DragEvent) => {
         if (!guard()) return;

@@ -120,8 +120,28 @@ pub struct RouteRequest {
 /// （AutoMatch 是默认模式），旧实现等于每条消息重建整份花名册 → 明显卡顿。
 /// 改为 Lazy 静态：只读热路径走 `all_experts_ref()` 零分配，
 /// 仅需 owned 列表的命令（发给前端）才 `clone()`。
-static EXPERTS: once_cell::sync::Lazy<Vec<ExpertCard>> =
-    once_cell::sync::Lazy::new(expert_groups::build_experts);
+/// 已裁撤专家（2026-06-16 提示词组合审计后下线：跨组重复 / 高度冗余 / 场景太冷门 / 团队仪式岗）。
+/// 用户明确保留 game-developer、embedded-systems，故不在此列。从花名册过滤掉 → 不再出现在
+/// 列表 / 智能路由 / 专家团。源 ec() 定义暂留 expert_groups.rs，后续可物理删除（功能已等同删除）。
+const RETIRED: &[&str] = &[
+    // —— cut（删除）——
+    "nlp-engineer", "rl-engineer", "technical-writer-pro", "graphql-architect",
+    "event-sourcing-architect", "platform-engineer-devops", "csharp-pro", "blockchain-developer",
+    "context-manager", "delivery-manager", "scrum-master", "scientific-researcher", "osint-analyst",
+    // —— merge（并入他人后下线被合并的一方）——
+    "llm-architect", "mlops-engineer", "flutter-expert", "brand-storyteller", "payment-integration",
+    "microservices-architect", "mermaid-expert", "multi-agent-coordinator", "knowledge-synthesizer",
+    "ops-engineer", "business-analyst", "qa-expert", "tech-debt-strategist", "research-analyst",
+    "penetration-tester", "appsec-coder", "license-counsel", "deployment-engineer",
+    "data-contract-engineer", "strategy-planner",
+];
+
+static EXPERTS: once_cell::sync::Lazy<Vec<ExpertCard>> = once_cell::sync::Lazy::new(|| {
+    expert_groups::build_experts()
+        .into_iter()
+        .filter(|e| !RETIRED.contains(&e.id.as_str()))
+        .collect()
+});
 
 /// 只读借用花名册（评分/路由等热路径用，零克隆）。
 fn all_experts_ref() -> &'static [ExpertCard] {
@@ -229,25 +249,34 @@ pub fn expert_list_by_group(group: String) -> Vec<ExpertCard> {
         .collect()
 }
 
-/// 全部分组列表
+/// 全部分组列表。计数从裁撤后的真实花名册动态统计（避免与 RETIRED 不一致）。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn expert_groups() -> Vec<ExpertGroup> {
-    vec![
-        ExpertGroup { id: "orchestration".into(), name: "编排/统帅".into(), icon: "🧭".into(), count: 5 },
-        ExpertGroup { id: "system_arch".into(), name: "系统架构".into(), icon: "🏛".into(), count: 10 },
-        ExpertGroup { id: "language".into(), name: "语言专精".into(), icon: "⌨".into(), count: 12 },
-        ExpertGroup { id: "frontend".into(), name: "前端/移动".into(), icon: "📱".into(), count: 6 },
-        ExpertGroup { id: "devops".into(), name: "DevOps/基础设施".into(), icon: "⚙".into(), count: 9 },
-        ExpertGroup { id: "data".into(), name: "数据".into(), icon: "📊".into(), count: 8 },
-        ExpertGroup { id: "ai_ml".into(), name: "AI/机器学习".into(), icon: "🧠".into(), count: 7 },
-        ExpertGroup { id: "security".into(), name: "安全/合规".into(), icon: "🛡".into(), count: 7 },
-        ExpertGroup { id: "quality".into(), name: "质量/治理".into(), icon: "🔬".into(), count: 7 },
-        ExpertGroup { id: "specialty".into(), name: "专项技术".into(), icon: "🧩".into(), count: 6 },
-        ExpertGroup { id: "docs".into(), name: "文档/技术写作".into(), icon: "📝".into(), count: 5 },
-        ExpertGroup { id: "product".into(), name: "产品/项目/战略".into(), icon: "📐".into(), count: 8 },
-        ExpertGroup { id: "research".into(), name: "研究/分析".into(), icon: "🔎".into(), count: 7 },
-        ExpertGroup { id: "marketing".into(), name: "营销/内容".into(), icon: "📣".into(), count: 8 },
-    ]
+    let meta: &[(&str, &str, &str)] = &[
+        ("orchestration", "编排/统帅", "🧭"),
+        ("system_arch", "系统架构", "🏛"),
+        ("language", "语言专精", "⌨"),
+        ("frontend", "前端/移动", "📱"),
+        ("devops", "DevOps/基础设施", "⚙"),
+        ("data", "数据", "📊"),
+        ("ai_ml", "AI/机器学习", "🧠"),
+        ("security", "安全/合规", "🛡"),
+        ("quality", "质量/治理", "🔬"),
+        ("specialty", "专项技术", "🧩"),
+        ("docs", "文档/技术写作", "📝"),
+        ("product", "产品/项目/战略", "📐"),
+        ("research", "研究/分析", "🔎"),
+        ("marketing", "营销/内容", "📣"),
+    ];
+    let experts = all_experts_ref();
+    meta.iter()
+        .map(|(id, name, icon)| ExpertGroup {
+            id: (*id).into(),
+            name: (*name).into(),
+            icon: (*icon).into(),
+            count: experts.iter().filter(|e| e.group == *id).count(),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -641,20 +670,43 @@ pub fn route_block(query: &str) -> Option<String> {
     if hit.is_empty() {
         return None;
     }
+    let primary = &hit[0].expert;
     let mut s = String::new();
-    s.push_str("【智能匹配·专家团】本轮已为你自动匹配最合适的专家，请以对应专家的专业视角与标准作答：\n");
-    for m in &hit {
-        s.push_str(&format!(
-            "- **{}**（{}）— 命中：{}；补「{}」。\n",
-            m.expert.name,
-            m.expert.role,
-            if m.hit_signals.is_empty() { "与你的需求相关".to_string() } else { m.hit_signals.join("、") },
-            m.complements
-        ));
+    s.push_str(
+        "【智能匹配·专家团】本轮自动匹配到主理专家。请**严格以下述专家的标准、品味与方法**作答 —— \
+         这是该专家完整的工作准则,优先级高于泛泛的通用风格(若与默认风格冲突,以专家准则为准):\n\n",
+    );
+    s.push_str(&format!("# 主理专家:{}（{}）\n\n", primary.name, primary.role));
+    // ★关键:注入该专家**完整提示词正文**(来自 templates/experts/<group>/<id>.md,可本地编辑),
+    //   而不是过去那一行"命中/补维度"标签 —— 否则改了提示词也驱动不了模型。
+    if let Some(body) = expert_docs::build_expert_doc(
+        &primary.claude_md_ref,
+        &primary.name,
+        &primary.role,
+        &primary.description,
+        &primary.keywords,
+        &primary.capabilities,
+        &primary.trigger_signals,
+        &primary.complements,
+        &primary.exclusive_with,
+        primary.cost_tier,
+    ) {
+        s.push_str(&body);
+        s.push('\n');
+    }
+    // 备选(其余命中)只给一行,供主理专家需要时借力,不喧宾夺主。
+    if hit.len() > 1 {
+        s.push_str("\n## 可借力的备选专家\n");
+        for m in &hit[1..] {
+            s.push_str(&format!(
+                "- **{}**（{}）— 补「{}」\n",
+                m.expert.name, m.expert.role, m.complements
+            ));
+        }
     }
     s.push_str(
-        "\n纪律：以首位专家为主、其余为辅；任务简单就单人直接干，\
-         确需分工且并行有收益时才多人协作（一次≤4~5 人，紧耦合则串行）。",
+        "\n纪律:以主理专家的标准为准、备选为辅;任务简单就主理专家一人直接干到好,\
+         确需分工且并行有收益时才召备选(一次≤4~5 人,紧耦合则串行)。",
     );
     Some(s)
 }
@@ -797,10 +849,51 @@ pub fn expert_recommend_from_kb(scope: Option<String>) -> KbRecommendation {
 mod tests {
     use super::*;
 
+    /// 一次性把全部专家导出成各自的可编辑 .md(放仓库源码,以后调它就是调这些文件)。
+    /// 已存在的文件不覆盖(保住手写的 visual-designer 等)。跑法:
+    ///   cargo test seed_expert_files -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn seed_expert_files() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/templates");
+        let mut written = 0;
+        for e in all_experts() {
+            let path = root.join(&e.claude_md_ref); // experts/<group>/<id>.md
+            if path.exists() {
+                continue; // 不覆盖已手写的专属提示词
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            // 文件不存在 → build_expert_doc 回落 GENERIC 骨架并填好该专家元数据
+            let body = expert_docs::build_expert_doc(
+                &e.claude_md_ref,
+                &e.name,
+                &e.role,
+                &e.description,
+                &e.keywords,
+                &e.capabilities,
+                &e.trigger_signals,
+                &e.complements,
+                &e.exclusive_with,
+                e.cost_tier,
+            )
+            .unwrap();
+            std::fs::write(&path, body).unwrap();
+            written += 1;
+        }
+        println!("seeded {} expert files", written);
+    }
+
     #[test]
     fn all_experts_count() {
+        // 2026-06-16 审计后裁撤约 33 个冗余/冷门专家（见 RETIRED），常驻精简到 ~72。
         let count = all_experts().len();
-        assert!(count >= 100, "专家数量应 >= 100，实际 {}", count);
+        assert!(count >= 60, "专家数量应 >= 60，实际 {}", count);
+        assert!(
+            !all_experts().iter().any(|e| RETIRED.contains(&e.id.as_str())),
+            "已裁撤专家不应出现在花名册"
+        );
     }
 
     #[test]
@@ -871,5 +964,19 @@ mod tests {
     fn route_block_fires_on_domain_not_chitchat() {
         assert!(route_block("帮我写个 python 异步爬虫").is_some(), "领域查询应注入专家块");
         assert!(route_block("嗯嗯好的谢谢你").is_none(), "闲聊不应注入");
+    }
+
+    /// route_block 现在注入主理专家**完整提示词正文**(来自可编辑的 .md),而非过去的一行标签。
+    /// "ppt" 应路由到视觉设计,并把 visual-designer.md 的实质内容带进来 —— 这才是「真的匹配上有
+    /// 审美的人格、且让它的准则驱动模型」。
+    #[test]
+    fn route_block_injects_full_expert_prompt() {
+        let block = route_block("你帮我写一个这个的ppt").expect("ppt 应命中专家");
+        assert!(block.contains("视觉设计"), "应路由到视觉设计专家");
+        assert!(
+            block.contains("演示美学") || block.contains("大字少字"),
+            "应注入 visual-designer.md 的实质提示词(证明吃的是文件全文而非标签),实际开头:\n{}",
+            &block[..block.len().min(400)]
+        );
     }
 }

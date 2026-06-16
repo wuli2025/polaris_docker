@@ -2573,6 +2573,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3931,7 +3950,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-app"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3947,6 +3966,7 @@ dependencies = [
  "getrandom 0.2.17",
  "headless_chrome",
  "image",
+ "include_dir",
  "libc",
  "once_cell",
  "parking_lot",
@@ -3981,7 +4001,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-cli"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "polaris-app",
  "serde_json",
