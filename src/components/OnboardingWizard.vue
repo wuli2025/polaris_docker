@@ -367,6 +367,8 @@ async function finishUp() {
     profilePath.value = "";
   }
   finishing.value = false;
+  // 3) 大模型据真实知识库智能匹配收尾建议(数秒,后台跑;不阻塞「完成」按钮)。
+  void loadSuggestions();
 }
 function openProfile() {
   if (profilePath.value) artifactsApi.openExternal(profilePath.value).catch(() => {});
@@ -376,10 +378,15 @@ interface FlowCard {
   title: string;
   prompt: string;
 }
-const suggested = computed<FlowCard[]>(() => {
+// 收尾建议改成「大模型据真实知识库智能匹配」:不再是固定阈值套话。
+// 先用本地确定性兜底秒填(保证立刻有卡片可点),LLM 结果回来再替换。
+const suggested = ref<FlowCard[]>([]);
+const suggesting = ref(false);
+
+// 本地确定性兜底:据类型分布给几张通用卡(仅当后端 LLM 彻底不可用时兜底)。
+function localFallbackFlows(): FlowCard[] {
   const ov = overview.value;
-  if (!ov) return [];
-  const cnt = (k: string) => ov.byKind.find((x) => x.kind === k)?.count ?? 0;
+  const cnt = (k: string) => ov?.byKind.find((x) => x.kind === k)?.count ?? 0;
   const out: FlowCard[] = [];
   if (cnt("video") >= 5)
     out.push({
@@ -409,7 +416,21 @@ const suggested = computed<FlowCard[]>(() => {
       prompt: "看了我的文件,你觉得我最近在忙什么?请基于知识库给我三条具体的下一步建议。",
     });
   return out;
-});
+}
+
+// 让大模型读真实知识库(主题/类型/语言 + 可抽查文件)智能匹配 3~5 条「我能立刻替你做的事」。
+async function loadSuggestions() {
+  suggesting.value = true;
+  suggested.value = localFallbackFlows(); // 立刻有卡片,LLM 回来再替换
+  try {
+    const flows = await fc.suggestWorkflows(null);
+    if (flows && flows.length) suggested.value = flows;
+  } catch {
+    /* 后端自身已会回落;真彻底失败就保留本地兜底卡 */
+  } finally {
+    suggesting.value = false;
+  }
+}
 function useFlow(f: FlowCard) {
   app.setView("chat");
   // ChatPanel 挂载后其 insertRequest watch 才生效,稍延迟再注入。
@@ -730,6 +751,12 @@ onBeforeUnmount(() => {
               <ChevronRight :size="15" :stroke-width="1.8" class="fc-arr" />
             </button>
           </div>
+          <div v-if="suggesting" class="suggest-busy">
+            <LoaderCircle :size="12" class="spin" /> AI 正在读你的资料、为你量身想建议…(先点上面任意一条也行)
+          </div>
+          <button v-else class="suggest-redo" @click="loadSuggestions">
+            <Sparkles :size="12" :stroke-width="1.8" /> 让 AI 再想几条
+          </button>
           <div class="finish-row">
             <button class="mini" :disabled="!profilePath" @click="openProfile"><FileText :size="12" :stroke-width="1.8" /> 打开桌面画像</button>
             <span v-if="finishing" class="fine-busy"><LoaderCircle :size="12" class="spin" /> 生成画像中…</span>
@@ -994,6 +1021,12 @@ onBeforeUnmount(() => {
 .flow-card:hover { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 7%, transparent); }
 .fc-t { font-size: 13.5px; color: var(--ink); font-weight: 560; }
 .fc-arr { color: var(--primary); flex: none; }
+.suggest-busy { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.suggest-redo {
+  display: inline-flex; align-items: center; gap: 5px; margin-top: 10px;
+  border: none; background: transparent; color: var(--primary); font-size: 12px; cursor: pointer; padding: 2px 0;
+}
+.suggest-redo:hover { text-decoration: underline; }
 .finish-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
 .fine-busy, .fine-ok { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
 .fine-ok { color: var(--primary); }

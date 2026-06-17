@@ -2010,6 +2010,128 @@ fn understanding_lines(ov: &FileOverview) -> Vec<String> {
     out
 }
 
+// ── 智能向导收尾「建议工作流」:大模型据**真实知识库**智能匹配,而非固定阈值套话 ──
+
+/// 一条注入对话框的建议:标题 + 用户第一人称的提示词。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestedFlow {
+    pub title: String,
+    pub prompt: String,
+}
+
+impl SuggestedFlow {
+    /// 兜底:LLM 不可用 / 解析失败时,用确定性的类型阈值建议(workflow_hints)转一份,绝不空手。
+    fn fallback(ov: &FileOverview) -> Vec<SuggestedFlow> {
+        workflow_hints(ov)
+            .into_iter()
+            .map(|h| SuggestedFlow {
+                title: h.title,
+                prompt: format!(
+                    "{}\n\n请基于我的知识库,先说清你打算怎么做、会用到我哪些资料,再开始。",
+                    h.detail
+                ),
+            })
+            .collect()
+    }
+}
+
+/// 把知识库画像(主题 / 类型 / 语言)摊成一段给大模型读的中文摘要,要它据此给「具体到我」的建议。
+fn suggest_workflows_directive(ov: &FileOverview) -> String {
+    let kinds: Vec<String> = ov
+        .by_kind
+        .iter()
+        .map(|k| format!("{}×{}", pf_kind_label(&k.kind), k.count))
+        .collect();
+    let langs: Vec<String> = ov
+        .by_lang
+        .iter()
+        .take(12)
+        .map(|l| format!("{}×{}", l.lang, l.count))
+        .collect();
+    // 主题:顶层主题 + 其下子主题名,这是「智能匹配」的核心依据。
+    let mut themes = String::new();
+    for top in ov.clusters.iter().filter(|c| c.parent == 0) {
+        let subs: Vec<&str> = ov
+            .clusters
+            .iter()
+            .filter(|c| c.parent == top.id)
+            .map(|c| c.label.as_str())
+            .collect();
+        if subs.is_empty() {
+            themes.push_str(&format!("- {}({} 项)\n", top.label, top.size));
+        } else {
+            themes.push_str(&format!("- {}:{}\n", top.label, subs.join(" / ")));
+        }
+    }
+    if themes.is_empty() {
+        themes.push_str("(还没归出主题,可据类型/语言分布与抽查文件来推断)\n");
+    }
+
+    format!(
+        r#"你是这个人**个人/企业知识库**的「行动建议官」。下面是他**真实的**知识库画像。
+请只基于他自己的资料,提出 3~5 条「我能立刻替他做的事」——每条都必须**具体到他的主题**,
+绝不能是「整理文档 / 总结资料」这种放之四海皆准、换谁都成立的套话。
+
+知识库画像:
+- 共 {total} 个文件,{bytes}
+- 类型分布:{kinds}
+- 语言 / 领域分布:{langs}
+- AI 归出的主题:
+{themes}
+你可以(可选)用 Grep / Read 抽查几个文件,让建议更贴他的真实内容(别超过 3~4 次,够用就停)。
+
+每条建议给两个字段:
+- title:6~16 字中文短语,点名他的**具体主题**(如「把『考研复习』整理成冲刺清单」,而不是「整理学习资料」);
+- prompt:**用户第一人称**写的、可直接发给我的指令,点名他的具体主题/资料,并要求我先讲计划再动手。
+
+硬要求:紧扣上面的真实主题,优先他**高频、最近、体量大**的那几摊;不同建议覆盖不同主题、不要重复;全用中文。
+
+**只输出一个 JSON 数组,不要任何额外文字、不要 markdown 代码围栏**:
+[{{"title":"…","prompt":"…"}}, ...]"#,
+        total = ov.total_files,
+        bytes = human_bytes(ov.total_bytes),
+        kinds = if kinds.is_empty() { "—".into() } else { kinds.join("、") },
+        langs = if langs.is_empty() { "—".into() } else { langs.join("、") },
+        themes = themes,
+    )
+}
+
+/// 据真实知识库用大模型智能匹配建议(同步阻塞,数秒;由调用方放到后台线程)。
+/// 任意环节失败 → 回落到确定性建议,保证永远有可用结果。
+pub fn suggest_workflows(root: Option<String>) -> Result<Vec<SuggestedFlow>, String> {
+    let ov = overview(root.clone())?;
+    if ov.total_files == 0 {
+        return Err("文件库还是空的,先「盘点」扫描磁盘文件".into());
+    }
+    let result = (|| -> Result<Vec<SuggestedFlow>, String> {
+        let prompt = suggest_workflows_directive(&ov);
+        // 配了独立归类模型 → 直连它(省钱);否则用聊天那个大模型(可 Read/Grep 抽查真文件)。
+        let collected = if let Some(cfg) = active_cluster_model() {
+            chat_complete(&cfg, &prompt)?
+        } else {
+            let kb_root = PathBuf::from(crate::kb::kb_root());
+            let cwd = if kb_root.exists() { kb_root } else { std::env::temp_dir() };
+            crate::kb::run_claude_readonly(&cwd, &prompt, |_k, _t| {})?
+        };
+        let raw = crate::kb::extract_balanced_json(&collected)
+            .ok_or("模型没有返回可解析的 JSON")?;
+        let flows: Vec<SuggestedFlow> =
+            serde_json::from_str(&raw).map_err(|e| format!("建议 JSON 解析失败: {e}"))?;
+        let flows: Vec<SuggestedFlow> = flows
+            .into_iter()
+            .filter(|f| !f.title.trim().is_empty() && !f.prompt.trim().is_empty())
+            .take(6)
+            .collect();
+        if flows.is_empty() {
+            return Err("模型返回了空建议".into());
+        }
+        Ok(flows)
+    })();
+    // LLM 路径任何失败都安静回落,不把错误抛给向导收尾页(那一步必须永远有卡片可点)。
+    Ok(result.unwrap_or_else(|_| SuggestedFlow::fallback(&ov)))
+}
+
 /// 生成「让 AI 更懂你」自包含 HTML → 桌面,返回文件路径。
 fn profile_html(root: Option<String>) -> Result<String, String> {
     let ov = overview(root)?;
@@ -2329,6 +2451,17 @@ pub fn file_cluster_build(app: AppHandle, root: Option<String>) -> Result<(), St
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn file_profile_html(root: Option<String>) -> Result<String, String> {
     profile_html(root)
+}
+
+/// 智能向导收尾「建议工作流」:大模型据**真实知识库**智能匹配,而非固定阈值套话。
+/// 桌面端为 async + spawn_blocking,避免数秒的大模型调用冻结主线程 WebView;
+/// server flavor 由 dispatch_sync 直接调内层 [`suggest_workflows`](已在 spawn_blocking 中)。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn file_suggest_workflows(root: Option<String>) -> Result<Vec<SuggestedFlow>, String> {
+    tauri::async_runtime::spawn_blocking(move || suggest_workflows(root))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
 }
 
 /// 文件中心「星图」:语义簇 + 抽样文件 → 与知识图谱同构的 KbGraph(供 KnowledgeGraph.vue 星河渲染)。

@@ -336,6 +336,7 @@ pub fn run() {
             fable::files::file_gist,
             fable::files::file_cluster_build,
             fable::files::file_profile_html,
+            fable::files::file_suggest_workflows,
             fable::files::file_graph,
             fable::files::file_warm_thumbs,
             fable::files::file_cluster_llm,
