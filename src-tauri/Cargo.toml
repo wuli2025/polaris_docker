@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "1.4.0"
+version = "1.4.2"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -104,6 +104,13 @@ sherpa-rs = { version = "0.6", optional = true, features = ["download-binaries"]
 cpal = { version = "0.15", optional = true }   # 跨平台音频采集(按住录音)
 rdev = { version = "0.5", optional = true }    # 全局热键(右 Alt 按住/松手边沿)
 enigo = { version = "0.3", optional = true }   # 把终稿「敲」进当前焦点应用
+# 本地开源嵌入/重排(local-embed feature):fastembed-rs(ONNX)本地跑 BAAI/bge-m3 + bge-reranker-v2-m3,
+# 与硅基流动**同源** → 向量同空间、兼容既有索引,无需重嵌全库;绕开 API 限速与网络延迟(治覆盖率+查询延迟)。
+# optional + 专属 feature → 默认 build 不拉(保护编译+体积);Docker 发版显式开 `--features local-embed`。
+# 经 ort 拉 onnxruntime,**勿与 voice-asr(sherpa 自带 onnxruntime)同时开**,避免两份运行时冲突。
+# load-dynamic:onnxruntime 运行时 dlopen(ORT_DYLIB_PATH 指向 .so),缺库不影响启动(只本地嵌入才报错),
+# 比 link 模式安全得多;hf-hub-rustls-tls 避免 Docker 拉 openssl。
+fastembed = { version = "5", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
 # 寓言计划 · 检索枢纽(fable/):盘点/chunk/向量统一落 SQLite(PRD v5 P0「SQLite 落盘」)。
 # bundled = 静态编译 sqlite3,三平台(Win/mac/Docker musl 之外的 gnu)零系统依赖。
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -152,6 +159,10 @@ voice-asr = ["dep:sherpa-rs"]
 # cpal(ALSA)/rdev(X11)/enigo 在无头容器里无意义且难编译,故从 voice-asr 拆出。
 # 桌面发版用 `--features voice-live`(自动带上 voice-asr)。
 voice-live = ["voice-asr", "dep:cpal", "dep:rdev", "dep:enigo"]
+# 本地开源嵌入/重排(fastembed/ONNX):本地 BGE-M3 + bge-reranker-v2-m3,无 API 限速、查询不走网络。
+# 默认不开(保护 build + 镜像体积);Docker 发版显式开 `--features local-embed`。
+# 运行时 POLARIS_LOCAL_EMBED=1 才真正启用本地路径(否则仍走云 API)。勿与 voice-asr 同开(双 onnxruntime)。
+local-embed = ["dep:fastembed"]
 
 # server 二进制：浏览器前端 + REST/WS 后端（替代 Tauri 外壳）。
 # 构建：cargo build --release --bin polaris-server --no-default-features --features server

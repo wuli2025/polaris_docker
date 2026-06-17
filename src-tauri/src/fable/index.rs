@@ -55,6 +55,11 @@ fn agent_http() -> ureq::Agent {
 
 /// 批量嵌入。429 退避重试 3 次;其余错误直接报(可读信息,UI 原样展示)。
 pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    // 本地开源嵌入(POLARIS_LOCAL_EMBED=1):绕开云 API 限速/网络往返;模型同源(bge-m3)故向量兼容。
+    #[cfg(feature = "local-embed")]
+    if crate::fable::embed_local::enabled() {
+        return crate::fable::embed_local::embed(texts);
+    }
     let p = crate::sense::active_provider("embed")
         .ok_or("没有可用的嵌入服务商:在「设置 › 寓言计划 API」给硅基流动填 key(免费),或检查云感官总闸")?;
     let key = crate::sense::effective_key(&p);
@@ -104,6 +109,11 @@ pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
 
 /// 重排:返回按相关度降序的 (原 index, 分数)。失败属可降级(调用方保持原序)。
 pub fn rerank(query: &str, docs: &[String], top_n: usize) -> Result<Vec<(usize, f32)>, String> {
+    // 本地开源重排(POLARIS_LOCAL_EMBED=1):本地 bge-reranker-v2-m3,省 ~600ms API 往返。
+    #[cfg(feature = "local-embed")]
+    if crate::fable::embed_local::enabled() {
+        return crate::fable::embed_local::rerank(query, docs, top_n);
+    }
     let p = crate::sense::active_provider("rerank").ok_or("没有可用的重排服务商")?;
     let key = crate::sense::effective_key(&p);
     let base = p.base_url.trim_end_matches('/');
@@ -197,6 +207,21 @@ pub(crate) fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// 直接在 f32 小端字节上算点积(向量均已归一化 → 即余弦),省掉 [`blob_to_vec`] 的中间
+/// `Vec<f32>` 堆分配 —— 检索精排每候选省一次分配(大库一次查询数百候选)。`blob` 字节数须
+/// 为 `qv.len()*4`(维度/模型一致),否则 `None`(脏数据/旧维度向量,调用方跳过)。
+pub(crate) fn dot_blob(qv: &[f32], blob: &[u8]) -> Option<f32> {
+    if blob.len() != qv.len() * 4 {
+        return None;
+    }
+    let mut s = 0f32;
+    for (i, q) in qv.iter().enumerate() {
+        let o = i * 4;
+        s += q * f32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
+    }
+    Some(s)
 }
 
 // ───────────────────────── 归一化 / 二值量化(P1-3 / P1-1)─────────────────────────
@@ -531,6 +556,52 @@ pub fn build_index(
     })
 }
 
+/// 一次性把待办文本**全部**嵌入完:循环调用 [`build_index`] 直到 pending 清零 / 取消 / 卡住。
+/// 文件中心 v3「后台精修」(T2)用 —— 向量化全库后再做一次真·语义归类。
+/// 与普通索引构建共用 `INDEXING` 闸(进行中则拒绝),RAII 守卫保证 panic 栈展开也释放。
+/// `progress(files_done_total, chunks_added_total, files_pending)`:每消化一个文件 + 每轮末各回调。
+pub fn build_index_full(progress: &dyn Fn(u64, u64, u64)) -> Result<IndexSummary, String> {
+    let Some(_guard) = FlagGuard::acquire(&INDEXING) else {
+        return Err("索引构建已在进行中(稍后会自动续上)".into());
+    };
+    CANCEL.store(false, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let mut total_files = 0u64;
+    let mut total_chunks = 0u64;
+    let mut last_pending = u64::MAX;
+    let mut stalled = 0u32;
+    let stopped = loop {
+        // 大预算单轮:尽量多消化、少轮次开销;MAX_FILES_PER_BUILD 仍在内部封顶单轮文件数。
+        let s = build_index(200_000, &|f, c, _cur| progress(total_files + f, total_chunks + c, 0))?;
+        total_files += s.files_done;
+        total_chunks += s.chunks_added;
+        progress(total_files, total_chunks, s.files_pending);
+        if cancelled() {
+            break "已取消".to_string();
+        }
+        if s.files_pending == 0 {
+            break "全部完成".to_string();
+        }
+        // 防空转:连续两轮 pending 不再下降(剩的都是超限大文件/不可读)→ 收工,别死循环。
+        if s.files_done == 0 || s.files_pending >= last_pending {
+            stalled += 1;
+            if stalled >= 2 {
+                break format!("剩 {} 个文件无法嵌入(超限/不可读),已尽力完成", s.files_pending);
+            }
+        } else {
+            stalled = 0;
+        }
+        last_pending = s.files_pending;
+    };
+    Ok(IndexSummary {
+        files_done: total_files,
+        chunks_added: total_chunks,
+        files_pending: 0,
+        seconds: started.elapsed().as_secs_f64(),
+        stopped,
+    })
+}
+
 // ───────────────────────── 向量 IVF 优化(20TB 级 ANN)─────────────────────────
 //
 // 把全部向量按「二值质心」聚成若干倒排单元(cell);查询时只在最近的 nprobe 个 cell
@@ -842,6 +913,20 @@ mod tests {
         assert_eq!(hamming(&b, &b2), 1);
         // 维度非 8 的整数倍:9 维 → 2 字节。
         assert_eq!(bits_of(&[0.0f32; 9]).len(), 2);
+    }
+
+    #[test]
+    fn dot_blob_matches_blob_to_vec_path() {
+        // dot_blob 必须与「blob_to_vec 后逐元素相乘求和」逐位一致(这是它替换的旧路径)。
+        let qv = [0.1f32, -0.2, 0.3, 0.5, -0.7];
+        let dv = [0.4f32, 0.4, -0.1, 0.2, 0.9];
+        let blob = vec_to_blob(&dv);
+        let want: f32 = blob_to_vec(&blob).iter().zip(qv.iter()).map(|(a, b)| a * b).sum();
+        let got = dot_blob(&qv, &blob).expect("维度一致应返回 Some");
+        assert!((got - want).abs() < 1e-6, "got={got} want={want}");
+        // 维度不符(脏数据/旧维度向量)→ None,调用方跳过而非误算。
+        assert!(dot_blob(&qv, &vec_to_blob(&[1.0f32, 2.0])).is_none());
+        assert!(dot_blob(&qv, &blob[..blob.len() - 1]).is_none()); // 截断字节
     }
 
     #[test]

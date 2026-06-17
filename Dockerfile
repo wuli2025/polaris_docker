@@ -60,7 +60,7 @@ RUN mkdir -p src-tauri/src/bin \
     && echo '' > src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --no-default-features --features server \
+        --bin polaris-server --no-default-features --features server,local-embed \
     ; rm -rf src-tauri/src
 
 # 2b) 真实源码层：拷源码 + 资源 + assets(feishu/wecom 的 include_str!)，编出 polaris-server。
@@ -71,7 +71,7 @@ COPY src-tauri/resources ./src-tauri/resources
 RUN touch src-tauri/src/main.rs src-tauri/src/lib.rs \
     && cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --bin polaris-forge --no-default-features --features server \
+        --bin polaris-server --bin polaris-forge --no-default-features --features server,local-embed \
     && cp src-tauri/target/release-fast/polaris-server /usr/local/bin/polaris-server \
     && cp src-tauri/target/release-fast/polaris-forge /usr/local/bin/polaris-forge
 
@@ -205,6 +205,25 @@ RUN sed -i 's/\r$//' /usr/local/bin/update.sh \
 # 引擎二进制 + 前端静态 + 资源种子
 COPY --from=server /usr/local/bin/polaris-server /usr/local/bin/polaris-server
 COPY --from=server /usr/local/bin/polaris-forge  /usr/local/bin/polaris-forge
+
+# ── 本地开源嵌入/重排(local-embed)运行时:onnxruntime 共享库 ─────────────────
+#   ort 用 load-dynamic 经 ORT_DYLIB_PATH 在「真正用到时」才 dlopen → 缺库不影响启动,
+#   只是本地嵌入不可用(默认 POLARIS_LOCAL_EMBED 未开,走云,不受影响)。故下载做成**非致命**。
+#   onnxruntime 1.24 匹配 ort 2.0.0-rc.12;bookworm(glibc2.36/libstdc++12)满足其依赖。
+ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
+ENV FASTEMBED_CACHE_DIR=/root/Polaris/models/fastembed
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* ; \
+    ( set -e; ORT_VER=1.24.0; \
+      curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz" -o /tmp/ort.tgz \
+      && tar -xzf /tmp/ort.tgz -C /tmp \
+      && cp /tmp/onnxruntime-linux-x64-${ORT_VER}/lib/libonnxruntime.so* /usr/local/lib/ \
+      && ln -sf "$(ls /usr/local/lib/libonnxruntime.so.* | head -1)" /usr/local/lib/libonnxruntime.so \
+      && ldconfig \
+      && echo "[onnxruntime] ${ORT_VER} ready (local-embed available)" ) \
+    || echo "[onnxruntime] download/install failed -> local-embed unavailable (默认走云,不影响启动)" ; \
+    rm -f /tmp/ort.tgz
+
 COPY --from=web    /app/dist /srv/web
 COPY src-tauri/resources /app/resources
 

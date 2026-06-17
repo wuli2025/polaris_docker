@@ -20,6 +20,9 @@
 //! 千万级时在 `index::vector_topk` 内换 ANN/量化,签名不变。
 
 pub mod agent;
+// 本地开源嵌入/重排(fastembed/ONNX),仅 local-embed feature 编译。
+#[cfg(feature = "local-embed")]
+pub mod embed_local;
 pub mod eval;
 pub mod files;
 pub mod index;
@@ -148,6 +151,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             text    TEXT NOT NULL DEFAULT '',
             made_at INTEGER NOT NULL DEFAULT 0
         );
+        -- 文件中心 v3 · 簇间语义关系边(大模型在「读懂资料」后推断:同源 / 进阶 / 方法论 / 印证…)。
+        -- 把星图从「从属树」升级成真·关系图谱。每次 AI 归类先清本范围旧边再重建,幂等。
+        CREATE TABLE IF NOT EXISTS cluster_edges(
+            id       INTEGER PRIMARY KEY,
+            root_id  INTEGER NOT NULL DEFAULT 0,
+            src      INTEGER NOT NULL,
+            dst      INTEGER NOT NULL,
+            label    TEXT NOT NULL DEFAULT '',
+            built_at INTEGER NOT NULL DEFAULT 0
+        );
         -- 文件中心 · 智能显示标题(覆盖原始乱/杂文件名;仅显示,不改磁盘)。
         -- 本地启发式不入库(grid 里现算);此表只存 AI 生成的标题(source='llm')。
         CREATE TABLE IF NOT EXISTS titles(
@@ -194,6 +207,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if conn.prepare("SELECT parent FROM clusters LIMIT 1").is_err() {
         conn.execute("ALTER TABLE clusters ADD COLUMN parent INTEGER NOT NULL DEFAULT 0", [])
             .map_err(|e| format!("fable.db 加 clusters.parent 列失败: {e}"))?;
+    }
+    // 文件中心 v3:簇「一句话画像」(大模型起的亲切口吻概括,如「你 2023-2024 的报税材料都在这」)。
+    // 渲染到星图选中卡 + 报告,强化「它很懂我」的感觉。旧库 '' = 尚未 AI 命名。
+    if conn.prepare("SELECT summary FROM clusters LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE clusters ADD COLUMN summary TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|e| format!("fable.db 加 clusters.summary 列失败: {e}"))?;
     }
     // ── 20TB 整改 · P2-2 嵌入模型版本隔离 ──
     // chunks.model:写入该 chunk 时生效的嵌入模型标识(provider.default_model)。
