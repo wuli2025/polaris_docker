@@ -148,7 +148,8 @@ function render() {
     container: container.value,
     minZoom: 0.1,
     maxZoom: 3,
-    wheelSensitivity: 0.85,
+    // 滚轮缩放灵敏度:用户反馈原 0.85 太肉 → 提到 2 倍以上,滚一下缩放更跟手。
+    wheelSensitivity: 1.8,
     elements: [
       ...nodes.map((n) => {
         const size = nodeSize(n.kind, deg[n.id] || 0);

@@ -1,0 +1,32 @@
+/* polaris-deck-studio :: motion.css — 网页幻灯片高级动效层(可选,与 motion.js 配套)
+ *
+ * 蒸馏自 Kimi 落地页 design.md 的动效系统。仅用于 html 模式的网页幻灯片(deck.html),
+ * 配深色主题使用。导出 .pptx 时 motion.js 会自动摘除 data-motion、动效落终值,不污染截图。
+ *   <html data-theme="tokyo-night" data-motion> → 神经网络 Canvas 背景 + 鼠标光晕
+ *   封面大标题 data-kinetic → 逐字滑入(每次该页激活时)
+ *   数据数字 data-count="95" [data-suffix="%"] → 该页激活时从 0 滚到目标值
+ */
+
+/* 固定背景层(motion.js 注入;垫在 .deck 之后) */
+#px-bg, #px-glow { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+#px-glow {
+  background: radial-gradient(circle 480px at var(--mx,50%) var(--my,50%),
+    var(--motion-glow, rgba(0,255,65,.07)), transparent 70%);
+}
+
+/* 让 Canvas 透过幻灯片显现:data-motion 时 .deck 透明并抬到 Canvas 之上(body 的 --bg 仍作底色) */
+[data-motion] .deck { background: transparent; z-index: 1; }
+
+/* 逐字标题 */
+.px-char { display: inline-block; opacity: 0; transform: translateY(40px);
+  transition: opacity .5s cubic-bezier(.16,1,.3,1), transform .5s cubic-bezier(.16,1,.3,1); }
+.px-char.in { opacity: 1; transform: none; }
+
+/* 数字滚动占位防跳动 */
+[data-count] { font-variant-numeric: tabular-nums; }
+
+/* 减少动画:静态可读优先 */
+@media (prefers-reduced-motion: reduce) {
+  #px-bg { display: none; }
+  .px-char { opacity: 1 !important; transform: none !important; }
+}

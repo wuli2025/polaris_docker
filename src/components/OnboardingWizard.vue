@@ -25,6 +25,10 @@ import {
   ChevronRight,
   Layers,
   Folder,
+  User,
+  Building2,
+  Network,
+  ShieldCheck,
 } from "@lucide/vue";
 import {
   files as fc,
@@ -47,17 +51,21 @@ const workflows = useWorkflowsStore();
 const wiz = useWizardStore();
 const tasks = useFileTasksStore();
 
-type Step = "intro" | "scope" | "scan" | "model" | "organize" | "graph" | "finish";
-const STEPS: { key: Step; label: string }[] = [
-  { key: "scope", label: "盘点范围" },
-  { key: "scan", label: "全盘扫描" },
-  { key: "model", label: "配模型" },
-  { key: "organize", label: "智能归类" },
-  { key: "graph", label: "知识图谱" },
-  { key: "finish", label: "进对话" },
-];
+type Step = "intro" | "profile" | "scope" | "scan" | "model" | "organize" | "graph" | "finish";
+// 进度条按画像走两套用词:个人=聚类「智能归类」,企业=框架「构建体系」。
+const STEPS = computed<{ key: Step; label: string }[]>(() => {
+  const enterprise = wiz.profile === "enterprise";
+  return [
+    { key: "scope", label: "盘点范围" },
+    { key: "scan", label: "全盘扫描" },
+    { key: "model", label: "配模型" },
+    { key: "organize", label: enterprise ? "构建知识体系" : "智能归类" },
+    ...(enterprise ? [] : [{ key: "graph" as Step, label: "知识图谱" }]),
+    { key: "finish", label: "进对话" },
+  ];
+});
 const step = ref<Step>("intro");
-const stepIndex = computed(() => STEPS.findIndex((s) => s.key === step.value));
+const stepIndex = computed(() => STEPS.value.findIndex((s) => s.key === step.value));
 
 // ── 盘点范围 ──
 const roots = ref<ScanRootInfo[]>([]);
@@ -252,10 +260,48 @@ async function runOfflineCluster() {
   }
   await fc.clusterBuild(null);
 }
+// 企业路径(D 方案):Schema-Guided 在框内抽三元组,事件走 fable:ontology。
+const ontoKept = ref(0);
+let unOnto: (() => void) | null = null;
+async function runSchemaExtract() {
+  if (!unOnto) {
+    unOnto = await listen<{ kind: string; text?: string; kept?: number; note?: string; message?: string }>(
+      "fable:ontology",
+      (p) => {
+        if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
+        else if (p.kind === "tick") organizeMsg.value = "模型正在框内抽取关系…";
+        else if (p.kind === "done") {
+          ontoKept.value = p.kept ?? 0;
+          organizeMsg.value = p.note ?? "知识体系构建完成";
+          void afterOrganize();
+        } else if (p.kind === "error") {
+          organizeMsg.value = `构建失败:${p.message ?? ""}`;
+          organizing.value = false;
+        }
+      },
+    );
+  }
+  // 走全局任务 store → 抽取也出现在右下角后台任务浮球,切走/最小化仍可见、完成有提醒。
+  await tasks.startOntology(wiz.schemaId);
+}
 async function startOrganize() {
   step.value = "organize";
   organizing.value = true;
   reportPath.value = "";
+  // 归类要跑几秒,趁这空当把星河图谱(cytoscape ~562KB)的 chunk 预下载好 →
+  // 归类一完成切到「知识图谱」步时,图谱「啪」地直接渲染,不再等大包下载的白屏。
+  void import("./KnowledgeGraph.vue").catch(() => {});
+  // 企业 → D 方案 Schema-Guided;个人 → B 方案聚类。
+  if (wiz.method === "schema") {
+    organizeMsg.value = `正在按「${chosenSchema.value?.name ?? "行业框"}」抽取实体与关系…`;
+    try {
+      await runSchemaExtract();
+    } catch (e: any) {
+      organizeMsg.value = `构建失败:${e?.message ?? e}`;
+      organizing.value = false;
+    }
+    return;
+  }
   if (mode.value === "offline") {
     organizeMsg.value = "正在按文件夹 / 名称离线归类(无需联网)…";
     try {
@@ -297,7 +343,9 @@ async function startOrganize() {
 async function afterOrganize() {
   await loadOverview();
   organizing.value = false;
-  step.value = "graph";
+  // 企业(D 方案)没有文件聚类星图,直接进收尾;个人(B 方案)先看知识图谱。
+  step.value = wiz.method === "schema" ? "finish" : "graph";
+  if (step.value === "finish") void finishUp();
 }
 
 // ── 知识图谱:复用 KnowledgeGraph.vue 的星河渲染(source=files),数据来自后端 file_graph ──
@@ -369,10 +417,55 @@ function useFlow(f: FlowCard) {
   finishDone();
 }
 
-// ── 生命周期 ──
-function begin() {
+// ── 画像:个人(B 聚类)/ 企业(D Schema-Guided)──
+interface SchemaCard {
+  id: string;
+  name: string;
+  industry: string;
+  source: string;
+  desc: string;
+  entities: { id: string; name: string; hint: string }[];
+  relations: { id: string; name: string; hint: string }[];
+  triples: number;
+}
+const schemaList = ref<SchemaCard[]>([]);
+const schemasLoading = ref(false);
+async function loadSchemas() {
+  if (schemaList.value.length) return;
+  schemasLoading.value = true;
+  try {
+    schemaList.value = await invoke<SchemaCard[]>("ontology_schemas");
+  } catch {
+    schemaList.value = [];
+  } finally {
+    schemasLoading.value = false;
+  }
+}
+function pickPersonal() {
+  wiz.setProfile("personal");
   step.value = "scope";
   loadRoots();
+}
+function pickEnterprise() {
+  wiz.setProfile("enterprise");
+  void loadSchemas();
+  // 留在 profile 步展开行业框选择;选定后再进 scope。
+}
+function pickSchema(id: string) {
+  wiz.setSchema(id);
+}
+function profileNext() {
+  // 企业必须先选一个行业框。
+  if (wiz.profile === "enterprise" && !wiz.schemaId) return;
+  step.value = "scope";
+  loadRoots();
+}
+const chosenSchema = computed(() => schemaList.value.find((s) => s.id === wiz.schemaId) || null);
+
+// ── 生命周期 ──
+function begin() {
+  step.value = "profile";
+  if (wiz.profile === "enterprise") void loadSchemas();
 }
 // 转入后台 / X / 点遮罩:只隐藏浮层,**不动 step**,后台扫描/归类继续 —— 回来还在原地。
 function close() {
@@ -391,6 +484,7 @@ onBeforeUnmount(() => {
   if (unLlm) unLlm();
   if (unCluster) unCluster();
   if (unPack) unPack();
+  if (unOnto) unOnto();
 });
 </script>
 
@@ -427,6 +521,58 @@ onBeforeUnmount(() => {
             <li><Radar :size="15" :stroke-width="1.7" /> 建索引 + 进对话:让 AI 懂你想干的事</li>
           </ol>
           <button class="wiz-go" @click="begin"><Sparkles :size="16" :stroke-width="1.8" /> 开始</button>
+        </div>
+
+        <!-- 0.5 · 选画像:个人(B 聚类)/ 企业(D Schema) -->
+        <div v-else-if="step === 'profile'" class="wiz-body">
+          <h3 class="wiz-h"><Sparkles :size="16" :stroke-width="1.7" /> 先告诉我:这是谁的知识库?</h3>
+          <p class="wiz-tip">我会据此**自动匹配**最合适的构建方案 —— 不用你懂技术。</p>
+          <div class="prof-cards">
+            <button class="prof-card" :class="{ on: wiz.profile === 'personal' }" @click="pickPersonal">
+              <div class="pc-ic"><User :size="22" :stroke-width="1.6" /></div>
+              <span class="pc-t">个人知识库</span>
+              <span class="pc-d">我的电脑、我的资料。自动发现「我常用的几摊事」,起好中文名,一眼认出。</span>
+              <span class="pc-tag">聚类驱动 · 自动发现</span>
+            </button>
+            <button class="prof-card" :class="{ on: wiz.profile === 'enterprise' }" @click="pickEnterprise">
+              <div class="pc-ic"><Building2 :size="22" :stroke-width="1.6" /></div>
+              <span class="pc-t">企业知识库</span>
+              <span class="pc-d">公司 / 行业资料。先选行业框,在框内抽出实体与关系,每条可溯源、可审计。</span>
+              <span class="pc-tag">框架派 · 低幻觉可审计</span>
+            </button>
+          </div>
+
+          <!-- 企业:选行业框(中文) -->
+          <div v-if="wiz.profile === 'enterprise'" class="schema-box">
+            <div class="schema-head"><Network :size="14" :stroke-width="1.7" /> <b>选一个行业框</b><span class="schema-fine">框里只用给定的实体/关系类型,模型「做选择题」→ 不乱编</span></div>
+            <div v-if="schemasLoading" class="wiz-loading"><LoaderCircle :size="16" class="spin" /> 加载行业框…</div>
+            <div v-else class="schema-grid">
+              <button
+                v-for="sc in schemaList"
+                :key="sc.id"
+                class="schema-card"
+                :class="{ on: wiz.schemaId === sc.id }"
+                @click="pickSchema(sc.id)"
+              >
+                <span class="sc-name">{{ sc.name }}</span>
+                <span class="sc-ind">{{ sc.industry }}</span>
+                <span class="sc-types">
+                  {{ sc.entities.slice(0, 5).map((e) => e.name).join(' · ') }}
+                </span>
+                <span class="sc-src">源自 {{ sc.source }}</span>
+              </button>
+            </div>
+            <div v-if="chosenSchema" class="schema-preview">
+              <ShieldCheck :size="13" :stroke-width="1.8" />
+              <span>「{{ chosenSchema.name }}」框内:<b>{{ chosenSchema.entities.length }}</b> 类实体、<b>{{ chosenSchema.relations.length }}</b> 类关系 —— {{ chosenSchema.relations.slice(0, 5).map((r) => r.name).join('、') }}</span>
+            </div>
+          </div>
+
+          <div class="wiz-foot end">
+            <button v-if="wiz.profile" class="wiz-go" :disabled="wiz.profile === 'enterprise' && !wiz.schemaId" @click="profileNext">
+              <ChevronRight :size="15" :stroke-width="1.8" /> 下一步:盘点资料
+            </button>
+          </div>
         </div>
 
         <!-- 1 · 盘点范围 -->
@@ -483,8 +629,8 @@ onBeforeUnmount(() => {
         <!-- 3 · 配模型 -->
         <div v-else-if="step === 'model'" class="wiz-body">
           <h3 class="wiz-h">让 AI 怎么理解你的文件</h3>
-          <p class="wiz-tip">扫到 <b>{{ (overview?.totalFiles ?? 0).toLocaleString() }}</b> 个文件。选一种归类方式,马上分主题、画图谱。</p>
-          <div class="mode-cards">
+          <p class="wiz-tip">扫到 <b>{{ (overview?.totalFiles ?? 0).toLocaleString() }}</b> 个文件。{{ wiz.method === 'schema' ? '配好嵌入模型,下一步在行业框内抽取实体与关系。' : '选一种归类方式,马上分主题、画图谱。' }}</p>
+          <div v-if="wiz.method !== 'schema'" class="mode-cards">
             <button class="mode-card" :class="{ on: mode === 'ai' }" @click="mode = 'ai'">
               <Brain :size="20" :stroke-width="1.6" />
               <span class="mc-t">AI 语义归类 <em>推荐</em></span>
@@ -538,16 +684,19 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="wiz-foot end">
-            <button v-if="!overview?.hasEmbedProvider" class="wiz-go ghost bg" @click="startOrganize">先跳过,直接归类</button>
-            <button class="wiz-go" @click="startOrganize"><Wand2 :size="15" :stroke-width="1.8" /> 开始归类</button>
+            <button v-if="!overview?.hasEmbedProvider" class="wiz-go ghost bg" @click="startOrganize">先跳过,直接{{ wiz.method === 'schema' ? '构建' : '归类' }}</button>
+            <button class="wiz-go" @click="startOrganize">
+              <component :is="wiz.method === 'schema' ? Network : Wand2" :size="15" :stroke-width="1.8" />
+              {{ wiz.method === 'schema' ? '开始构建知识体系' : '开始归类' }}
+            </button>
           </div>
         </div>
 
-        <!-- 4 · 归类中 -->
+        <!-- 4 · 归类中 / 构建中 -->
         <div v-else-if="step === 'organize'" class="wiz-body center">
-          <div class="scan-orb"><Wand2 :size="28" :stroke-width="1.3" /><div class="scan-ring" /></div>
+          <div class="scan-orb"><component :is="wiz.method === 'schema' ? Network : Wand2" :size="28" :stroke-width="1.3" /><div class="scan-ring" /></div>
           <div class="scan-lab big">{{ organizeMsg }}</div>
-          <div class="scan-fine">AI 正在读你的文件清单分主题,稍候…</div>
+          <div class="scan-fine">{{ wiz.method === 'schema' ? '模型正在行业框内抽实体与关系,只抽资料里写明的、可溯源的,稍候…' : 'AI 正在读你的文件清单分主题,稍候…' }}</div>
           <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
         </div>
 
@@ -567,7 +716,11 @@ onBeforeUnmount(() => {
         <!-- 6 · 收尾 -->
         <div v-else-if="step === 'finish'" class="wiz-body">
           <h3 class="wiz-h"><Sparkles :size="16" :stroke-width="1.7" /> 全部就绪 · AI 已经懂你了</h3>
-          <p class="wiz-tip">
+          <p v-if="wiz.method === 'schema'" class="wiz-tip">
+            已在「<b>{{ chosenSchema?.name ?? '行业' }}</b>」框内抽出 <b>{{ ontoKept }}</b> 条可溯源的实体关系,
+            存进了知识体系(可在「核心层」查看)。向量索引正在<b>后台</b>建。挑一件我能立刻替你做的事:
+          </p>
+          <p v-else class="wiz-tip">
             向量 / 全文索引正在<b>后台</b>建(可以放着不管)。已在桌面生成你的「知识画像」。
             挑一个我能立刻替你做的事开始吧:
           </p>
@@ -844,6 +997,57 @@ onBeforeUnmount(() => {
 .finish-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
 .fine-busy, .fine-ok { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
 .fine-ok { color: var(--primary); }
+
+/* 画像选择(个人 / 企业) */
+.prof-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 16px; }
+.prof-card {
+  display: flex; flex-direction: column; gap: 7px; text-align: left;
+  padding: 20px 18px; border-radius: 15px; cursor: pointer;
+  border: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel) 45%, transparent);
+  color: var(--text-2); transition: border-color 0.14s, background 0.14s, transform 0.14s;
+}
+.prof-card:hover { border-color: var(--border-strong); transform: translateY(-2px); }
+.prof-card.on { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 9%, transparent); }
+.pc-ic {
+  width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
+  color: var(--primary); background: color-mix(in srgb, var(--primary) 13%, transparent); margin-bottom: 4px;
+}
+.pc-t { font-size: 16px; font-weight: 650; color: var(--ink); }
+.pc-d { font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+.pc-tag { font-size: 11px; color: var(--primary); margin-top: 2px; }
+
+/* 企业:行业框选择 */
+.schema-box {
+  margin-top: 4px; padding: 14px 16px; border-radius: 13px;
+  background: color-mix(in srgb, var(--panel) 50%, transparent); border: 1px solid var(--border-soft);
+}
+.schema-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); margin-bottom: 12px; }
+.schema-head :deep(svg) { color: var(--primary); flex: none; }
+.schema-fine { margin-left: auto; font-size: 11px; color: var(--dim); }
+.schema-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.schema-card {
+  display: flex; flex-direction: column; gap: 4px; text-align: left;
+  padding: 13px 14px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel) 55%, transparent);
+  color: var(--text-2); transition: border-color 0.14s, background 0.14s;
+}
+.schema-card:hover { border-color: var(--border-strong); }
+.schema-card.on { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 9%, transparent); }
+.sc-name { font-size: 14px; font-weight: 640; color: var(--ink); }
+.sc-ind { font-size: 11px; color: var(--primary); }
+.sc-types { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+.sc-src { font-size: 10.5px; color: var(--dim); font-family: ui-monospace, Consolas, monospace; }
+.schema-preview {
+  display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 12px;
+  border-radius: 10px; font-size: 12px; color: var(--text-2);
+  background: color-mix(in srgb, var(--primary) 6%, var(--panel)); border: 1px solid color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.schema-preview :deep(svg) { color: var(--primary); flex: none; }
+.schema-preview b { color: var(--text); }
+@media (max-width: 760px) {
+  .prof-cards { grid-template-columns: 1fr; }
+  .schema-grid { grid-template-columns: 1fr 1fr; }
+}
 
 .spin { animation: spin 0.9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

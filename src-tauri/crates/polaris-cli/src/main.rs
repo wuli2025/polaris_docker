@@ -207,6 +207,17 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
                         .map_err(|e| e.to_string())
                     }
                 }
+                "backfill-lang" => {
+                    // 给所有文件补「语言」归类标签(代码/媒体零 IO;文稿读头嗅探中文/英文)。
+                    let n = app::fable::inventory::fable_backfill_lang()?;
+                    serde_json::to_value(serde_json::json!({ "backfilled": n }))
+                        .map_err(|e| e.to_string())
+                }
+                "overview" => {
+                    // 文件中心总览(含 by_lang 按语言分布),验「按语言归类」用。
+                    serde_json::to_value(app::fable::files::overview(flag(rest, "root"))?)
+                        .map_err(|e| e.to_string())
+                }
                 other => Err(format!("未知 fable 子命令 {other}(--help 看用法)")),
             }
         }

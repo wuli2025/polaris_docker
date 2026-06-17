@@ -323,6 +323,7 @@ pub fn run() {
             fable::inventory::fable_scan_folders,
             fable::inventory::fable_scan_folder_children,
             fable::inventory::fable_folder_size,
+            fable::inventory::fable_backfill_lang,
             fable::index::fable_index_start,
             fable::index::fable_index_optimize,
             fable::retrieve::fable_search,
@@ -342,6 +343,11 @@ pub fn run() {
             fable::files::file_titles_clear,
             fable::files::file_cluster_model_get,
             fable::files::file_cluster_model_set,
+            fable::ontology::ontology_schemas,
+            fable::ontology::ontology_overview,
+            fable::ontology::ontology_seed,
+            fable::ontology::ontology_extract,
+            fable::ontology::ontology_triples,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Polaris application")

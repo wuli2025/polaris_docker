@@ -300,32 +300,50 @@ pub fn build_index(
     max_chunks: usize,
     progress: &dyn Fn(u64, u64, &str),
 ) -> Result<IndexSummary, String> {
-    // 先探一次嵌入可用性,免得扫半天才报 key 缺失
-    let _ = crate::sense::active_provider("embed")
-        .ok_or("没有可用的嵌入服务商:在「设置 › 寓言计划 API」给硅基流动填 key(免费),或检查云感官总闸")?;
     let started = std::time::Instant::now();
     let conn = open_db()?;
-    let model = active_embed_model().unwrap_or_default(); // P2-2:落到每个 chunk 上做版本隔离
+    // ── 认字腿 / 认意思腿解耦(关键修)──
+    // 旧实现:没有嵌入 key 直接 `?` 整体放弃 → 倒排(FTS,**零网络**)也跟着建不起来,
+    // 全盘几百 GB 资料只有 ~5% 进过索引,绝大多数搜不到。现在两腿独立:
+    // - 有 key → 认字腿 + 认意思腿都建;
+    // - 无 key → 只建认字腿(全盘文本进 FTS 倒排,关键词秒搜),向量留待补 key 后再建;
+    // - 两腿都不可用(FTS 未就绪 + 无 key)→ 才报错。
+    let embed_ok = crate::sense::active_provider("embed").is_some();
     let lex_ok = lex_available(&conn); // P1-2:FTS5 就绪才走倒排,否则只做向量(实时扫描兜全文)
+    if !embed_ok && !lex_ok {
+        return Err("没有可用的嵌入服务商,且 FTS 倒排未就绪:在「设置 › 寓言计划 API」给硅基流动填 key(免费)以建向量;或重建数据库以启用全文倒排。".into());
+    }
+    let model = active_embed_model().unwrap_or_default(); // P2-2:落到每个 chunk 上做版本隔离
     let mut files_done = 0u64;
     let mut chunks_added = 0u64;
     let mut stopped = "全部完成".to_string();
 
-    // pending 文件 = 还要嵌入(chunked=0)或还要进倒排(ftsed=0)的文本文件。
-    // lex 不可用时去掉 ftsed 条件,免得永远选中标记不掉、空转。
-    let pending_sql = if lex_ok {
-        "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
-         FROM files f JOIN roots r ON r.id=f.root_id
-         WHERE f.kind='text' AND f.size<=?1 AND (f.chunked=0 OR f.ftsed=0)
-         ORDER BY f.size ASC LIMIT 32"
-    } else {
-        "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
-         FROM files f JOIN roots r ON r.id=f.root_id
-         WHERE f.kind='text' AND f.size<=?1 AND f.chunked=0
-         ORDER BY f.size ASC LIMIT 32"
+    // pending 文件 = 还要建索引的文本文件。按可用的腿决定「待办」条件,避免选中标记不掉、空转:
+    // - 两腿都在: chunked=0 OR ftsed=0
+    // - 仅认字腿(无 key): ftsed=0  ← 不因 chunked=0 反复空转(等补 key 再嵌)
+    // - 仅认意思腿(FTS 未就绪): chunked=0
+    let pending_sql = match (embed_ok, lex_ok) {
+        (true, true) => {
+            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
+             FROM files f JOIN roots r ON r.id=f.root_id
+             WHERE f.kind='text' AND f.size<=?1 AND (f.chunked=0 OR f.ftsed=0)
+             ORDER BY f.size ASC LIMIT 32"
+        }
+        (false, true) => {
+            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
+             FROM files f JOIN roots r ON r.id=f.root_id
+             WHERE f.kind='text' AND f.size<=?1 AND f.ftsed=0
+             ORDER BY f.size ASC LIMIT 32"
+        }
+        _ => {
+            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
+             FROM files f JOIN roots r ON r.id=f.root_id
+             WHERE f.kind='text' AND f.size<=?1 AND f.chunked=0
+             ORDER BY f.size ASC LIMIT 32"
+        }
     };
 
-    loop {
+    'outer: loop {
         if cancelled() {
             stopped = "已取消".into();
             break;
@@ -394,7 +412,8 @@ pub fn build_index(
             }
 
             // ── 向量层(认意思腿):P1-4 只覆盖「精华」文本(按类型/大小分流)──
-            if chunked == 0 {
+            // 无 key 时整块跳过:chunked 保持 0,补 key 后再点构建即补建向量(认字腿已先行覆盖)。
+            if embed_ok && chunked == 0 {
                 if embeddable(&ext, size) && !text.is_empty() {
                     let chunks = chunk_text(&text);
                     if !chunks.is_empty() {
@@ -425,12 +444,28 @@ pub fn build_index(
                                     });
                                 }
                             });
+                            // 嵌入错误(断网/限速/TLS 闪断)**不再整体放弃**:几百 GB 的索引
+                            // 跑几小时,一次网络抖动就清零代价太大。此前已 DELETE 旧 chunk、未标
+                            // chunked=1 → 本文件留待下轮重试;优雅停在已索引处(认字腿+已成功的
+                            // 向量都已逐文件提交落库),报可重试。
+                            let mut embed_err: Option<String> = None;
                             for (i, r) in collected.into_inner().unwrap() {
-                                let mut vecs = r?;
-                                for v in vecs.iter_mut() {
-                                    normalize(v); // P1-3:入库归一化一次 → 查询退化成纯点积
+                                match r {
+                                    Ok(mut vecs) => {
+                                        for v in vecs.iter_mut() {
+                                            normalize(v); // P1-3:入库归一化一次 → 查询退化成纯点积
+                                        }
+                                        all_vecs[i] = vecs;
+                                    }
+                                    Err(e) => {
+                                        embed_err = Some(e);
+                                        break;
+                                    }
                                 }
-                                all_vecs[i] = vecs;
+                            }
+                            if let Some(e) = embed_err {
+                                stopped = format!("嵌入中断(可再点继续补建向量):{e}");
+                                break 'outer;
                             }
                         }
                         // 写库:整文件单事务批量插入(seq = batch_i*EMBED_BATCH+i,顺序稳定)。
@@ -471,17 +506,20 @@ pub fn build_index(
         }
     }
 
-    // 剩余工作 = 还要嵌入(chunked=0)或还要进倒排(ftsed=0,仅 lex 可用时)的文本文件。
-    let pending_count_sql = if lex_ok {
-        "SELECT COUNT(*) FROM files WHERE kind='text' AND size<=?1 AND (chunked=0 OR ftsed=0)"
-    } else {
-        "SELECT COUNT(*) FROM files WHERE kind='text' AND size<=?1 AND chunked=0"
+    // 剩余工作:与 pending_sql 同口径 —— 无 key 时只数还没进倒排(ftsed=0)的文件,
+    // 别把「待补向量」(chunked=0)算成欠账,否则永远显示一堆 pending 误导用户。
+    let pending_count_sql = match (embed_ok, lex_ok) {
+        (true, true) => {
+            "SELECT COUNT(*) FROM files WHERE kind='text' AND size<=?1 AND (chunked=0 OR ftsed=0)"
+        }
+        (false, true) => "SELECT COUNT(*) FROM files WHERE kind='text' AND size<=?1 AND ftsed=0",
+        _ => "SELECT COUNT(*) FROM files WHERE kind='text' AND size<=?1 AND chunked=0",
     };
     let files_pending: i64 = conn
         .query_row(pending_count_sql, [MAX_LEX_FILE_BYTES], |r| r.get(0))
         .unwrap_or(0);
-    // 首次跨过规模门槛时自动建一次 IVF 倒排单元(20TB 级检索开箱即亚秒);未取消时才做。
-    if !cancelled() {
+    // 首次跨过规模门槛时自动建一次 IVF 倒排单元(20TB 级检索开箱即亚秒);未取消、有向量可聚类时才做。
+    if !cancelled() && embed_ok {
         maybe_optimize(&conn, &model);
     }
     Ok(IndexSummary {

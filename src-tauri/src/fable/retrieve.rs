@@ -65,35 +65,129 @@ struct GrepHit {
     score: f32,
 }
 
-/// 把查询拆成「全句 + ≥2 字符分词」。中文整句即全句通道,CJK 不强行分词。
-fn split_query(query: &str) -> (String, Vec<String>) {
-    let q_full = query.trim().to_lowercase();
-    let tokens: Vec<String> = q_full
-        .split_whitespace()
-        .map(|t| t.to_string())
-        .filter(|t| t.chars().count() >= 2 && *t != q_full)
-        .collect();
-    (q_full, tokens)
+/// CJK(中日韩)表意文字判断 —— 这些字之间没有空格,必须自行切词。
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3400}'..='\u{4DBF}'   // 扩展 A
+        | '\u{4E00}'..='\u{9FFF}' // 基本汉字
+        | '\u{F900}'..='\u{FAFF}' // 兼容表意
+        | '\u{3040}'..='\u{30FF}' // 日文假名
+    )
 }
 
-/// 组 FTS5(trigram)MATCH 表达式:全句 + 各 token(均需 ≥3 字符)拼成 OR;双引号转义成短语。
-/// 返回 None 表示无可用 ≥3 字符项(trigram 索引不了 1~2 字符)→ 调用方落实时扫描兜底。
-fn fts_match_expr(q_full: &str, tokens: &[String]) -> Option<String> {
-    let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let mut terms: Vec<String> = Vec::new();
-    if q_full.chars().count() >= 3 {
-        terms.push(esc(q_full));
-    }
-    for t in tokens {
-        if t.chars().count() >= 3 {
-            terms.push(esc(t));
+/// CJK 功能词/填充词(2 字),作检索词无区分度 —— 从二元组里剔除以降噪(自然句里满是这种)。
+const CJK_STOP: &[&str] = &[
+    "我想", "想了", "了解", "怎么", "么做", "是怎", "做的", "一下", "知道", "什么", "这个",
+    "那个", "可以", "因为", "所以", "但是", "如果", "就是", "没有", "已经", "这样", "一个",
+    "一些", "现在", "时候", "出来", "起来", "相关", "资料", "的话", "进行", "通过", "对于",
+    "以及", "或者", "还是", "为了", "需要", "应该", "如何", "请问", "帮我", "告诉",
+];
+
+/// 把查询切成原子:`(拉丁/数字词, CJK 连续段)`。空白与标点都作分隔符。
+fn atoms(query: &str) -> (Vec<String>, Vec<String>) {
+    let mut latin = Vec::new();
+    let mut runs = Vec::new();
+    let mut cur_latin = String::new();
+    let mut cur_cjk = String::new();
+    for ch in query.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if !cur_cjk.is_empty() {
+                runs.push(std::mem::take(&mut cur_cjk));
+            }
+            cur_latin.push(ch);
+        } else if is_cjk(ch) {
+            if !cur_latin.is_empty() {
+                latin.push(std::mem::take(&mut cur_latin));
+            }
+            cur_cjk.push(ch);
+        } else {
+            if !cur_latin.is_empty() {
+                latin.push(std::mem::take(&mut cur_latin));
+            }
+            if !cur_cjk.is_empty() {
+                runs.push(std::mem::take(&mut cur_cjk));
+            }
         }
     }
+    if !cur_latin.is_empty() {
+        latin.push(cur_latin);
+    }
+    if !cur_cjk.is_empty() {
+        runs.push(cur_cjk);
+    }
+    (latin, runs)
+}
+
+/// 把查询拆成「全句 + 内容词」。**内容词 = 拉丁词(≥2)+ CJK 重叠二元组(滤功能词)+ 单字 CJK**。
+/// 关键改动:CJK 自然句不再当一个大短语 —— 「我想了解模型索引」会切出 `模型`/`索引` 等概念词,
+/// 这样子串算分(scan_and_score)能逐概念命中,自然句不再零召回。
+pub(crate) fn split_query(query: &str) -> (String, Vec<String>) {
+    let q_full = query.trim().to_lowercase();
+    let (latin, runs) = atoms(&q_full);
+    let mut terms: Vec<String> = Vec::new();
+    for w in latin {
+        if w.chars().count() >= 2 {
+            terms.push(w);
+        }
+    }
+    for run in runs {
+        let chars: Vec<char> = run.chars().collect();
+        if chars.len() == 1 {
+            terms.push(run);
+        } else {
+            for w in chars.windows(2) {
+                let bg: String = w.iter().collect();
+                if !CJK_STOP.contains(&bg.as_str()) {
+                    terms.push(bg);
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    terms.retain(|t| seen.insert(t.clone()));
+    terms.truncate(40);
+    (q_full, terms)
+}
+
+/// FTS5(trigram)只能命中 ≥3 个码点的项。从查询里取**可被 trigram 服务**的检索词:
+/// 拉丁词(≥3)+ 每个 CJK 段(≥3 字)的重叠三元组。OR 拼接(非整句短语,故自然句也有候选)。
+/// 返回 None 表示没有 ≥3 项 → 调用方靠实时子串扫描兜底。
+fn fts_query_expr(query: &str) -> Option<String> {
+    let esc = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let (latin, runs) = atoms(query);
+    let mut terms: Vec<String> = Vec::new();
+    for w in latin {
+        if w.chars().count() >= 3 {
+            terms.push(w);
+        }
+    }
+    for run in runs {
+        let chars: Vec<char> = run.chars().collect();
+        if chars.len() >= 3 {
+            for w in chars.windows(3) {
+                terms.push(w.iter().collect());
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    terms.retain(|t| seen.insert(t.clone()));
+    terms.truncate(60);
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" OR "))
+        Some(terms.iter().map(|t| esc(t)).collect::<Vec<_>>().join(" OR "))
     }
+}
+
+/// 查询里是否含 trigram **无法**索引的短概念词(独立 1~2 字 CJK 段、或 2 字拉丁词)。
+/// 有则补一趟实时子串扫描(覆盖 2 字中文关键词 + 未进倒排的文件);没有则纯走快的倒排路。
+fn has_short_terms(query: &str) -> bool {
+    let (latin, runs) = atoms(query);
+    latin.iter().any(|w| w.chars().count() == 2)
+        || runs.iter().any(|r| {
+            let n = r.chars().count();
+            n == 1 || n == 2
+        })
 }
 
 /// 多核回读候选文件 → 精确算分 + 抽命中行/上下文窗口。FTS 路与实时扫描路共用此算分口径。
@@ -179,43 +273,88 @@ fn scan_and_score(
     (out, truncated.load(Ordering::Relaxed))
 }
 
-/// 认字腿(P1-2):优先走 FTS5 倒排(提前建好、查词秒回、**覆盖全部文本文件不漏**),
-/// 命中候选后只回读这几百个文件精确算分;倒排不可用或查询过短(<3 字符)时退回实时扫描兜底。
+/// 认字腿(P1-2 + CJK 修):两路候选合并 ——
+/// - **倒排路**(快、可扩展):FTS5 trigram 取 ≥3 码点检索词的候选;自然句靠三元组 OR 也有候选。
+/// - **实时扫描路**(子串、覆盖未索引文件):仅当查询含 trigram 服务不了的短词(独立 1~2 字
+///   CJK 概念词、2 字拉丁词,如「模型 索引」)、或倒排无候选时才补扫,带字节预算护栏。
+///
+/// 旧实现的致命缺陷:整句当一个 FTS 短语 → 「模型 索引」「检索 重排」「<整句自然语言>」全部零召回
+/// (实测 0 命中)。现在 split_query 把 CJK 句切成概念词、fts_query_expr 用三元组 OR 取候选,
+/// scan_and_score 按概念词子串算分,自然句/双关键词都能命中。
 fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
-    let (q_full, tokens) = split_query(query);
+    let (q_full, terms) = split_query(query);
     if q_full.is_empty() {
         return Ok((Vec::new(), false));
     }
     let conn = open_db()?;
 
-    // —— 倒排路:lex 就绪 + 有 ≥3 字符项 ——
-    if lex_available(&conn) {
-        if let Some(expr) = fts_match_expr(&q_full, &tokens) {
-            let candidates: Vec<(String, String, i64)> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT r.path, f.relpath, f.size FROM lex l
-                         JOIN files f ON f.id=l.rowid JOIN roots r ON r.id=f.root_id
-                         WHERE l.body MATCH ?1 ORDER BY bm25(lex) LIMIT ?2",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(rusqlite::params![expr, FTS_CAND_LIMIT], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-                    })
-                    .map_err(|e| e.to_string())?;
-                rows.flatten().collect()
-            };
-            drop(conn);
-            // 倒排已对全库匹配,候选即「全部命中文件按相关度排序后的前 N」→ 不存在实时扫描的漏检截断。
-            let (hits, _) = scan_and_score(candidates, &q_full, &tokens, None);
-            return Ok((hits, false));
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut fts_cand: Vec<(String, String, i64)> = Vec::new();
+    let lex_ok = lex_available(&conn);
+
+    // —— 倒排路 ——
+    if lex_ok {
+        if let Some(expr) = fts_query_expr(&q_full) {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.path, f.relpath, f.size FROM lex l
+                     JOIN files f ON f.id=l.rowid JOIN roots r ON r.id=f.root_id
+                     WHERE l.body MATCH ?1 ORDER BY bm25(lex) LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![expr, FTS_CAND_LIMIT], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.flatten() {
+                if seen.insert((row.0.clone(), row.1.clone())) {
+                    fts_cand.push(row);
+                }
+            }
         }
-        // 查询不足 3 字符:trigram 索引不了 → 落实时扫描。
     }
 
-    // —— 兜底:实时扫描(无 FTS / 查询过短),保留原字节预算护栏 ——
-    let candidates: Vec<(String, String, i64)> = {
+    // 纯标点/纯空白等「无内容词」查询:倒排也没候选 → 直接收工,别空扫一整轮磁盘(实测省 ~1s)。
+    if terms.is_empty() && fts_cand.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+
+    // —— 短词补召(trigram 服务不了的 ≤2 码点概念词,如「模型」「索引」)——
+    // 优先 lex LIKE:读 DB 页(OS 缓存,快)、覆盖**全部**已索引文件,命中后只回读这几百个文件;
+    // 比扫 2 万个磁盘文件快一两个数量级(实测 ~1s → 数十 ms)。
+    let mut like_cand: Vec<(String, String, i64)> = Vec::new();
+    if lex_ok && has_short_terms(&q_full) {
+        let shorts: Vec<&String> =
+            terms.iter().filter(|t| t.chars().count() <= 2).take(8).collect();
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.path, f.relpath, f.size FROM lex l
+                 JOIN files f ON f.id=l.rowid JOIN roots r ON r.id=f.root_id
+                 WHERE l.body LIKE ?1 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        for t in shorts {
+            // 检索词只含 CJK / 字母数字(atoms 已过滤),不含 LIKE 元字符,直接拼 %term%。
+            let pat = format!("%{t}%");
+            let rows = stmt
+                .query_map(rusqlite::params![pat, FTS_CAND_LIMIT], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.flatten() {
+                if seen.insert((row.0.clone(), row.1.clone())) {
+                    like_cand.push(row);
+                }
+            }
+        }
+    }
+
+    // —— 磁盘兜底(有界子串扫盘)——
+    // 仅当倒排 + LIKE 都没候选(目标可能落在**未索引**文件里),或 lex 整个没就绪时才扫;
+    // 命中索引时绝不触发,把昂贵的全盘扫描留给真正必要的场景。
+    let need_disk = !lex_ok || (fts_cand.is_empty() && like_cand.is_empty());
+    let scan_cand: Vec<(String, String, i64)> = if need_disk {
         let mut stmt = conn
             .prepare(
                 "SELECT r.path, f.relpath, f.size FROM files f JOIN roots r ON r.id=f.root_id
@@ -227,10 +366,30 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })
             .map_err(|e| e.to_string())?;
-        rows.flatten().collect()
+        rows.flatten().filter(|row| seen.insert((row.0.clone(), row.1.clone()))).collect()
+    } else {
+        Vec::new()
     };
     drop(conn);
-    Ok(scan_and_score(candidates, &q_full, &tokens, Some(MAX_GREP_TOTAL_BYTES)))
+
+    // 倒排 / LIKE 候选已有界(≤ 几百)→ 无预算、不截断;磁盘兜底候选带字节预算护栏。
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    let indexed_cand: Vec<(String, String, i64)> =
+        fts_cand.into_iter().chain(like_cand).collect();
+    if !indexed_cand.is_empty() {
+        let (h, _) = scan_and_score(indexed_cand, &q_full, &terms, None);
+        hits.extend(h);
+    }
+    if !scan_cand.is_empty() {
+        let (h, t) = scan_and_score(scan_cand, &q_full, &terms, Some(MAX_GREP_TOTAL_BYTES));
+        hits.extend(h);
+        truncated = t;
+    }
+    // 两路命中合并后重排、截断(各路内部已 ≤60,合并后再收一次)。
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(60);
+    Ok((hits, truncated))
 }
 
 // ───────────────────────── 向量车道 ─────────────────────────
@@ -445,6 +604,17 @@ pub fn search(
     scope: Option<&str>,
 ) -> Result<FableSearchResult, String> {
     let started = std::time::Instant::now();
+    // 防御性截断:超长查询(误把整篇文档/日志粘进搜索框)会撑爆嵌入请求体与 FTS5 MATCH
+    // 表达式(单个 ~2MB 短语),且对召回毫无增益 —— 检索意图在前几十字就已表达。截到 2000
+    // 字符,正常查询零影响;这是「最严峻输入」下保证向量/倒排两腿都不被拖垮的硬护栏。
+    const MAX_QUERY_CHARS: usize = 2000;
+    let clamped: String;
+    let query: &str = if query.chars().count() > MAX_QUERY_CHARS {
+        clamped = query.chars().take(MAX_QUERY_CHARS).collect();
+        &clamped
+    } else {
+        query
+    };
     let top_k = top_k.clamp(1, 50);
     let want_grep = mode != "vector";
     let want_vec = mode != "grep";
@@ -698,26 +868,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_query_full_and_tokens() {
-        let (full, toks) = split_query("  Open Hours 营业时间 ");
+    fn split_query_segments_cjk_and_latin() {
+        let (full, terms) = split_query("  Open Hours 营业时间 ");
         assert_eq!(full, "open hours 营业时间");
-        // ≥2 字符、且不等于全句的分词
-        assert!(toks.contains(&"open".to_string()));
-        assert!(toks.contains(&"hours".to_string()));
-        assert!(toks.contains(&"营业时间".to_string()));
+        // 拉丁词原样保留
+        assert!(terms.contains(&"open".to_string()));
+        assert!(terms.contains(&"hours".to_string()));
+        // CJK 段切成重叠二元组(概念词),而非整段一个 token
+        assert!(terms.contains(&"营业".to_string()));
+        assert!(terms.contains(&"时间".to_string()));
     }
 
     #[test]
-    fn fts_expr_needs_three_chars() {
-        // 全句 4 字符(≥3)→ 有表达式
-        let (full, toks) = split_query("开放时间");
-        assert!(fts_match_expr(&full, &toks).is_some());
-        // 全句 2 字符且无 ≥3 字符 token → None(trigram 索引不了)
-        let (full2, toks2) = split_query("时间");
-        assert!(fts_match_expr(&full2, &toks2).is_none());
-        // 内嵌双引号要被转义成 ""(防 FTS 语法注入/语法错)
-        let expr = fts_match_expr("a\"b\"c", &[]).unwrap();
-        assert_eq!(expr, "\"a\"\"b\"\"c\"");
+    fn split_query_drops_cjk_stopword_bigrams() {
+        // 自然句:功能词二元组(我想/想了/了解/怎么…)应被滤掉,内容词(模型/索引)保留
+        let (_full, terms) = split_query("我想了解模型索引是怎么做的");
+        assert!(terms.contains(&"模型".to_string()));
+        assert!(terms.contains(&"索引".to_string()));
+        assert!(!terms.contains(&"我想".to_string()));
+        assert!(!terms.contains(&"怎么".to_string()));
+    }
+
+    #[test]
+    fn fts_expr_uses_trigrams_not_whole_phrase() {
+        // CJK ≥3 段 → 出三元组 OR(自然句/拼接词也有候选),不再是整句一个短语
+        let expr = fts_query_expr("知识库检索").unwrap();
+        assert!(expr.contains("\"知识库\""));
+        assert!(expr.contains("\"识库检\""));
+        assert!(expr.contains(" OR "));
+        // 纯 2 字 CJK(独立概念)→ trigram 索引不了 → None(靠实时扫描兜底)
+        assert!(fts_query_expr("模型").is_none());
+        assert!(fts_query_expr("模型 索引").is_none());
+        // 拉丁 ≥3 词原样成短语;<3 拉丁(a/bc)被丢,故标点切词后无 ≥3 项 → None
+        assert_eq!(fts_query_expr("config").unwrap(), "\"config\"");
+        assert!(fts_query_expr("a\"bc").is_none());
+    }
+
+    #[test]
+    fn has_short_terms_detects_bare_cjk_concepts() {
+        // 含独立 2 字 CJK 概念 → 需补实时扫描(trigram 服务不了)
+        assert!(has_short_terms("模型"));
+        assert!(has_short_terms("模型 索引"));
+        // 长 CJK 段(自然句/拼接词)→ trigram 三元组够用,不必慢扫
+        assert!(!has_short_terms("知识库检索系统"));
+        assert!(!has_short_terms("我想了解模型索引是怎么做的"));
+        // 2 字拉丁词也算短词
+        assert!(has_short_terms("ab"));
+        assert!(!has_short_terms("abcd"));
     }
 
     #[test]

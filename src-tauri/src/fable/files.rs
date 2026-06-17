@@ -100,6 +100,15 @@ pub struct KindCount {
     pub bytes: u64,
 }
 
+/// 「按语言归类」的一档:编程语言(Python/Rust…)/ 自然语言(中文/英文)/ 媒体大类(图片/视频…)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LangCount {
+    pub lang: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterView {
@@ -128,6 +137,8 @@ pub struct FileOverview {
     pub total_files: u64,
     pub total_bytes: u64,
     pub by_kind: Vec<KindCount>,
+    /// 按语言归类的分布(编程语言 / 自然语言 / 媒体大类)。
+    pub by_lang: Vec<LangCount>,
     pub clusters: Vec<ClusterView>,
     pub text_files: u64,
     pub embedded_files: u64,
@@ -202,6 +213,20 @@ fn in_clause(ids: &[i64]) -> String {
     }
 }
 
+/// 文件的「语言归类」标签:优先用回填好的 lang 列;为空时由 ext/kind 当场推(代码/媒体准确,
+/// 文稿尚未回填自然语言 → 归「文档·待识别」)。grid 过滤与 overview 折叠共用同一口径。
+fn language_label(stored: &str, ext: &str, kind: &str) -> String {
+    if !stored.is_empty() {
+        return stored.to_string();
+    }
+    let q = super::inventory::quick_lang(ext, kind);
+    if q.is_empty() {
+        "文档·待识别".to_string()
+    } else {
+        q
+    }
+}
+
 pub fn overview(root: Option<String>) -> Result<FileOverview, String> {
     let conn = open_db()?;
     // 根列表(给前端做切换器)
@@ -252,6 +277,38 @@ pub fn overview(root: Option<String>) -> Result<FileOverview, String> {
     }
     by_kind.sort_by(|a, b| b.count.cmp(&a.count));
 
+    // 按语言分布:GROUP BY (lang, ext, kind),Rust 里折成语言标签。代码/媒体即便 lang 列还没回填
+    // 也能由 ext/kind 当场推出(零等待);文稿的中文/英文需回填 lang 后才细分,未回填前归「文档·待识别」。
+    let mut by_lang = {
+        let mut agg: HashMap<String, (u64, u64)> = HashMap::new();
+        let sql = format!(
+            "SELECT f.lang, f.ext, f.kind, COUNT(*), COALESCE(SUM(f.size),0)
+             FROM files f WHERE 1=1{filter} GROUP BY f.lang, f.ext, f.kind"
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u64,
+                ))
+            }) {
+                for (lang, ext, kind, count, bytes) in rows.flatten() {
+                    let label = language_label(&lang, &ext, &kind);
+                    let e = agg.entry(label).or_insert((0, 0));
+                    e.0 += count;
+                    e.1 += bytes;
+                }
+            }
+        }
+        agg.into_iter()
+            .map(|(lang, (count, bytes))| LangCount { lang, count, bytes })
+            .collect::<Vec<_>>()
+    };
+    by_lang.sort_by(|a, b| b.count.cmp(&a.count));
+
     // 簇
     let mut clusters = Vec::new();
     {
@@ -295,6 +352,7 @@ pub fn overview(root: Option<String>) -> Result<FileOverview, String> {
         total_files,
         total_bytes,
         by_kind,
+        by_lang,
         clustered: !clusters.is_empty(),
         clusters,
         text_files,
@@ -366,6 +424,7 @@ pub fn grid(
     root: Option<String>,
     cluster_id: Option<i64>,
     kind: Option<String>,
+    lang: Option<String>,
     sort: Option<String>,
     query: Option<String>,
     page: usize,
@@ -392,6 +451,26 @@ pub fn grid(
     if !kinds.is_empty() {
         let list: Vec<String> = kinds.iter().map(|k| format!("'{k}'")).collect();
         where_sql.push_str(&format!(" AND f.kind IN ({})", list.join(",")));
+    }
+    // 按语言过滤:代码/标记语言按扩展名集合(不依赖回填)、媒体按 kind、自然语言按回填好的 lang 列。
+    if let Some(l) = lang.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "all") {
+        let exts = super::inventory::exts_for_lang(l);
+        if !exts.is_empty() {
+            let list: Vec<String> = exts.iter().map(|e| format!("'{e}'")).collect();
+            where_sql.push_str(&format!(" AND LOWER(f.ext) IN ({})", list.join(",")));
+        } else if let Some(k) = super::inventory::kind_for_media_lang(l) {
+            where_sql.push_str(&format!(" AND f.kind='{k}'"));
+        } else if l == "文档·待识别" {
+            let codes: Vec<String> =
+                super::inventory::CODE_EXTS.iter().map(|e| format!("'{e}'")).collect();
+            where_sql.push_str(&format!(
+                " AND f.lang='' AND f.kind IN ('text','doc') AND LOWER(f.ext) NOT IN ({})",
+                codes.join(",")
+            ));
+        } else {
+            let safe = l.replace('\'', "''");
+            where_sql.push_str(&format!(" AND f.lang='{safe}'"));
+        }
     }
     // 文件名子串过滤(语义/全文检索走 fable_search,这里只做轻量的名字过滤)
     let q = query.unwrap_or_default();
@@ -653,7 +732,16 @@ pub fn gist(abspath: String) -> Result<String, String> {
 
     let ext = ext_of(&abspath);
     let result = if TEXT_GIST_EXTS.contains(&ext.as_str()) {
-        let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+        // 速览只取前 8000 字符,故只读文件头若干字节即可 —— 原 `fs::read` 会把 GB 级
+        // 大文本(.txt/.json/.log)整个读进内存做一个小预览,弱 NAS 上直接 OOM。256KB
+        // 远超 8000 字符所需(即便全 4 字节 UTF-8 也才 32KB),既防爆内存又不影响预览质量。
+        const GIST_HEAD_BYTES: usize = 256 * 1024;
+        use std::io::Read;
+        let mut bytes = vec![0u8; GIST_HEAD_BYTES];
+        let n = std::fs::File::open(p)
+            .and_then(|mut f| f.read(&mut bytes))
+            .map_err(|e| e.to_string())?;
+        bytes.truncate(n);
         if bytes.iter().take(4096).any(|&b| b == 0) {
             String::new()
         } else {
@@ -1484,6 +1572,13 @@ fn llm_cluster_directive(files: &[FileLite]) -> String {
 请**纯按内容主题 / 思想类型**把它们归成**两级**树:先归成几个「大主题」,每个大主题下再分若干「子主题」。
 完全按语义归——把同一思想 / 同一话题 / 同一用途的文件放在一起,**不要按文件类型(图片/视频/文档)来分**。
 
+**命名是重中之重**:这是给「本人」看的个人知识库,标签要让他扫一眼就认出「这就是我那堆 XX」。
+- 一律用**用户自己会用的中文大白话**,像他平时怎么称呼这些文件就怎么叫:
+  「我的合同」「报税资料」「装修」「考研复习」「孩子照片」「工作汇报」「旅行」「副业接单」「发票收据」……
+- 大主题可带「我的」口吻更亲切(如「我的项目」「我的财务」);**绝不要英文、绝不要技术黑话、绝不要文件夹原名**(像 raw/output/新建文件夹 这类);
+- 出现最多、最近频繁出现的话题优先单独成主题(用户最关心高频的);
+- 别用「其它 / 杂项 / 未分类」这种空标签——再小的一摊也给个具体中文名。
+
 要求:
 - 大主题 3~8 个;每个大主题下 2~6 个子主题;子主题尽量 ≥2 个文件;
 - 大主题是宽泛的思想/领域(如「产品设计」「财务合同」「学习资料」);子主题是其下更细的话题;
@@ -2167,6 +2262,7 @@ pub fn file_grid(
     root: Option<String>,
     cluster_id: Option<i64>,
     kind: Option<String>,
+    lang: Option<String>,
     sort: Option<String>,
     query: Option<String>,
     page: Option<usize>,
@@ -2176,6 +2272,7 @@ pub fn file_grid(
         root,
         cluster_id,
         kind,
+        lang,
         sort,
         query,
         page.unwrap_or(0),

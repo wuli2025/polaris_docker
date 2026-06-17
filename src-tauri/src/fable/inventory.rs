@@ -55,6 +55,135 @@ pub(crate) fn classify(ext: &str) -> &'static str {
     }
 }
 
+// ───────────────────────── 按「语言」归类 ─────────────────────────
+//
+// 用户诉求:文件归类要「按语言」(编程语言 / 自然语言),不要按应用名或粗粒度类型。
+// 三层判定:① 代码/标记类 → 编程语言(扩展名精确判定,零 IO);② 媒体/压缩 → 大类;
+// ③ 文稿(md/txt/doc…)→ 自然语言(读文件头按 CJK 占比嗅探,放在回填里做,避免拖慢盘点)。
+
+/// 扩展名 → 编程语言/标记语言(「按语言归类」的精确信号,零 IO)。None = 非代码类。
+pub(crate) fn prog_lang(ext: &str) -> Option<&'static str> {
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "py" | "pyw" | "pyi" | "ipynb" => "Python",
+        "rs" => "Rust",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "ts" => "TypeScript",
+        "tsx" | "jsx" => "React/JSX",
+        "vue" => "Vue",
+        "go" => "Go",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "C++",
+        "cs" => "C#",
+        "rb" => "Ruby",
+        "php" => "PHP",
+        "swift" => "Swift",
+        "scala" => "Scala",
+        "sh" | "bash" | "zsh" => "Shell",
+        "ps1" | "psm1" | "psd1" => "PowerShell",
+        "bat" | "cmd" => "Batch",
+        "sql" => "SQL",
+        "r" => "R",
+        "lua" => "Lua",
+        "dart" => "Dart",
+        "pl" | "pm" => "Perl",
+        "html" | "htm" => "HTML",
+        "css" | "scss" | "sass" | "less" => "CSS/样式",
+        "json" | "jsonl" | "ndjson" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "toml" | "ini" | "cfg" | "conf" => "配置",
+        "xml" => "XML",
+        _ => return None,
+    })
+}
+
+/// kind → 媒体/压缩大类(非代码、非文稿的语言归类兜底)。None = 文稿类(交自然语言嗅探)。
+fn media_lang(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "image" => "图片",
+        "video" => "视频",
+        "audio" => "音频",
+        "archive" => "压缩包",
+        "other" => "其他文件",
+        _ => return None, // text / doc → 文稿,按自然语言归
+    })
+}
+
+/// 全部受支持的代码/标记扩展名(grid 按语言反查用)。与 [`prog_lang`] 的 match 同源。
+pub(crate) const CODE_EXTS: &[&str] = &[
+    "py", "pyw", "pyi", "ipynb", "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "go", "java",
+    "kt", "kts", "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "hxx", "cs", "rb", "php", "swift",
+    "scala", "sh", "bash", "zsh", "ps1", "psm1", "psd1", "bat", "cmd", "sql", "r", "lua", "dart",
+    "pl", "pm", "html", "htm", "css", "scss", "sass", "less", "json", "jsonl", "ndjson", "yaml",
+    "yml", "toml", "ini", "cfg", "conf", "xml",
+];
+
+/// 某编程/标记语言 → 对应扩展名集合(grid 按语言过滤;代码语言由扩展名确定,不依赖回填)。
+/// 空 = 该标签不是代码语言(改按 lang 列 / kind 过滤)。
+pub(crate) fn exts_for_lang(label: &str) -> Vec<&'static str> {
+    CODE_EXTS.iter().copied().filter(|e| prog_lang(e) == Some(label)).collect()
+}
+
+/// 媒体/压缩语言标签 → 对应 kind(grid 过滤用)。None = 非媒体标签。
+pub(crate) fn kind_for_media_lang(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "图片" => "image",
+        "视频" => "video",
+        "音频" => "audio",
+        "压缩包" => "archive",
+        "其他文件" => "other",
+        _ => return None,
+    })
+}
+
+/// 盘点时即可定的语言(零 IO):代码看扩展名、媒体看 kind;文稿返回 ""(留待回填读头嗅探)。
+pub(crate) fn quick_lang(ext: &str, kind: &str) -> String {
+    if let Some(l) = prog_lang(ext) {
+        return l.to_string();
+    }
+    media_lang(kind).unwrap_or("").to_string()
+}
+
+/// 读文件头嗅探自然语言:CJK 占比 ≥10% → 中文;拉丁字母为主 → 英文;否则其他语言。
+pub(crate) fn natural_lang(sample: &str) -> &'static str {
+    let (mut cjk, mut latin, mut letters) = (0usize, 0usize, 0usize);
+    for c in sample.chars().take(8000) {
+        if ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3400}'..='\u{4dbf}').contains(&c) {
+            cjk += 1;
+            letters += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
+            letters += 1;
+        } else if c.is_alphabetic() {
+            letters += 1;
+        }
+    }
+    if letters < 8 {
+        return "其他语种";
+    }
+    if cjk as f32 / letters as f32 >= 0.10 {
+        "中文"
+    } else if latin as f32 / letters as f32 >= 0.6 {
+        "英文"
+    } else {
+        "其他语种"
+    }
+}
+
+/// 读文件头(≤16KB)做文本采样;二进制(含 NUL)或不可读返回 None。
+pub(crate) fn read_head_sample(abs: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(abs).ok()?;
+    let mut buf = vec![0u8; 16 * 1024];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    if buf.iter().take(1024).any(|&b| b == 0) {
+        return None; // 二进制(含改名的伪文本 / docx/pdf 等容器)
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// 扫描时跳过的目录名(系统/缓存/版本仓;@eaDir、#recycle 是群晖特产)。
 const SKIP_DIRS: &[&str] = &[
     ".git", ".svn", "node_modules", "target", ".fable", ".history", ".quarantine", "__pycache__",
@@ -119,6 +248,8 @@ struct FileRow {
     name: String,
     ext: String,
     kind: &'static str,
+    /// 「按语言归类」标签:代码=编程语言、媒体=大类;文稿盘点时为 ""(回填读头嗅探自然语言)。
+    lang: String,
     size: u64,
     mtime: i64,
 }
@@ -182,10 +313,12 @@ pub fn scan_root(
                 {
                     let mut stmt = conn
                         .prepare_cached(
-                            "INSERT INTO files(root_id,relpath,name,ext,kind,size,mtime,chunked,seen)
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8)
+                            "INSERT INTO files(root_id,relpath,name,ext,kind,lang,size,mtime,chunked,seen)
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)
                              ON CONFLICT(root_id,relpath) DO UPDATE SET
                                name=excluded.name, ext=excluded.ext, kind=excluded.kind,
+                               -- 文稿回填得到的自然语言(中文/英文)别被重扫的 '' 覆盖:仅当新值非空才更新。
+                               lang=CASE WHEN excluded.lang!='' THEN excluded.lang ELSE files.lang END,
                                chunked=CASE WHEN files.mtime=excluded.mtime AND files.size=excluded.size
                                             THEN files.chunked ELSE 0 END,
                                ftsed=CASE WHEN files.mtime=excluded.mtime AND files.size=excluded.size
@@ -195,7 +328,7 @@ pub fn scan_root(
                         .map_err(|e| e.to_string())?;
                     for row in batch.drain(..) {
                         stmt.execute(rusqlite::params![
-                            root_id, row.relpath, row.name, row.ext, row.kind,
+                            root_id, row.relpath, row.name, row.ext, row.kind, row.lang,
                             row.size as i64, row.mtime, gen
                         ])
                         .map_err(|e| e.to_string())?;
@@ -275,10 +408,12 @@ pub fn scan_root(
                                 let size = on_disk_size(&p, &meta);
                                 let total = n_files.fetch_add(1, Ordering::Relaxed) + 1;
                                 let bytes = n_bytes.fetch_add(size, Ordering::Relaxed) + size;
+                                let kind = classify(&ext);
                                 let _ = tx.send(FileRow {
                                     relpath: rel,
                                     name,
-                                    kind: classify(&ext),
+                                    kind,
+                                    lang: quick_lang(&ext, kind), // 代码/媒体当场定;文稿留 "" 待回填
                                     ext,
                                     size,
                                     mtime,
@@ -826,9 +961,112 @@ pub fn fable_folder_size(path: String) -> Result<FolderSize, String> {
     Ok(FolderSize { files, bytes })
 }
 
+/// 「按语言归类」回填:给所有还没定语言(lang='')的文件补上语言标签。
+/// 代码/媒体零 IO 当场定;文稿读文件头嗅探自然语言(中文/英文/其他)。多核并行、幂等续跑。
+/// 旧库(刚加 lang 列,全为 '')或新盘点后的文稿都靠它补齐。返回本轮回填条数。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn fable_backfill_lang() -> Result<u64, String> {
+    let conn = open_db()?;
+    let mut done = 0u64;
+    loop {
+        if cancelled() {
+            break;
+        }
+        // 取一批未定语言的文件(连 root 路径,文稿要据此读头)。
+        let batch: Vec<(i64, String, String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT f.id, f.ext, f.kind, r.path, f.relpath FROM files f
+                     JOIN roots r ON r.id=f.root_id WHERE f.lang='' LIMIT 4096",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        if batch.is_empty() {
+            break;
+        }
+        // 多核算语言:代码/媒体 quick_lang 零 IO;文稿读头嗅探(work-stealing 栈)。
+        let stack = Mutex::new(batch);
+        let out: Mutex<Vec<(i64, String)>> = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..worker_count() {
+                let (stack, out) = (&stack, &out);
+                s.spawn(move || loop {
+                    let item = { stack.lock().unwrap().pop() };
+                    let Some((id, ext, kind, root, rel)) = item else { break };
+                    let mut lang = quick_lang(&ext, &kind);
+                    if lang.is_empty() {
+                        // 文稿:读头嗅探自然语言;不可读/二进制 → 其他。
+                        let abs = Path::new(&root).join(&rel);
+                        lang = read_head_sample(&abs)
+                            .map(|sample| natural_lang(&sample))
+                            .unwrap_or("未识别")
+                            .to_string();
+                    }
+                    out.lock().unwrap().push((id, lang));
+                });
+            }
+        });
+        // 单事务写回这一批。
+        let updates = out.into_inner().unwrap();
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        {
+            let mut stmt = conn
+                .prepare_cached("UPDATE files SET lang=?1 WHERE id=?2")
+                .map_err(|e| e.to_string())?;
+            for (id, lang) in &updates {
+                // 给个非空哨兵避免再次入选(理论上 lang 已非空)。
+                let v = if lang.is_empty() { "未识别" } else { lang.as_str() };
+                stmt.execute(rusqlite::params![v, id]).map_err(|e| e.to_string())?;
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        done += updates.len() as u64;
+        // 单次调用封顶 ~16K 文件:桌面前端循环调用,每次都短(不冻界面),返回 0 即收工。
+        if done >= 16_384 {
+            break;
+        }
+    }
+    Ok(done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prog_lang_maps_extensions() {
+        assert_eq!(prog_lang("py"), Some("Python"));
+        assert_eq!(prog_lang("rs"), Some("Rust"));
+        assert_eq!(prog_lang("tsx"), Some("React/JSX"));
+        assert_eq!(prog_lang("md"), None); // 文稿交自然语言
+        assert_eq!(prog_lang("png"), None);
+    }
+
+    #[test]
+    fn natural_lang_detects_script() {
+        assert_eq!(natural_lang("这是一段中文文本,讲的是知识库检索系统"), "中文");
+        assert_eq!(natural_lang("This is an English document about retrieval."), "英文");
+        assert_eq!(natural_lang("123 456 !!! ==="), "其他语种"); // 字母太少
+    }
+
+    #[test]
+    fn quick_lang_code_and_media() {
+        assert_eq!(quick_lang("py", "text"), "Python");
+        assert_eq!(quick_lang("png", "image"), "图片");
+        assert_eq!(quick_lang("md", "text"), ""); // 文稿留空待回填
+    }
 
     #[test]
     fn skip_dir_scan_prunes_system_and_appdata() {

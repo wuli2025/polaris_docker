@@ -179,6 +179,37 @@ html.no-anim .slide.is-active .anim-slide-left,
 html.no-anim .slide.is-active .anim-slide-right,
 html.no-anim .slide.is-active .anim-stagger-list>*{opacity:1!important;transform:none!important}
 
+/* ================= FUNNEL (转化漏斗版式) =================
+ * 阶梯式转化漏斗：底对齐，每段 --lvl(0~1)=该环节量÷漏斗顶端量，
+ * 同时决定阶梯高度与色深(顶端浓→末端淡)。仅引用既有 token，
+ * 故 36 套主题(深/浅)自动适配。大数字可挂 data-count 由 motion.js 滚动。
+ * ★ 防压字：标签/转化率不再绝对定位，统一进 .funnel-head 顶行内排布，
+ *   名称/大数字/页脚走正常弹性流，彼此不重叠。 */
+.funnel{display:flex;align-items:flex-end;gap:16px;width:100%;height:60vh;min-height:340px}
+.funnel-step{
+  --lvl:1;
+  flex:1;min-width:0;display:flex;flex-direction:column;
+  height:calc(46% + var(--lvl) * 54%);          /* 阶梯：最矮 46%，满格 100% */
+  padding:20px 22px;border-radius:var(--radius);position:relative;overflow:hidden;
+  color:var(--text-1);box-shadow:var(--shadow);border:1px solid var(--border-strong);
+  background:linear-gradient(165deg,
+    color-mix(in srgb, var(--accent) calc(22% * var(--lvl)), var(--surface)), var(--surface));
+}
+.funnel-step::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;
+  background:linear-gradient(90deg,var(--accent),transparent);opacity:calc(.4 + .6*var(--lvl))}
+.funnel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:22px;margin-bottom:8px}
+.funnel-step .fs-tag{font-size:11px;letter-spacing:.12em;color:var(--text-3);text-transform:uppercase;white-space:nowrap}
+.funnel-step .fs-rate{font-size:12px;font-weight:700;padding:2px 9px;border-radius:999px;color:var(--good);white-space:nowrap;
+  background:color-mix(in srgb,var(--good) 16%,transparent);border:1px solid color-mix(in srgb,var(--good) 32%,transparent)}
+.funnel-step .fs-name{font-size:15px;color:var(--text-2);font-weight:500;margin-bottom:4px}
+.funnel-step .fs-num{font-size:clamp(28px,3.2vw,50px);font-weight:800;letter-spacing:-.02em;line-height:1.05}
+.funnel-step .fs-num .u{font-size:.42em;font-weight:600;color:var(--text-2);margin-left:4px}
+.funnel-step .fs-foot{margin-top:auto;padding-top:12px;border-top:1px solid var(--border);
+  display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--text-3)}
+.funnel-step .fs-foot .kv{display:flex;align-items:center;gap:7px}
+.funnel-step .fs-foot .dot{width:7px;height:7px;border-radius:50%;background:var(--good);flex:none}
+.funnel-step .fs-foot b{color:var(--text-2);font-weight:600}
+
 /* ================= PRINT ================= */
 @media print{
   .slide{position:relative;opacity:1!important;transform:none!important;page-break-after:always;height:100vh}

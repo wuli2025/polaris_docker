@@ -492,6 +492,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             req_str(a, "path")?,
         )?),
         "fable_folder_size" => ok(fable::inventory::fable_folder_size(req_str(a, "path")?)?),
+        "fable_backfill_lang" => ok(fable::inventory::fable_backfill_lang()?),
         "fable_index_start" => {
             ok(fable::index::fable_index_start(app, opt_usize(a, "maxChunks"))?)
         }
@@ -515,6 +516,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             opt_str(a, "root"),
             a.get("clusterId").and_then(|v| v.as_i64()),
             opt_str(a, "kind"),
+            opt_str(a, "lang"),
             opt_str(a, "sort"),
             opt_str(a, "query"),
             opt_usize(a, "page"),

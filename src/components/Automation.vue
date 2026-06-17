@@ -21,6 +21,7 @@ import {
   Square,
   Moon,
   Power,
+  ChevronDown,
 } from "@lucide/vue";
 import { useAutomationStore, type AutomationFlow } from "../stores/automation";
 import { useAppStore } from "../stores/app";
@@ -44,6 +45,12 @@ interface EchoStatus {
   log: DreamLog[];
 }
 const echo = ref<EchoStatus | null>(null);
+// 卡片收起状态（纯前端，持久化）——不影响是否开启，只折叠这张卡的占位
+const dreamCollapsed = ref(localStorage.getItem("polaris.dreamCollapsed") === "1");
+function toggleDream() {
+  dreamCollapsed.value = !dreamCollapsed.value;
+  localStorage.setItem("polaris.dreamCollapsed", dreamCollapsed.value ? "1" : "0");
+}
 async function loadEcho() {
   if (!isTauri) return;
   try {
@@ -156,12 +163,12 @@ function stopFlow(f: AutomationFlow) {
       </header>
 
       <!-- 自动做梦 · 每日晨报（回声层）-->
-      <section v-if="echo" class="dream-card">
+      <section v-if="echo" class="dream-card" :class="{ collapsed: dreamCollapsed }">
         <div class="dc-head">
           <span class="dc-ic"><Moon :size="15" :stroke-width="1.8" color="#fff" /></span>
           <div class="dc-tt">
             <span class="dc-name">自动做梦 · 每日晨报</span>
-            <span class="dc-sub"
+            <span v-if="!dreamCollapsed" class="dc-sub"
               >每天自动整理你的对话与新资料，归类进记忆，并据新内容给出工程化建议 —— 别的 AI 把功能做得更强，我们让 AI 更懂你。</span
             >
           </div>
@@ -173,9 +180,16 @@ function stopFlow(f: AutomationFlow) {
             />
             <span class="dc-track"></span>
           </label>
+          <button
+            class="dc-fold"
+            :title="dreamCollapsed ? '展开' : '收起'"
+            @click="toggleDream"
+          >
+            <ChevronDown :size="16" :stroke-width="2" :class="{ up: !dreamCollapsed }" />
+          </button>
         </div>
 
-        <div v-if="echo.enabled" class="dc-body">
+        <div v-if="echo.enabled && !dreamCollapsed" class="dc-body">
           <div class="dc-row">
             <span class="dc-label"><Clock :size="13" :stroke-width="1.7" /> 每天执行时间</span>
             <select
@@ -355,7 +369,18 @@ function stopFlow(f: AutomationFlow) {
   padding: 16px 18px;
   margin-bottom: 18px;
 }
+.dream-card.collapsed { padding: 11px 18px; }
 .dc-head { display: flex; align-items: flex-start; gap: 12px; }
+.dream-card.collapsed .dc-head { align-items: center; }
+.dc-fold {
+  flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--border-soft); background: transparent; color: var(--muted);
+  transition: background 0.15s, color 0.15s;
+}
+.dc-fold:hover { background: var(--selection-bg); color: var(--ink); }
+.dc-fold svg { transition: transform 0.18s; }
+.dc-fold svg.up { transform: rotate(180deg); }
 .dc-ic {
   width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;

@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { reactive, computed } from "vue";
-import { files as fc, listen } from "../tauri";
+import { files as fc, listen, invoke } from "../tauri";
 
 // 文件中心长任务的全局状态枢纽。
 //
@@ -19,7 +19,7 @@ import { files as fc, listen } from "../tauri";
 //   AI 归类   file:cluster_llm  {kind: phase(text) / done(clusters,assigned,report) / error}
 //   AI 整理名 file:title_llm    {kind: phase(text) / done(count) / error}
 
-export type FileTaskId = "inventory" | "index" | "cluster" | "clusterLlm" | "titles";
+export type FileTaskId = "inventory" | "index" | "cluster" | "clusterLlm" | "titles" | "ontology";
 
 const LABELS: Record<FileTaskId, string> = {
   inventory: "盘点磁盘",
@@ -27,10 +27,11 @@ const LABELS: Record<FileTaskId, string> = {
   cluster: "智能归类",
   clusterLlm: "AI 语义归类",
   titles: "AI 整理名称",
+  ontology: "构建知识体系",
 };
 
 export const useFileTasksStore = defineStore("fileTasks", () => {
-  const ids: FileTaskId[] = ["inventory", "index", "cluster", "clusterLlm", "titles"];
+  const ids: FileTaskId[] = ["inventory", "index", "cluster", "clusterLlm", "titles", "ontology"];
   const mk = <T,>(v: T) => Object.fromEntries(ids.map((k) => [k, v])) as Record<FileTaskId, T>;
 
   const running = reactive<Record<FileTaskId, boolean>>(mk(false));
@@ -113,6 +114,18 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
         else if (p.kind === "error") fail("titles", `AI 整理失败:${p.message ?? ""}`);
       }),
     );
+    // 框架派(D 方案)Schema-Guided 抽取:fable:ontology {phase / tick / done(kept,note) / error}。
+    unlisteners.push(
+      await listen<{ kind: string; text?: string; kept?: number; note?: string; message?: string }>(
+        "fable:ontology",
+        (p) => {
+          if (p.kind === "phase") detail.ontology = p.text ?? "";
+          else if (p.kind === "tick") detail.ontology = "模型正在框内抽取关系…";
+          else if (p.kind === "done") finish("ontology", p.note || `已抽出 ${p.kept ?? 0} 条关系`);
+          else if (p.kind === "error") fail("ontology", `构建失败:${p.message ?? ""}`);
+        },
+      ),
+    );
   }
 
   // ── 启动各任务(进行中重复调用直接忽略,后端 FlagGuard 也会兜底拒绝双发)──
@@ -172,6 +185,17 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
       fail("titles", `AI 整理失败:${e?.message ?? e}`);
     }
   }
+  // 框架派(D 方案):在某行业 schema 框内抽实体关系三元组(企业知识库构建)。
+  async function startOntology(schemaId: string) {
+    if (running.ontology) return;
+    await ensureListeners();
+    begin("ontology", "正在行业框内抽取实体与关系…");
+    try {
+      await invoke("ontology_extract", { schemaId });
+    } catch (e: any) {
+      fail("ontology", `构建失败:${e?.message ?? e}`);
+    }
+  }
 
   // 任一归类(离线 / AI)进行中。
   const clustering = computed(() => running.cluster || running.clusterLlm);
@@ -197,5 +221,6 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     startClusterLlm,
     startSmartCluster,
     startTitles,
+    startOntology,
   };
 });

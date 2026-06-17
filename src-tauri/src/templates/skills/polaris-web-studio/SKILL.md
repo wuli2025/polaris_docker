@@ -17,6 +17,8 @@ created_at: 0
 assets/site.css     网站组件库（nav/hero/bento/stats/pricing/cta/footer/btn，响应式）
 assets/themes.css   17 套主题（[data-theme] 属性选择器，与 PPT 演示同源）
 assets/runtime.js   滚动揭示(.reveal→.in) + T 键预览换主题
+assets/motion.css   高级动效层（神经网络背景/鼠标光晕/进度条/逐字/数字滚动，可选）
+assets/motion.js    高级动效运行时（零依赖、自动降级；data-motion / data-kinetic / data-count 触发）
 templates/site.html 起始模板（完整一页站点骨架）
 ```
 
@@ -33,6 +35,13 @@ templates/site.html 起始模板（完整一页站点骨架）
 应用：`<html data-theme="...">`。
 
 ## 制作步骤
+0. **★ 先定「微设计规格」（设计先行，定完再写 HTML）**。这一步是平庸与高级的分水岭，照填:
+   - **色板 token**:背景 / 主文字 / 辅助文字(降一档) / 主色(只 1 个) / 强调或警示色 / 边框。颜色越少越高级。
+   - **字阶**:超大标题 / 区块标题 / 正文 / 等宽数据,各一个字号+字重,**档差拉开**。
+   - **间距**:区块间距、四周边距(≥屏宽 8%)、最大内容宽度。
+   - **动效清单**:本次要用哪几个(逐字标题 / 数字滚动 / 卡片错峰揭示 / 神经网络背景 / 鼠标光晕)。深色站默认开,浅色严肃站克制。
+   - **逐区块入场**:每个区块写一行「怎么进场、什么顺序」。
+   - 铁律:**纯代码渲染 = 技术自信**,零图片素材也要靠 Canvas / CSS 渐变 / 大字排版撑住高级感。
 1. **定信息架构**：按站点类型排版块顺序。落地页常用：导航 → Hero(大标题+主张+双 CTA+信任 pill) → 功能(bento) → 数据 → 价格 → CTA 横幅 → 页脚。作品集换成 项目网格；博客换成 文章卡片流。
 2. **用 site.css 的组件写**（class 词表）：
    - 布局：`.container` `.section`/`.section.tight` `.grid .cols-2/3/4` `.bento`(内 `.card.wide/.tall`)
@@ -41,11 +50,18 @@ templates/site.html 起始模板（完整一页站点骨架）
    - 区块：`.hero`、`.stats>.stat>(.num,.lbl)`、`.price-card(.featured)`、`.cta`、`.footer>.footer-grid`
    - 按钮/标签：`.btn .btn-primary/.btn-grad/.btn-ghost`、`.pill .pill-accent`
    - 动效：需要入场的元素加 `class="reveal"`（runtime 滚动时加 `.in` 淡入上移）
-3. **★ 做成自包含单文件**：把 `assets/site.css` + `assets/themes.css` 内联进 `<style>`、`assets/runtime.js` 内联进 `<script>`，删掉对 `../assets/*` 的外链。读取：
+2.5 **高级动效（可选，深色站默认开 / 浅色严肃站默认关）**——这是追平一线落地页的关键，零依赖纯原生:
+   - **全局背景/光晕/进度条**：在 `<html data-theme="..." data-motion>` 上加 `data-motion`，motion.js 会自动注入神经网络 Canvas 背景 + 鼠标跟随光晕 + 顶部滚动进度条。主色默认矩阵绿；可在主题/根样式设 `--motion-accent:#xxxxxx; --motion-glow:rgba(...);` 改色。
+   - **逐字标题**：给 Hero 大标题加 `data-kinetic`（每个字会错峰滑入）。
+   - **数字滚动**：给数据区的数字元素加 `data-count="5000000"`（可选 `data-suffix="%"`），进视口时从 0 滚到目标值。例：`<span class="num" data-count="95" data-suffix="%">0</span>`。
+   - **降级已内置**：`prefers-reduced-motion` 时自动停 Canvas、动画直接落终值；粒子数按屏宽分档（≤80/120/180）。**别给学术/公文/暖色品牌站开**（粒子干扰阅读）。
+3. **★ 做成自包含单文件**：把 `assets/site.css` + `assets/themes.css` 内联进 `<style>`、`assets/runtime.js` 内联进 `<script>`，删掉对 `../assets/*` 的外链。**启用了高级动效就再内联 `assets/motion.css`（进 `<style>`）+ `assets/motion.js`（进 `<script>`）**。读取：
    ```bash
    cat ~/Polaris/skills/polaris-web-studio/assets/site.css
    cat ~/Polaris/skills/polaris-web-studio/assets/themes.css
    cat ~/Polaris/skills/polaris-web-studio/assets/runtime.js
+   cat ~/Polaris/skills/polaris-web-studio/assets/motion.css   # 仅启用动效时
+   cat ~/Polaris/skills/polaris-web-studio/assets/motion.js    # 仅启用动效时
    ```
    存到产物目录（文件名如 `网站-<主题>.html`）。
 4. 回答末尾给出 `.html` 绝对路径，说明：双击用浏览器打开；响应式；按 `T` 可预览换主题。

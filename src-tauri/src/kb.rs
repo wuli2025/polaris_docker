@@ -1840,6 +1840,25 @@ pub fn path_contains(base: &Path, child: &Path) -> bool {
 pub fn kb_read(rel_path: String) -> Result<String, String> {
     let root = KB_ROOT.read().clone();
     let full = resolve_within_kb(&root, &rel_path)?;
+    // 防御:rel_path 由前端/模型决定,无上限直读会被超大文件(GB 级日志/数据集)一次性
+    // 撑爆内存(OOM,弱 NAS 上尤甚)。先看体积:超上限只按 UTF-8 边界安全截读前若干字节,
+    // 附省略提示,既不崩也不悄悄给半截当全文。8 MiB 对任何 wiki/正文页都绰绰有余。
+    const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+    let meta = fs::metadata(&full).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_READ_BYTES {
+        use std::io::Read;
+        let mut f = fs::File::open(&full).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; MAX_READ_BYTES as usize];
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        buf.truncate(n);
+        let mut s = String::from_utf8_lossy(&buf).into_owned();
+        s.push_str(&format!(
+            "\n\n…[文件过大: {} MB,仅显示前 {} MB;需全文请用 Grep 定向检索]…",
+            meta.len() / 1024 / 1024,
+            MAX_READ_BYTES / 1024 / 1024
+        ));
+        return Ok(s);
+    }
     fs::read_to_string(&full).map_err(|e| e.to_string())
 }
 
@@ -1889,11 +1908,14 @@ pub struct KbHit {
 /// PRD §8.8 关键词加权评分: 标题 +10 / category +8 / 正文 +1
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn kb_search(query: String, top_k: Option<usize>) -> Vec<KbHit> {
-    let q = query.to_lowercase();
-    let terms: Vec<&str> = q.split_whitespace().collect();
-    if terms.is_empty() {
+    // CJK 感知切词(与寓言检索同口径):中文无空格,旧版 split_whitespace 把整句当一个词,
+    // 「公司的退款政策是怎样的」永远 contains 不到 → 妈妈库自然语言提问零召回。现在切成
+    // 概念词(退款/政策…)+ 拉丁词,逐词 contains 算分,自然句也能命中权威 wiki。
+    let (_full, owned) = crate::fable::retrieve::split_query(&query);
+    if owned.is_empty() {
         return vec![];
     }
+    let terms: Vec<&str> = owned.iter().map(String::as_str).collect();
     let topk = top_k.unwrap_or(8);
     let idx = INDEX.read();
     let mut scored: Vec<(f64, String, String, String)> = Vec::new(); // score, path, title, snippet
@@ -2054,9 +2076,13 @@ pub fn kb_ingest(source_path: String) -> Result<String, String> {
 /// 全部处理完只重扫一次索引。返回逐文件结果(失败不影响其余)。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn kb_upload_files(paths: Vec<String>) -> Vec<KbUploadResult> {
-    const MAX_FILES: usize = 500;
+    // 完整性:用户勾选的文件必须**全部**归档,不能像旧版那样到 500 就静默丢弃(界面还提示
+    // 「正在归档 N 个」却只进 500 个)。上限抬到 50000(远超资源扫描表 20000 行上限,故勾选多少
+    // 归多少);仅作防呆护栏拦住「拖进一个含几十万文件的超大目录」这类病态输入。
+    const MAX_FILES: usize = 50_000;
     let root = KB_ROOT.read().clone();
     let files = expand_to_files(&paths, MAX_FILES);
+    let truncated = files.len() >= MAX_FILES;
     // 整批共用一个缓存: 未变且产物仍在的源跳过转换, 结束统一落盘。
     let mut cache = IngestCache::load(&root);
 
@@ -2082,6 +2108,18 @@ pub fn kb_upload_files(paths: Vec<String>) -> Vec<KbUploadResult> {
         }
     }
     cache.save(&root);
+
+    // 万一真撞上 5 万护栏:显式告知用户还有剩余(别静默丢),让其分批或缩小范围。
+    if truncated {
+        results.push(KbUploadResult {
+            name: "(已达单次归档上限)".into(),
+            rel_path: String::new(),
+            ok: false,
+            message: format!(
+                "本次按上限归档了 {MAX_FILES} 个文件;若还有更多,请再点一次归档(已归档的会自动跳过)。"
+            ),
+        });
+    }
 
     // 增量: 逐个解析成功入库的文件加入 INDEX, 避免全量重扫
     for r in &results {

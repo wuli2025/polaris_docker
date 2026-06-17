@@ -29,14 +29,19 @@ import {
   ChevronLeft,
   Folder,
   SlidersHorizontal,
+  Languages,
   Layers,
   FolderTree,
   Check,
   RotateCcw,
+  Network,
+  ShieldCheck,
+  BookOpen,
 } from "@lucide/vue";
 import {
   files as fc,
   artifacts as artifactsApi,
+  invoke,
   type FileOverview,
   type FileCard,
   type FcCluster,
@@ -78,8 +83,72 @@ watch(
 );
 
 // ───────────────────────── 状态 ─────────────────────────
-type ViewKind = "gallery" | "clusters" | "list";
+type ViewKind = "gallery" | "clusters" | "list" | "core";
 const view = ref<ViewKind>("gallery");
+
+// ── 核心层(知识体系):个人=知识网/聚类,企业=Schema-Guided 抽出的实体关系三元组 ──
+interface OntoTypeLite { id: string; name: string; hint: string }
+interface OntoSchema {
+  id: string;
+  name: string;
+  industry: string;
+  source: string;
+  desc: string;
+  entities: OntoTypeLite[];
+  relations: OntoTypeLite[];
+  triples: number;
+}
+interface OntoTriple {
+  subject: string;
+  subjectType: string;
+  predicate: string;
+  object: string;
+  objectType: string;
+  confidence: number;
+  sourceFile: string;
+}
+const ontoSchemas = ref<OntoSchema[]>([]);
+const ontoTotal = ref(0);
+const ontoLoading = ref(false);
+const openSchema = ref<string>("");
+const schemaTriples = ref<OntoTriple[]>([]);
+const triplesLoading = ref(false);
+async function loadCore() {
+  ontoLoading.value = true;
+  try {
+    const ov: any = await invoke("ontology_overview");
+    ontoSchemas.value = ov.schemas ?? [];
+    ontoTotal.value = ov.totalTriples ?? 0;
+  } catch {
+    ontoSchemas.value = [];
+    ontoTotal.value = 0;
+  } finally {
+    ontoLoading.value = false;
+  }
+}
+async function toggleSchema(id: string) {
+  if (openSchema.value === id) {
+    openSchema.value = "";
+    return;
+  }
+  openSchema.value = id;
+  triplesLoading.value = true;
+  schemaTriples.value = [];
+  try {
+    schemaTriples.value = await invoke<OntoTriple[]>("ontology_triples", { schemaId: id, limit: 200 });
+  } catch {
+    schemaTriples.value = [];
+  } finally {
+    triplesLoading.value = false;
+  }
+}
+const ontoSchemasWithData = computed(() => ontoSchemas.value.filter((s) => s.triples > 0));
+function openFullKb() {
+  app.setView("wiki");
+}
+watch(view, (v) => {
+  if (v === "core" && !ontoSchemas.value.length) void loadCore();
+});
 const overview = ref<FileOverview | null>(null);
 const cards = ref<FileCard[]>([]);
 const page = ref(0);
@@ -88,6 +157,7 @@ const loading = ref(false);
 const exhausted = ref(false);
 
 const activeKind = ref<string | null>(null);
+const activeLang = ref<string | null>(null);
 const activeCluster = ref<number | null>(null);
 const sort = ref<"recent" | "name" | "size" | "kind">("recent");
 const searchText = ref("");
@@ -154,9 +224,11 @@ function saveFc(key: string, v: boolean) {
 const bannerOpen = ref(loadFc("polaris.fc.banner", false));
 const foldersOpen = ref(loadFc("polaris.fc.folders", true));
 const kindOpen = ref(loadFc("polaris.fc.kinds", false));
+const langOpen = ref(loadFc("polaris.fc.langs", true));
 watch(bannerOpen, (v) => saveFc("polaris.fc.banner", v));
 watch(foldersOpen, (v) => saveFc("polaris.fc.folders", v));
 watch(kindOpen, (v) => saveFc("polaris.fc.kinds", v));
+watch(langOpen, (v) => saveFc("polaris.fc.langs", v));
 // 语义文件夹下钻路径(目前两级:[] = 顶层主题;[topId] = 某主题内看子主题)
 const folderPath = ref<number[]>([]);
 
@@ -228,7 +300,7 @@ let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
 // 任务完成(store doneTick 自增)→ 刷新文件中心数据,让新盘点/新索引/新归类结果显示出来。
 // 监听全局 store,故即便任务是在别的视图发起、本组件后挂载,回来也会因 tick 变化而刷新。
-watch(() => tasks.doneTick.inventory, () => { loadOverview(); loadGrid(true); });
+watch(() => tasks.doneTick.inventory, () => { loadOverview(); loadGrid(true); ensureLangBackfill(); });
 watch(() => tasks.doneTick.index, () => { loadOverview(); });
 watch(
   () => tasks.doneTick.cluster + tasks.doneTick.clusterLlm,
@@ -260,6 +332,23 @@ const CODE_EXTS = new Set([
   "rb", "php", "json", "jsonl", "html", "htm", "css", "sh", "ps1", "bat", "sql", "toml",
 ]);
 const TEXTY_EXTS = new Set(["md", "txt", "rst", "org", "tex", "log", "yaml", "yml", "xml", "ini", "cfg", "srt", "vtt"]);
+
+// 「按语言归类」配色:自然语言/媒体给固定色,编程语言按名字哈希到一组高级色,稳定且区分度高。
+const LANG_FIXED: Record<string, string> = {
+  中文: "#e0736b", 英文: "#5b8cff", 其他语种: "#9aa0e6", 未识别: "#8a8f98",
+  图片: "#6fcf97", 视频: "#c264d6", 音频: "#e0a24b", 压缩包: "#93a0b4", 其他文件: "#8a8f98",
+  "文档·待识别": "#b0b4bd",
+};
+const LANG_PALETTE = [
+  "#8b6cff", "#42c8d4", "#e08aae", "#7ec8a0", "#d49a6a", "#6cc0c0", "#cf9fd6", "#7f9cf5",
+  "#d4b06a", "#b487e0", "#5fa8e6", "#e6a4c4",
+];
+function langColor(lang: string): string {
+  if (LANG_FIXED[lang]) return LANG_FIXED[lang];
+  let h = 0;
+  for (let i = 0; i < lang.length; i++) h = (h * 31 + lang.charCodeAt(i)) >>> 0;
+  return LANG_PALETTE[h % LANG_PALETTE.length];
+}
 
 const clusterColor = computed<Record<number, FcCluster>>(() => {
   const m: Record<number, FcCluster> = {};
@@ -333,6 +422,25 @@ async function loadOverview() {
   }
 }
 
+// 后台把文稿的自然语言(中文/英文)补齐:代码/媒体的语言无需回填即可显示,文稿要读文件头嗅探。
+// 单次调用封顶 ~16K 文件(不冻界面),循环到无待回填为止,中途刷新「按语言」分布。幂等、可重入。
+let langBackfilling = false;
+async function ensureLangBackfill() {
+  if (langBackfilling) return;
+  langBackfilling = true;
+  try {
+    for (let i = 0; i < 200; i++) {
+      const n = await fc.backfillLang();
+      if (i === 0 || n === 0) await loadOverview();
+      if (n === 0) break;
+    }
+  } catch {
+    /* 静默:回填失败不影响代码/媒体的按语言归类 */
+  } finally {
+    langBackfilling = false;
+  }
+}
+
 async function loadGrid(reset = false) {
   if (loading.value) return;
   if (reset) {
@@ -347,6 +455,7 @@ async function loadGrid(reset = false) {
       root: null,
       clusterId: activeCluster.value,
       kind: activeKind.value,
+      lang: activeLang.value,
       sort: sort.value,
       query: searchText.value.trim() || null,
       page: page.value,
@@ -375,6 +484,10 @@ function applyFilters() {
 // 过滤切换
 function pickKind(k: string | null) {
   activeKind.value = activeKind.value === k ? null : k;
+  applyFilters();
+}
+function pickLang(l: string | null) {
+  activeLang.value = activeLang.value === l ? null : l;
   applyFilters();
 }
 function pickCluster(id: number | null) {
@@ -897,15 +1010,12 @@ onMounted(async () => {
   setupObservers();
   await loadOverview();
   await loadGrid(true);
+  // 后台补齐文稿自然语言(不阻塞首屏;代码/媒体的按语言归类已即时可用)
+  ensureLangBackfill();
   await nextTick();
-  // 首次进入文件中心且库为空 → 自动弹出「让 AI 更懂你」引导向导。
-  let seen = false;
-  try {
-    seen = localStorage.getItem(WIZ_SEEN_KEY) === "1";
-  } catch {
-    /* ignore */
-  }
-  if (!seen && (overview.value?.totalFiles ?? 0) === 0) openWizard();
+  // 进入文件中心且库还是空的 → 立刻拉起「让 AI 更懂你」引导,用户一点进来就被带着走完
+  // 盘点 → 语义归类 → 图谱 → 建索引。库一旦有内容(说明引导过/手动盘过)就不再打扰。
+  if ((overview.value?.totalFiles ?? 0) === 0) openWizard();
 });
 
 onBeforeUnmount(() => {
@@ -950,6 +1060,10 @@ onBeforeUnmount(() => {
         </button>
         <button class="seg-btn" :class="{ on: view === 'list' }" @click="view = 'list'" title="列表">
           <ListIcon :size="15" :stroke-width="1.7" />
+        </button>
+        <button class="seg-btn core-seg" :class="{ on: view === 'core' }" @click="view = 'core'" title="核心层 · 知识体系">
+          <Network :size="15" :stroke-width="1.7" />
+          <span class="seg-lab">核心层</span>
         </button>
       </div>
 
@@ -1185,6 +1299,34 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <!-- 按语言归类(编程语言 / 自然语言 / 媒体大类)—— 比「按类型」更细,按语言分门别类 -->
+    <div v-if="hasFiles" class="fc-kinds">
+      <button class="kinds-toggle" :class="{ open: langOpen }" @click="langOpen = !langOpen">
+        <Languages :size="13" :stroke-width="1.8" />
+        <span>按语言归类</span>
+        <span v-if="activeLang" class="kinds-active" :style="{ '--c': langColor(activeLang) }">
+          <span class="chip-dot" />{{ activeLang }}
+        </span>
+        <ChevronDown :size="14" :stroke-width="1.8" class="kinds-chev" :class="{ flip: langOpen }" />
+      </button>
+      <div v-if="langOpen" class="fc-chips">
+        <button class="chip" :class="{ on: activeLang === null }" @click="activeLang = null; applyFilters()">
+          全部语言
+        </button>
+        <button
+          v-for="lc in overview?.byLang ?? []"
+          :key="lc.lang"
+          class="chip"
+          :class="{ on: activeLang === lc.lang }"
+          :style="{ '--chip': langColor(lc.lang) }"
+          @click="pickLang(lc.lang)"
+        >
+          <span class="chip-dot" />{{ lc.lang }}
+          <span class="chip-n">{{ lc.count }}</span>
+        </button>
+      </div>
+    </div>
+
     <!-- 空库引导 -->
     <div v-if="!hasFiles" class="fc-empty glass">
       <div class="empty-orb"><FolderSearch :size="30" :stroke-width="1.3" /></div>
@@ -1246,6 +1388,7 @@ onBeforeUnmount(() => {
               <div v-if="card.thumbable && !thumbCache.has(card.abspath)" class="shimmer" />
             </div>
             <span class="ext-badge">{{ card.ext || card.kind }}</span>
+            <span v-if="card.source" class="src-badge">{{ card.source }}</span>
             <span v-if="card.kind === 'video'" class="play-badge">▶</span>
           </div>
           <div class="tile-meta">
@@ -1370,6 +1513,59 @@ onBeforeUnmount(() => {
           <span class="lv-c-time">{{ fmtTime(card.mtime) }}</span>
         </div>
         <div v-if="loading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</div>
+      </div>
+
+      <!-- 核心层 · 知识体系(整套知识库系统的家) -->
+      <div v-show="view === 'core'" class="coreview">
+        <div class="core-hero glass">
+          <div class="ch-ic"><Network :size="24" :stroke-width="1.5" /></div>
+          <div class="ch-main">
+            <div class="ch-t">核心层 · 知识体系</div>
+            <div class="ch-d">
+              这是你资料的「大脑」——散落的文件经过编译,连成一张互联的知识网。
+              个人库自动归出你常用的主题;企业库在行业框内抽出可溯源的实体与关系。
+            </div>
+          </div>
+          <button class="ch-open" @click="openFullKb"><BookOpen :size="14" :stroke-width="1.8" /> 打开完整知识库</button>
+        </div>
+
+        <div v-if="ontoLoading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 读取知识体系…</div>
+
+        <!-- 企业:Schema-Guided 抽出的关系三元组(中文、可溯源) -->
+        <template v-else-if="ontoSchemasWithData.length">
+          <div class="core-section-h">
+            <ShieldCheck :size="14" :stroke-width="1.8" />
+            <b>已建立的关系网</b>
+            <span class="csh-fine">共 {{ ontoTotal }} 条 · 每条都标了置信度与来源,可审计</span>
+          </div>
+          <div v-for="sc in ontoSchemasWithData" :key="sc.id" class="onto-card glass">
+            <button class="oc-head" @click="toggleSchema(sc.id)">
+              <span class="oc-name">{{ sc.name }}</span>
+              <span class="oc-ind">{{ sc.industry }}</span>
+              <span class="oc-cnt">{{ sc.triples }} 条关系</span>
+              <ChevronDown class="oc-chev" :class="{ flip: openSchema === sc.id }" :size="15" :stroke-width="2" />
+            </button>
+            <div v-if="openSchema === sc.id" class="oc-body">
+              <div v-if="triplesLoading" class="grid-loading"><LoaderCircle :size="16" class="spin" /> 加载关系…</div>
+              <div v-else class="triple-list">
+                <div v-for="(tp, i) in schemaTriples" :key="i" class="triple-row">
+                  <span class="tr-sub">{{ tp.subject }}</span>
+                  <span class="tr-rel">{{ tp.predicate }}</span>
+                  <span class="tr-obj">{{ tp.object }}</span>
+                  <span v-if="tp.sourceFile" class="tr-src" :title="tp.sourceFile">{{ tp.sourceFile.split('/').pop() }}</span>
+                  <span class="tr-conf" :title="'置信度'">{{ Math.round(tp.confidence * 100) }}%</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- 还没有知识体系:引导去构建 -->
+        <div v-else class="core-empty">
+          <Sparkles :size="26" :stroke-width="1.3" />
+          <p>还没有构建知识体系。点「智能向导」,个人库自动归出常用主题,企业库在行业框内抽实体关系。</p>
+          <button class="ch-open" @click="openWizard"><Wand2 :size="14" :stroke-width="1.8" /> 打开智能向导</button>
+        </div>
       </div>
 
       <div ref="sentinel" class="sentinel" />
@@ -2346,6 +2542,20 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(6px);
   box-shadow: 0 2px 8px -2px color-mix(in srgb, var(--accent) 70%, transparent);
 }
+.src-badge {
+  position: absolute;
+  left: 9px;
+  top: 9px;
+  font-size: 9.5px;
+  letter-spacing: 0.3px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: color-mix(in srgb, #6fcf97 80%, #000 12%);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 8px -2px color-mix(in srgb, #6fcf97 60%, transparent);
+}
 .play-badge {
   position: absolute;
   right: 9px;
@@ -3097,4 +3307,65 @@ onBeforeUnmount(() => {
 .drawer-enter-from, .drawer-leave-to { transform: translateX(20px); opacity: 0; }
 .fade-enter-active, .fade-leave-active { transition: opacity 0.26s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* ── 核心层 · 知识体系 ── */
+.seg-btn.core-seg { width: auto; padding: 0 11px; gap: 6px; }
+.seg-lab { font-size: 12px; font-weight: 600; }
+.coreview { display: flex; flex-direction: column; gap: 14px; padding: 4px 2px 24px; }
+.core-hero {
+  display: flex; align-items: center; gap: 16px; padding: 18px 20px; border-radius: 16px;
+  border: 1px solid var(--border-soft);
+}
+.ch-ic {
+  width: 50px; height: 50px; border-radius: 14px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--primary); background: color-mix(in srgb, var(--primary) 13%, transparent);
+}
+.ch-main { flex: 1; min-width: 0; }
+.ch-t { font-size: 17px; font-weight: 660; color: var(--ink); }
+.ch-d { font-size: 12.5px; color: var(--muted); line-height: 1.6; margin-top: 3px; }
+.ch-open {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 14px;
+  border-radius: 10px; border: 1px solid var(--primary); background: var(--primary); color: #fff;
+  font-size: 13px; cursor: pointer; transition: filter 0.15s;
+}
+.ch-open:hover { filter: brightness(1.08); }
+.core-section-h { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); margin-top: 4px; }
+.core-section-h :deep(svg) { color: var(--primary); flex: none; }
+.csh-fine { margin-left: auto; font-size: 11px; color: var(--dim); }
+.onto-card { border-radius: 13px; border: 1px solid var(--border-soft); overflow: hidden; }
+.oc-head {
+  display: flex; align-items: center; gap: 12px; width: 100%; padding: 13px 16px;
+  background: transparent; border: none; cursor: pointer; text-align: left;
+}
+.oc-head:hover { background: color-mix(in srgb, var(--primary) 5%, transparent); }
+.oc-name { font-size: 14px; font-weight: 640; color: var(--ink); }
+.oc-ind { font-size: 11px; color: var(--primary); }
+.oc-cnt { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.oc-chev { color: var(--muted); transition: transform 0.2s; }
+.oc-chev.flip { transform: rotate(180deg); }
+.oc-body { padding: 4px 12px 12px; border-top: 1px solid var(--hairline); }
+.triple-list { display: flex; flex-direction: column; }
+.triple-row {
+  display: flex; align-items: center; gap: 8px; padding: 8px 6px; font-size: 12.5px;
+  border-bottom: 1px solid var(--hairline);
+}
+.triple-row:last-child { border-bottom: none; }
+.tr-sub, .tr-obj { color: var(--ink); font-weight: 560; }
+.tr-rel {
+  font-size: 11px; color: var(--primary); padding: 1px 8px; border-radius: 99px;
+  background: color-mix(in srgb, var(--primary) 11%, transparent); white-space: nowrap;
+}
+.tr-src {
+  margin-left: auto; font-size: 10.5px; color: var(--dim);
+  font-family: ui-monospace, Consolas, monospace; max-width: 160px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.tr-conf { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.core-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center;
+  padding: 48px 40px; color: var(--muted);
+}
+.core-empty :deep(svg) { color: var(--primary); }
+.core-empty p { font-size: 13px; max-width: 420px; line-height: 1.7; margin: 0; }
 </style>

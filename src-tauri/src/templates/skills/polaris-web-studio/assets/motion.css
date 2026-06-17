@@ -1,0 +1,33 @@
+/* polaris-web-studio :: motion.css — 高级动效层(可选,与 motion.js 配套)
+ *
+ * 蒸馏自 Kimi 落地页 design.md 的动效系统。零依赖、纯原生。
+ * 启用方式:在 <html> 上加 data-motion(全局背景/光晕/进度条),
+ *           在元素上加 data-kinetic(逐字标题)/ data-count(数字滚动)。
+ * 降级:prefers-reduced-motion 时 motion.js 会停掉 Canvas、直接显示终值。
+ */
+
+/* 全局固定层(data-motion 时由 motion.js 注入这三个节点) */
+#px-bg{position:fixed;inset:0;z-index:0;pointer-events:none}
+#px-glow{position:fixed;inset:0;z-index:1;pointer-events:none;
+  background:radial-gradient(circle 480px at var(--mx,50%) var(--my,50%),
+    var(--motion-glow,rgba(0,255,65,.07)),transparent 70%)}
+#px-progress{position:fixed;top:0;left:0;height:2px;width:0;z-index:9999;
+  background:var(--motion-accent,#00ff41);
+  box-shadow:0 0 10px var(--motion-glow,rgba(0,255,65,.4));transition:width .1s linear}
+
+/* 内容应浮在固定层之上 */
+[data-motion] body > *:not(#px-bg):not(#px-glow):not(#px-progress){position:relative;z-index:10}
+
+/* 逐字标题:每个字一个 .px-char,初始下沉透明,由 motion.js 逐个揭示 */
+.px-char{display:inline-block;opacity:0;transform:translateY(40px);
+  transition:opacity .5s cubic-bezier(.16,1,.3,1),transform .5s cubic-bezier(.16,1,.3,1)}
+.px-char.in{opacity:1;transform:none}
+
+/* 数字滚动占位:终值由 motion.js 写入,无需特殊样式;给个等宽防跳动 */
+[data-count]{font-variant-numeric:tabular-nums}
+
+/* 减少动画:静态可读优先 */
+@media (prefers-reduced-motion:reduce){
+  #px-bg{display:none}
+  .px-char{opacity:1!important;transform:none!important}
+}

@@ -24,6 +24,7 @@ pub mod eval;
 pub mod files;
 pub mod index;
 pub mod inventory;
+pub mod ontology;
 pub mod retrieve;
 
 use directories::UserDirs;
@@ -155,6 +156,32 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             source  TEXT NOT NULL DEFAULT '',
             made_at INTEGER NOT NULL DEFAULT 0
         );
+        -- 框架派(Schema-Guided / D 方案,见 fable/ontology.rs)本体落地表。
+        -- onto_types:某行业 schema 定义的实体 / 关系类型清单(单一事实源)。
+        CREATE TABLE IF NOT EXISTS onto_types(
+            id        INTEGER PRIMARY KEY,
+            schema_id TEXT NOT NULL,
+            type_id   TEXT NOT NULL,
+            name      TEXT NOT NULL,
+            kind      TEXT NOT NULL,
+            hint      TEXT NOT NULL DEFAULT '',
+            UNIQUE(schema_id, type_id, kind)
+        );
+        -- triples:Schema-Guided 抽出的显式三元组(主-谓-宾 + 置信 + 来源,可审计)。
+        CREATE TABLE IF NOT EXISTS triples(
+            id           INTEGER PRIMARY KEY,
+            schema_id    TEXT NOT NULL,
+            subject      TEXT NOT NULL,
+            subject_type TEXT NOT NULL DEFAULT '',
+            predicate    TEXT NOT NULL,
+            object       TEXT NOT NULL,
+            object_type  TEXT NOT NULL DEFAULT '',
+            confidence   REAL NOT NULL DEFAULT 0,
+            source_file  TEXT NOT NULL DEFAULT '',
+            made_at      INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_triples_schema  ON triples(schema_id);
+        CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject);
         "#,
     )
     .map_err(|e| format!("fable.db 迁移失败: {e}"))?;
@@ -197,6 +224,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if conn.prepare("SELECT cell FROM chunks LIMIT 1").is_err() {
         conn.execute("ALTER TABLE chunks ADD COLUMN cell INTEGER NOT NULL DEFAULT -1", [])
             .map_err(|e| format!("fable.db 加 chunks.cell 列失败: {e}"))?;
+    }
+    // ── 文件中心 · 按「语言」归类 ──
+    // files.lang:文件的语言维度 —— 代码按编程语言(Python/Rust/JavaScript…,由扩展名精确判定)、
+    // 文稿按自然语言(中文/英文/其他,读文件头按 CJK 占比嗅探)、媒体按大类(图片/视频/音频…)。
+    // 比粗粒度 kind(text/image/…)细、比文件名(应用名)更稳。盘点时写入;旧库 '' = 待回填。
+    if conn.prepare("SELECT lang FROM files LIMIT 1").is_err() {
+        conn.execute("ALTER TABLE files ADD COLUMN lang TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|e| format!("fable.db 加 files.lang 列失败: {e}"))?;
     }
     // 20TB 热点查询复合索引 + IVF 质心表(均在所需列 ALTER 之后建,故放此处)。
     conn.execute_batch(

@@ -22,7 +22,8 @@ import CommandPalette from "./components/CommandPalette.vue";
 import TaskCenter from "./components/TaskCenter.vue";
 import { useHotkeys } from "./composables/useHotkeys";
 import { installMarkdownDelegation } from "./lib/markdown";
-import { openUrl, onWsStatus, isTauri } from "./tauri";
+import { openUrl, onWsStatus, isTauri, files as fc } from "./tauri";
+import { toast } from "./composables/useToast";
 // ── 重 / 非首屏视图：懒加载，切到对应视图时才拉各自 chunk ──
 // 把 cytoscape(图谱) + 4 套工坊 + 各面板/弹层(合计上万行)从启动主包挪走 → 开窗快、首屏不卡。
 // KnowledgeGraph / SandboxStatus / 四工坊都有 defineOptions({name})，懒加载后 KeepAlive 仍按 name 缓存；
@@ -115,6 +116,26 @@ function onViewReady(v: ViewKey) {
   if (switchLoader.value === v) switchLoader.value = null;
 }
 
+// 开机静默续建索引:盘点过、还有没嵌完的文本(embeddedFiles < textFiles)才接着建,
+// 走全局 fileTasks store(任务中心可见、跨视图后台跑)。给一句温和 toast 提醒。延后几秒
+// 起,别和启动的其它活儿抢资源;没待办或读不到总览就安静退出。
+async function autoBuildIndexOnStartup() {
+  try {
+    const ov = await fc.overview(null);
+    if (ov.indexing || ov.scanning) return; // 已经在跑,别重复
+    // 没配嵌入服务商时向量索引无可续建(FTS 倒排首轮已一遍建完),不必每次开机空跑 + 误报。
+    if (!ov.hasEmbedProvider) return;
+    const pending = (ov.textFiles ?? 0) - (ov.embeddedFiles ?? 0);
+    if ((ov.totalFiles ?? 0) === 0 || pending <= 0) return; // 没盘点过 / 全嵌完 → 不打扰
+    window.setTimeout(() => {
+      void tasks.startIndex();
+      toast.info(`索引正在后台构建(约 ${pending.toLocaleString()} 个文件待处理)· 完成后 AI 检索更聪明,可放着不管`);
+    }, 3000);
+  } catch {
+    /* 浏览器/降级模式或总览读取失败 → 安静跳过 */
+  }
+}
+
 // 多开核心：app 级注册一次流式监听，任意对话的事件都按 conversationId 路由进各自缓冲，
 // 这样切走/未挂载 ChatPanel 时后台任务仍持续流式推进、完成有提醒。
 let unMdDelegate: (() => void) | null = null;
@@ -125,6 +146,10 @@ onMounted(() => {
   // 脱离任何视图生命周期 → 在文件中心点了任务后切走/关掉该视图,进度照常推进、回来即见,
   // 全局任务中心浮层也据此随处显示「还在跑」。
   tasks.ensureListeners();
+  // 开机自动续建检索索引:只要盘点过、还有没嵌完的文本,就在后台静默接着建(幂等续跑,
+  // 不动用户原文件——只把内容切块嵌进本地 SQLite)。给用户一句温和提醒「索引在后台构建」,
+  // 让 AI 检索越用越聪明。没有待办(全嵌完/没盘点过)就什么都不做、不打扰。
+  void autoBuildIndexOnStartup();
   // markdown 区域事件委托(代码复制/展开/外链系统浏览器打开),全 v-html 区域一次覆盖
   unMdDelegate = installMarkdownDelegation(document, (url) => {
     openUrl(url).catch(() => {});

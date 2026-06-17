@@ -49,7 +49,7 @@ const PVS_WORKFLOW: &str =
 // 与 PVS 同套路：全部编译期内嵌、启动时确保落到 ~/Polaris/skills（靠 DECK_VERSION 比对覆盖）。
 const DECK_ID: &str = "polaris-deck-studio";
 // 改动任一内嵌资源后必须 +1，让已安装用户下次启动拿到更新。
-const DECK_VERSION: &str = "6";
+const DECK_VERSION: &str = "8";
 const DECK_SKILL_MD: &str = include_str!("templates/skills/polaris-deck-studio/SKILL.md");
 const DECK_LICENSE: &str = include_str!("templates/skills/polaris-deck-studio/LICENSE");
 const DECK_BASE_CSS: &str = include_str!("templates/skills/polaris-deck-studio/assets/base.css");
@@ -57,6 +57,10 @@ const DECK_THEMES_CSS: &str =
     include_str!("templates/skills/polaris-deck-studio/assets/themes.css");
 const DECK_RUNTIME_JS: &str =
     include_str!("templates/skills/polaris-deck-studio/assets/runtime.js");
+const DECK_MOTION_CSS: &str =
+    include_str!("templates/skills/polaris-deck-studio/assets/motion.css");
+const DECK_MOTION_JS: &str =
+    include_str!("templates/skills/polaris-deck-studio/assets/motion.js");
 const DECK_TEMPLATE: &str =
     include_str!("templates/skills/polaris-deck-studio/templates/deck.html");
 const DECK_INSTALL_DEPS: &str =
@@ -70,12 +74,16 @@ const DECK_FIND_BROWSER: &str =
 // 支撑「网站生成」UI 入口。复用 deck-studio 的 17 套主题（DECK_THEMES_CSS，不重复源文件），
 // 配一套网站组件 site.css + 滚动揭示 runtime.js + 站点模板 + SKILL.md。
 const WEB_ID: &str = "polaris-web-studio";
-const WEB_VERSION: &str = "2";
+const WEB_VERSION: &str = "3";
 const WEB_SKILL_MD: &str = include_str!("templates/skills/polaris-web-studio/SKILL.md");
 const WEB_LICENSE: &str = include_str!("templates/skills/polaris-web-studio/LICENSE");
 const WEB_SITE_CSS: &str = include_str!("templates/skills/polaris-web-studio/assets/site.css");
 const WEB_RUNTIME_JS: &str =
     include_str!("templates/skills/polaris-web-studio/assets/runtime.js");
+const WEB_MOTION_CSS: &str =
+    include_str!("templates/skills/polaris-web-studio/assets/motion.css");
+const WEB_MOTION_JS: &str =
+    include_str!("templates/skills/polaris-web-studio/assets/motion.js");
 const WEB_TEMPLATE: &str =
     include_str!("templates/skills/polaris-web-studio/templates/site.html");
 
@@ -1144,6 +1152,8 @@ fn write_deck_studio_files(dest: &Path) -> Result<(), String> {
     fs::write(assets.join("base.css"), DECK_BASE_CSS).map_err(|e| e.to_string())?;
     fs::write(assets.join("themes.css"), DECK_THEMES_CSS).map_err(|e| e.to_string())?;
     fs::write(assets.join("runtime.js"), DECK_RUNTIME_JS).map_err(|e| e.to_string())?;
+    fs::write(assets.join("motion.css"), DECK_MOTION_CSS).map_err(|e| e.to_string())?;
+    fs::write(assets.join("motion.js"), DECK_MOTION_JS).map_err(|e| e.to_string())?;
     fs::write(templates.join("deck.html"), DECK_TEMPLATE).map_err(|e| e.to_string())?;
     fs::write(scripts.join("install-deps.mjs"), DECK_INSTALL_DEPS).map_err(|e| e.to_string())?;
     fs::write(scripts.join("export-pptx.mjs"), DECK_EXPORT_PPTX).map_err(|e| e.to_string())?;
@@ -1179,6 +1189,8 @@ fn write_web_studio_files(dest: &Path) -> Result<(), String> {
     fs::write(assets.join("site.css"), WEB_SITE_CSS).map_err(|e| e.to_string())?;
     fs::write(assets.join("themes.css"), DECK_THEMES_CSS).map_err(|e| e.to_string())?;
     fs::write(assets.join("runtime.js"), WEB_RUNTIME_JS).map_err(|e| e.to_string())?;
+    fs::write(assets.join("motion.css"), WEB_MOTION_CSS).map_err(|e| e.to_string())?;
+    fs::write(assets.join("motion.js"), WEB_MOTION_JS).map_err(|e| e.to_string())?;
     fs::write(templates.join("site.html"), WEB_TEMPLATE).map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -40,15 +40,16 @@ function authToken(): string | null {
   }
 }
 
-export function authHeaders(): Record<string, string> {
+function authHeaders(): Record<string, string> {
   const t = authToken();
   return t ? { authorization: `Bearer ${t}` } : {};
 }
 
 /**
- * 后端受限文件 URL（/api/file）。window.open/<a download> 等导航请求带不了
- * Authorization 头，故 token 走 query（与 /ws 同理）。download=true 让后端加
- * Content-Disposition: attachment 强制下载。
+ * 受 token 保护的后端文件 URL（Docker/Web 用）。
+ * - 默认内联：HTML 在新标签渲染、图片直接显示。
+ * - download:true → 后端加 Content-Disposition: attachment，强制下载。
+ * window.open / <a download> 等导航请求带不了 Authorization 头，token 故走 query（与 /ws 同理）。
  */
 export function backendFileUrl(
   path: string,
@@ -504,6 +505,12 @@ export interface FcKindCount {
   count: number;
   bytes: number;
 }
+/** 按语言归类的一档:编程语言(Python/Rust…)/ 自然语言(中文/英文)/ 媒体大类(图片/视频…) */
+export interface FcLangCount {
+  lang: string;
+  count: number;
+  bytes: number;
+}
 export interface FcCluster {
   id: number;
   label: string;
@@ -519,6 +526,8 @@ export interface FileOverview {
   totalFiles: number;
   totalBytes: number;
   byKind: FcKindCount[];
+  /** 按语言分布(编程语言 / 自然语言 / 媒体大类) */
+  byLang: FcLangCount[];
   clusters: FcCluster[];
   textFiles: number;
   embeddedFiles: number;
@@ -542,6 +551,8 @@ export interface FileCard {
   mtime: number;
   clusterId: number;
   thumbable: boolean;
+  /** 来源徽标:下载 / 微信 / QQ / 企业微信 / ""(普通文件,不显示) */
+  source: string;
 }
 export interface FileGridPage {
   items: FileCard[];
@@ -588,6 +599,8 @@ export interface FileGridParams {
   root?: string | null;
   clusterId?: number | null;
   kind?: string | null;
+  /** 按语言过滤:编程语言(Python/Rust…)、自然语言(中文/英文)、媒体大类(图片/视频…) */
+  lang?: string | null;
   sort?: "recent" | "name" | "size" | "kind";
   query?: string | null;
   page?: number;
@@ -605,11 +618,14 @@ export const files = {
       root: p.root ?? null,
       clusterId: p.clusterId ?? null,
       kind: p.kind ?? null,
+      lang: p.lang ?? null,
       sort: p.sort ?? "recent",
       query: p.query ?? null,
       page: p.page ?? 0,
       pageSize: p.pageSize ?? 60,
     }),
+  /** 给所有文件补「语言」归类标签(代码/媒体零 IO,文稿读头嗅探中文/英文);返回回填条数 */
+  backfillLang: () => invoke<number>("fable_backfill_lang", {}),
   /** 缩略图/首帧 → data URL(失败返回 null,前端落类型图标);磁盘缓存 */
   thumb: (abspath: string, max = 360) =>
     invoke<string | null>("file_thumb", { abspath, max }),
@@ -843,6 +859,12 @@ export const artifacts = {
   /** 跨所有对话检索历史产物文件（文件名 + 正文） */
   search: (query: string) =>
     invoke<ArtifactSearchHit[]>("artifact_search", { query }),
+  /** deck.html → .pptx 重新导出（自研 forge 管线逐页截图 + 纯 Rust OOXML，覆盖写出） */
+  deckToPptx: (deck: string, out: string) =>
+    invoke<unknown>("forge_deck_to_pptx", { deck, out }),
+  /** polaris.slides.json(spec) → 原生可编辑 .pptx（路线 B 传统PPT，零浏览器）。spec 传文件路径或 JSON 字符串 */
+  specToPptx: (spec: string, out: string) =>
+    invoke<{ ok: boolean; slides: number; warnings: string[] }>("forge_spec_to_pptx", { spec, out }),
 };
 
 /** 跨对话产物搜索命中 */
@@ -1285,6 +1307,15 @@ export interface CodexProxyInfo {
   port: number;
   lastError: string;
 }
+export interface ClaudeAuthStatus {
+  loggedIn: boolean;
+  credPath: string;
+}
+export interface ClaudeLoginStart {
+  authorizeUrl: string;
+  verifier: string;
+  state: string;
+}
 
 export const provider = {
   list: () => invoke<ProviderListResult>("provider_list"),
@@ -1300,13 +1331,18 @@ export const provider = {
   codexPollLogin: (deviceCode: string, userCode: string) =>
     invoke<CodexPollResult>("codex_poll_login", { deviceCode, userCode }),
   codexProxyInfo: () => invoke<CodexProxyInfo>("codex_proxy_info"),
+  // Claude 官方订阅 OAuth(PKCE):start 开浏览器并回 verifier/state;finish 回贴授权码换 token
+  claudeAuthStatus: () => invoke<ClaudeAuthStatus>("claude_oauth_status"),
+  claudeStartLogin: () => invoke<ClaudeLoginStart>("claude_start_login"),
+  claudeFinishLogin: (pasted: string, verifier: string, state: string) =>
+    invoke<ClaudeAuthStatus>("claude_finish_login", { pasted, verifier, state }),
 };
 
 // ──────────────────────────────────────────────────────────────
 // 环境医生 module — 新用户「环境监测 + 配置安装」(claude / pwsh / PATH)
 // ──────────────────────────────────────────────────────────────
 export interface ToolStatus {
-  key: "claude" | "pwsh" | "node" | "npm";
+  key: "claude" | "pwsh" | "node" | "npm" | "uv" | "python";
   name: string;
   found: boolean;
   version: string | null;
@@ -1321,6 +1357,10 @@ export interface EnvReport {
   pwsh: ToolStatus;
   node: ToolStatus;
   npm: ToolStatus;
+  /** uv —— Python 脚本运行时的统一托管者 (脚本执行公约依赖它) */
+  uv: ToolStatus;
+  /** 系统 Python —— 仅信息展示 (脚本由 uv 按需托管, found=false 多半是只剩 Store 占位符) */
+  python: ToolStatus;
   claudeDir: string | null;
   claudeDirOnUserPath: boolean;
   /** 是否有 claude 可用的 shell (真身 PowerShell 7 / Git Bash)；false ⇒ 对话会报缺 shell */
@@ -1349,6 +1389,13 @@ export interface ClaudeUpdateInfo {
   checked: boolean;
   message: string;
 }
+/** uv 缓存占用信息 */
+export interface UvCacheInfo {
+  available: boolean;
+  dir: string | null;
+  bytes: number;
+  human: string;
+}
 
 export const envDoctor = {
   check: () => invoke<EnvReport>("env_check"),
@@ -1359,6 +1406,12 @@ export const envDoctor = {
   /** 安装 Node.js LTS (winget) —— npm 安装方式的前置依赖 */
   installNode: () => invoke<string>("env_install_node"),
   installPwsh: () => invoke<string>("env_install_pwsh"),
+  /** 安装 uv —— Python 脚本运行时托管者 (装到 ~/.local/bin, 流式日志同安装) */
+  installUv: () => invoke<string>("env_install_uv"),
+  /** uv 缓存占用 (展示 + 决定是否提示清理) */
+  uvCacheInfo: () => invoke<UvCacheInfo>("env_uv_cache_info"),
+  /** 清理 uv 缓存 (`uv cache clean`) */
+  uvCacheClean: () => invoke<string>("env_uv_cache_clean"),
   /** 检测 Claude Code 是否有新版本 (当前版本 vs npmmirror latest) */
   checkClaudeUpdate: () => invoke<ClaudeUpdateInfo>("env_claude_update_check"),
   /** 更新 Claude Code 到最新版 (走国内 npmmirror)，流式日志同安装 */
@@ -1598,13 +1651,16 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       return undefined;
     case "persona_list":
       return [
-        { id: "stock-expert", name: "股票助手", icon: "📈", description: "A 股深度分析 / 公告监控 / 行情查询。", kbScope: "raw/股票", body: "(browser stub)" },
-        { id: "content-writer", name: "内容创作", icon: "✍️", description: "公众号/自媒体写手：选题、撰写、5 种风格。", kbScope: "raw/创作", body: "(browser stub)" },
-        { id: "lesson-planner", name: "备课出卷", icon: "📚", description: "K12 教案/试卷/答案解析。", kbScope: "raw/教学", body: "(browser stub)" },
-        { id: "content-summarizer", name: "内容总结", icon: "📋", description: "网页/文档/会议纪要结构化摘要。", kbScope: "", body: "(browser stub)" },
-        { id: "health-interpreter", name: "医疗健康解读", icon: "🏥", description: "体检报告/化验单通俗解读。", kbScope: "raw/健康", body: "(browser stub)" },
-        { id: "pet-care", name: "萌宠管家", icon: "🐾", description: "猫狗行为/健康/营养。", kbScope: "raw/萌宠", body: "(browser stub)" },
-        { id: "mao", name: "毛主席", icon: "☭", description: "毛选式客观分析。", kbScope: "raw/毛主席", body: "(browser stub)" },
+        { id: "stock-expert", name: "股票助手", icon: "📈", description: "A 股深度分析 / 公告监控 / 行情查询。", kbScope: "raw/股票", body: "(browser stub)", kind: "single" },
+        { id: "content-writer", name: "内容创作", icon: "✍️", description: "公众号/自媒体写手：选题、撰写、5 种风格。", kbScope: "raw/创作", body: "(browser stub)", kind: "single" },
+        { id: "lesson-planner", name: "备课出卷", icon: "📚", description: "K12 教案/试卷/答案解析。", kbScope: "raw/教学", body: "(browser stub)", kind: "single" },
+        { id: "content-summarizer", name: "内容总结", icon: "📋", description: "网页/文档/会议纪要结构化摘要。", kbScope: "", body: "(browser stub)", kind: "single" },
+        { id: "health-interpreter", name: "医疗健康解读", icon: "🏥", description: "体检报告/化验单通俗解读。", kbScope: "raw/健康", body: "(browser stub)", kind: "single" },
+        { id: "pet-care", name: "萌宠管家", icon: "🐾", description: "猫狗行为/健康/营养。", kbScope: "raw/萌宠", body: "(browser stub)", kind: "single" },
+        { id: "mao", name: "毛主席", icon: "☭", description: "毛选式客观分析。", kbScope: "raw/毛主席", body: "(browser stub)", kind: "single" },
+        { id: "team-general", name: "全能专家团", icon: "🧭", description: "战略师领衔，按情况临时组阵；默认单 agent。", kbScope: "", body: "(browser stub)", kind: "team" },
+        { id: "team-creative", name: "创作专家团", icon: "🎨", description: "成品要美、动人、能交付。", kbScope: "raw/创作", body: "(browser stub)", kind: "team" },
+        { id: "team-research", name: "研究专家团", icon: "🔬", description: "多源检索×对抗校验×收口。", kbScope: "", body: "(browser stub)", kind: "team" },
       ];
     case "provider_list": {
       const mk = (id: string, name: string, baseUrl: string, category: string, color: string, kind: string, hasKey: boolean, authToken = "") => ({
@@ -1647,6 +1703,16 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       };
     case "codex_poll_login":
       return { status: "ok" };
+    case "claude_oauth_status":
+      return { loggedIn: false, credPath: "(browser-only)" };
+    case "claude_start_login":
+      return {
+        authorizeUrl: "https://claude.ai/oauth/authorize?code=true",
+        verifier: "stub-verifier",
+        state: "stub-state",
+      };
+    case "claude_finish_login":
+      return { loggedIn: true, credPath: "(browser stub) ~/.claude/.credentials.json" };
     case "codex_proxy_info":
       return { running: false, port: 0, lastError: "" };
     case "env_check": {
@@ -1666,12 +1732,18 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         pwsh: tool("pwsh", "PowerShell 7", false),
         node: tool("node", "Node.js", true),
         npm: tool("npm", "npm", true),
+        uv: tool("uv", "uv", false),
+        python: tool("python", "Python", false),
         claudeDir: null,
         claudeDirOnUserPath: true,
         shellReady: false,
         ready: false,
       };
     }
+    case "env_uv_cache_info":
+      return { available: false, dir: null, bytes: 0, human: "0 B" };
+    case "env_uv_cache_clean":
+      return "浏览器预览模式无法清理 uv 缓存。";
     case "env_fix_path":
       return {
         ok: false,
@@ -1682,6 +1754,7 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
     case "env_install_claude":
     case "env_install_node":
     case "env_install_pwsh":
+    case "env_install_uv":
     case "env_update_claude":
       return "env-stub-req";
     case "env_claude_update_check":
