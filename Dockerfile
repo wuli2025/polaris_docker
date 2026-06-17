@@ -214,7 +214,7 @@ ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
 ENV FASTEMBED_CACHE_DIR=/root/Polaris/models/fastembed
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* ; \
-    ( set -e; ORT_VER=1.24.0; \
+    ( set -e; ORT_VER=1.26.0; \
       curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz" -o /tmp/ort.tgz \
       && tar -xzf /tmp/ort.tgz -C /tmp \
       && cp /tmp/onnxruntime-linux-x64-${ORT_VER}/lib/libonnxruntime.so* /usr/local/lib/ \
