@@ -493,6 +493,16 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         )?),
         "fable_folder_size" => ok(fable::inventory::fable_folder_size(req_str(a, "path")?)?),
         "fable_backfill_lang" => ok(fable::inventory::fable_backfill_lang()?),
+
+        // ── 企业 Schema 知识库(本体)——desktop 走 #[tauri::command],server/Docker 须在此显式接 dispatch ──
+        "ontology_schemas" => ok(fable::ontology::ontology_schemas()?),
+        "ontology_overview" => ok(fable::ontology::ontology_overview()?),
+        "ontology_seed" => ok(fable::ontology::ontology_seed(req_str(a, "schemaId")?)?),
+        "ontology_extract" => ok(fable::ontology::ontology_extract(app, req_str(a, "schemaId")?)?),
+        "ontology_triples" => ok(fable::ontology::ontology_triples(
+            req_str(a, "schemaId")?,
+            opt_usize(a, "limit").map(|v| v as u32),
+        )?),
         "fable_index_start" => {
             ok(fable::index::fable_index_start(app, opt_usize(a, "maxChunks"))?)
         }
@@ -529,6 +539,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "file_gist" => ok(fable::files::file_gist(req_str(a, "abspath")?)?),
         "file_cluster_build" => ok(fable::files::file_cluster_build(app, opt_str(a, "root"))?),
         "file_profile_html" => ok(fable::files::file_profile_html(opt_str(a, "root"))?),
+        "file_suggest_workflows" => ok(fable::files::suggest_workflows(opt_str(a, "root"))?),
         "file_graph" => ok(fable::files::file_graph(opt_str(a, "root"))?),
         "file_warm_thumbs" => ok(fable::files::file_warm_thumbs(
             vec_str(a, "paths"),
