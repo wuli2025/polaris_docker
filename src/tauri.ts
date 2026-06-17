@@ -641,10 +641,11 @@ export const files = {
   clusterBuild: (root?: string | null) =>
     invoke<void>("file_cluster_build", { root: root ?? null }),
   /** 文件中心 v3 渐进式智能归类:T0 秒级骨架 → T1 AI 初级命名+关系 → T2 全量向量化后语义重聚再命名。
-   *  后台线程跑,进度/各档走 file:cluster 事件(phase/tick/tier/done/error) */
-  smartCluster: (root?: string | null) =>
-    invoke<void>("file_smart_cluster", { root: root ?? null }),
-  /** 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告;进度走 file:cluster_llm 事件 */
+   *  后台线程跑,进度/各档走 file:cluster 事件(phase/tick/tier/done/error)。
+   *  quick=true 只跑 T0+T1(全覆盖词法 + AI 命名)就收尾、不追加耗时的 T2 —— 新用户向导用,几秒搞定。 */
+  smartCluster: (root?: string | null, quick?: boolean) =>
+    invoke<void>("file_smart_cluster", { root: root ?? null, quick: quick ?? false }),
+  /** 用已连接的大模型按语义归类(免嵌入 key);进度走 file:cluster_llm 事件 */
   clusterLlm: (root?: string | null) =>
     invoke<void>("file_cluster_llm", { root: root ?? null }),
   /** 「让 AI 更懂你」:据盘点统计确定性生成知识画像 HTML → 桌面,返回文件路径(同步,不调大模型) */

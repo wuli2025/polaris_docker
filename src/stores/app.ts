@@ -7,6 +7,7 @@ import {
   type Conversation,
   type Project,
 } from "../tauri";
+import { useChatStore } from "./chat";
 
 export type ViewKey =
   | "chat"
@@ -273,6 +274,10 @@ export const useAppStore = defineStore("app", () => {
     };
     expandedProjects.value = new Set([...expandedProjects.value, projectId]);
     currentConvId.value = c.id;
+    // 同步标记这条新对话为「历史已加载(空)」——必须紧跟 currentConvId 赋值、其间不能有
+    // await。否则 currentConvId 变更触发的 loadHistory(微任务)会在首条消息推入后用空历史
+    // 把它覆盖掉(现象:第一次给对话发消息经常被「吃掉」)。覆盖所有「新建即发送」入口。
+    useChatStore().markFresh(c.id);
     currentProjectId.value = projectId;
     if (navigate) setView("chat");
     return c;

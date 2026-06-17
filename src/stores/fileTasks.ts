@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { reactive, computed } from "vue";
+import { reactive, computed, ref } from "vue";
 import { files as fc, listen, invoke } from "../tauri";
 
 // 文件中心长任务的全局状态枢纽。
@@ -16,7 +16,7 @@ import { files as fc, listen, invoke } from "../tauri";
 //   盘点      fable:inventory   {kind: progress(files,bytes) / done(files,...) / error(message)}
 //   建索引    fable:index       {kind: progress(files,chunks) / done(files,stopped) / error}
 //   智能归类  file:cluster      {kind: phase(text) / done(clusters,files,note) / error}     ← 本轮改后台
-//   AI 归类   file:cluster_llm  {kind: phase(text) / done(clusters,assigned,report) / error}
+//   AI 归类   file:cluster_llm  {kind: phase(text) / done(clusters,assigned) / error}
 //   AI 整理名 file:title_llm    {kind: phase(text) / done(count) / error}
 
 export type FileTaskId = "inventory" | "index" | "cluster" | "clusterLlm" | "titles" | "ontology";
@@ -39,14 +39,14 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
   const failed = reactive<Record<FileTaskId, boolean>>(mk(false));
   // done 自增 → 组件 watch 刷新对应数据(总览 / 网格)。
   const doneTick = reactive<Record<FileTaskId, number>>(mk(0));
-  // AI 归类完成后的桌面报告路径。
-  const reportPath = reactive<Record<FileTaskId, string>>(mk(""));
+  // 上一轮盘点中「连不上、已跳过」的根(群晖 NAS / 拔掉的外置盘等)。文件中心 watch doneTick.inventory
+  // 后读它弹温和提示框,提醒用户「这些没扫到」,而不是误以为盘点完成 = 全都扫到了。
+  const lastUnreachable = ref<string[]>([]);
 
   function begin(id: FileTaskId, msg: string) {
     running[id] = true;
     failed[id] = false;
     detail[id] = msg;
-    reportPath[id] = "";
   }
   function finish(id: FileTaskId, msg: string) {
     running[id] = false;
@@ -66,11 +66,16 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     if (wired) return;
     wired = true;
     unlisteners.push(
-      await listen<{ kind: string; files?: number; message?: string }>("fable:inventory", (p) => {
-        if (p.kind === "progress") detail.inventory = `已盘点 ${p.files ?? 0} 个文件…`;
-        else if (p.kind === "done") finish("inventory", `盘点完成 · ${p.files ?? 0} 个文件`);
-        else if (p.kind === "error") fail("inventory", `盘点失败:${p.message ?? ""}`);
-      }),
+      await listen<{ kind: string; files?: number; message?: string; unreachable?: string[] }>(
+        "fable:inventory",
+        (p) => {
+          if (p.kind === "progress") detail.inventory = `已盘点 ${p.files ?? 0} 个文件…`;
+          else if (p.kind === "done") {
+            lastUnreachable.value = p.unreachable ?? [];
+            finish("inventory", `盘点完成 · ${p.files ?? 0} 个文件`);
+          } else if (p.kind === "error") fail("inventory", `盘点失败:${p.message ?? ""}`);
+        },
+      ),
     );
     unlisteners.push(
       await listen<{ kind: string; files?: number; chunks?: number; stopped?: string; message?: string }>(
@@ -89,7 +94,6 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
         tier?: string;
         clusters?: number;
         note?: string;
-        report?: string;
         message?: string;
       }>("file:cluster", (p) => {
         if (p.kind === "phase") detail.cluster = p.text ?? detail.cluster;
@@ -98,24 +102,21 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
         } else if (p.kind === "tier") {
           // v3 某一档(骨架/AI 初级/语义精修)完成 → 刷新星图/网格(doneTick),但任务继续。
           if (p.note) detail.cluster = p.note;
-          if (p.report) reportPath.cluster = p.report;
           doneTick.cluster++;
         } else if (p.kind === "done") {
-          if (p.report) reportPath.cluster = p.report;
           finish("cluster", p.note || "归类完成");
         } else if (p.kind === "error") fail("cluster", `归类失败:${p.message ?? ""}`);
       }),
     );
     unlisteners.push(
-      await listen<{ kind: string; text?: string; clusters?: number; assigned?: number; report?: string; message?: string }>(
+      await listen<{ kind: string; text?: string; clusters?: number; assigned?: number; message?: string }>(
         "file:cluster_llm",
         (p) => {
           if (p.kind === "phase") detail.clusterLlm = p.text ?? "";
           else if (p.kind === "done") {
-            reportPath.clusterLlm = p.report ?? "";
             finish(
               "clusterLlm",
-              `AI 归类完成 · ${p.clusters ?? 0} 个子主题 · ${p.assigned ?? 0} 个文件已归类 · 报告已存桌面`,
+              `AI 归类完成 · ${p.clusters ?? 0} 个子主题 · ${p.assigned ?? 0} 个文件已归类`,
             );
           } else if (p.kind === "error") fail("clusterLlm", `AI 归类失败:${p.message ?? ""}`);
         },
@@ -255,7 +256,7 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     detail,
     failed,
     doneTick,
-    reportPath,
+    lastUnreachable,
     clustering,
     anyRunning,
     activeList,

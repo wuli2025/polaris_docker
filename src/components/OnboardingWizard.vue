@@ -4,7 +4,7 @@
  *
  * 全程复用既有命令(零新后端轮子):
  *   盘点  fc.scanFolders / fc.inventoryStart(fable:inventory)
- *   归类  fc.clusterLlm(AI 读清单分主题, file:cluster_llm) ‖ fc.clusterBuild(离线词法)
+ *   归类  fc.smartCluster(quick: 全覆盖词法 + AI 命名, file:cluster) ‖ fc.clusterBuild(离线词法)
  *   索引  fc.indexStart(后台向量索引, fable:index)
  *   画像  fc.profileHtml(确定性桌面 HTML)
  * 收尾据文件构成给「建议工作流」卡片,点一下带着任务跳进对话框。
@@ -82,9 +82,75 @@ function loadRoots() {
       uncheckedRoots.clear();
       // 默认全勾(后端现在「一个不落」把所有盘/卷 defaultOn=true);只把 defaultOn=false 的预置为不勾。
       for (const x of r.roots) if (!x.defaultOn) uncheckedRoots.add(x.path);
+      // 后台逐个算每个盘/目录的真实体量(限并发,跟文件中心·盘点选择器一致)。
+      sizeCache.clear();
+      sizeQueue.length = 0;
+      sizeInflight.clear();
+      for (const x of r.roots) requestSize(x.path);
     })
     .catch((e: any) => (rootsErr.value = `扫描失败:${e?.message ?? e}`))
     .finally(() => (loadingRoots.value = false));
+}
+
+// ── 体积:限并发的后台计算队列(复用后端 fable_folder_size,带 10s 死线兜底)──
+const sizeCache = reactive(new Map<string, { files: number; bytes: number }>());
+const sizeQueue: string[] = [];
+const sizeInflight = new Set<string>();
+let sizeActive = 0;
+const SIZE_CONCURRENCY = 4;
+function requestSize(path: string) {
+  if (sizeCache.has(path) || sizeInflight.has(path) || sizeQueue.includes(path)) return;
+  sizeQueue.push(path);
+  pumpSize();
+}
+function pumpSize() {
+  while (sizeActive < SIZE_CONCURRENCY && sizeQueue.length) {
+    const p = sizeQueue.shift()!;
+    sizeInflight.add(p);
+    sizeActive++;
+    fc.folderSize(p)
+      .then((r) => sizeCache.set(p, r))
+      .catch(() => sizeCache.set(p, { files: 0, bytes: 0 }))
+      .finally(() => {
+        sizeActive--;
+        sizeInflight.delete(p);
+        pumpSize();
+      });
+  }
+}
+// 仿 WizTree:每个盘/目录在「所有范围」里的占比 + 条长(占比=本项/已知总和;条长=本项/已知最大)。
+const rootSizeStats = computed(() => {
+  let sum = 0;
+  let max = 1;
+  for (const r of roots.value) {
+    const s = sizeCache.get(r.path);
+    if (s) {
+      sum += s.bytes;
+      if (s.bytes > max) max = s.bytes;
+    }
+  }
+  return { sum, max };
+});
+function rootSizePct(r: ScanRootInfo): number {
+  const s = sizeCache.get(r.path);
+  if (!s || rootSizeStats.value.sum <= 0) return 0;
+  return (s.bytes / rootSizeStats.value.sum) * 100;
+}
+function rootSizeBar(r: ScanRootInfo): number {
+  const s = sizeCache.get(r.path);
+  if (!s || rootSizeStats.value.max <= 0) return 0;
+  return s.bytes / rootSizeStats.value.max;
+}
+function fmtBytes(b: number): string {
+  if (b <= 0) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let n = b;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
 }
 const keywordList = computed(() =>
   excludeKeywords.value
@@ -113,17 +179,30 @@ const selectedRoots = computed(() => roots.value.filter(isRootOn).map((r) => r.p
 // ── 扫描 ──
 const scanFiles = ref(0);
 const scanMsg = ref("");
+// 扫描被取消 / 出错的恢复态:置位后停掉转圈动画、亮出「重新扫描 / 返回」出口,
+// 否则向导会永远停在 scan 这一步(只有 done 才会 afterScan 往下走)。
+const scanFailed = ref(false);
+const scanCancelled = ref(false);
 let unScan: (() => void) | null = null;
 async function startScan() {
   step.value = "scan";
   scanFiles.value = 0;
+  scanFailed.value = false;
+  scanCancelled.value = false;
   scanMsg.value = "正在扫描你电脑上的文件…";
   try {
     if (!unScan) {
       unScan = await listen<{ kind: string; files?: number; message?: string }>(
         "fable:inventory",
         (p) => {
+          // 已离开 scan 步(转后台 / 已往下走)就不再让迟到的事件改动这屏 UI;
+          // 但若后台真扫完了,仍把流程推进下去。
+          if (step.value !== "scan") {
+            if (p.kind === "done") void afterScan();
+            return;
+          }
           if (p.kind === "progress") {
+            scanFailed.value = false;
             scanFiles.value = p.files ?? 0;
             scanMsg.value = `已扫描 ${scanFiles.value.toLocaleString()} 个文件…`;
           } else if (p.kind === "done") {
@@ -131,7 +210,10 @@ async function startScan() {
             scanMsg.value = `扫描完成 · 共 ${scanFiles.value.toLocaleString()} 个文件`;
             void afterScan();
           } else if (p.kind === "error") {
-            scanMsg.value = `扫描失败:${p.message ?? ""}`;
+            // 后端取消时发的是 error{message:"已取消"};与真实错误区分文案,但都给恢复出口。
+            scanCancelled.value = (p.message ?? "").includes("已取消");
+            scanFailed.value = true;
+            scanMsg.value = scanCancelled.value ? "扫描已取消" : `扫描失败:${p.message ?? ""}`;
           }
         },
       );
@@ -139,8 +221,15 @@ async function startScan() {
     // 托管全局任务 store(全局任务中心可见 + 后台跑);向导自身的 fable:inventory 监听仍负责推进步骤。
     await tasks.startInventory(selectedRoots.value, []);
   } catch (e: any) {
+    scanFailed.value = true;
     scanMsg.value = `扫描失败:${e?.message ?? e}`;
   }
+}
+// 失败 / 取消后「返回」重选盘点范围。
+function backToScope() {
+  scanFailed.value = false;
+  scanCancelled.value = false;
+  step.value = "scope";
 }
 async function afterScan() {
   await loadOverview();
@@ -237,27 +326,30 @@ function openKeyUrl() {
 // ── 归类 ──
 const organizing = ref(false);
 const organizeMsg = ref("");
-const reportPath = ref("");
-let unLlm: (() => void) | null = null;
 let unCluster: (() => void) | null = null;
-// 离线词法归类:file_cluster_build 现为后台事件式(fire-and-forget),进度/完成走 file:cluster
-// 事件(phase/done/error)。必须等 done 再进图谱,否则聚类还没落库、星图会是空的。
+// 归类(智能 smartCluster / 离线词法 clusterBuild)进度与完成都走 file:cluster 事件
+// (phase/tier/done/error)。必须等 done 再进图谱,否则聚类还没落库、星图会是空的。
+// 两条路共用这一个监听器,避免同一频道挂两个监听导致 afterOrganize 触发两次。
+async function ensureClusterListener() {
+  if (unCluster) return;
+  unCluster = await listen<{ kind: string; text?: string; note?: string; message?: string }>(
+    "file:cluster",
+    (p) => {
+      if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
+      else if (p.kind === "tier") organizeMsg.value = p.note ?? organizeMsg.value;
+      else if (p.kind === "done") {
+        organizeMsg.value = p.note ?? "归类完成";
+        void afterOrganize();
+      } else if (p.kind === "error") {
+        organizeMsg.value = `归类失败:${p.message ?? ""}`;
+        organizing.value = false;
+      }
+    },
+  );
+}
+// 离线词法归类:file_cluster_build 现为后台事件式(fire-and-forget)。
 async function runOfflineCluster() {
-  if (!unCluster) {
-    unCluster = await listen<{ kind: string; text?: string; note?: string; message?: string }>(
-      "file:cluster",
-      (p) => {
-        if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
-        else if (p.kind === "done") {
-          organizeMsg.value = p.note ?? "归类完成";
-          void afterOrganize();
-        } else if (p.kind === "error") {
-          organizeMsg.value = `归类失败:${p.message ?? ""}`;
-          organizing.value = false;
-        }
-      },
-    );
-  }
+  await ensureClusterListener();
   await fc.clusterBuild(null);
 }
 // 企业路径(D 方案):Schema-Guided 在框内抽三元组,事件走 fable:ontology。
@@ -287,7 +379,6 @@ async function runSchemaExtract() {
 async function startOrganize() {
   step.value = "organize";
   organizing.value = true;
-  reportPath.value = "";
   // 归类要跑几秒,趁这空当把星河图谱(cytoscape ~562KB)的 chunk 预下载好 →
   // 归类一完成切到「知识图谱」步时,图谱「啪」地直接渲染,不再等大包下载的白屏。
   void import("./KnowledgeGraph.vue").catch(() => {});
@@ -312,29 +403,14 @@ async function startOrganize() {
     }
     return;
   }
-  // AI 语义归类:大模型读文件清单 → 分两级主题(免嵌入 key,走对话模型)。
-  organizeMsg.value = "正在用 AI 读你的文件清单、分主题…";
+  // 智能归类(v3 全覆盖):T0 词法把**全库每个文件**都归类(不再像旧 file_cluster_llm 只看最近 240 个)
+  // + T1 大模型读「簇画像」起亲切名/理关系。quick=true 跳过耗时的 T2 全量向量化(向导收尾自己会
+  // 后台建索引,且大库 T2 要几十分钟、会爆「几秒就好」的预期)。AI 命名失败也会优雅降级保留词法名、
+  // 照常 done,不再需要单独回落离线。
+  organizeMsg.value = "正在快速归类你的全部文件、再请 AI 读懂起名…";
   try {
-    if (!unLlm) {
-      unLlm = await listen<{ kind: string; text?: string; report?: string; message?: string }>(
-        "file:cluster_llm",
-        (p) => {
-          if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
-          else if (p.kind === "done") {
-            reportPath.value = p.report ?? "";
-            void afterOrganize();
-          } else if (p.kind === "error") {
-            // AI 失败 → 自动回落离线词法,绝不卡住引导。
-            organizeMsg.value = "AI 归类暂不可用,改用离线归类…";
-            runOfflineCluster().catch((e: any) => {
-              organizeMsg.value = `归类失败:${e?.message ?? e}`;
-              organizing.value = false;
-            });
-          }
-        },
-      );
-    }
-    await fc.clusterLlm(null);
+    await ensureClusterListener();
+    await fc.smartCluster(null, true);
   } catch (e: any) {
     organizeMsg.value = `归类失败:${e?.message ?? e}`;
     organizing.value = false;
@@ -502,7 +578,6 @@ const inLongStep = computed(() => step.value === "scan" || step.value === "organ
 // 整个组件常驻 App,不随视图切换卸载;onBeforeUnmount 基本只在 App 退出时触发。
 onBeforeUnmount(() => {
   if (unScan) unScan();
-  if (unLlm) unLlm();
   if (unCluster) unCluster();
   if (unPack) unPack();
   if (unOnto) unOnto();
@@ -625,6 +700,13 @@ onBeforeUnmount(() => {
                 <Folder v-else :size="15" :stroke-width="1.7" class="root-ic" />
                 <span class="root-name">{{ r.label }}</span>
                 <span class="root-path">{{ r.path }}</span>
+                <template v-if="sizeCache.get(r.path)">
+                  <span class="root-bar" :title="rootSizePct(r).toFixed(1) + '% 占总量'">
+                    <span class="root-bar-fill" :style="{ width: Math.max(2, rootSizeBar(r) * 100) + '%' }" />
+                  </span>
+                  <span class="root-size">{{ fmtBytes(sizeCache.get(r.path)!.bytes) }}</span>
+                </template>
+                <span v-else class="root-calc"><LoaderCircle :size="11" class="spin" /> 计算体积…</span>
               </button>
             </div>
             <p class="wiz-fine">
@@ -639,13 +721,26 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 2 · 扫描中 -->
+        <!-- 2 · 扫描中 / 已取消 / 失败 -->
         <div v-else-if="step === 'scan'" class="wiz-body center">
-          <div class="scan-orb"><FolderSearch :size="30" :stroke-width="1.3" /><div class="scan-ring" /></div>
-          <div class="scan-num">{{ scanFiles.toLocaleString() }}</div>
-          <div class="scan-lab">{{ scanMsg }}</div>
-          <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
-          <div class="scan-fine">扫描在后台继续,可最小化窗口或去用别的功能;扫完再点「智能向导」回来。</div>
+          <!-- 失败 / 取消:停掉转圈,给明确出口,不再让向导卡死在这屏 -->
+          <template v-if="scanFailed">
+            <div class="scan-orb stopped"><component :is="scanCancelled ? Layers : X" :size="30" :stroke-width="1.4" /></div>
+            <div class="scan-lab big">{{ scanMsg }}</div>
+            <div class="scan-fine">{{ scanCancelled ? "盘点已停止。你可以重新扫描,或返回调整盘点范围。" : "扫描中断了。可重试,或返回重新选择范围。" }}</div>
+            <div class="scan-actions">
+              <button class="wiz-go ghost" @click="backToScope"><ChevronRight :size="14" :stroke-width="1.8" class="flip" /> 返回选范围</button>
+              <button class="wiz-go" @click="startScan"><FolderSearch :size="15" :stroke-width="1.8" /> 重新扫描</button>
+            </div>
+          </template>
+          <!-- 进行中 -->
+          <template v-else>
+            <div class="scan-orb"><FolderSearch :size="30" :stroke-width="1.3" /><div class="scan-ring" /></div>
+            <div class="scan-num">{{ scanFiles.toLocaleString() }}</div>
+            <div class="scan-lab">{{ scanMsg }}</div>
+            <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
+            <div class="scan-fine">扫描在后台继续,可最小化窗口或去用别的功能;扫完再点「智能向导」回来。</div>
+          </template>
         </div>
 
         <!-- 3 · 配模型 -->
@@ -730,7 +825,6 @@ onBeforeUnmount(() => {
             <KnowledgeGraph source="files" :embedded="true" />
           </div>
           <div class="wiz-foot end">
-            <button v-if="reportPath" class="mini" @click="artifactsApi.openExternal(reportPath).catch(() => {})"><FileText :size="12" :stroke-width="1.8" /> 看归类报告</button>
             <button class="wiz-go" @click="finishUp"><ChevronRight :size="15" :stroke-width="1.8" /> 继续:建索引 & 进对话</button>
           </div>
         </div>
@@ -931,7 +1025,12 @@ onBeforeUnmount(() => {
 .root-check.on { background: var(--primary); border-color: var(--primary); }
 .root-ic { color: var(--muted); flex: none; }
 .root-name { font-size: 13px; color: var(--text); flex: none; }
-.root-path { font-size: 11px; color: var(--dim); font-family: ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.root-path { flex: 1; min-width: 0; font-size: 11px; color: var(--dim); font-family: ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 仿 WizTree:占总量条 + 体积 */
+.root-bar { flex: none; width: 64px; height: 6px; border-radius: 99px; overflow: hidden; background: color-mix(in srgb, var(--ink) 10%, transparent); }
+.root-bar-fill { display: block; height: 100%; border-radius: 99px; background: color-mix(in srgb, var(--primary) 70%, var(--ink) 8%); }
+.root-size { flex: none; min-width: 56px; text-align: right; font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--text-2); }
+.root-calc { flex: none; display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--dim); }
 
 .wiz-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 20px; }
 .wiz-foot.end { justify-content: flex-end; }
@@ -940,7 +1039,11 @@ onBeforeUnmount(() => {
 
 /* 扫描 / 归类动画 */
 .scan-orb { position: relative; width: 84px; height: 84px; display: flex; align-items: center; justify-content: center; color: var(--primary); }
+/* 失败 / 取消:静止的灰圈,不再转动,一眼能看出「停了」而非「卡了」 */
+.scan-orb.stopped { color: var(--muted); border: 2px solid var(--border-strong); border-radius: 50%; }
 .scan-ring { position: absolute; inset: 0; border: 2px solid color-mix(in srgb, var(--primary) 40%, transparent); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+.scan-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.scan-actions .flip { transform: rotate(180deg); }
 .scan-num { font-size: 34px; font-weight: 680; font-variant-numeric: tabular-nums; color: var(--ink); }
 .scan-lab { font-size: 13px; color: var(--muted); }
 .scan-lab.big { font-size: 14px; color: var(--text); }

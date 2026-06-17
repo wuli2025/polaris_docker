@@ -857,31 +857,54 @@ fn lexical_vec(relpath: &str, name: &str, _ext: &str) -> Vec<f32> {
 }
 
 /// 词法兜底:加载范围内文件的**样本**(上限 6000)→ 归一化词法向量,用来算 k-means 质心。
-/// 样本不再按 mtime 倒序(只取最近的会漏掉老主题),改用 id 哈希**均匀散布全库**取样,
-/// 让质心覆盖到所有主题;真正的「全覆盖指派」在 [`cluster_build_on`] 里对全部文件做(O(N·k))。
+///
+/// 取样两路并集(各自去重、合计 ≤ `CAP`):
+///  ① **最近改动的 `RECENT` 个**(mtime 倒序)—— 用户「当下在忙」的那摊活儿,务必让它**自成质心**,
+///     否则在被某个大旧库(几十万文件)占满的库里,纯均匀取样会让最近的活儿一个质心都分不到、
+///     被并进某个大旧簇里 → 星图上彻底看不见,用户感觉「不懂我」;
+///  ② **id 哈希均匀散布全库**补齐到 `CAP` —— 保证所有老主题也都有质心、覆盖到全库。
+/// 真正的「全覆盖指派」在 [`cluster_build_on`] 里对**全部文件**做(O(N·k)),取样只决定质心位置,
+/// 故加 recency 偏置不影响覆盖率(仍 1.0),只让「最近主题」在星图里冒出来。
 fn load_lexical_files(conn: &rusqlite::Connection, filter: &str) -> Result<Vec<FileVec>, String> {
-    let sql = format!(
+    const CAP: usize = 6000;
+    const RECENT: usize = 2000;
+    let mut out: Vec<FileVec> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut take = |sql: String| -> Result<(), String> {
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for (id, root_id, relpath, name, ext) in rows.flatten() {
+            if out.len() >= CAP {
+                break;
+            }
+            if !seen.insert(id) {
+                continue; // 已被「最近」路取过,不重复算
+            }
+            let mut v = lexical_vec(&relpath, &name, &ext);
+            normalize(&mut v);
+            out.push(FileVec { file_id: id, root_id, relpath, name, vec: v });
+        }
+        Ok(())
+    };
+    // ① 最近改动(mtime>0 跳过读不出时间的);② 哈希均匀补齐全库。
+    take(format!(
         "SELECT f.id, f.root_id, f.relpath, f.name, f.ext FROM files f
-         WHERE 1=1{filter} ORDER BY (f.id * 2654435761) % 1000003 LIMIT 6000"
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for (id, root_id, relpath, name, ext) in rows.flatten() {
-        let mut v = lexical_vec(&relpath, &name, &ext);
-        normalize(&mut v);
-        out.push(FileVec { file_id: id, root_id, relpath, name, vec: v });
-    }
+         WHERE 1=1{filter} AND f.mtime>0 ORDER BY f.mtime DESC LIMIT {RECENT}"
+    ))?;
+    take(format!(
+        "SELECT f.id, f.root_id, f.relpath, f.name, f.ext FROM files f
+         WHERE 1=1{filter} ORDER BY (f.id * 2654435761) % 1000003 LIMIT {CAP}"
+    ))?;
     Ok(out)
 }
 
@@ -1552,7 +1575,7 @@ pub fn warm_thumbs(paths: Vec<String>, max: u32) -> usize {
 // ───────────────────────── 大模型语义归类(免嵌入 key) ─────────────────────────
 //
 // 用户没有硅基嵌入 key,但聊天大模型(claude/配置的供应商)已经接通 → 直接让它读
-// 文件清单、按主题归类,Rust 写回 cluster_id + clusters 表,并在桌面生成 HTML 报告。
+// 文件清单、按主题归类,Rust 写回 cluster_id + clusters 表。
 // 复用回声层「做梦」同一套:run_claude_readonly(无头跑已连接模型)+ extract_balanced_json。
 
 // ── 归类专用模型(可选):独立于「对话供应商」,可指向便宜/免费的 OpenAI 兼容端点 ──
@@ -1676,13 +1699,6 @@ struct LlmGroup {
     groups: Vec<LlmGroup>,
 }
 
-/// 报告用:一个顶层主题 + 其下若干子主题(子主题各自的成员下标)。
-struct ReportTheme {
-    label: String,
-    color: String,
-    children: Vec<(String, Vec<usize>)>,
-}
-
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -1803,7 +1819,7 @@ fn cluster_llm_run(app: &AppHandle, root: Option<String>) -> Result<(usize, usiz
     let groups: Vec<LlmGroup> =
         serde_json::from_str(&raw).map_err(|e| format!("归类 JSON 解析失败: {e}"))?;
 
-    emit_llm(app, json!({ "kind": "phase", "text": "写回归类 + 生成桌面报告…" }));
+    emit_llm(app, json!({ "kind": "phase", "text": "写回归类…" }));
 
     // 清旧簇(范围内)+ 旧关系边(簇 id 即将重排)。
     if ids.is_empty() {
@@ -1819,7 +1835,6 @@ fn cluster_llm_run(app: &AppHandle, root: Option<String>) -> Result<(usize, usiz
     }
 
     let built_at = chrono::Local::now().timestamp_millis();
-    let mut report_themes: Vec<ReportTheme> = Vec::new();
     let mut assigned = 0usize;
     let mut n_clusters = 0usize; // 叶簇数(实际承载文件的子主题)
     let mut color_i = 0usize;
@@ -1908,123 +1923,10 @@ fn cluster_llm_run(app: &AppHandle, root: Option<String>) -> Result<(usize, usiz
             assigned += m.len();
             n_clusters += 1;
         }
-        report_themes.push(ReportTheme { label: theme_label, color, children });
     }
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
 
-    let report_path = write_report_html(&files, &report_themes, assigned)?;
-    Ok((n_clusters, assigned, report_path))
-}
-
-/// 生成自包含 HTML 报告 → 桌面,返回文件路径。
-fn write_report_html(
-    files: &[FileLite],
-    themes: &[ReportTheme],
-    assigned: usize,
-) -> Result<String, String> {
-    let now = chrono::Local::now();
-    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
-    let human = now.format("%Y-%m-%d %H:%M").to_string();
-
-    let mut n_sub = 0usize;
-    let mut cards = String::new();
-    for t in themes {
-        let total: usize = t.children.iter().map(|(_, m)| m.len()).sum();
-        let mut subs = String::new();
-        for (lab, members) in &t.children {
-            n_sub += 1;
-            let mut items = String::new();
-            for &i in members {
-                let f = &files[i];
-                items.push_str(&format!(
-                    r#"<li><span class="dot" style="background:{c}"></span><span class="fn">{name}</span><span class="fp">{path}</span><span class="fk">{kind}</span></li>"#,
-                    c = esc(&t.color),
-                    name = esc(&f.name),
-                    path = esc(&f.relpath),
-                    kind = esc(&f.kind),
-                ));
-            }
-            subs.push_str(&format!(
-                r#"<div class="subgrp"><div class="subgrp-h"><span class="sbadge">{n}</span>{lab}</div><ul>{items}</ul></div>"#,
-                n = members.len(),
-                lab = esc(lab),
-                items = items,
-            ));
-        }
-        cards.push_str(&format!(
-            r#"<section class="cluster"><header style="--c:{c}"><span class="badge">{n}</span><h2>{label}</h2></header><div class="subs">{subs}</div></section>"#,
-            c = esc(&t.color),
-            n = total,
-            label = esc(&t.label),
-            subs = subs,
-        ));
-    }
-
-    let html = format!(
-        r##"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>文件中心 · AI 语义归类报告</title>
-<style>
-:root{{--bg:#0f1115;--panel:#171a21;--line:#252a33;--ink:#e8e8e6;--mut:#9aa0ab;--gold:#d4b06a}}
-*{{box-sizing:border-box}}
-body{{margin:0;background:linear-gradient(180deg,#0f1115,#13161c);color:var(--ink);
-font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6}}
-.wrap{{max-width:1040px;margin:0 auto;padding:48px 32px 100px}}
-h1{{font-size:26px;margin:0 0 4px;letter-spacing:.5px}}
-.sub{{color:var(--mut);font-size:13px}}
-.stats{{display:flex;gap:28px;margin:24px 0 32px;padding:18px 22px;background:var(--panel);
-border:1px solid var(--line);border-radius:14px}}
-.stat .v{{font-size:24px;font-weight:650}}.stat .l{{color:var(--mut);font-size:12px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}}
-.cluster{{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}}
-.cluster header{{display:flex;align-items:center;gap:10px;padding:14px 18px;
-background:color-mix(in srgb,var(--c) 14%,transparent);border-bottom:1px solid var(--line)}}
-.cluster header::before{{content:"";width:10px;height:10px;border-radius:50%;background:var(--c);
-box-shadow:0 0 10px var(--c)}}
-.cluster h2{{font-size:15px;margin:0;flex:1}}
-.badge{{font-size:12px;color:#0f1115;background:var(--c);padding:1px 9px;border-radius:99px;font-weight:700}}
-.subs{{padding:6px 0}}
-.subgrp{{border-bottom:1px solid var(--line)}}
-.subgrp:last-child{{border-bottom:none}}
-.subgrp-h{{display:flex;align-items:center;gap:8px;padding:9px 18px 4px;font-size:12.5px;font-weight:600;color:var(--ink)}}
-.sbadge{{font-size:10.5px;color:var(--mut);background:rgba(255,255,255,.06);padding:0 7px;border-radius:99px}}
-.cluster ul{{list-style:none;margin:0;padding:2px 0 8px;max-height:420px;overflow:auto}}
-.cluster li{{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px;
-padding:6px 18px;font-size:12.5px;border-bottom:1px solid rgba(255,255,255,.03)}}
-.cluster li:hover{{background:rgba(255,255,255,.03)}}
-.dot{{width:6px;height:6px;border-radius:50%}}
-.fn{{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.fp{{grid-column:2;color:var(--mut);font-size:10.5px;font-family:ui-monospace,Consolas,monospace;
-overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.fk{{color:var(--gold);font-size:10px;text-transform:uppercase}}
-.foot{{margin-top:40px;color:#5a606b;font-size:12px;text-align:center}}
-</style></head><body><div class="wrap">
-<h1>文件中心 · AI 语义归类报告</h1>
-<div class="sub">由已连接的大模型按语义两级归类 · 生成于 {human}</div>
-<div class="stats">
-<div class="stat"><div class="v">{ng}</div><div class="l">大主题</div></div>
-<div class="stat"><div class="v">{ns}</div><div class="l">子主题</div></div>
-<div class="stat"><div class="v">{na}</div><div class="l">已归类文件</div></div>
-<div class="stat"><div class="v">{nt}</div><div class="l">参与归类</div></div>
-</div>
-<div class="grid">{cards}</div>
-<div class="foot">Polaris 文件中心 · AI 语义两级归类 · 大模型按思想主题分组,非嵌入向量</div>
-</div></body></html>"##,
-        human = esc(&human),
-        ng = themes.len(),
-        ns = n_sub,
-        na = assigned,
-        nt = files.len(),
-        cards = cards,
-    );
-
-    let desktop = directories::UserDirs::new()
-        .and_then(|u| u.desktop_dir().map(|d| d.to_path_buf()))
-        .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
-        .ok_or("找不到桌面目录")?;
-    let path = desktop.join(format!("文件中心-AI归类报告-{stamp}.html"));
-    std::fs::write(&path, html).map_err(|e| format!("写报告失败: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    Ok((n_clusters, assigned, String::new()))
 }
 
 // ───────────────── 文件中心 v3 · 簇画像 + 大模型命名/关系(读懂全库,不止 240) ─────────────────
@@ -2416,9 +2318,9 @@ fn apply_names_and_relations(
     Ok((renamed, edges, merged))
 }
 
-/// 让大模型**读簇画像**给全库的簇起亲切名 + 一句概括 + 簇间关系,然后落库 + 出桌面报告。
+/// 让大模型**读簇画像**给全库的簇起亲切名 + 一句概括 + 簇间关系,然后落库。
 /// 失败可降级:调用方(编排器)捕获错误后保留 cluster_build 的启发式名,不卡流程。
-/// 返回 (改名簇数, 关系边数, 报告路径)。
+/// 返回 (改名簇数, 关系边数, 保留位)。
 fn cluster_rename_llm(
     app: &AppHandle,
     root: Option<String>,
@@ -2477,158 +2379,7 @@ fn cluster_rename_llm(
             json!({ "kind": "phase", "tier": tier, "text": format!("AI 又按意思把 {merged} 个同义簇并进了相近主题") }),
         );
     }
-    let report = write_cluster_report_html(&conn, &ids).unwrap_or_default();
-    Ok((renamed, edges, report))
-}
-
-/// 据当前 clusters 状态(AI 命名后)生成自包含 HTML 报告 → 桌面,返回路径。
-/// 直接读库(主题→子主题→样本文件),不依赖某一次归类的内存结构,故 v3 各档都能复用。
-fn write_cluster_report_html(conn: &rusqlite::Connection, ids: &[i64]) -> Result<String, String> {
-    let cfilter = if ids.is_empty() {
-        String::new()
-    } else {
-        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
-        format!(" AND root_id IN ({})", list.join(","))
-    };
-    // 顶层主题(parent=0 且确有旗下文件 / 子簇)。
-    let themes: Vec<(i64, String, String, String, i64)> = {
-        let sql = format!(
-            "SELECT id, label, color, summary, size FROM clusters WHERE parent=0{cfilter} ORDER BY size DESC"
-        );
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.flatten().collect()
-    };
-    let mut n_sub = 0usize;
-    let mut cards = String::new();
-    for (tid, tlabel, color, tsummary, tsize) in &themes {
-        // 子主题
-        let subs: Vec<(i64, String, String, i64)> = {
-            let mut stmt = conn
-                .prepare("SELECT id, label, summary, size FROM clusters WHERE parent=?1 ORDER BY size DESC")
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([tid], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?;
-            rows.flatten().collect()
-        };
-        // 单级归类:主题自身即叶簇(没有子主题),把它当唯一子主题展示。
-        let leaves: Vec<(i64, String, String, i64)> = if subs.is_empty() {
-            vec![(*tid, tlabel.clone(), tsummary.clone(), *tsize)]
-        } else {
-            subs
-        };
-        let mut sub_html = String::new();
-        for (sid, slabel, ssummary, ssize) in &leaves {
-            n_sub += 1;
-            let names: Vec<String> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT COALESCE(t.title, f.name) FROM files f LEFT JOIN titles t ON t.file_id=f.id
-                         WHERE f.cluster_id=?1 ORDER BY f.mtime DESC LIMIT 6",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map([sid], |r| r.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?;
-                rows.flatten().collect()
-            };
-            let files_html: String = names
-                .iter()
-                .map(|n| format!("<li>{}</li>", esc(n)))
-                .collect::<Vec<_>>()
-                .join("");
-            let sm = if ssummary.trim().is_empty() {
-                String::new()
-            } else {
-                format!("<div class=\"ssum\">{}</div>", esc(ssummary))
-            };
-            sub_html.push_str(&format!(
-                r#"<div class="sub"><div class="sub-h"><span class="sn">{label}</span><span class="sc">{size}</span></div>{sm}<ul>{files}</ul></div>"#,
-                label = esc(slabel),
-                size = ssize,
-                sm = sm,
-                files = files_html,
-            ));
-        }
-        let tsum = if tsummary.trim().is_empty() {
-            String::new()
-        } else {
-            format!("<div class=\"tsum\">{}</div>", esc(tsummary))
-        };
-        cards.push_str(&format!(
-            r#"<section class="theme" style="--c:{color}"><header><span class="badge">{size}</span><h2>{label}</h2></header>{tsum}<div class="subs">{subs}</div></section>"#,
-            color = esc(color),
-            size = tsize,
-            label = esc(tlabel),
-            tsum = tsum,
-            subs = sub_html,
-        ));
-    }
-
-    let now = chrono::Local::now();
-    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
-    let human = now.format("%Y-%m-%d %H:%M").to_string();
-    let html = format!(
-        r##"<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
-<title>文件中心 · 知识画像报告</title><style>
-:root{{--bg:#0f1115;--panel:#171a21;--line:#272b36;--ink:#e8eaf0;--mut:#9aa0ad;--gold:#d4b06a}}
-*{{box-sizing:border-box;margin:0}}body{{background:var(--bg);color:var(--ink);
-font-family:-apple-system,'Segoe UI','PingFang SC',sans-serif;padding:40px 20px;line-height:1.6}}
-.wrap{{max-width:1080px;margin:0 auto}}h1{{font-size:26px;font-weight:650}}
-.sub{{color:var(--mut);margin:8px 0 22px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}}
-.theme{{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}}
-.theme header{{display:flex;align-items:center;gap:10px;padding:14px 18px;
-background:color-mix(in srgb,var(--c) 16%,transparent);border-bottom:1px solid var(--line)}}
-.theme header::before{{content:"";width:10px;height:10px;border-radius:50%;background:var(--c);box-shadow:0 0 10px var(--c)}}
-.theme h2{{font-size:16px;margin:0;flex:1}}
-.badge{{font-size:12px;color:#0f1115;background:var(--c);padding:1px 9px;border-radius:99px;font-weight:700}}
-.tsum{{padding:10px 18px 2px;color:var(--gold);font-size:13px}}
-.subs{{padding:6px 0}}
-.sub{{border-bottom:1px solid var(--line);padding:8px 18px}}.sub:last-child{{border-bottom:none}}
-.sub-h{{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600}}
-.sn{{flex:1}}.sc{{font-size:10.5px;color:var(--mut);background:rgba(255,255,255,.06);padding:0 7px;border-radius:99px}}
-.ssum{{color:var(--mut);font-size:12px;margin:2px 0 4px}}
-ul{{list-style:none;margin:4px 0 0;padding:0}}li{{color:var(--mut);font-size:12px;padding:2px 0;
-overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.foot{{margin-top:36px;color:#5a606b;font-size:12px;text-align:center}}
-</style></head><body><div class="wrap">
-<h1>文件中心 · 知识画像报告</h1>
-<div class="sub">AI 读懂你的全部资料后,按你自己的说法重新命名归类 · 生成于 {human}</div>
-<div class="grid">{cards}</div>
-<div class="foot">Polaris 文件中心 · 大模型读「簇画像」全库命名(不止最近 240 个)· 主题 {nt} 个 · 子主题 {ns} 个</div>
-</div></body></html>"##,
-        human = esc(&human),
-        cards = cards,
-        nt = themes.len(),
-        ns = n_sub,
-    );
-
-    let desktop = directories::UserDirs::new()
-        .and_then(|u| u.desktop_dir().map(|d| d.to_path_buf()))
-        .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
-        .ok_or("找不到桌面目录")?;
-    let path = desktop.join(format!("文件中心-知识画像-{stamp}.html"));
-    std::fs::write(&path, html).map_err(|e| format!("写报告失败: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+    Ok((renamed, edges, String::new()))
 }
 
 // ───────────────────────── 「让 AI 更懂你」桌面画像 ─────────────────────────
@@ -2791,8 +2542,98 @@ impl SuggestedFlow {
     }
 }
 
-/// 把知识库画像(主题 / 类型 / 语言)摊成一段给大模型读的中文摘要,要它据此给「具体到我」的建议。
-fn suggest_workflows_directive(ov: &FileOverview) -> String {
+/// relpath → 「最能说明在忙什么」的上级文件夹标签(取末两级目录;无目录则「(根目录)」)。
+fn recent_parent_label(relpath: &str) -> String {
+    let norm = relpath.replace('\\', "/");
+    let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() <= 1 {
+        return "(根目录)".to_string();
+    }
+    let dirs = &segs[..segs.len() - 1]; // 去掉文件名本身
+    let tail = if dirs.len() > 2 { &dirs[dirs.len() - 2..] } else { dirs };
+    tail.join("/")
+}
+
+/// 秒差 → 中文相对时间(让「最近在动」一眼可读)。
+fn rel_time_cn(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 86_400 {
+        "今天".into()
+    } else if s < 2 * 86_400 {
+        "昨天".into()
+    } else if s < 14 * 86_400 {
+        format!("{}天前", s / 86_400)
+    } else if s < 60 * 86_400 {
+        format!("{}周前", s / (7 * 86_400))
+    } else if s < 730 * 86_400 {
+        format!("{}个月前", s / (30 * 86_400))
+    } else {
+        format!("{}年前", s / (365 * 86_400))
+    }
+}
+
+/// 「最近改动的文件」按上级文件夹聚合 → 一段中文证据,喂给建议官,让收尾工作流
+/// **锚定他此刻真在忙的几摊**(画像里只有主题/类型分布、没有时间线;不给这段,模型只能照主题名
+/// 泛泛而谈)。拉最近改动的 ~300 个文件,按末两级目录聚合,取「最新文件夹」前 12 个,
+/// 每个带:相对时间 + 近期改动数 + 几个例子文件名。失败一律返回空串(收尾页绝不能因此卡住)。
+fn recent_activity_digest(root: &Option<String>) -> String {
+    let Ok(conn) = open_db() else {
+        return String::new();
+    };
+    let ids = resolve_root_ids(&conn, root);
+    let filter = in_clause(&ids);
+    let sql = format!(
+        "SELECT f.name, f.relpath, f.mtime FROM files f
+         WHERE 1=1{filter} AND f.mtime>0 ORDER BY f.mtime DESC LIMIT 300"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return String::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+    }) else {
+        return String::new();
+    };
+    let now = chrono::Local::now().timestamp();
+    struct Agg {
+        count: usize,
+        newest: i64,
+        examples: Vec<String>,
+    }
+    // rows 已按 mtime 倒序 → 文件夹首次出现的顺序 = 按「各自最新文件」排序,直接取前几个即可。
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, Agg> = std::collections::HashMap::new();
+    for (name, relpath, mtime) in rows.flatten() {
+        let dir = recent_parent_label(&relpath);
+        let e = map.entry(dir.clone()).or_insert_with(|| {
+            order.push(dir.clone());
+            Agg { count: 0, newest: mtime, examples: Vec::new() }
+        });
+        e.count += 1;
+        let nm = name.trim();
+        if e.examples.len() < 3 && !nm.is_empty() {
+            e.examples.push(nm.to_string());
+        }
+    }
+    if order.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for dir in order.iter().take(12) {
+        let a = &map[dir];
+        out.push_str(&format!(
+            "- {dir} — 最近{ago}动过、近期 {cnt} 个改动(如 {ex})\n",
+            dir = dir,
+            ago = rel_time_cn(now - a.newest),
+            cnt = a.count,
+            ex = a.examples.join("、"),
+        ));
+    }
+    out
+}
+
+/// 把知识库画像(主题 / 类型 / 语言 + 最近在动的文件夹)摊成给大模型读的中文摘要,要它据此给「具体到我」的建议。
+fn suggest_workflows_directive(ov: &FileOverview, recent: &str) -> String {
     let kinds: Vec<String> = ov
         .by_kind
         .iter()
@@ -2834,13 +2675,28 @@ fn suggest_workflows_directive(ov: &FileOverview) -> String {
 - 语言 / 领域分布:{langs}
 - AI 归出的主题:
 {themes}
+- 他最近在动的文件夹(按最近改动时间排序,**最能代表他此刻在忙什么**):
+{recent}
 你可以(可选)用 Grep / Read 抽查几个文件,让建议更贴他的真实内容(别超过 3~4 次,够用就停)。
 
 每条建议给两个字段:
-- title:6~16 字中文短语,点名他的**具体主题**(如「把『考研复习』整理成冲刺清单」,而不是「整理学习资料」);
-- prompt:**用户第一人称**写的、可直接发给我的指令,点名他的具体主题/资料,并要求我先讲计划再动手。
+- title:6~18 字中文短语,点名他的**具体主题 + 这件事的动作**(如「给《XX 落地页》加高级入场动效」「对《YY 项目》跑高强度压测」,而不是「整理学习资料」);
+- prompt:**用户第一人称**写的、可直接发给我执行的指令。**不要怕长**——把「整个解决问题的工作流」写清楚:
+  目标 → 我希望你走的步骤 → 期望产出 → 怎么算做完(验收标准),并要求我先讲计划再动手。
+  点名他的具体主题 / 文件夹 / 文件名,让这条像是为他量身定的。
 
-硬要求:紧扣上面的真实主题,优先他**高频、最近、体量大**的那几摊;不同建议覆盖不同主题、不要重复;全用中文。
+这类「成体系的工作流」最受欢迎,可据他的资料择优产出(只是**示例方向**,不要硬套、更不要全选):
+- 给某个前端 / 落地页加一套高级动效与微交互(逐元素入场、滚动视差、悬停反馈、暗色适配);
+- 把散落的多份 PRD / 需求文档归类、对齐、合并成一份结构化总览(冲突点、优先级、里程碑);
+- 把一批报错 / 日志归类成「根因 → 影响面 → 修复建议」清单;
+- 对某个项目做高强度压测 / 并发与 CPU 调度测试(给出测试矩阵、指标、判定阈值、跑法);
+- 据他最近在忙的几摊,排一份「明日全行动计划」(按时段、依赖、优先级排好,带验收点);
+- 把某摊重复劳动固化成一条可复用的标准流程 / 检查清单。
+
+硬要求:
+- **至少 1~2 条必须紧扣上面「他最近在动的文件夹」**——那是他正在干的事,要让他一眼觉得「这正是我现在要的」;
+- 其余几条覆盖他**体量大 / 高频**的主题,或上面的成体系工作流,不同建议不重主题、动作各异;
+- 绝不能是「整理文档 / 总结资料」这种换谁都成立的套话;全用中文。
 
 **只输出一个 JSON 数组,不要任何额外文字、不要 markdown 代码围栏**:
 [{{"title":"…","prompt":"…"}}, ...]"#,
@@ -2849,6 +2705,7 @@ fn suggest_workflows_directive(ov: &FileOverview) -> String {
         kinds = if kinds.is_empty() { "—".into() } else { kinds.join("、") },
         langs = if langs.is_empty() { "—".into() } else { langs.join("、") },
         themes = themes,
+        recent = if recent.trim().is_empty() { "(暂无近期改动记录)\n" } else { recent },
     )
 }
 
@@ -2859,8 +2716,10 @@ pub fn suggest_workflows(root: Option<String>) -> Result<Vec<SuggestedFlow>, Str
     if ov.total_files == 0 {
         return Err("文件库还是空的,先「盘点」扫描磁盘文件".into());
     }
+    // 时间线证据:他最近在动哪几摊(画像不含时间线,这段是建议「具体到他最近在干的」的关键)。
+    let recent = recent_activity_digest(&root);
     let result = (|| -> Result<Vec<SuggestedFlow>, String> {
-        let prompt = suggest_workflows_directive(&ov);
+        let prompt = suggest_workflows_directive(&ov, &recent);
         // 配了独立归类模型 → 直连它(省钱);否则用聊天那个大模型(可 Read/Grep 抽查真文件)。
         let collected = if let Some(cfg) = active_cluster_model() {
             chat_complete(&cfg, &prompt)?
@@ -3185,7 +3044,10 @@ static SMART_CLUSTERING: AtomicBool = AtomicBool::new(false);
 ///
 /// 每档完成 emit `{kind:"tier", tier, note}` 让前端原地刷新星图;全部结束 emit `kind:"done"`。
 /// LLM 档失败可降级:保留 `cluster_build` 的启发式名、继续后续档,绝不卡住。
-fn smart_cluster_progressive(app: &AppHandle, root: Option<String>) -> Result<(), String> {
+/// `deep=false`(快速档)只跑 T0 词法全覆盖 + T1 AI 命名就收尾——几秒归全库 + 一次 AI 调用,
+/// 远低于 2 分钟,**给新用户向导用**(向导自己在收尾另起后台建索引,这里再触发 T2 全量向量化
+/// 会与之冲突、且大库要几十分钟爆掉「2 分钟」预期)。`deep=true`(文件中心按钮)才追加 T2。
+fn smart_cluster_progressive(app: &AppHandle, root: Option<String>, deep: bool) -> Result<(), String> {
     // ── T0:结构骨架(秒级,零嵌入)──
     emit_cluster(
         app,
@@ -3228,8 +3090,7 @@ fn smart_cluster_progressive(app: &AppHandle, root: Option<String>) -> Result<()
     // ── T2:全量向量化 → 语义重聚 → 再命名(配了嵌入能力时;全程后台)──
     // 「嵌入能力」= 云 API 服务商 **或** 本地开源嵌入(local-embed,离线就能产向量);
     // 后者此前不被计入 → 纯本地用户永远停在结构归类、走不到「按内容语义」这一档。见 embed_capable。
-    let has_embed = super::index::embed_capable();
-    if has_embed {
+    if deep && super::index::embed_capable() {
         emit_cluster(
             app,
             json!({ "kind": "phase", "tier": "semantic", "text": "后台精修:正在把全部资料向量化(可关页面去忙别的)…" }),
@@ -3309,15 +3170,19 @@ pub fn file_cluster_build(app: AppHandle, root: Option<String>) -> Result<(), St
 /// 文件中心 v3 渐进式智能归类(秒级骨架 → AI 初级命名+关系 → 全量向量化后语义重聚再命名)。
 /// 后台线程跑,进度/各档完成走 `file:cluster` 事件(phase / tick / tier / done / error);
 /// 切走文件中心也不中断,与 [`file_cluster_build`] / [`file_cluster_llm`] 同构。
+///
+/// `quick=Some(true)`:只跑 T0+T1(全覆盖词法 + AI 命名)就收尾,不追加耗时的 T2 全量向量化
+/// —— 新用户向导用(几秒 + 一次 AI 调用,远低于 2 分钟);其余(含文件中心按钮)默认深档跑全程。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn file_smart_cluster(app: AppHandle, root: Option<String>) -> Result<(), String> {
+pub fn file_smart_cluster(app: AppHandle, root: Option<String>, quick: Option<bool>) -> Result<(), String> {
     let Some(guard) = FlagGuard::acquire(&SMART_CLUSTERING) else {
         return Err("智能归类正在进行中".into());
     };
+    let deep = !quick.unwrap_or(false);
     emit_cluster(&app, json!({ "kind": "phase", "tier": "skeleton", "text": "正在启动智能归类…" }));
     std::thread::spawn(move || {
         let _guard = guard; // panic 栈展开也释放闸,防永久锁死
-        if let Err(e) = smart_cluster_progressive(&app, root) {
+        if let Err(e) = smart_cluster_progressive(&app, root, deep) {
             emit_cluster(&app, json!({ "kind": "error", "message": e }));
         }
     });
@@ -3352,7 +3217,7 @@ pub fn file_warm_thumbs(paths: Vec<String>, max: Option<u32>) -> Result<usize, S
     Ok(warm_thumbs(paths, max.unwrap_or(360)))
 }
 
-/// 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告。
+/// 用已连接的大模型按语义归类(免嵌入 key)。
 /// 后台线程跑,进度走 `file:cluster_llm` 事件(phase/tick/done/error)。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn file_cluster_llm(app: AppHandle, root: Option<String>) -> Result<(), String> {

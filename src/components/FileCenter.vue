@@ -23,7 +23,6 @@ import {
   Wand2,
   KeyRound,
   Brain,
-  FileText,
   LoaderCircle,
   ArrowDownWideNarrow,
   ChevronDown,
@@ -37,6 +36,8 @@ import {
   Check,
   RotateCcw,
   Network,
+  Info,
+  WifiOff,
 } from "@lucide/vue";
 import {
   files as fc,
@@ -171,6 +172,16 @@ const scanning = computed(() => tasks.running.inventory);
 const scanMsg = computed(() => tasks.detail.inventory);
 // 即时操作(检索/打开/定位/撤销)的轻提示位,独立于上面的任务进度文案。
 const opMsg = ref("");
+// 盘点完成但有根「连不上、已跳过」时,这里存这些路径 → 弹温和提示框(见模板 .fc-alert)。
+const unreachableNotice = ref<string[]>([]);
+function dismissUnreachable() {
+  unreachableNotice.value = [];
+}
+function retryUnreachable() {
+  const roots = [...unreachableNotice.value];
+  unreachableNotice.value = [];
+  if (roots.length) doScan(roots, []);
+}
 
 // ── 「盘点」= 先扫一眼文件夹结构 → 勾选要盘点的目录(不限知识库)→ 建库 ──
 const pickerOpen = ref(false);
@@ -202,7 +213,6 @@ const building = computed(() => tasks.running.index);
 const buildMsg = computed(() => tasks.detail.index);
 const llmClustering = computed(() => tasks.running.clusterLlm);
 const llmMsg = computed(() => tasks.detail.clusterLlm);
-const reportPath = computed(() => tasks.reportPath.cluster || tasks.reportPath.clusterLlm);
 // 星图重挂载键:归类每完成一档,doneTick 自增 → key 变 → KnowledgeGraph 重载新数据,星图原地升级。
 const graphRefreshKey = computed(() => tasks.doneTick.cluster + tasks.doneTick.clusterLlm);
 
@@ -337,7 +347,12 @@ watch(bodyEl, (el) => {
 
 // 任务完成(store doneTick 自增)→ 刷新文件中心数据,让新盘点/新索引/新归类结果显示出来。
 // 监听全局 store,故即便任务是在别的视图发起、本组件后挂载,回来也会因 tick 变化而刷新。
-watch(() => tasks.doneTick.inventory, () => { loadOverview(); loadGrid(true); ensureLangBackfill(); });
+watch(() => tasks.doneTick.inventory, () => {
+  loadOverview(); loadGrid(true); ensureLangBackfill();
+  // 本轮盘点里「连不上、已跳过」的根(群晖 NAS / 拔掉的外置盘)→ 弹个温和提示框,提醒这些没扫到,
+  // 别让用户误以为「盘点完成 = 全都扫到了」。能连上时数组为空,提示框不出现。
+  unreachableNotice.value = [...tasks.lastUnreachable];
+});
 watch(() => tasks.doneTick.index, () => { loadOverview(); });
 watch(
   () => tasks.doneTick.cluster + tasks.doneTick.clusterLlm,
@@ -842,17 +857,14 @@ async function buildIndex() {
   await tasks.startIndex();
 }
 
-// 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告。
+// 用已连接的大模型按语义归类(免嵌入 key)。
 async function doClusterLlm() {
   flashTip("ai");
   await tasks.startClusterLlm();
 }
-function openReport() {
-  if (reportPath.value) openPath(reportPath.value);
-}
 
 // 合并后的统一「智能归类」入口:
-//  · 配了硅基流动嵌入 key(hasEmbedProvider)→ AI 语义归类(复用已有向量并在桌面出报告);
+//  · 配了硅基流动嵌入 key(hasEmbedProvider)→ AI 语义归类(复用已有向量);
 //  · 没配 key → 离线「文件夹 / 名称」启发式归类。提示条据是否配 key 给出对应说明 / 配 key 入口。
 async function doSmartCluster() {
   if (clustering.value || llmClustering.value) return;
@@ -995,12 +1007,19 @@ function nameOf(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 const hasFiles = computed(() => (overview.value?.totalFiles ?? 0) > 0);
-const headerStats = computed(() => {
+const headerStats = computed<{ label: string; value: string; hint?: string }[]>(() => {
   const o = overview.value;
   if (!o) return [];
   return [
     { label: "文件", value: o.totalFiles.toLocaleString() },
-    { label: "总量", value: fmtBytes(o.totalBytes) },
+    {
+      label: "总量",
+      value: fmtBytes(o.totalBytes),
+      // 「总量」= 磁盘实占空间(与资源管理器「占用空间」同口径),不是文件声称的逻辑大小。
+      // 虚拟磁盘(.vhdx)、虚拟机盘、稀疏/压缩文件的逻辑大小可虚高几十倍,这里按实占算才准 ——
+      // 这条提示就是为了让人看到数字变小时不会误以为「少算了 / 文件丢了」(文件数才是真凭据)。
+      hint: "磁盘实占空间,与资源管理器「占用空间」一致 · 不含虚拟磁盘/稀疏文件的虚高逻辑大小 · 文件数不受影响",
+    },
     { label: "语义簇", value: String(o.clusters.length) },
     { label: "已嵌入", value: `${o.embeddedFiles}/${o.textFiles}` },
   ];
@@ -1038,9 +1057,11 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div v-if="bannerOpen" class="fc-stats">
-        <div v-for="s in headerStats" :key="s.label" class="stat">
+        <div v-for="s in headerStats" :key="s.label" class="stat" :class="{ 'has-hint': s.hint }" :title="s.hint || ''">
           <div class="stat-val">{{ s.value }}</div>
-          <div class="stat-lab">{{ s.label }}</div>
+          <div class="stat-lab">
+            {{ s.label }}<Info v-if="s.hint" :size="11" :stroke-width="2" class="stat-info" />
+          </div>
         </div>
       </div>
       <button class="fc-collapse" :title="bannerOpen ? '收起' : '展开'" @click="bannerOpen = !bannerOpen">
@@ -1166,22 +1187,16 @@ onBeforeUnmount(() => {
       <button v-if="titleDone" class="link-btn" @click="resetTitles">撤销 AI 名称</button>
     </div>
 
-    <!-- AI 归类进度 / 报告(旧向导 file:cluster_llm 路径) -->
+    <!-- AI 归类进度(旧向导 file:cluster_llm 路径) -->
     <div v-if="llmMsg && view !== 'core'" class="fc-llm">
       <Brain :size="14" :stroke-width="1.8" class="llm-ic" />
       <span class="llm-text">{{ llmMsg }}</span>
-      <button v-if="reportPath" class="link-btn" @click="openReport">
-        <FileText :size="13" :stroke-width="1.8" /> 打开桌面报告
-      </button>
     </div>
 
-    <!-- 智能归类(v3 渐进式:骨架→AI 命名→后台语义精修)进度 / 报告 -->
-    <div v-if="(clustering || reportPath) && !llmMsg && view !== 'core'" class="fc-llm">
+    <!-- 智能归类(v3 渐进式:骨架→AI 命名→后台语义精修)进度 -->
+    <div v-if="clustering && !llmMsg && view !== 'core'" class="fc-llm">
       <Brain :size="14" :stroke-width="1.8" class="llm-ic" />
       <span class="llm-text">{{ clusterMsg || "智能归类已就绪" }}</span>
-      <button v-if="reportPath" class="link-btn" @click="openReport">
-        <FileText :size="13" :stroke-width="1.8" /> 打开桌面报告
-      </button>
     </div>
 
     <!-- 归类小提示:默认不常驻,只在点「智能归类 / AI 归类」时弹一下解释能力 -->
@@ -1215,7 +1230,7 @@ onBeforeUnmount(() => {
         <template v-else>
           <Brain :size="14" :stroke-width="1.8" class="tip-ic ai" />
           <span class="tip-body">
-            先<b>秒级</b>出星图骨架 → AI 读懂你的资料、起<b>亲切名字</b>并理清关系 → 后台向量化全部资料后再按<b>语义</b>精修一次。完成后桌面出 HTML 画像报告。
+            先<b>秒级</b>出星图骨架 → AI 读懂你的资料、起<b>亲切名字</b>并理清关系 → 后台向量化全部资料后再按<b>语义</b>精修一次。
           </span>
         </template>
       </div>
@@ -1586,6 +1601,27 @@ onBeforeUnmount(() => {
 
     <!-- 文件夹选择器:盘点前先扫一眼,取消勾选不要的文件夹 -->
     <transition name="fade">
+      <!-- 连不上的根(群晖 NAS / 拔掉的外置盘)温和提示框:盘点完成后弹出,可重试 / 知道了 -->
+      <div v-if="unreachableNotice.length" class="fc-alert-scrim" @click="dismissUnreachable">
+        <div class="fc-alert glass" @click.stop>
+          <div class="fc-alert-head">
+            <WifiOff :size="18" :stroke-width="1.8" class="fc-alert-ic" />
+            <span>有 {{ unreachableNotice.length }} 个位置这次没连上</span>
+          </div>
+          <div class="fc-alert-body">
+            下面这些位置盘点时连接不上,已自动跳过(其它盘已正常盘点、不受影响):
+            <ul class="fc-alert-list">
+              <li v-for="p in unreachableNotice" :key="p">{{ p }}</li>
+            </ul>
+            常见原因:群晖 NAS 没开机 / Tailscale 没连上 / 外置盘没插好。处理后点「重试这些」即可补扫。
+          </div>
+          <div class="fc-alert-foot">
+            <button class="fc-alert-btn ghost" @click="dismissUnreachable">知道了</button>
+            <button class="fc-alert-btn solid" @click="retryUnreachable">重试这些</button>
+          </div>
+        </div>
+      </div>
+
       <div v-if="pickerOpen" class="picker-scrim" @click="closeFolderPicker">
         <div class="picker glass" @click.stop>
           <div class="picker-head">
@@ -1770,7 +1806,17 @@ onBeforeUnmount(() => {
   font-size: 11px;
   color: var(--muted);
   margin-top: 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
+.stat.has-hint { cursor: help; }
+.stat-info {
+  color: var(--muted);
+  opacity: 0.6;
+  vertical-align: -1px;
+}
+.stat.has-hint:hover .stat-info { opacity: 1; color: var(--gold, var(--text)); }
 
 /* 横幅收起态:压成一条,只留标题 + 文件数/总量 */
 .fc-banner { transition: padding 0.2s; }
@@ -3101,6 +3147,72 @@ onBeforeUnmount(() => {
   padding: 18px 20px 16px;
   box-shadow: var(--shadow-lg, 0 24px 60px -20px rgba(0, 0, 0, 0.45));
 }
+
+/* 连不上的根:温和提示框(比 picker 更靠上,z-index 40) */
+.fc-alert-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 50%, transparent);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  padding: 24px;
+}
+.fc-alert {
+  width: min(440px, 100%);
+  padding: 18px 20px 14px;
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg, 0 24px 60px -20px rgba(0, 0, 0, 0.45));
+}
+.fc-alert-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-family: var(--serif);
+  font-size: 15.5px;
+  letter-spacing: 0.5px;
+  color: var(--ink);
+}
+.fc-alert-ic { color: var(--gold, #d4b06a); flex: none; }
+.fc-alert-body { margin: 11px 0 4px; font-size: 12.8px; line-height: 1.7; color: var(--muted); }
+.fc-alert-list {
+  margin: 8px 0;
+  padding: 9px 12px;
+  list-style: none;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  border: 1px solid var(--border-soft);
+  max-height: 168px;
+  overflow: auto;
+}
+.fc-alert-list li {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  padding: 2px 0;
+}
+.fc-alert-foot { display: flex; justify-content: flex-end; gap: 9px; margin-top: 14px; }
+.fc-alert-btn {
+  padding: 7px 16px;
+  border-radius: 9px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  transition: background 0.15s, border-color 0.15s, transform 0.12s;
+}
+.fc-alert-btn:active { transform: translateY(1px); }
+.fc-alert-btn.ghost { background: transparent; color: var(--muted); }
+.fc-alert-btn.ghost:hover { color: var(--text); background: var(--selection-bg); }
+.fc-alert-btn.solid {
+  background: var(--btn-solid-bg, var(--gold, #d4b06a));
+  color: var(--btn-solid-text, #1a1a1a);
+  border-color: transparent;
+}
+.fc-alert-btn.solid:hover { filter: brightness(1.06); }
 .picker-head { display: flex; align-items: center; justify-content: space-between; }
 .picker-title {
   display: flex;

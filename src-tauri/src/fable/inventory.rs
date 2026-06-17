@@ -34,10 +34,24 @@ fn dir_deadline() -> Duration {
 /// 「已跳过」。重试是「调到最后再试」,不原地阻塞别人 —— 见 [`WorkQueue::demote`]。
 const MAX_DIR_ATTEMPTS: u32 = 2;
 
-/// 每个 worker 的心跳:它正卡在哪个目录(`None`=空闲)、从何时起、是否已被看门狗判定卡死。
+/// 挂载点「可达性探测」的死线(秒)。映射的 NAS/网络盘**冷连接**首个 `is_dir`/`read_dir` 常要
+/// 数秒(SMB 握手 + 唤醒休眠的群晖硬盘)——旧实现一律卡 3s 判不可达,会把「其实活着、只是第一
+/// 下慢」的 NAS 盘直接挡在盘点与选择器之外(用户「Z 盘采集不到」的根因之一)。放宽到默认 12s,
+/// 可经 `POLARIS_SCAN_PROBE_SECS` 调。注:这只是「要不要尝试这个根」的预检,真扫起来还有
+/// 每目录看门狗兜底,放宽预检不会让死 NAS 把盘点拖死。
+fn probe_secs() -> u64 {
+    std::env::var("POLARIS_SCAN_PROBE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s >= 2)
+        .unwrap_or(12)
+}
+
+/// 每个 worker 的心跳:它正卡在哪个目录(`None`=空闲)、是否已被看门狗判定卡死。
+/// 「卡了多久」不再记在这里 —— 改由看门狗结合 worker 的「已处理目录项计数」自行判断,
+/// 这样「目录大但仍在稳定吐项」与「真·僵死(计数纹丝不动)」能被区分开(见盘点看门狗)。
 struct Beat {
     dir: Option<PathBuf>,
-    since: Instant,
     abandoned: bool,
 }
 
@@ -289,6 +303,40 @@ pub(crate) fn is_os_disk_root(path: &str) -> bool {
     b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
 }
 
+/// 这个根是不是「网络/远程盘」:Windows 把群晖/NAS 共享映射成的盘符(如 `Z:`)、或 UNC
+/// (`\\server\share`)都属于此类。判定用 `GetDriveTypeW == DRIVE_REMOTE`。
+///
+/// 为什么要单独认它:[`is_os_disk_root`] 只看路径形状,会把 `Z:\` 也判成「一整块系统盘」→
+/// 于是盘点用 `heavy_prune` 模式,把任何名叫 library/system/private/bin/boot… 的目录(NAS 上
+/// 很常见的用户共享名)在**任意深度**整棵剪掉 → 大量 NAS 数据被静默丢弃、扫不全。映射进来的
+/// NAS 盘其实等同「外置卷/挂载点」,应当「里面的全归类进库」,只剪永远跳的噪音(@eaDir/#recycle)。
+/// 所以盘点时 `heavy_prune = is_os_disk_root && !is_remote_root`,远程盘退回轻剪。
+/// 非 Windows 一律 false(mac/Docker 的 NAS 走 /Volumes、bind mount,本就不当系统盘重剪)。
+#[cfg(windows)]
+pub(crate) fn is_remote_root(path: &str) -> bool {
+    let t = path.trim();
+    if t.starts_with("\\\\") || t.starts_with("//") {
+        return true; // UNC 路径 = 网络盘
+    }
+    let b = t.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+        use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+        let drive = format!("{}:\\", b[0] as char); // GetDriveType 要盘符根
+        let wide: Vec<u16> =
+            std::ffi::OsStr::new(&drive).encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: wide 是 NUL 结尾的合法宽字符串。
+        return unsafe { GetDriveTypeW(wide.as_ptr()) == DRIVE_REMOTE };
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_remote_root(_path: &str) -> bool {
+    false
+}
+
 /// 盘 `parent` 时是否真能扫到 `child`:child 在 parent 之内,且从 parent 到 child 的
 /// 每一段目录名都不会被 [`skip_dir_scan`] 剪掉(否则 walker 会在中途剪枝、到不了 child)。
 /// 嵌套根去重用它:被剪枝挡住的子根不算「已覆盖」,须独立保留(典型=appdata 内的下载目录)。
@@ -350,7 +398,10 @@ pub fn scan_root(
     progress: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<ScanSummary, String> {
     // 是否叠加 OS 目录黑名单:整盘扫描 = 重剪;显式文件夹/卷/挂载点 = 只剪永远跳的噪音。
-    let heavy_prune = is_os_disk_root(root);
+    // 关键:映射进来的 NAS 盘符(Z: 这类)虽是 `X:\` 形状,却**不是**本机系统盘 → 退回轻剪,
+    // 否则 library/system/private 等 NAS 常见共享名会被整棵丢掉(见 [`is_remote_root`])。
+    let remote = is_remote_root(root);
+    let heavy_prune = is_os_disk_root(root) && !remote;
     let root_path = PathBuf::from(root);
     if !root_path.is_dir() {
         return Err(format!("根目录不存在或不是目录: {root}"));
@@ -386,9 +437,14 @@ pub fn scan_root(
     queue.set_live_workers(workers);
     let beats: Arc<Vec<Mutex<Beat>>> = Arc::new(
         (0..workers)
-            .map(|_| Mutex::new(Beat { dir: None, since: Instant::now(), abandoned: false }))
+            .map(|_| Mutex::new(Beat { dir: None, abandoned: false }))
             .collect(),
     );
+    // 每个 worker 的「已处理目录项」累加计数(Relaxed,热循环里零锁开销)。看门狗据此区分
+    // 「真卡死(计数不动)」与「目录大、仍在稳定吐项(计数仍在涨)」——后者绝不误杀,这是
+    // NAS 等慢盘上「扫得彻底、不丢子树」的关键。worker 取到新目录时也 +1,给看门狗重置死线基线。
+    let progressed: Arc<Vec<AtomicU64>> =
+        Arc::new((0..workers).map(|_| AtomicU64::new(0)).collect());
     let problematic: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let scan_done = Arc::new(AtomicBool::new(false));
     let root_arc = Arc::new(root_path.clone());
@@ -466,6 +522,7 @@ pub fn scan_root(
         let tx = tx.clone();
         let queue = queue.clone();
         let beats = beats.clone();
+        let progressed = progressed.clone();
         let problematic = problematic.clone();
         let n_files = n_files.clone();
         let n_bytes = n_bytes.clone();
@@ -477,12 +534,16 @@ pub fn scan_root(
                 {
                     let mut b = beats[i].lock().unwrap();
                     b.dir = Some(dir.clone());
-                    b.since = Instant::now();
                     b.abandoned = false;
                 }
+                // 取到新目录:计数 +1,让看门狗看到「有进度」从而重置该 worker 的死线基线
+                // (否则可能拿上一件活儿留下的旧基线,刚接手就被误判卡死)。
+                progressed[i].fetch_add(1, Ordering::Relaxed);
                 match std::fs::read_dir(&dir) {
                     Ok(rd) => {
                         for entry in rd.flatten() {
+                            // 每吐一项就记一次进度:只要还在稳定吐项,看门狗就知道没卡死。
+                            progressed[i].fetch_add(1, Ordering::Relaxed);
                             let Ok(ft) = entry.file_type() else { continue };
                             if ft.is_symlink() {
                                 continue;
@@ -520,7 +581,7 @@ pub fn scan_root(
                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                     .map(|d| d.as_secs() as i64)
                                     .unwrap_or(0);
-                                let size = on_disk_size(&p, &meta);
+                                let size = on_disk_size(&p, &meta, remote);
                                 n_files.fetch_add(1, Ordering::Relaxed);
                                 n_bytes.fetch_add(size, Ordering::Relaxed);
                                 let kind = classify(&ext);
@@ -563,36 +624,56 @@ pub fn scan_root(
     }
     drop(tx); // 协调线程不再持 tx;writer 靠 scan_done 收尾,不依赖通道关闭
 
-    // 看门狗:每 250ms 巡一遍心跳,谁卡在同一目录超死线就判定卡死、记账释放、列入已跳过。
+    // 看门狗:每 250ms 巡一遍心跳。**只有当某 worker「在忙、且自上次巡查以来一个目录项都没新
+    // 处理过」持续超过死线**,才判定它真·卡死(僵死的 read_dir/stat 系统调用)、记账释放、列入
+    // 已跳过。换言之死线指的是「零进度的时长」而非「处理这个目录的总时长」—— 于是 NAS 上一个动辄
+    // 十万项的大目录,只要还在稳定吐项就永不被误杀(旧实现按总时长 60s 一刀切,大目录被整棵丢弃,
+    // 正是「扫不全」的头号原因)。真·僵死时计数纹丝不动,死线一到照样果断放弃,绝不冻结盘点。
     {
         let queue = queue.clone();
         let beats = beats.clone();
+        let progressed = progressed.clone();
         let problematic = problematic.clone();
         let scan_done = scan_done.clone();
         let deadline = dir_deadline();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(250));
-            if scan_done.load(Ordering::SeqCst) || cancelled() {
-                break;
-            }
-            for slot in beats.iter() {
-                let stuck = {
-                    let mut b = slot.lock().unwrap();
-                    // 先从不可变借用算出路径串(借用就此结束),再置 abandoned —— 避免借用冲突。
-                    let hit = if !b.abandoned && b.since.elapsed() > deadline {
-                        b.dir.as_ref().map(|p| p.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    };
-                    if hit.is_some() {
-                        b.abandoned = true;
+        let nworkers = workers;
+        std::thread::spawn(move || {
+            // 每槽:(上次见到的进度计数, 那一刻)。计数变了就刷新基线;长时间不变才算卡死。
+            let mut last: Vec<(u64, Instant)> =
+                (0..nworkers).map(|_| (0u64, Instant::now())).collect();
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if scan_done.load(Ordering::SeqCst) || cancelled() {
+                    break;
+                }
+                for (i, slot) in beats.iter().enumerate() {
+                    let cur = progressed[i].load(Ordering::Relaxed);
+                    if cur != last[i].0 {
+                        last[i] = (cur, Instant::now()); // 有进度 → 重置死线基线
+                        continue;
                     }
-                    hit
-                };
-                if let Some(path) = stuck {
-                    problematic.lock().unwrap().push(path);
-                    // 释放在途 + 存活 worker -1:可能令 live_workers 归零 → 满足完成判据、解除冻结。
-                    queue.abandon();
+                    let stuck = {
+                        let mut b = slot.lock().unwrap();
+                        // 仅当「在忙(dir 有值)、未被放弃、且零进度已超死线」才判卡死。
+                        let hit = if !b.abandoned
+                            && b.dir.is_some()
+                            && last[i].1.elapsed() > deadline
+                        {
+                            b.dir.as_ref().map(|p| p.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        };
+                        if hit.is_some() {
+                            b.abandoned = true;
+                        }
+                        hit
+                    };
+                    if let Some(path) = stuck {
+                        problematic.lock().unwrap().push(path);
+                        // 释放在途 + 存活 worker -1:可能令 live_workers 归零 → 满足完成判据、解除冻结。
+                        queue.abandon();
+                        last[i] = (cur, Instant::now()); // 放弃后基线归位,避免重复触发
+                    }
                 }
             }
         });
@@ -721,10 +802,23 @@ pub fn scan_root(
 }
 
 /// Windows 的 canonicalize 会出 `\\?\` 前缀(已在 PPTX 审计里踩过坑),手工剥掉。
+/// 网络盘(映射进来的群晖 NAS,如 `Z:`)canonicalize 后是 `\\?\UNC\server\share` —— 若按
+/// 普通前缀只剥 `\\?\` 会留下 `UNC\server\share` 这种**非法路径**(于是这条根的文件打不开、
+/// 对账 stat 也失效)。UNC 前缀要还原成 `\\server\share` 才是有效路径。
 fn dunce_canonical(p: &Path) -> String {
     let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let s = c.to_string_lossy().into_owned();
-    s.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or(s)
+    strip_extended_prefix(&c.to_string_lossy())
+}
+
+/// 剥掉 Windows 扩展长度前缀,得到「正常」可用路径(纯字符串变换,便于单测):
+/// - `\\?\UNC\host\share\...` → `\\host\share\...`(网络盘必须还原成合法 UNC)
+/// - `\\?\C:\...`             → `C:\...`
+/// - 其它原样返回。
+fn strip_extended_prefix(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    s.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or_else(|| s.to_string())
 }
 
 /// 文件「磁盘实占」字节数,而非 `metadata().len()` 报的逻辑大小。
@@ -733,7 +827,15 @@ fn dunce_canonical(p: &Path) -> String {
 /// 的逻辑大小可达声称的几十 GB,但磁盘上几乎不占空间。照逻辑大小累加会让「总量」
 /// 虚高好几倍(实测一台机 D:\ 真实 371 GB 被算成 2.8 TB,光 60 个稀疏 .mkv 就虚报 2.3 TB)。
 /// NTFS 压缩卷同理——实占小于逻辑。这里统一取磁盘实占,口径才与资源管理器的「占用」一致。
-fn on_disk_size(path: &Path, meta: &std::fs::Metadata) -> u64 {
+///
+/// `remote=true`(映射的 NAS/网络盘)时直接取逻辑大小:`GetCompressedFileSizeW` 在网络盘上
+/// 本就常失败回退,但它**每个文件一次网络往返**——成千上万文件串起来能把一个目录的处理时间
+/// 拖到几十秒、撞上看门狗死线被判卡死整棵丢掉。网络盘上稀疏/压缩文件少见,逻辑大小够用,
+/// 省掉这趟往返让 NAS 扫描快上数量级,也才扫得全。
+fn on_disk_size(path: &Path, meta: &std::fs::Metadata, remote: bool) -> u64 {
+    if remote {
+        return meta.len();
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -853,7 +955,11 @@ fn app_data_roots() -> Vec<ScanRootInfo> {
 /// - `roots` = 用户在选择器里勾选的要盘点的文件夹/盘符(可以是知识库之外的任意目录);
 ///   缺省/空 → 退回默认(知识库根 + 约定的 NAS 挂载点)。
 /// - `exclude` = 勾选范围内又被取消的子文件夹绝对路径(整棵跳过)。
-#[cfg_attr(feature = "desktop", tauri::command)]
+///
+/// **`(async)`**:函数体里对每个根做 [`dir_reachable`] 有界探测(死 NAS 上每根最多卡
+/// `probe_secs`≈12s)。同步 tauri 命令跑在主线程会冻住 UI;标 `(async)` 让 tauri 把这段
+/// 同步活儿派到工作线程,主线程不被吊死(冷 NAS 盘上点「盘点」UI 仍跟手)。
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn fable_inventory_start(
     app: AppHandle,
     roots: Option<Vec<String>>,
@@ -866,18 +972,30 @@ pub fn fable_inventory_start(
         .map(|r| r.trim_end_matches(['/', '\\']).to_string())
         .filter(|r| !r.is_empty())
         .collect();
-    let mut roots: Vec<String> = if picked.is_empty() {
+    let candidates: Vec<String> = if picked.is_empty() {
         inventory_roots(None)
     } else {
         picked
-    }
-    .into_iter()
-    // 有界探测:挂载点掉线时 is_dir 会吊死「开始盘点」请求 → 3s 判不可达即剔除(scan_root
+    };
+    // 有界探测可达性:挂载点掉线时 is_dir 会吊死「开始盘点」请求 → 超死线判不可达即剔除(scan_root
     // 内部还有看门狗兜底,这里先把死根挡在请求路径外,点「盘点」立刻有反应)。
-    .filter(|r| super::sched::dir_reachable(std::path::Path::new(r), 3))
-    .collect();
+    // **连不上的根不再默默丢弃**,而是收进 `unreachable` 一并报给前端 —— 否则用户只看到「盘点完成」
+    // 却不知道群晖 NAS / 拔掉的外置盘这次根本没扫到。远程盘(映射的 NAS、UNC)给更长的冷连接时间:
+    // Tailscale/SMB 首次握手本就慢,免得「只是第一下慢」被误判不可达而整盘采集不到。
+    let mut roots: Vec<String> = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for r in candidates {
+        let secs = if is_remote_root(&r) { probe_secs().max(25) } else { probe_secs() };
+        if super::sched::dir_reachable(std::path::Path::new(&r), secs) {
+            roots.push(r);
+        } else {
+            unreachable.push(r);
+        }
+    }
     roots.sort();
     roots.dedup();
+    unreachable.sort();
+    unreachable.dedup();
     // 去掉「嵌套根」:若 B 在 A 之内**且 A 扫得到 B**,盘 A 已覆盖 B,留 A 去 B(免重复)。
     // 排序后父目录必排在子目录前,顺序扫描即可。注意「扫得到」要排除中途被剪枝的情况:
     // 例如 B = …/AppData/…/Downloads 在 A = C:\ 之内,但扫 C:\ 时 `appdata` 整棵被
@@ -893,6 +1011,12 @@ pub fn fable_inventory_start(
         roots = kept;
     }
     if roots.is_empty() {
+        if !unreachable.is_empty() {
+            return Err(format!(
+                "这些位置连接不上,已跳过:{} —— 检查网络 / Tailscale / 外置盘连接后重新盘点即可。",
+                unreachable.join("、")
+            ));
+        }
         return Err("没有可盘点的根目录(知识库未初始化,也无可访问的挂载点)".into());
     }
     let exclude: HashSet<String> = exclude
@@ -943,11 +1067,18 @@ pub fn fable_inventory_start(
         if cancelled() {
             emit(&app, json!({ "kind": "error", "message": "已取消" }));
         } else if acc_files == 0 {
-            emit(
-                &app,
-                json!({ "kind": "error", "message": last_err.unwrap_or_else(|| "未扫描到任何文件".into()) }),
-            );
+            let msg = match (last_err, unreachable.is_empty()) {
+                (Some(e), _) => e,
+                (None, false) => format!(
+                    "这些位置连接不上,已跳过:{} —— 检查网络 / Tailscale / 外置盘连接后重新盘点即可。",
+                    unreachable.join("、")
+                ),
+                (None, true) => "未扫描到任何文件".into(),
+            };
+            emit(&app, json!({ "kind": "error", "message": msg }));
         } else {
+            // `unreachable` 一并带回:本轮成功扫了 C/D 盘,但群晖 NAS / 外置盘没连上时,前端据此弹个
+            // 温和提示框(「XX 这次没连上,已跳过」),而不是让用户误以为「盘点完成 = 全都扫到了」。
             emit(
                 &app,
                 json!({
@@ -955,6 +1086,7 @@ pub fn fable_inventory_start(
                     "removed": acc_removed, "skipped": acc_skipped,
                     "seconds": acc_secs, "workers": workers,
                     "roots": roots.len(),
+                    "unreachable": unreachable,
                 }),
             );
         }
@@ -1031,8 +1163,9 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
         app_data_roots().into_iter().map(|r| (r.path, r.label)).collect();
     // 默认勾:知识库根 + NAS 挂载点 + App 数据下载目录(沿用盘点默认根集合)。
     for r in inventory_roots(None) {
-        // 有界探测:NAS 挂载点掉线时 is_dir 会 stat 几十秒吊死选择器 → 3s 判不可达即跳过。
-        if !super::sched::dir_reachable(Path::new(&r), 3) || !seen.insert(r.clone()) {
+        // 有界探测:NAS 挂载点掉线时 is_dir 会 stat 几十秒吊死选择器 → 超死线判不可达即跳过
+        // (死线见 [`probe_secs`],放宽到 12s 容忍冷连接 NAS 的首次慢响应)。
+        if !super::sched::dir_reachable(Path::new(&r), probe_secs()) || !seen.insert(r.clone()) {
             continue;
         }
         let label = if r == kb {
@@ -1051,8 +1184,10 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
     // default_on 直接沿用 scan_roots 的判断(现在「一个不落」——所有真实存在的盘符/卷默认都勾),
     // 这样首次盘点就能把整机所有可达的盘都纳入,用户想缩小范围再手动取消。
     for sr in crate::scan::scan_roots() {
-        // 同上:挂载点/网络卷可能僵死,有界探测 3s,不可达就不进选择器(绝不卡住面板)。
-        if !super::sched::dir_reachable(Path::new(&sr.path), 3) || !seen.insert(sr.path.clone()) {
+        // 同上:挂载点/网络卷可能僵死,有界探测(死线见 [`probe_secs`]),不可达就不进选择器。
+        if !super::sched::dir_reachable(Path::new(&sr.path), probe_secs())
+            || !seen.insert(sr.path.clone())
+        {
             continue;
         }
         out.push(ScanRootInfo { path: sr.path, label: sr.label, default_on: sr.default_on });
@@ -1064,10 +1199,12 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
 /// `root` = 所属盘点根(用于算 depth 并回填 FolderNode.root)。
 fn list_child_folders(dir: &Path, root: &str) -> Vec<FolderNode> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    // 只有正浏览「整盘根目录顶层」(如 C:\ 直属子目录)时才叠加 OS 目录黑名单,把 Windows、
+    // 只有正浏览「本机整盘根目录顶层」(如 C:\ 直属子目录)时才叠加 OS 目录黑名单,把 Windows、
     // Program Files 等藏起来;往里钻一层后(用户自己的文件夹)只剪永远跳的噪音,这样里面名叫
     // library/boot 的子目录照常显示、可选可盘 ——「文件夹里的都能归类进库」也要在选择器里看得见。
-    let os_top = is_os_disk_root(root) && Path::new(root) == dir;
+    // 映射的 NAS 盘符是远程盘(非本机系统盘)→ 不当整盘重剪,选择器才会和盘点一样把它顶层那些
+    // 名叫 system/library 的 NAS 共享如实列出(否则用户在选择器里根本看不到、也就盘不到它们)。
+    let os_top = is_os_disk_root(root) && !is_remote_root(root) && Path::new(root) == dir;
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
@@ -1132,11 +1269,11 @@ pub fn scan_folders(explicit: Option<String>) -> Result<FolderScan, String> {
     let mut folders: Vec<FolderNode> = Vec::new();
     let mut truncated = false;
     for root in &roots {
-        // 列子目录要 read_dir 挂载点,死 NAS 会吊死整个选择器 → 每根加 8s 死线,超时就跳过
-        // 这个根(其它健康根照常展示),用户点「盘点」绝不转圈卡死。
+        // 列子目录要 read_dir 挂载点,死 NAS 会吊死整个选择器 → 每根加死线(见 [`probe_secs`]),
+        // 超时就跳过这个根(其它健康根照常展示),用户点「盘点」绝不转圈卡死。
         let rp = root.path.clone();
         let children =
-            super::sched::with_deadline(8, move || list_child_folders(Path::new(&rp), &rp))
+            super::sched::with_deadline(probe_secs(), move || list_child_folders(Path::new(&rp), &rp))
                 .unwrap_or_default();
         for node in children {
             folders.push(node);
@@ -1152,18 +1289,21 @@ pub fn scan_folders(explicit: Option<String>) -> Result<FolderScan, String> {
     Ok(FolderScan { roots, folders, truncated })
 }
 
-/// 盘点前先扫一眼文件夹结构(根 + 第一层)。同步返回。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// 盘点前先扫一眼文件夹结构(根 + 第一层)。
+/// `(async)`:枚举盘符 + 读顶层目录在掉线的映射网盘(Z: 等)上可能久卡 → 派到工作线程,不冻 UI。
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn fable_scan_folders(root: Option<String>) -> Result<FolderScan, String> {
     scan_folders(root)
 }
 
 /// 懒加载:点开某个文件夹时才扫它的直属子文件夹(支持一层层往下钻到任意深度)。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// `(async)`:`with_deadline` 内部已开旁路线程,但调用线程仍要 `recv_timeout` 等满死线
+/// (NAS 上≈12s)→ 主线程跑会冻 UI(每展开一个文件夹冻一次)。派到工作线程即解。
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn fable_scan_folder_children(root: String, path: String) -> Result<Vec<FolderNode>, String> {
-    // 展开子目录:is_dir + read_dir 都可能卡死 NAS → 整体加 8s 死线,超时返回空(该项显示为
-    // 不可展开),请求线程绝不被吊死。
-    Ok(super::sched::with_deadline(8, move || {
+    // 展开子目录:is_dir + read_dir 都可能卡死 NAS → 整体加死线(见 [`probe_secs`]),超时返回空
+    // (该项显示为不可展开),请求线程绝不被吊死。
+    Ok(super::sched::with_deadline(probe_secs(), move || {
         let p = Path::new(&path);
         if !p.is_dir() {
             return Vec::new();
@@ -1181,7 +1321,10 @@ pub struct FolderSize {
     pub bytes: u64,
 }
 
-fn folder_size_rec(dir: &Path, files: &mut u64, bytes: &mut u64) {
+// 累加进原子计数器(而非 `&mut u64`):这样即便外层撞上死线被中途掐断,已经数到的部分也
+// 留在计数器里能读回来 —— 大目录至少给个「下限体积」,而不是一刀切归 0。
+fn folder_size_rec(dir: &Path, files: &AtomicU64, bytes: &AtomicU64, remote: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
@@ -1194,33 +1337,84 @@ fn folder_size_rec(dir: &Path, files: &mut u64, bytes: &mut u64) {
             if skip_dir_always(&name) {
                 continue;
             }
-            folder_size_rec(&entry.path(), files, bytes);
+            folder_size_rec(&entry.path(), files, bytes, remote);
         } else if ft.is_file() {
             if let Ok(m) = entry.metadata() {
-                *bytes += on_disk_size(&entry.path(), &m);
-                *files += 1;
+                bytes.fetch_add(on_disk_size(&entry.path(), &m, remote), Relaxed);
+                files.fetch_add(1, Relaxed);
             }
         }
     }
 }
 
+/// 整盘根 / 网络盘根的「已用容量」= 磁盘总量 − 可用空间。一整块盘逐文件走完要几分钟、必撞死线
+/// 返 0,但用户问「这个盘多大」要的本就是已用容量 → `GetDiskFreeSpaceExW` 即时拿到,准确零遍历。
+/// 拿不到(盘掉线 / 非 Windows)返回 None,调用方退回递归(带死线、超时给部分值)。
+#[cfg(windows)]
+fn disk_used_bytes(path: &str) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let t = path.trim().trim_end_matches(['/', '\\']);
+    let b = t.as_bytes();
+    let root = if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        format!("{}:\\", b[0] as char) // "C:\"
+    } else if t.starts_with("\\\\") || t.starts_with("//") {
+        format!("{t}\\") // UNC 根 "\\server\share\"
+    } else {
+        return None;
+    };
+    let wide: Vec<u16> =
+        std::ffi::OsStr::new(&root).encode_wide().chain(std::iter::once(0)).collect();
+    let mut free_avail: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY: wide 是 NUL 结尾的合法宽字符串;三个 out 指针均指向本栈上的有效 u64。
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_avail, &mut total, &mut total_free)
+    };
+    if ok == 0 || total == 0 {
+        return None;
+    }
+    Some(total.saturating_sub(total_free))
+}
+
+#[cfg(not(windows))]
+fn disk_used_bytes(_path: &str) -> Option<u64> {
+    None // mac/Docker:整盘根("/"、/Volumes/*)退回递归部分值;后续可接 statvfs
+}
+
 /// 递归统计一个文件夹的总文件数与总字节数(skip_dir_scan 剪枝;符号链接跳过)。
 /// 前端在选择器里按需、限并发地逐个文件夹调用,把大小填进对应行。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// `(async)`:同上 —— 调用线程要等满 10s 死线,主线程跑会冻 UI(选择器里每行都调一次,
+/// 冻得最频繁)→ 派到工作线程。
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn fable_folder_size(path: String) -> Result<FolderSize, String> {
-    // 递归算大小可能在死 NAS / 超大目录上久卡 → 加 10s 死线,超时返回 0(选择器该行不显示
-    // 大小,而非卡住整个面板)。
-    Ok(super::sched::with_deadline(10, move || {
-        let p = Path::new(&path);
-        if !p.is_dir() {
-            return FolderSize { files: 0, bytes: 0 };
+    use std::sync::atomic::Ordering::Relaxed;
+    // 整盘 / 网络盘根:走「已用容量」即时返回,不做注定撞死线的全盘遍历(那只会一直显示 0 ——
+    // 正是 C:\ / D:\ / Z:\ 这些最该看到体积的行之前显示空白的根因)。
+    if is_os_disk_root(&path) || is_remote_root(&path) {
+        let pc = path.clone();
+        // 掉线网络盘上 GetDiskFreeSpaceExW 也可能卡 → 同样套死线兜底。
+        if let Some(Some(used)) =
+            super::sched::with_deadline(probe_secs(), move || disk_used_bytes(&pc))
+        {
+            return Ok(FolderSize { files: 0, bytes: used });
         }
-        let mut files = 0u64;
-        let mut bytes = 0u64;
-        folder_size_rec(p, &mut files, &mut bytes);
-        FolderSize { files, bytes }
-    })
-    .unwrap_or(FolderSize { files: 0, bytes: 0 }))
+        // 拿不到容量(盘掉线等)→ 落到下面的递归(同样带死线)。
+    }
+    // 普通文件夹:递归累加,带 10s 死线;超时也把「已数到的部分」读回来(原子计数器),给个下限
+    // 体积而非 0,避免大目录永远显示空白。
+    let files = std::sync::Arc::new(AtomicU64::new(0));
+    let bytes = std::sync::Arc::new(AtomicU64::new(0));
+    let (fc, bc) = (files.clone(), bytes.clone());
+    let remote = is_remote_root(&path); // 网络盘:跳过逐文件实占往返,直接取逻辑大小
+    super::sched::with_deadline(10, move || {
+        let p = Path::new(&path);
+        if p.is_dir() {
+            folder_size_rec(p, &fc, &bc, remote);
+        }
+    });
+    Ok(FolderSize { files: files.load(Relaxed), bytes: bytes.load(Relaxed) })
 }
 
 /// 「按语言归类」回填:给所有还没定语言(lang='')的文件补上语言标签。
@@ -1376,6 +1570,196 @@ mod tests {
             assert!(skip_dir_os(n), "{n} 应属整盘扫的 OS 黑名单");
             assert!(!skip_dir_always(n), "{n} 不该被永远跳");
         }
+    }
+
+    /// 真机验证(默认 `#[ignore]`,只在手动跑时执行):
+    /// `cargo test --manifest-path src-tauri/Cargo.toml --lib scan_real_z_drive -- --ignored --nocapture`
+    ///
+    /// 用**真实的剪枝判定 + 真实的工业级调度器**(`WorkQueue` + 多核 worker)遍历映射的 Z 盘,
+    /// 只计数不写库(绝不碰用户真实 fable.db)。验证三件事:① Z: 被判为远程盘 → 不当系统盘狠剪;
+    /// ② 整盘可达、能一路扫进去(报文件数/字节数/类型分布/顶层分布);③ 量化老规则(heavy_prune)
+    /// 本会多丢多少目录。带 4 分钟墙钟上限,超时报「已扫到的量 + 仍在继续」,证明吞吐与可达性。
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn scan_real_z_drive() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let root = r"Z:\";
+        if !Path::new(root).is_dir() {
+            eprintln!("Z: 未挂载,跳过本测试");
+            return;
+        }
+        // ① 远程盘判定 + 剪枝档位
+        let remote = is_remote_root(root);
+        let heavy = is_os_disk_root(root) && !remote;
+        eprintln!("──────── Z 盘盘点真机验证 ────────");
+        eprintln!("is_remote_root(Z:\\) = {remote}   (期望 true:映射的 NAS 网络盘)");
+        eprintln!("heavy_prune        = {heavy}   (期望 false:不当系统盘狠剪,里面全归类)");
+        assert!(remote, "Z: 应被判为远程网络盘");
+        assert!(!heavy, "远程盘不应启用 OS 目录黑名单重剪");
+
+        // ② 真调度器 + 真剪枝,多核计数遍历(复刻 scan_root,只把写库换成累加计数)。
+        let queue = Arc::new(crate::fable::sched::WorkQueue::new(vec![PathBuf::from(root)]));
+        let workers = crate::fable::worker_count();
+        queue.set_live_workers(workers);
+        let files = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let ndirs = Arc::new(AtomicU64::new(0));
+        let extra_pruned = Arc::new(AtomicU64::new(0)); // 老 heavy_prune 本会多丢的目录数
+        let by_kind: Arc<Mutex<BTreeMap<&'static str, (u64, u64)>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let (queue, files, bytes, ndirs, extra_pruned, by_kind, stop) = (
+                queue.clone(),
+                files.clone(),
+                bytes.clone(),
+                ndirs.clone(),
+                extra_pruned.clone(),
+                by_kind.clone(),
+                stop.clone(),
+            );
+            handles.push(std::thread::spawn(move || {
+                while let Some(job) = queue.pop() {
+                    let dir = job.item;
+                    if stop.load(Ordering::Relaxed) {
+                        queue.complete(); // 超时:不再下钻,快速把队列抽干
+                        continue;
+                    }
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for entry in rd.flatten() {
+                            let Ok(ft) = entry.file_type() else { continue };
+                            if ft.is_symlink() {
+                                continue;
+                            }
+                            let name = crate::fable::decode_fs(&entry.file_name());
+                            if ft.is_dir() {
+                                if skip_dir_always(&name) {
+                                    continue; // 永远跳的噪音(@eaDir/#recycle/.git…)
+                                }
+                                // 老代码对远程盘也 heavy_prune,会再剪 skip_dir_os —— 量化它的误伤。
+                                if skip_dir_os(&name) {
+                                    extra_pruned.fetch_add(1, Ordering::Relaxed);
+                                }
+                                ndirs.fetch_add(1, Ordering::Relaxed);
+                                queue.push(entry.path());
+                            } else if ft.is_file() {
+                                if let Ok(m) = entry.metadata() {
+                                    let ext = entry
+                                        .path()
+                                        .extension()
+                                        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                                        .unwrap_or_default();
+                                    let kind = classify(&ext);
+                                    let sz = on_disk_size(&entry.path(), &m, true);
+                                    files.fetch_add(1, Ordering::Relaxed);
+                                    bytes.fetch_add(sz, Ordering::Relaxed);
+                                    let mut bk = by_kind.lock().unwrap();
+                                    let e = bk.entry(kind).or_insert((0, 0));
+                                    e.0 += 1;
+                                    e.1 += sz;
+                                }
+                            }
+                        }
+                    }
+                    queue.complete();
+                }
+                queue.worker_exited();
+            }));
+        }
+
+        // 主线程:每 5s 报一次进度;到 4 分钟墙钟上限则置 stop,让 worker 收尾。
+        let cap = Duration::from_secs(240);
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let (inflight, qlen, live) = queue.stats();
+            let done = inflight == 0 && (qlen == 0 || live == 0);
+            if started.elapsed().as_millis() % 5000 < 600 {
+                eprintln!(
+                    "  …已扫 {} 文件 / {:.1} GB / {} 目录(队列 {qlen},耗时 {:.0}s)",
+                    files.load(Ordering::Relaxed),
+                    bytes.load(Ordering::Relaxed) as f64 / 1e9,
+                    ndirs.load(Ordering::Relaxed),
+                    started.elapsed().as_secs_f64(),
+                );
+            }
+            if done {
+                break;
+            }
+            if started.elapsed() > cap && !stop.load(Ordering::Relaxed) {
+                eprintln!("  (到 4 分钟上限,停止下钻,抽干在途…)");
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let f = files.load(Ordering::Relaxed);
+        let b = bytes.load(Ordering::Relaxed);
+        let finished = !stop.load(Ordering::Relaxed);
+        eprintln!("──────── 结果 ────────");
+        eprintln!(
+            "{} · 文件 {f} 个 · 总量 {:.1} GB · 目录 {} 个 · 耗时 {:.0}s",
+            if finished { "扫完整盘" } else { "达上限(部分)" },
+            b as f64 / 1e9,
+            ndirs.load(Ordering::Relaxed),
+            started.elapsed().as_secs_f64(),
+        );
+        eprintln!("按类型分布(文件数 / 体量):");
+        let bk = by_kind.lock().unwrap();
+        let mut rows: Vec<_> = bk.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        for (kind, (cnt, sz)) in rows {
+            eprintln!("  {kind:>8}: {cnt:>9} 个 · {:>8.1} GB", *sz as f64 / 1e9);
+        }
+        let ep = extra_pruned.load(Ordering::Relaxed);
+        eprintln!(
+            "修复影响:老代码(把 Z: 当系统盘 heavy_prune)本会再整棵剪掉 {ep} 个目录\
+             (名叫 system/library/private/bin/boot… 的 NAS 共享/文件夹),现在全部纳入。"
+        );
+        assert!(f > 0, "Z: 应至少扫到一些文件");
+    }
+
+    /// 网络盘判定:UNC 路径恒为远程;不存在的盘符根 GetDriveType 返回 NO_ROOT_DIR(非 REMOTE)
+    /// → false。真实映射的 NAS 盘符在真机上才返回 true(依赖系统驱动器表,这里只回归确定分支)。
+    #[cfg(windows)]
+    #[test]
+    fn unc_paths_are_remote() {
+        assert!(is_remote_root(r"\\nas\share"));
+        assert!(is_remote_root("//nas/share/sub"));
+        assert!(!is_remote_root(r"C:\Users\me")); // 本地系统盘 = 非远程
+    }
+
+    /// 核心回归:映射的 NAS 盘符虽是 `X:\` 形状(被 [`is_os_disk_root`] 判为整盘),但若是远程盘
+    /// 就**不该**叠加 OS 目录黑名单 —— 否则 library/system/private 等 NAS 常见共享名被整棵丢掉。
+    /// 这里用纯逻辑组合断言,不依赖具体盘是否真挂着。
+    #[test]
+    fn remote_disk_root_skips_heavy_prune() {
+        // heavy_prune 的真值 = is_os_disk_root && !is_remote_root。非远程的 `/`、`C:\` 仍重剪。
+        assert!(is_os_disk_root("/") && !is_remote_root("/"));
+        assert!(is_os_disk_root(r"C:\") && !is_remote_root(r"C:\"));
+        // UNC 永远是远程 → 即便 is_os_disk_root(对 UNC 为 false)也不会重剪,语义一致。
+        #[cfg(windows)]
+        assert!(is_remote_root(r"\\nas\share"));
+    }
+
+    /// 扩展长度前缀剥离:网络盘 canonicalize 出的 `\\?\UNC\host\share` 必须还原成合法 `\\host\share`
+    /// (旧实现只剥 `\\?\` 会留下非法的 `UNC\host\share`,导致这条根的文件打不开、对账失效)。
+    #[test]
+    fn strips_unc_extended_prefix() {
+        assert_eq!(strip_extended_prefix(r"\\?\UNC\100.78.103.101\tx"), r"\\100.78.103.101\tx");
+        assert_eq!(strip_extended_prefix(r"\\?\UNC\nas\share\sub"), r"\\nas\share\sub");
+        assert_eq!(strip_extended_prefix(r"\\?\C:\Users\me"), r"C:\Users\me");
+        assert_eq!(strip_extended_prefix(r"C:\already\normal"), r"C:\already\normal");
+        assert_eq!(strip_extended_prefix(r"\\nas\share"), r"\\nas\share");
     }
 
     #[test]

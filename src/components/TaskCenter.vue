@@ -15,12 +15,11 @@
  * 兼顾高级感;深浅主题各自换 tint(见 style 末尾的 data-theme 覆盖)。
  */
 import { computed, ref, watch } from "vue";
-import { LoaderCircle, ChevronDown, Activity, FileText, Sparkles, X } from "@lucide/vue";
+import { LoaderCircle, ChevronDown, Activity, Sparkles, X } from "@lucide/vue";
 import { useFileTasksStore } from "../stores/fileTasks";
 import { useKbStore } from "../stores/kb";
 import { useChatStore } from "../stores/chat";
 import { useAppStore, type ViewKey } from "../stores/app";
-import { artifacts as artifactsApi } from "../tauri";
 import { toast } from "../composables/useToast";
 
 const tasks = useFileTasksStore();
@@ -39,7 +38,6 @@ interface Row {
   convId?: string;
   /** 是 AI 生成类任务(图标用 Sparkles) */
   ai?: boolean;
-  report?: string;
   /** 可停止/关闭(文件任务走 fable_cancel;AI 对话走 chat.cancel)。构建知识网暂无取消入口。 */
   stoppable?: boolean;
 }
@@ -65,7 +63,6 @@ const rows = computed<Row[]>(() => {
       label: t.label,
       detail: t.detail,
       view: "file_center",
-      report: t.id === "clusterLlm" ? tasks.reportPath.clusterLlm : undefined,
       stoppable: true,
     });
   }
@@ -127,9 +124,6 @@ function stop(r: Row) {
   if (r.key.startsWith("ft:")) tasks.cancel(r.key.slice(3) as Parameters<typeof tasks.cancel>[0]);
   else if (r.key.startsWith("chat:") && r.convId) chat.cancel(r.convId);
 }
-function openReport(path?: string) {
-  if (path) artifactsApi.openExternal(path).catch(() => {});
-}
 </script>
 
 <template>
@@ -148,14 +142,6 @@ function openReport(path?: string) {
             <div class="tc-label">{{ r.label }}</div>
             <div class="tc-detail">{{ r.detail }}</div>
           </div>
-          <button
-            v-if="r.report"
-            class="tc-report"
-            title="打开桌面报告"
-            @click.stop="openReport(r.report)"
-          >
-            <FileText :size="13" :stroke-width="1.9" />
-          </button>
           <button
             v-if="r.stoppable"
             class="tc-stop"
@@ -302,20 +288,6 @@ function openReport(path?: string) {
 }
 @keyframes tc-rot {
   to { transform: rotate(360deg); }
-}
-.tc-report {
-  flex-shrink: 0;
-  background: transparent;
-  border: 1px solid var(--glass-edge);
-  border-radius: 8px;
-  padding: 5px;
-  color: var(--muted, #999);
-  cursor: pointer;
-  display: inline-flex;
-}
-.tc-report:hover {
-  color: var(--primary, #d4b06a);
-  border-color: var(--primary, #d4b06a);
 }
 /* 停止/关闭任务:平时低调,hover 转危险红,明确「这会停掉它」 */
 .tc-stop {

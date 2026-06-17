@@ -139,6 +139,18 @@ export const useChatStore = defineStore("chatRuntime", () => {
     return historyErrorByConv.value[convId] ?? null;
   }
 
+  /** 标记一个**刚新建**的对话为「历史已加载(空)」——它本来就没有历史。
+   *  关键用途:在「新建对话 → 立刻发首条消息」时,createConversation 会同步切换
+   *  currentConvId、触发 ChatPanel 的 loadHistory;而那次 loadHistory 在 send 还没
+   *  把 sending 置真之前就通过了守卫、随后用**空历史覆盖** byConv,把刚推入的用户
+   *  气泡与流式回复一起抹掉(现象:第一次给对话发消息,消息经常被「吃掉」)。
+   *  在创建后**同步**调用本函数占位,让那次 loadHistory 因 loaded 守卫直接早退。 */
+  function markFresh(convId: string) {
+    if (!convId) return;
+    if (!byConv.value[convId]) byConv.value[convId] = [];
+    loadedByConv.value[convId] = true;
+  }
+
   async function loadHistory(convId: string | null, force = false) {
     if (!convId) return;
     // 正在运行的对话别用历史覆盖实时气泡
@@ -146,6 +158,9 @@ export const useChatStore = defineStore("chatRuntime", () => {
     if (loadedByConv.value[convId] && !force) return;
     try {
       const msgs = await convApi.getMessages(convId);
+      // 防御纵深:异步取历史的空档里,这条对话可能刚开始发送(首条消息竞态)——
+      // 此刻本地气泡才是权威,别再用(多半是空的)历史覆盖它。
+      if (sendingByConv.value[convId] && !force) return;
       byConv.value[convId] = msgs.map((m) => {
         const at = m.createdAt > 1e12 ? m.createdAt : m.createdAt * 1000;
         if (m.role === "assistant") {
@@ -310,6 +325,7 @@ export const useChatStore = defineStore("chatRuntime", () => {
     activityAt,
     pushBubble,
     loadHistory,
+    markFresh,
     historyError,
     send,
     cancel,

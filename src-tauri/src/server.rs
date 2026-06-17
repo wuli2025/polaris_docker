@@ -538,7 +538,9 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         )?),
         "file_gist" => ok(fable::files::file_gist(req_str(a, "abspath")?)?),
         "file_cluster_build" => ok(fable::files::file_cluster_build(app, opt_str(a, "root"))?),
-        "file_smart_cluster" => ok(fable::files::file_smart_cluster(app, opt_str(a, "root"))?),
+        "file_smart_cluster" => {
+            ok(fable::files::file_smart_cluster(app, opt_str(a, "root"), opt_bool(a, "quick"))?)
+        }
         "file_profile_html" => ok(fable::files::file_profile_html(opt_str(a, "root"))?),
         "file_suggest_workflows" => ok(fable::files::suggest_workflows(opt_str(a, "root"))?),
         "file_graph" => ok(fable::files::file_graph(opt_str(a, "root"))?),

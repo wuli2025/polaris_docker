@@ -43,6 +43,7 @@ import {
   Rocket,
   Flag,
   FolderTree,
+  RefreshCw,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import {
@@ -50,6 +51,7 @@ import {
   convApi,
   skills as skillsApi,
   expert,
+  files as fc,
   avatarSlot,
   invoke,
   listen,
@@ -62,6 +64,7 @@ import {
   type ExpertAgentStatus,
   type ExpertCard,
   type ExpertTeam as ExpertTeamCard,
+  type SuggestedFlow,
 } from "../tauri";
 import { WebVoiceRecorder } from "../lib/webVoice";
 import { renderMarkdown, mdVersion } from "../lib/markdown";
@@ -559,6 +562,66 @@ async function runBriefing(s: Suggestion) {
     agentMode: agentMode.value,
   });
 }
+// ─────────── 空对话页的「下一步工作流」推荐(仿豆包的建议气泡)───────────
+// 据用户真实知识库(主题/类型/语言 + 最近在动的文件夹)用大模型推几条「成体系的工作流」,
+// 点一下把整条工作流提示词填进输入框(可改可发)。LLM 要数秒、要花 token,故按会话缓存,
+// 只在首次进空白页时生成一次,顶部「换一批」可手动重算。
+const workflowFlows = ref<SuggestedFlow[]>([]);
+const flowsLoading = ref(false);
+const flowsTried = ref(false); // 本会话已尝试过(无论成败),避免空白页反复触发 LLM
+const FLOWS_CACHE_KEY = "polaris.flows.v1";
+function readFlowsCache(): SuggestedFlow[] | null {
+  try {
+    const raw = sessionStorage.getItem(FLOWS_CACHE_KEY);
+    if (!raw) return null;
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) && arr.length ? (arr as SuggestedFlow[]) : null;
+  } catch {
+    return null;
+  }
+}
+async function loadWorkflowFlows(force = false) {
+  if (flowsLoading.value) return;
+  if (!force) {
+    const cached = readFlowsCache();
+    if (cached) {
+      workflowFlows.value = cached;
+      flowsTried.value = true;
+      return;
+    }
+    if (flowsTried.value) return; // 本会话已试过且无结果 → 不再反复打扰
+  }
+  flowsLoading.value = true;
+  try {
+    const flows = await fc.suggestWorkflows(null);
+    workflowFlows.value = flows || [];
+    if (flows && flows.length) sessionStorage.setItem(FLOWS_CACHE_KEY, JSON.stringify(flows));
+  } catch {
+    // 库还空 / 模型不可用 → 安静留空,空白页只显示问候语,不报错打扰。
+    workflowFlows.value = [];
+  } finally {
+    flowsLoading.value = false;
+    flowsTried.value = true;
+  }
+}
+// 点一条建议:把整条工作流提示词填进输入框并聚焦,让用户先看清(这些是成体系的长提示词)再发。
+function applyFlow(f: SuggestedFlow) {
+  input.value = f.prompt;
+  nextTick(() => {
+    autoGrow();
+    inputEl.value?.focus();
+  });
+}
+// 空白页(没有任何回合、且非毛主席彩蛋页)→ 拉一次工作流推荐;有缓存秒出,无缓存才走 LLM。
+const showFlowSuggestions = computed(() => renderTurns.value.length === 0 && !isMaoProject.value);
+watch(
+  showFlowSuggestions,
+  (empty) => {
+    if (empty) loadWorkflowFlows();
+  },
+  { immediate: true },
+);
+
 onMounted(async () => {
   await loadBriefings();
   // 每次打开软件:只要有今日建议,就在屏幕正中自动弹出一次(本次启动仅弹一次,
@@ -1517,6 +1580,36 @@ async function deleteCurrentConv() {
               <span class="hm-pill">⚠️ 查不到就标「资料不足」</span>
             </div>
           </details>
+
+          <!-- 下一步工作流推荐(据你的知识库 + 最近在动的文件):点一条把整条工作流提示词填进输入框 -->
+          <div v-if="flowsLoading || workflowFlows.length" class="flow-suggest">
+            <div class="flow-head">
+              <Sparkles :size="13" :stroke-width="1.8" />
+              <span>据你最近的资料，下一步可以——</span>
+              <button
+                v-if="workflowFlows.length && !flowsLoading"
+                class="flow-refresh"
+                title="换一批建议"
+                @click="loadWorkflowFlows(true)"
+              >
+                <RefreshCw :size="12" :stroke-width="2" /> 换一批
+              </button>
+            </div>
+            <div v-if="flowsLoading && !workflowFlows.length" class="flow-chips">
+              <span v-for="i in 4" :key="i" class="flow-chip skeleton"></span>
+            </div>
+            <div v-else class="flow-chips">
+              <button
+                v-for="(f, i) in workflowFlows"
+                :key="i"
+                class="flow-chip"
+                :title="f.prompt"
+                @click="applyFlow(f)"
+              >
+                {{ f.title }}
+              </button>
+            </div>
+          </div>
         </template>
       </div>
 
@@ -2356,6 +2449,80 @@ async function deleteCurrentConv() {
   background: transparent;
   border: none;
   padding: 0;
+}
+/* ── 下一步工作流推荐(空白页建议气泡,仿豆包)── */
+.flow-suggest {
+  margin: 30px auto 0;
+  max-width: 680px;
+}
+.flow-head {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+  letter-spacing: 0.3px;
+}
+.flow-head svg { color: var(--gold, #d4b06a); flex: none; }
+.flow-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.flow-refresh:hover { color: var(--text); border-color: var(--border); background: var(--bg-soft); }
+.flow-chips {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 9px;
+}
+.flow-chip {
+  max-width: 100%;
+  text-align: left;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text);
+  background: var(--panel, var(--bg-soft));
+  border: 1px solid var(--border-soft);
+  border-radius: 13px;
+  padding: 9px 15px;
+  cursor: pointer;
+  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: transform 0.14s, border-color 0.14s, box-shadow 0.14s, background 0.14s;
+}
+.flow-chip:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--gold, #d4b06a) 55%, transparent);
+  background: color-mix(in srgb, var(--gold, #d4b06a) 8%, var(--panel, var(--bg-soft)));
+  box-shadow: 0 8px 22px -14px color-mix(in srgb, var(--gold, #d4b06a) 80%, transparent);
+}
+.flow-chip:active { transform: translateY(0); }
+.flow-chip.skeleton {
+  width: 156px;
+  height: 36px;
+  cursor: default;
+  pointer-events: none;
+  background: linear-gradient(90deg, var(--bg-soft) 25%, var(--border-soft) 37%, var(--bg-soft) 63%);
+  background-size: 400% 100%;
+  animation: flow-sk 1.3s ease infinite;
+  border-color: transparent;
+}
+@keyframes flow-sk {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0 0; }
 }
 /* ── 毛主席项目彩蛋空状态 ── */
 .mao-hero {
