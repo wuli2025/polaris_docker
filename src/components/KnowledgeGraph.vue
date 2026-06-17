@@ -35,6 +35,7 @@ const selected = ref<{
   kind: KbNode["kind"];
   path: string;
   deg: number;
+  summary?: string;
 } | null>(null);
 
 let cy: Core | null = null;
@@ -163,6 +164,7 @@ function render() {
           uopa: glowOpacity(n.kind, size),
           deg: deg[n.id] || 0,
           path: n.kind === "doc" || n.kind === "feedback" ? n.id : "",
+          summary: n.summary || "",
         };
         // files 源:category 携带所属语义簇的颜色(#hex)→ 按簇着色(root 仍用金核),
         // 让画面一眼分出几个语义聚类(同簇同色)。
@@ -172,7 +174,10 @@ function render() {
         return { data };
       }),
       ...edges.map((e, i) => ({
-        data: { id: `e${i}`, source: e.source, target: e.target },
+        // rel 只在「簇间语义关系边」上有(AI 推断:同源/进阶/方法论…);层级/双链边不带 → 不匹配 edge[rel]。
+        data: e.rel
+          ? { id: `e${i}`, source: e.source, target: e.target, rel: e.rel }
+          : { id: `e${i}`, source: e.source, target: e.target },
       })),
     ],
     style: [
@@ -260,6 +265,35 @@ function render() {
         selector: "edge.hl",
         style: { "line-color": "#cfe2ff", width: 1.4, opacity: 0.85 },
       },
+      // 簇间语义关系边(AI 推断):鎏金虚线 + 箭头 + 关系标签(放大/悬停才显字),让星图成真·关系图谱
+      {
+        selector: "edge[rel]",
+        style: {
+          width: 1.3,
+          "line-color": "#d4b06a",
+          "line-style": "dashed",
+          "curve-style": "bezier",
+          opacity: 0.5,
+          "target-arrow-shape": "triangle",
+          "target-arrow-color": "#d4b06a",
+          "arrow-scale": 0.7,
+          label: "data(rel)",
+          "font-family": "var(--sans)",
+          "font-size": 8,
+          color: "#f0dcae",
+          "text-outline-color": "#070b16",
+          "text-outline-width": 2,
+          "text-outline-opacity": 0.85,
+          "text-rotation": "autorotate" as any,
+          "text-opacity": 0,
+          "min-zoomed-font-size": 6,
+        },
+      },
+      { selector: "edge[rel].show-label", style: { "text-opacity": 0.92 } },
+      {
+        selector: "edge[rel].hl",
+        style: { opacity: 0.95, width: 2, "text-opacity": 1, "line-color": "#e8c878" },
+      },
     ],
     layout: fcoseLayout,
   });
@@ -290,9 +324,10 @@ function wireInteractions(c: Core) {
     const show = c.zoom() >= 0.9;
     if (show !== labelsShown) {
       labelsShown = show;
-      c.batch(() =>
-        c.nodes('[kind = "doc"], [kind = "feedback"]').toggleClass("show-label", show)
-      );
+      c.batch(() => {
+        c.nodes('[kind = "doc"], [kind = "feedback"]').toggleClass("show-label", show);
+        c.edges("[rel]").toggleClass("show-label", show); // 关系标签同步显隐
+      });
     }
   };
   c.on("zoom", syncLabels);
@@ -311,7 +346,7 @@ function wireInteractions(c: Core) {
 
   c.on("tap", "node", (evt) => {
     const d = evt.target.data();
-    selected.value = { title: d.label, kind: d.kind, path: d.path, deg: d.deg };
+    selected.value = { title: d.label, kind: d.kind, path: d.path, deg: d.deg, summary: d.summary };
   });
   c.on("tap", (evt) => {
     if (evt.target === c) selected.value = null;
@@ -522,15 +557,22 @@ onUnmounted(() => {
           <div class="card-kind">
             {{
               selected.kind === "root"
-                ? "星系核心 · 知识库"
+                ? isFiles
+                  ? "星系核心 · 我的资料"
+                  : "星系核心 · 知识库"
                 : selected.kind === "folder"
-                ? "目录中枢"
+                ? isFiles
+                  ? "主题 · 一类资料"
+                  : "目录中枢"
                 : selected.kind === "feedback"
                 ? "回声 · 记忆"
+                : isFiles
+                ? "文件"
                 : "文档"
             }}
           </div>
           <div class="card-title">{{ selected.title }}</div>
+          <div v-if="selected.summary" class="card-summary">{{ selected.summary }}</div>
           <div v-if="selected.path" class="card-path">{{ selected.path }}</div>
           <div class="card-meta">连接数 {{ selected.deg }}</div>
         </div>
@@ -794,6 +836,13 @@ onUnmounted(() => {
   font-size: 16px;
   color: #f1f5ff;
   margin: 3px 0 6px;
+  word-break: break-word;
+}
+.card-summary {
+  font-size: 12.5px;
+  color: #f0dcae;
+  line-height: 1.6;
+  margin: 0 0 7px;
   word-break: break-word;
 }
 .card-path {

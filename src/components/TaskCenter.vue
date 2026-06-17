@@ -15,7 +15,7 @@
  * 兼顾高级感;深浅主题各自换 tint(见 style 末尾的 data-theme 覆盖)。
  */
 import { computed, ref, watch } from "vue";
-import { LoaderCircle, ChevronDown, Activity, FileText, Sparkles } from "@lucide/vue";
+import { LoaderCircle, ChevronDown, Activity, FileText, Sparkles, X } from "@lucide/vue";
 import { useFileTasksStore } from "../stores/fileTasks";
 import { useKbStore } from "../stores/kb";
 import { useChatStore } from "../stores/chat";
@@ -40,6 +40,8 @@ interface Row {
   /** 是 AI 生成类任务(图标用 Sparkles) */
   ai?: boolean;
   report?: string;
+  /** 可停止/关闭(文件任务走 fable_cancel;AI 对话走 chat.cancel)。构建知识网暂无取消入口。 */
+  stoppable?: boolean;
 }
 
 // 汇总三个 store 里所有「正在跑」的任务成统一列表。
@@ -54,6 +56,7 @@ const rows = computed<Row[]>(() => {
       view: "chat",
       convId: cid,
       ai: true,
+      stoppable: true,
     });
   }
   for (const t of tasks.activeList) {
@@ -63,6 +66,7 @@ const rows = computed<Row[]>(() => {
       detail: t.detail,
       view: "file_center",
       report: t.id === "clusterLlm" ? tasks.reportPath.clusterLlm : undefined,
+      stoppable: true,
     });
   }
   if (kb.compiling) {
@@ -118,6 +122,11 @@ function goto(r: Row) {
   if (r.convId) app.openConversationById(r.convId);
   else app.setView(r.view);
 }
+// 停止/关闭某任务:文件任务走协作式取消(盘点/索引真停,索引可再点继续);AI 对话走 chat.cancel。
+function stop(r: Row) {
+  if (r.key.startsWith("ft:")) tasks.cancel(r.key.slice(3) as Parameters<typeof tasks.cancel>[0]);
+  else if (r.key.startsWith("chat:") && r.convId) chat.cancel(r.convId);
+}
 function openReport(path?: string) {
   if (path) artifactsApi.openExternal(path).catch(() => {});
 }
@@ -146,6 +155,14 @@ function openReport(path?: string) {
             @click.stop="openReport(r.report)"
           >
             <FileText :size="13" :stroke-width="1.9" />
+          </button>
+          <button
+            v-if="r.stoppable"
+            class="tc-stop"
+            :title="r.ai ? '停止生成' : '停止任务(盘点/索引可再点继续)'"
+            @click.stop="stop(r)"
+          >
+            <X :size="13" :stroke-width="2.2" />
           </button>
         </div>
       </div>
@@ -299,6 +316,23 @@ function openReport(path?: string) {
 .tc-report:hover {
   color: var(--primary, #d4b06a);
   border-color: var(--primary, #d4b06a);
+}
+/* 停止/关闭任务:平时低调,hover 转危险红,明确「这会停掉它」 */
+.tc-stop {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--glass-edge);
+  border-radius: 8px;
+  padding: 5px;
+  color: var(--muted, #999);
+  cursor: pointer;
+  display: inline-flex;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.tc-stop:hover {
+  color: #e5484d;
+  border-color: #e5484d;
+  background: rgba(229, 72, 77, 0.1);
 }
 .tc-mini {
   display: flex;

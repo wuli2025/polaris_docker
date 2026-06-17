@@ -404,6 +404,71 @@ static SHOULD_RUN: AtomicBool = AtomicBool::new(false);
 fn bridge_dir() -> Option<PathBuf> {
     UserDirs::new().map(|u| u.home_dir().join("Polaris").join("feishu-bridge"))
 }
+
+/// 桥进程 PID 落盘:用于「上次崩溃/被强杀(退出钩子没跑成)→ 这次启动回收孤儿」。
+/// node 桥用 `WSClient({autoReconnect:true})`,父进程死了它也不会自己退,会变孤儿空转烧 CPU。
+fn pidfile() -> Option<PathBuf> {
+    bridge_dir().map(|d| d.join("bridge.pid"))
+}
+fn write_pidfile(pid: u32) {
+    if let Some(p) = pidfile() {
+        if let Some(dir) = p.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(p, pid.to_string());
+    }
+}
+fn clear_pidfile() {
+    if let Some(p) = pidfile() {
+        let _ = fs::remove_file(p);
+    }
+}
+/// 启动时回收上次遗留的桥孤儿:只在「该 PID 确实仍是 node 进程」时才杀,防 PID 复用误伤无辜进程。
+fn reap_stale_bridge() {
+    let Some(p) = pidfile() else { return };
+    if let Ok(s) = fs::read_to_string(&p) {
+        if let Ok(pid) = s.trim().parse::<u32>() {
+            #[cfg(target_os = "windows")]
+            {
+                // 双过滤:PID 命中且镜像名是 node.exe 才杀(连子树),否则空操作。
+                let mut c = Command::new("taskkill");
+                c.args([
+                    "/FI",
+                    &format!("PID eq {pid}"),
+                    "/FI",
+                    "IMAGENAME eq node.exe",
+                    "/T",
+                    "/F",
+                ]);
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(0x0800_0000);
+                let _ = c.output();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if let Ok(out) =
+                    Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output()
+                {
+                    if String::from_utf8_lossy(&out.stdout).contains("node") {
+                        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(&p);
+}
+
+/// App 退出(关窗/主动退出)时调用:停守护 + 杀桥进程树 + 清 pidfile,
+/// 防 node 桥变孤儿继续 autoReconnect 空转烧 CPU。由 lib.rs 的 RunEvent 钩子调用。
+pub fn shutdown_on_exit() {
+    SHOULD_RUN.store(false, Ordering::Relaxed);
+    let pid = GATEWAY.lock().pid.take();
+    if let Some(pid) = pid {
+        kill_pid(pid);
+    }
+    clear_pidfile();
+}
 fn emit_log(app: &AppHandle, text: impl Into<String>) {
     let _ = app.emit("feishu://log", text.into());
 }
@@ -564,6 +629,7 @@ pub fn feishu_gateway_stop(app: AppHandle) -> Result<(), String> {
     g.stdin = None;
     g.running = false;
     drop(g);
+    clear_pidfile();
     emit_status(&app, "stopped");
     emit_log(&app, "网关已停止。");
     Ok(())
@@ -709,6 +775,7 @@ fn run_bridge_once(app: &AppHandle, dir: &std::path::Path, cfg: &FeishuConfig, b
         g.stdin = child.stdin.take();
         g.running = true;
     }
+    write_pidfile(pid); // 记录到磁盘,崩溃后下次启动据此回收孤儿
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
         let line = line.trim();
@@ -740,6 +807,7 @@ pub fn feishu_gateway_start(app: AppHandle) -> Result<(), String> {
         return Err("请先填写并保存 App ID 与 App Secret".into());
     }
     emit_status(&app, "starting");
+    reap_stale_bridge(); // 先回收上次崩溃遗留的桥孤儿,再起新桥(此处 SHOULD_RUN 仍 false,不会误杀本进程在飞的桥)
     let dir = ensure_bridge(&app)?;
     // 机器人 open_id（「不回复自己」闸门），best-effort
     let bot_open_id = fetch_tenant_token(&cfg)

@@ -2546,12 +2546,18 @@ pub struct KbNode {
     pub category: String,
     /// 节点类型: "doc" 文档 | "folder" 目录中枢 | "root" 知识库根
     pub kind: String,
+    /// 文件中心星图:簇的「一句话画像」(AI 命名时给的温暖概括),选中卡片展示。其余场景为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct KbEdge {
     pub source: String,
     pub target: String,
+    /// 文件中心星图:簇间**语义关系**标签(如「方法论 / 进阶 / 同源」)。普通层级/双链边为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rel: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2632,6 +2638,7 @@ pub fn kb_graph() -> KbGraph {
             title: d.title.clone(),
             category: d.category.clone(),
             kind: if is_memory { "feedback".into() } else { "doc".into() },
+            summary: None,
         });
     }
 
@@ -2675,6 +2682,7 @@ pub fn kb_graph() -> KbGraph {
             title,
             category: String::new(),
             kind: "folder".into(),
+            summary: None,
         });
     }
     // ④ 知识库根节点 (有内容时)
@@ -2684,6 +2692,7 @@ pub fn kb_graph() -> KbGraph {
             title: "知识库".into(),
             category: String::new(),
             kind: "root".into(),
+            summary: None,
         });
     }
 
@@ -2727,7 +2736,7 @@ pub fn kb_graph() -> KbGraph {
 
     let edges = edge_set
         .into_iter()
-        .map(|(source, target)| KbEdge { source, target })
+        .map(|(source, target)| KbEdge { source, target, rel: None })
         .collect();
 
     KbGraph { nodes, edges }

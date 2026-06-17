@@ -335,6 +335,7 @@ pub fn run() {
             fable::files::file_thumb,
             fable::files::file_gist,
             fable::files::file_cluster_build,
+            fable::files::file_smart_cluster,
             fable::files::file_profile_html,
             fable::files::file_suggest_workflows,
             fable::files::file_graph,
@@ -359,6 +360,7 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 chat::kill_all_children();
+                feishu::shutdown_on_exit(); // 回收飞书 node 桥,防其 autoReconnect 空转成孤儿烧 CPU
             }
         });
 }

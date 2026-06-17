@@ -139,8 +139,18 @@ export const useAppStore = defineStore("app", () => {
   const currentConvId = ref<string | null>(null);
   const currentProjectId = ref<string | null>(null);
 
+  // 「召唤专家」跨视图通道:「召唤其它专家」跳到「专家团」页,在那里点某张卡的「召唤」时,
+  // 经此把 (kind,id) 投递给对话区(ChatPanel 挂载时消费)去真正入驻 + 记入最近召唤。
+  // 带 nonce:连续召唤同一个也能触发消费。
+  const pendingSummon = ref<{ kind: "expert" | "team"; id: string; nonce: number } | null>(null);
+
   function setView(v: ViewKey) {
     view.value = v;
+  }
+  // 在「专家团」页点「召唤」→ 投递召唤意图并切回对话区,由 ChatPanel 落地。
+  function requestSummon(kind: "expert" | "team", id: string) {
+    pendingSummon.value = { kind, id, nonce: (pendingSummon.value?.nonce ?? 0) + 1 };
+    view.value = "chat";
   }
   function toggleSidebar() {
     sidebarCollapsed.value = !sidebarCollapsed.value;
@@ -345,6 +355,8 @@ export const useAppStore = defineStore("app", () => {
     theme,
     setTheme,
     setView,
+    pendingSummon,
+    requestSummon,
     toggleSidebar,
     toggleDrawer,
     unreadConvs,

@@ -26,7 +26,7 @@ import {
 import { useAutomationStore, type AutomationFlow } from "../stores/automation";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
-import { invoke, listen, isTauri } from "../tauri";
+import { invoke, listen } from "../tauri";
 
 const auto = useAutomationStore();
 const app = useAppStore();
@@ -52,7 +52,6 @@ function toggleDream() {
   localStorage.setItem("polaris.dreamCollapsed", dreamCollapsed.value ? "1" : "0");
 }
 async function loadEcho() {
-  if (!isTauri) return;
   try {
     echo.value = await invoke<EchoStatus>("echo_status");
   } catch (e) {
@@ -88,11 +87,12 @@ onMounted(() => {
   if (!app.projects.length) app.refreshProjects();
   auto.startScheduler();
   loadEcho();
-  if (isTauri) {
-    listen("echo:dream", (p: any) => {
-      if (p?.payload?.kind === "done" || p?.payload?.kind === "error") loadEcho();
-    });
-  }
+  // 桌面 / Docker 两条路径都直接回传 payload 本体(见 tauri.ts),读 p.kind;
+  // 旧代码读 p.payload.kind 多包一层取不到,且 isTauri 闸把 Docker 一并误杀。
+  listen("echo:dream", (p: any) => {
+    const k = p?.kind ?? p?.payload?.kind;
+    if (k === "done" || k === "error") loadEcho();
+  });
 });
 
 const ICONS: Record<string, any> = {

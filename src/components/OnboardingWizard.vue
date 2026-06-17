@@ -542,6 +542,7 @@ onBeforeUnmount(() => {
             <li><Radar :size="15" :stroke-width="1.7" /> 建索引 + 进对话:让 AI 懂你想干的事</li>
           </ol>
           <button class="wiz-go" @click="begin"><Sparkles :size="16" :stroke-width="1.8" /> 开始</button>
+          <button class="wiz-skip" @click="close">跳过,稍后我自己来</button>
         </div>
 
         <!-- 0.5 · 选画像:个人(B 聚类)/ 企业(D Schema) -->
@@ -883,6 +884,14 @@ onBeforeUnmount(() => {
 .wiz-go.ghost { background: transparent; color: var(--text); border-color: var(--border-strong); }
 .wiz-go.bg { height: 32px; font-size: 12.5px; margin-top: 6px; color: var(--text-2); }
 .wiz-go.bg:hover { color: var(--text); }
+/* intro「跳过」:克制的文字按钮,不与主 CTA 抢视觉 */
+.wiz-skip {
+  display: block; margin: 12px auto 0;
+  border: none; background: transparent;
+  color: var(--muted); font-size: 12.5px; cursor: pointer;
+  transition: color 0.16s;
+}
+.wiz-skip:hover { color: var(--text-2); text-decoration: underline; }
 .mini {
   display: inline-flex; align-items: center; gap: 5px;
   height: 28px; padding: 0 11px;

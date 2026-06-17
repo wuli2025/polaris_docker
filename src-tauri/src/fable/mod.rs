@@ -29,6 +29,7 @@ pub mod index;
 pub mod inventory;
 pub mod ontology;
 pub mod retrieve;
+pub mod sched;
 
 use directories::UserDirs;
 use rusqlite::Connection;

@@ -600,16 +600,6 @@ function sendTableCmd() {
           </button>
           <span v-if="rootsLoaded && !scanRoots.length" class="muted">未发现可扫描的盘/目录</span>
         </div>
-        <div class="rg-scanrow">
-          <button class="rg-primary" :disabled="resScanning" @click="doResourceScan">
-            <LoaderCircle v-if="resScanning" :size="15" :stroke-width="1.8" class="spin" />
-            <span>{{ resScanning ? "扫描中…" : "开始扫描" }}</span>
-          </button>
-          <span v-if="scanMeta" class="rg-meta">
-            命中 <b>{{ scanMeta.hit }}</b> · 跳过系统/缓存 {{ scanMeta.skipped }}
-            <template v-if="scanMeta.truncated"> · 已达上限截断</template>
-          </span>
-        </div>
       </div>
 
       <!-- 多维表格 -->
@@ -665,7 +655,7 @@ function sendTableCmd() {
         没扫到可归档的资源(命中 0)。换个扫描范围试试。
       </div>
       <div v-else-if="!resScanning" class="rg-empty muted">
-        勾选上方范围,点「开始扫描」—— 扫到的有用文件会铺成一张多维表格。
+        到「文件中心」点「盘点」扫描你的盘 —— 扫到的有用文件会归入核心层,在这里连成知识网。
       </div>
 
       <!-- 表格对话框 -->

@@ -173,9 +173,12 @@ fn count_memories() -> usize {
 
 // ───────────────────────── 晨报建议(每日工程化建议)─────────────────────────
 //
-// 「让 AI 更懂你」最锋利的一刀:做梦沉淀完, 据**你近期新加入的内容**(新对话 + 新资料)
-// 产出 ≤N 条具体、可落地的工程化建议, 落进 memory/briefing/<date>.json。对话框顶部呈现,
-// 点「让我去做」= 把 action 当 prompt 发起一轮对话。建议长在你昨天的内容上, 不是通用模板。
+// 「让 AI 更懂你」最锋利的一刀。内容产生原理(三步,见 kb_portrait + suggest_directive):
+//   ① **观察整座知识库** → 全库画像(四层家底 / 语言·类型分布 / AI 命名的主题簇);
+//   ② 据画像在心里勾出**用户画像**(主人是谁 / 在做什么 / 关注与擅长什么);
+//   ③ 落到近期新内容 + 搁置老项目, 产出 ≤N 条既贴画像、又指到具体素材的可落地建议。
+// 结果落进 memory/briefing/<date>.json, 对话框顶部呈现, 点「让我去做」= 把 action 当 prompt
+// 发起一轮对话。关键升级:不再只盯昨天的零碎 —— 只要库里有东西, 建议就长在「主人是谁」之上。
 
 /// 一条晨报建议(写盘 + 给前端)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +186,13 @@ pub struct Suggestion {
     pub id: String,
     /// 一句话建议
     pub title: String,
+    /// 类别:progress(新进展)/ wrapup(收尾搁置)/ workflow(可复用工作流)/ organize(整理资料)
+    /// —— 前端据此选图标与配色。空则按默认展示。
+    #[serde(default)]
+    pub kind: String,
+    /// 依据来源的简短标签(某段对话标题 / 某份文件名 / 某个老项目名,≤16 字)——「懂你」的落点。
+    #[serde(default)]
+    pub source: String,
     /// 基于哪条新内容(引文/文件名)
     #[serde(default)]
     pub why: String,
@@ -201,6 +211,10 @@ pub struct Suggestion {
 #[derive(Debug, Deserialize)]
 struct SuggestionIn {
     title: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    source: String,
     #[serde(default)]
     why: String,
     #[serde(default)]
@@ -324,14 +338,10 @@ pub fn echo_briefing_run(app: AppHandle) -> Result<(), String> {
         return Err("正在做梦/生成中,请稍候".into());
     }
     std::thread::spawn(move || {
-        const DAY: i64 = 24 * 3600 * 1000;
-        // 与每日做梦同口径:近一周新内容 + 几个月前疑似搁置的老项目。
-        let week_ago = now_ms() - 7 * DAY;
-        let transcripts = crate::conv::transcripts_since(week_ago, 8, 6_000);
-        let files = recent_additions(week_ago, 40);
-        let stale = crate::conv::stale_unfinished_transcripts(now_ms(), 3, 4_000);
+        // 与每日做梦同口径:近一周新内容,近期没东西就逐级往前回溯;并入搁置老项目。
+        let (transcripts, files, stale, window) = gather_briefing_material(now_ms());
         let result = match generate_briefing(&app, &transcripts, &files, &stale) {
-            Ok(n) => Ok((n, format!("生成 {n} 条建议"))),
+            Ok(n) => Ok((n, format!("生成 {n} 条建议(取材{window})"))),
             Err(e) => Err(e),
         };
         finish_job(&app, result, false);
@@ -442,16 +452,17 @@ fn dream(app: &AppHandle, manual: bool) -> Result<(usize, String), String> {
         if cfg.last_dream_ms > 0 { cfg.last_dream_ms } else { now_ms() - DAY }
     };
     let day_transcripts = crate::conv::transcripts_since(since, 8, 12_000);
-    // ② 晨报取材更宽:近一周新内容 + 几个月前疑似搁置的老项目。
-    let week_ago = now_ms() - 7 * DAY;
-    let recent_transcripts = crate::conv::transcripts_since(week_ago, 8, 6_000);
-    let new_files = recent_additions(week_ago, 40);
-    let stale = crate::conv::stale_unfinished_transcripts(now_ms(), 3, 4_000);
+    // ② 晨报取材:近一周新内容为主;**近期没东西就逐级往前回溯**(月→季→年→不限),
+    //    宁可拿旧素材给建议也别因为「昨天没动静」就空着。stale 老项目始终并入。
+    let (recent_transcripts, new_files, stale, window) = gather_briefing_material(now_ms());
 
+    // 即便昨天没有任何新动静,只要整座库非空就仍据「全库画像」生成晨报 —— 让对话框
+    // 顶部的建议板块始终长在「主人是谁」之上,而不是动不动就空着。
     if day_transcripts.is_empty()
         && recent_transcripts.is_empty()
         && new_files.is_empty()
         && stale.is_empty()
+        && kb_portrait().is_empty()
     {
         return Ok((
             0,
@@ -465,12 +476,21 @@ fn dream(app: &AppHandle, manual: bool) -> Result<(usize, String), String> {
         distill_and_write(app, &day_transcripts)?.0
     };
     // 据「近一周新内容 + 旧项目回顾」生成工程化晨报建议(失败不影响沉淀结果)。
-    let n_sug = generate_briefing(app, &recent_transcripts, &new_files, &stale).unwrap_or(0);
+    // 失败别再静默吞 0:打日志 + 发一条 phase 事件留痕,免得「晨报 0 条」成黑箱
+    // (排障时无从分辨「模型真没建议」还是「这步报错了」)。
+    let n_sug = match generate_briefing(app, &recent_transcripts, &new_files, &stale) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[echo] 生成晨报失败(沉淀不受影响): {e}");
+            emit_dream(app, "phase", Some(format!("晨报生成失败: {e}")), None);
+            0
+        }
+    };
     let summary = if written == 0 && n_sug == 0 {
         "今日没有值得沉淀的记忆, 也没有可提的工程化建议".to_string()
     } else {
         format!(
-            "沉淀 {written} 条记忆 · 晨报 {n_sug} 条建议(近一周 {} 段对话 / {} 份新资料 + {} 个旧项目回顾)",
+            "沉淀 {written} 条记忆 · 晨报 {n_sug} 条建议({window} {} 段对话 / {} 份新资料 + {} 个旧项目回顾)",
             recent_transcripts.len(),
             new_files.len(),
             stale.len()
@@ -701,6 +721,96 @@ tags: [<标签>]
 
 // ───────────────────────── 晨报生成 ─────────────────────────
 
+/// 知识库画像(全库观察)—— 晨报的「用户画像」事实底座。
+///
+/// 这是「内容产生原理」升级的核心:旧版只盯着**昨天新增的零碎**(新对话/新文件),
+/// 像个只会复述近况的人;真正「懂你」的助理得先**通观你整座库是关于什么的** ——
+/// 你沉淀了哪些权威知识、攒了哪些资料、库里以什么语言/类型为主、被智能归类出哪些主题,
+/// 据此在脑子里勾勒「主人是谁、在做什么、关注与擅长什么」,再据这画像给建议。
+///
+/// 取材全部只读且有界(各维度取 Top-N):
+/// - 四车道家底(权威 wiki / 原始资料 / 成品 / 记忆)—— 来自内存索引,O(n) 极快;
+/// - 盘点文件库的语言分布 / 类型分布 / AI 命名的主题簇 —— 来自文件库 SQL 总览。
+/// 库整体为空(全新用户)时返回空串,不硬凑画像。
+fn kb_portrait() -> String {
+    let ov = crate::kb::kb_overview();
+    let files = crate::fable::files::overview(None).ok();
+    let total_files = files.as_ref().map(|f| f.total_files).unwrap_or(0);
+    // 整座库空空如也(四车道无文档、盘点无文件)→ 不画像,留给新用户向导去引导。
+    if ov.total_docs == 0 && total_files == 0 {
+        return String::new();
+    }
+
+    let mut s = String::new();
+    s.push_str(
+        "## 知识库画像(全库观察 —— 先据此勾勒「主人是谁 / 在做什么 / 关注与擅长什么」)\n",
+    );
+    s.push_str(&format!(
+        "- 四层家底:权威 wiki {} 篇 · 原始资料 {} 篇 · 成品 {} 篇 · 记忆 {} 条(共索引 {} 篇文档)\n",
+        ov.wiki, ov.raw_md, ov.output, ov.memory, ov.total_docs
+    ));
+    if let Some(f) = files.as_ref() {
+        s.push_str(&format!("- 盘点文件总量:{} 个\n", f.total_files));
+        let langs: Vec<String> =
+            f.by_lang.iter().take(8).map(|l| format!("{}({})", l.lang, l.count)).collect();
+        if !langs.is_empty() {
+            s.push_str(&format!("- 语言分布(看 ta 在用什么):{}\n", langs.join(" · ")));
+        }
+        let kinds: Vec<String> =
+            f.by_kind.iter().take(6).map(|k| format!("{}({})", k.kind, k.count)).collect();
+        if !kinds.is_empty() {
+            s.push_str(&format!("- 类型分布:{}\n", kinds.join(" · ")));
+        }
+        // 主题簇(AI 给整座库命的名)——「关注/擅长什么」最直接的证据。优先顶层主题。
+        let mut topics: Vec<String> = f
+            .clusters
+            .iter()
+            .filter(|c| c.parent == 0 && !c.label.trim().is_empty())
+            .take(12)
+            .map(|c| format!("{}({})", c.label.trim(), c.size))
+            .collect();
+        if topics.is_empty() {
+            topics = f
+                .clusters
+                .iter()
+                .filter(|c| !c.label.trim().is_empty())
+                .take(12)
+                .map(|c| format!("{}({})", c.label.trim(), c.size))
+                .collect();
+        }
+        if !topics.is_empty() {
+            s.push_str(&format!("- 主要主题(整库智能归类):{}\n", topics.join(" · ")));
+        }
+    }
+    s.push('\n');
+    s
+}
+
+/// 晨报取材:默认看近一周的新对话 + 新资料;**近期捞不到就逐级往前回溯**
+/// (一个月 → 三个月 → 一年 → 不限历史),命中第一个有素材的窗口即止 ——
+/// 宁可拿旧素材给建议,也别因为「昨天没动静」就给主人一片空白。
+/// `stale`(几个月前疑似搁置的老项目)始终单独并入,与窗口无关。
+/// 返回 (近期新对话, 近期新资料, 搁置老项目, 取材窗口中文描述)。
+fn gather_briefing_material(
+    now: i64,
+) -> (Vec<(String, String)>, Vec<(String, String)>, Vec<(String, String)>, String) {
+    const DAY: i64 = 24 * 3600 * 1000;
+    let stale = crate::conv::stale_unfinished_transcripts(now, 3, 4_000);
+    // (回溯天数, 中文描述);0 天 = 不限,取全部历史。
+    for (days, label) in
+        [(7i64, "近一周"), (30, "近一个月"), (90, "近三个月"), (365, "近一年"), (0, "全部历史")]
+    {
+        let since = if days == 0 { 0 } else { now - days * DAY };
+        let transcripts = crate::conv::transcripts_since(since, 8, 6_000);
+        let files = recent_additions(since, 40);
+        if !transcripts.is_empty() || !files.is_empty() {
+            return (transcripts, files, stale, label.to_string());
+        }
+    }
+    // 全程都没有新对话/新资料:只剩 stale(可能也空)。
+    (Vec::new(), Vec::new(), stale, "无新内容".to_string())
+}
+
 /// 据「近一周新内容 + 几个月前疑似搁置的老项目」生成晨报建议(≤4 条), 写 memory/briefing/<today>.json。
 /// AI 出建议(只读 claude 输出 JSON 数组), Rust 补 id/落盘。无素材或无值得提的 → 写空、返回 0。
 fn generate_briefing(
@@ -709,17 +819,22 @@ fn generate_briefing(
     new_files: &[(String, String)],
     stale: &[(String, String)],
 ) -> Result<usize, String> {
-    if transcripts.is_empty() && new_files.is_empty() && stale.is_empty() {
+    // 全库画像作为「用户画像」的事实底座:只要库里有东西,哪怕昨天没新动静也能给建议。
+    let portrait = kb_portrait();
+    if transcripts.is_empty() && new_files.is_empty() && stale.is_empty() && portrait.is_empty() {
         return Ok(0);
     }
     let kb_root = PathBuf::from(crate::kb::kb_root());
     if kb_root.as_os_str().is_empty() || !kb_root.exists() {
         return Ok(0);
     }
-    emit_dream(app, "phase", Some("据新内容与旧项目生成工程化建议…".into()), None);
+    emit_dream(app, "phase", Some("观察全库画像 → 据用户画像生成工程化建议…".into()), None);
 
-    // 素材:新资料清单 + 近期新对话节选 + 几个月前疑似搁置的老项目(各自截断, 控成本)。
+    // 素材顺序刻意:**先全库画像(立人设)**,再近期新内容/老项目(给落点)。
     let mut material = String::new();
+    if !portrait.is_empty() {
+        material.push_str(&portrait);
+    }
     if !new_files.is_empty() {
         material.push_str("## 近期新加入的资料\n");
         for (name, rel) in new_files {
@@ -763,6 +878,13 @@ fn generate_briefing(
         .map(|(i, s)| Suggestion {
             id: format!("{day}-{i}"),
             title: s.title.trim().to_string(),
+            // 只接受白名单类别,异常值归一到 progress,免得前端拿到脏值。
+            kind: match s.kind.trim() {
+                "wrapup" | "workflow" | "organize" | "progress" => s.kind.trim().to_string(),
+                _ => "progress".to_string(),
+            },
+            // 依据标签控长,过长截断(按字符,兼容 CJK)。
+            source: s.source.trim().chars().take(20).collect::<String>(),
             why: s.why.trim().to_string(),
             how: s.how.trim().to_string(),
             action: s.action.trim().to_string(),
@@ -775,28 +897,40 @@ fn generate_briefing(
     Ok(items.len())
 }
 
-/// 晨报提示词:核心是「反泛泛」—— 每条都要指到具体素材、能立刻执行, 否则宁可输出空数组。
-/// 取材两类:① 近期新内容(新对话 + 新资料);② 几个月前疑似搁置、没收尾的老项目。
+/// 晨报提示词。内容产生原理(本次升级的核心):
+/// **先观察整座知识库 → 在心里勾出「用户画像」→ 再据画像给建议**,而不是只复述昨天的零碎。
+/// 仍守「反泛泛」铁律:每条都要指到具体素材、能立刻执行,否则宁可输出空数组。
 fn suggest_directive(day: &str, material: &str) -> String {
     format!(
-        r#"你是 Polaris 的工程顾问。下面是主人到 {day} 为止的两类素材:
-**① 近期新加入的内容**(近一周的新对话 + 新资料);
-**② 几个月前曾大量讨论、之后冷掉、看着没收尾的老项目**(标注了「疑未收尾」)。
-请基于这些素材,提出不超过 4 条**具体、可落地**的工程化/智能化建议 —— 像一个懂他的助理在盘点「接下来该干什么 / 哪些半截的事值得收个尾」。
+        r#"你是 Polaris 的私人工程顾问,长期观察主人这座知识库。今天是 {day}。
+下面给你三类材料:
+**① 知识库画像**(整座库的全局观察:四层家底、语言/类型分布、被智能归类出的主题);
+**② 近期新加入的内容**(近一周的新对话 + 新资料);
+**③ 几个月前曾大量讨论、之后冷掉、看着没收尾的老项目**(标注「疑未收尾」)。
+
+## 怎么想(内容产生原理,务必照此推理)
+1. **先读①画像,在心里给主人画像**:这个人是谁?在做什么?主要关注/擅长哪些方向?
+   ——从主题簇、语言分布、家底结构里读出来(例:Rust+大量「检索/盘点」主题 ⇒ 在做本地知识引擎;
+   大量中文资料+「自媒体/视频」主题 ⇒ 在做内容创作)。**画像只在心里建,不要输出。**
+2. **再落到②③的具体素材**:据这份画像,判断「以 ta 的方向,接下来最该推进 / 最该收尾的是什么」。
+3. 产出不超过 4 条建议,**每条都既贴合画像、又指到具体素材** —— 像一个真懂 ta 的助理在盘点下一步。
 
 ## 硬要求
-- **每条都要指到具体素材**:能指到某段对话、某份资料或某个老项目;指不到的通用建议一律不要。
-- 兼顾两类:既可针对新内容提进展,也可挑 ①~② 里某个**搁置的老项目**建议「要不要收尾 / 重启」——但同样要具体到那个项目本身,别泛泛说「整理旧项目」。
-- **拒绝泛泛而谈**:不要「多记录」「保持学习」「关注趋势」这类空话;要给出能立刻执行的下一步。
-- 每条给出:做什么(title)、依据哪条素材(why)、具体怎么做/需要什么(how)、一句可直接发给我执行的指令(action)。
+- **每条都要指到具体素材**:某段对话、某份资料、某个主题簇或某个老项目;指不到的通用建议一律不要。
+- 既可就②新内容提进展,也可挑某个**搁置的老项目**建议「收尾 / 重启」,还可据①画像里**某个大主题**建议把它系统化(沉淀成 wiki / 固化成工作流);但都要具体到那个主题/项目本身,别泛泛说「整理旧项目」。
+- **拒绝泛泛而谈**:不要「多记录」「保持学习」「关注趋势」这类空话;要能立刻执行的下一步。
+- 每条给出:类别(kind)、依据来源标签(source)、做什么(title)、依据哪条素材(why)、具体怎么做/需要什么(how)、一句可直接发给我执行的指令(action)。
+- **kind** 从这四选一:`progress`(就近期新内容推进展)、`wrapup`(给搁置老项目收尾/重启)、`workflow`(把反复做的事固化成可复用流程)、`organize`(整理/归类某批资料或某个大主题)。
+- **source** 是「懂你」的落点:用 ≤16 字点名**真实出现过的那条素材**——某主题簇名、某段对话标题、某份文件名、或某个老项目名(如「红楼视频」「EDGAR 语料」「飞书采集」)。务必真实,不要编。
+- **why** 里点明这条建议是怎么从画像 + 素材推出来的(例:「库里 Rust 与『检索』主题最重,而 X 对话刚提到 Y → 建议…」)。
 - 没有值得提的就输出 `[]`。
 
 ## 输出格式(严格:只输出一个 JSON 数组,不要其它文字)
 [
-  {{"title":"一句话建议","why":"基于哪条素材(可引文件名/项目名/原话)","how":"具体步骤与所需材料","action":"可直接作为对话发起的一句话指令"}}
+  {{"kind":"progress|wrapup|workflow|organize","source":"≤16字·点名真实素材","title":"一句话建议","why":"由画像+哪条素材推出(可引主题名/文件名/原话)","how":"具体步骤与所需材料","action":"可直接作为对话发起的一句话指令"}}
 ]
 
-## 素材
+## 材料
 {material}
 "#
     )

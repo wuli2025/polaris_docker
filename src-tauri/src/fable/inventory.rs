@@ -11,8 +11,35 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use super::sched::WorkQueue;
+
+/// 单个目录从被取出到扫完(read_dir + 逐项 stat)的「死线」:超过此值看门狗判定该 worker
+/// 卡死(NAS 挂载掉线 / 网络盘僵死 / 权限挂起),记账释放、把目录列入「已跳过」,盘点照常完成。
+/// 取值要远大于任何正常目录(本地盘 read_dir 毫秒级,慢 NAS 大目录秒级),只兜真·僵死。
+/// 可经 `POLARIS_SCAN_DIR_DEADLINE_SECS` 调(NAS 极慢时调大,本地想更快兜底调小)。
+fn dir_deadline() -> Duration {
+    let secs = std::env::var("POLARIS_SCAN_DIR_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s >= 5)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// 读目录瞬断(权限抖动 / NAS 短暂不可达)时,把该目录降级到队尾重试的最大次数;超次即列为
+/// 「已跳过」。重试是「调到最后再试」,不原地阻塞别人 —— 见 [`WorkQueue::demote`]。
+const MAX_DIR_ATTEMPTS: u32 = 2;
+
+/// 每个 worker 的心跳:它正卡在哪个目录(`None`=空闲)、从何时起、是否已被看门狗判定卡死。
+struct Beat {
+    dir: Option<PathBuf>,
+    since: Instant,
+    abandoned: bool,
+}
 
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
@@ -208,17 +235,58 @@ const SCAN_EXTRA_SKIP: &[&str] = &[
     "$recycle.bin", "system volume information", "recovery", "appdata", "$windows.~bs",
     "$windows.~ws", "intel", "amd", "nvidia", "site-packages", "anaconda3", "miniconda3",
     "library", "applications", "boot", "proc", "sys", "dev",
+    // macOS 根级系统目录(整盘扫 `/` 时才剪):/System 密封系统卷、/private(var/tmp/etc)、
+    // /cores 崩溃转储、/Network、/automount —— 全是系统态,扫进去既极慢又毫无用户文档。
+    "system", "private", "cores", "network", "automount",
 ];
 
-fn skip_dir_scan(name: &str) -> bool {
-    if skip_dir(name) {
-        return true;
-    }
-    if name.starts_with('$') {
-        return true;
-    }
+/// macOS「包/库目录」——以扩展名结尾、在 Finder 里显示成**单个文件**、内部却塞着成千上万份
+/// 资源的目录:应用 `.app`、框架 `.framework`、媒体库 `.photoslibrary`/`.fcpbundle`…。
+/// 用户从不想把它们的内部资源逐个归类进库;不跳的话(尤其 `~/Pictures` 下的 `.photoslibrary`
+/// 动辄**十万级**文件、`/Applications` 里每个 `.app` 又有几千文件)会让**每次盘点慢上数倍**、
+/// 还把文件库塞满机器味碎文件。整棵跳过 —— 任何平台同名目录(含拷到 NAS/Win 上的)都几乎
+/// 一定是 mac 包,跳了无害。这是 macOS 盘点慢的头号来源。
+fn is_macos_package_dir(name: &str) -> bool {
+    const PKG_EXT: &[&str] = &[
+        ".app", ".framework", ".bundle", ".appex", ".dsym", ".xcarchive", ".xcassets",
+        ".xcodeproj", ".photoslibrary", ".fcpbundle", ".imovielibrary", ".tvlibrary",
+        ".aplibrary", ".musiclibrary",
+    ];
+    let low = name.to_ascii_lowercase();
+    PKG_EXT.iter().any(|e| low.ends_with(e))
+}
+
+/// 「永远跳过」的目录:版本仓 / 依赖 / 回收站 / NAS 系统目录(`@`/`#`)/ `$` 系统目录 /
+/// macOS 包目录([`is_macos_package_dir`])。这些从来不是用户文档,任何根、任何深度都跳——
+/// 即便用户显式选了某文件夹也不会想要它们。
+fn skip_dir_always(name: &str) -> bool {
+    skip_dir(name) || name.starts_with('$') || is_macos_package_dir(name)
+}
+
+/// 「仅整盘扫描时叠加」的操作系统目录黑名单(windows / program files / appdata / library …)。
+/// 这些名字在系统盘根下是 OS 目录该跳;但在用户自己挑的文件夹里同名子目录(如一个叫
+/// `library` 的资料夹)却是真数据——所以只在扫整块系统盘(见 [`is_os_disk_root`])时才剪。
+fn skip_dir_os(name: &str) -> bool {
     let low = name.to_ascii_lowercase();
     SCAN_EXTRA_SKIP.iter().any(|s| *s == low)
+}
+
+/// 重剪 = 永远跳 + OS 目录。给文件夹选择器顶层与嵌套根去重([`covered_by`])用,保守。
+fn skip_dir_scan(name: &str) -> bool {
+    skip_dir_always(name) || skip_dir_os(name)
+}
+
+/// 这个根是不是「一整块系统盘」:Windows 盘符根(`C:\`)或 Unix 根(`/`)。
+/// 只有这种根扫描时才叠加 OS 目录黑名单;用户显式挑的某个文件夹、外置卷、NAS 挂载点都不是,
+/// 它们一律「文件夹里的全归类进库」(只剪永远跳的版本仓/回收站噪音)。
+pub(crate) fn is_os_disk_root(path: &str) -> bool {
+    let p = path.trim();
+    if p == "/" {
+        return true;
+    }
+    let t = p.trim_end_matches(['/', '\\']);
+    let b = t.as_bytes();
+    b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
 }
 
 /// 盘 `parent` 时是否真能扫到 `child`:child 在 parent 之内,且从 parent 到 child 的
@@ -260,6 +328,9 @@ pub struct ScanSummary {
     pub files: u64,
     pub bytes: u64,
     pub removed: u64,
+    /// 因不可达(挂载掉线 / 权限挂起 / 反复读失败)被看门狗判定卡死、降级后仍失败而**跳过**的目录数。
+    /// >0 表示这次盘点没冻死、但有部分目录没扫到(常因 NAS 掉线),如实上报供用户重扫。
+    pub skipped: u64,
     pub seconds: f64,
     pub workers: usize,
 }
@@ -267,11 +338,19 @@ pub struct ScanSummary {
 /// 同步全量扫描一个根(CLI 直接调;桌面/Docker 由 `fable_inventory_start` 包后台线程)。
 /// `progress(files, bytes)` 每 ~5000 个文件回调一次。
 /// `exclude` = 用户在「扫描」步骤里取消勾选的文件夹绝对路径集合,整棵跳过(空集=全盘点)。
+///
+/// 剪枝分两档(治「文件夹里的东西要全归类进库」):
+/// - **永远跳**(版本仓 / 依赖 / 回收站 / NAS / `$` 系统目录):任何根都跳。
+/// - **OS 目录黑名单**(windows/program files/library/boot…):仅当本根是「一整块系统盘」
+///   ([`is_os_disk_root`])时才叠加。用户显式挑的文件夹 / 外置卷 / NAS 挂载点 → 不叠加,
+///   里面的同名子目录(如自己的 `library` 资料夹)照常全部归类进文件库。
 pub fn scan_root(
     root: &str,
     exclude: &HashSet<String>,
     progress: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<ScanSummary, String> {
+    // 是否叠加 OS 目录黑名单:整盘扫描 = 重剪;显式文件夹/卷/挂载点 = 只剪永远跳的噪音。
+    let heavy_prune = is_os_disk_root(root);
     let root_path = PathBuf::from(root);
     if !root_path.is_dir() {
         return Err(format!("根目录不存在或不是目录: {root}"));
@@ -292,16 +371,33 @@ pub fn scan_root(
         .map_err(|e| e.to_string())?;
     drop(conn);
 
-    // walker 线程池:共享目录栈 + pending 计数(栈空且 pending=0 才算扫完)
+    // ── 工业级协作调度(永不冻结)──────────────────────────────────────────
+    // 旧实现用 `thread::scope` + 共享栈 + `sleep(2ms)` 忙等:一个目录卡在 read_dir(NAS 掉线/
+    // 权限挂起)就会让 scope 末尾的 join 永久阻塞 → 整个盘点冻死(「点盘点卡死」的头号根因)。
+    // 新实现:WorkQueue(Condvar 零忙等 + 在途记账 + 存活 worker 计数)+ 每目录心跳看门狗。
+    //   · worker 卡在某目录超 [`dir_deadline`] → 看门狗判定卡死、记账释放、列入「已跳过」;
+    //   · 完成判据 `in_flight==0 && (队空 || 存活 worker==0)` 数学上保证协调线程必然返回;
+    //   · 真·僵死的 worker 线程被 detach(不 join),其阻塞 syscall 随挂载恢复/进程退出回收。
     let (tx, rx) = mpsc::channel::<FileRow>();
-    let stack = Mutex::new(vec![root_path.clone()]);
-    let pending = AtomicUsize::new(1);
-    let n_files = AtomicU64::new(0);
-    let n_bytes = AtomicU64::new(0);
+    let n_files = Arc::new(AtomicU64::new(0));
+    let n_bytes = Arc::new(AtomicU64::new(0));
     let workers = worker_count();
+    let queue = Arc::new(WorkQueue::new(vec![root_path.clone()]));
+    queue.set_live_workers(workers);
+    let beats: Arc<Vec<Mutex<Beat>>> = Arc::new(
+        (0..workers)
+            .map(|_| Mutex::new(Beat { dir: None, since: Instant::now(), abandoned: false }))
+            .collect(),
+    );
+    let problematic: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let scan_done = Arc::new(AtomicBool::new(false));
+    let root_arc = Arc::new(root_path.clone());
+    let exclude_arc = Arc::new(exclude.clone());
 
-    // writer 线程:独占连接,批量事务
+    // writer 线程:独占连接,批量事务。**靠 scan_done 收尾**(不再依赖通道关闭)——
+    // 这样即便有卡死的 worker 还握着 tx 克隆,writer 也不会被永久挂在 recv 上(旧实现的二级冻结)。
     let writer = {
+        let scan_done = scan_done.clone();
         std::thread::spawn(move || -> Result<(), String> {
             let conn = open_db()?;
             let mut batch: Vec<FileRow> = Vec::with_capacity(2048);
@@ -337,10 +433,27 @@ pub fn scan_root(
                 conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
                 Ok(())
             };
-            while let Ok(row) = rx.recv() {
-                batch.push(row);
-                if batch.len() >= 2048 {
-                    flush(&conn, &mut batch)?;
+            loop {
+                match rx.recv_timeout(Duration::from_millis(150)) {
+                    Ok(row) => {
+                        batch.push(row);
+                        if batch.len() >= 2048 {
+                            flush(&conn, &mut batch)?;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if scan_done.load(Ordering::SeqCst) {
+                            // 收尾:把刚到的尾巴排空再退,绝不漏行。
+                            while let Ok(row) = rx.try_recv() {
+                                batch.push(row);
+                                if batch.len() >= 2048 {
+                                    flush(&conn, &mut batch)?;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
             flush(&conn, &mut batch)?;
@@ -348,26 +461,27 @@ pub fn scan_root(
         })
     };
 
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            let tx = tx.clone();
-            let (stack, pending, n_files, n_bytes) = (&stack, &pending, &n_files, &n_bytes);
-            let root_path = &root_path;
-            let exclude = &exclude;
-            s.spawn(move || {
-                loop {
-                    if cancelled() {
-                        break;
-                    }
-                    let dir = { stack.lock().unwrap().pop() };
-                    let Some(dir) = dir else {
-                        if pending.load(Ordering::SeqCst) == 0 {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        continue;
-                    };
-                    if let Ok(rd) = std::fs::read_dir(&dir) {
+    // walker 线程池:从 WorkQueue 取目录,扫到的子目录回压入队;每件活儿前后打心跳。
+    for i in 0..workers {
+        let tx = tx.clone();
+        let queue = queue.clone();
+        let beats = beats.clone();
+        let problematic = problematic.clone();
+        let n_files = n_files.clone();
+        let n_bytes = n_bytes.clone();
+        let exclude = exclude_arc.clone();
+        let root_path = root_arc.clone();
+        std::thread::spawn(move || {
+            while let Some(job) = queue.pop() {
+                let dir = job.item;
+                {
+                    let mut b = beats[i].lock().unwrap();
+                    b.dir = Some(dir.clone());
+                    b.since = Instant::now();
+                    b.abandoned = false;
+                }
+                match std::fs::read_dir(&dir) {
+                    Ok(rd) => {
                         for entry in rd.flatten() {
                             let Ok(ft) = entry.file_type() else { continue };
                             if ft.is_symlink() {
@@ -376,7 +490,9 @@ pub fn scan_root(
                             // 非 UTF-8 名(Linux/Docker 上的 GBK 中文名)解回中文,避免乱码 �。
                             let name = super::decode_fs(&entry.file_name());
                             if ft.is_dir() {
-                                if skip_dir_scan(&name) {
+                                // 永远跳的噪音任何根都剪;OS 目录黑名单只在整盘扫描时叠加,
+                                // 这样显式挑的文件夹里的东西「全归类进库」。
+                                if skip_dir_always(&name) || (heavy_prune && skip_dir_os(&name)) {
                                     continue;
                                 }
                                 let child = entry.path();
@@ -386,13 +502,12 @@ pub fn scan_root(
                                 {
                                     continue;
                                 }
-                                pending.fetch_add(1, Ordering::SeqCst);
-                                stack.lock().unwrap().push(child);
+                                queue.push(child);
                             } else if ft.is_file() {
                                 let Ok(meta) = entry.metadata() else { continue };
                                 let p = entry.path();
                                 let rel = p
-                                    .strip_prefix(&root_path)
+                                    .strip_prefix(root_path.as_path())
                                     .map(|r| super::decode_fs(r.as_os_str()).replace('\\', "/"))
                                     .unwrap_or_else(|_| name.clone());
                                 let ext = p
@@ -406,8 +521,8 @@ pub fn scan_root(
                                     .map(|d| d.as_secs() as i64)
                                     .unwrap_or(0);
                                 let size = on_disk_size(&p, &meta);
-                                let total = n_files.fetch_add(1, Ordering::Relaxed) + 1;
-                                let bytes = n_bytes.fetch_add(size, Ordering::Relaxed) + size;
+                                n_files.fetch_add(1, Ordering::Relaxed);
+                                n_bytes.fetch_add(size, Ordering::Relaxed);
                                 let kind = classify(&ext);
                                 let _ = tx.send(FileRow {
                                     relpath: rel,
@@ -418,21 +533,94 @@ pub fn scan_root(
                                     size,
                                     mtime,
                                 });
-                                if total % 5000 == 0 {
-                                    progress(total, bytes);
-                                }
                             }
                         }
                     }
-                    pending.fetch_sub(1, Ordering::SeqCst);
+                    Err(_) => {
+                        // 读目录失败(权限抖动 / NAS 瞬断):不丢弃也不原地卡住别人,而是降级到
+                        // 队尾「最后再试」;超过 [`MAX_DIR_ATTEMPTS`] 仍失败才列为「已跳过」。
+                        if job.attempts < MAX_DIR_ATTEMPTS {
+                            queue.demote(dir.clone(), job.attempts + 1);
+                        } else {
+                            problematic.lock().unwrap().push(dir.to_string_lossy().into_owned());
+                        }
+                    }
                 }
-            });
+                // 结算心跳:看门狗若已判定本 worker 卡死(已 abandon 记账)→ 本线程就此退场,
+                // 既不再 complete(避免重复减在途)也不 worker_exited(abandon 已减存活数)。
+                let was_abandoned = {
+                    let mut b = beats[i].lock().unwrap();
+                    b.dir = None;
+                    std::mem::replace(&mut b.abandoned, false)
+                };
+                if was_abandoned {
+                    return;
+                }
+                queue.complete();
+            }
+            queue.worker_exited();
+        });
+    }
+    drop(tx); // 协调线程不再持 tx;writer 靠 scan_done 收尾,不依赖通道关闭
+
+    // 看门狗:每 250ms 巡一遍心跳,谁卡在同一目录超死线就判定卡死、记账释放、列入已跳过。
+    {
+        let queue = queue.clone();
+        let beats = beats.clone();
+        let problematic = problematic.clone();
+        let scan_done = scan_done.clone();
+        let deadline = dir_deadline();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(250));
+            if scan_done.load(Ordering::SeqCst) || cancelled() {
+                break;
+            }
+            for slot in beats.iter() {
+                let stuck = {
+                    let mut b = slot.lock().unwrap();
+                    // 先从不可变借用算出路径串(借用就此结束),再置 abandoned —— 避免借用冲突。
+                    let hit = if !b.abandoned && b.since.elapsed() > deadline {
+                        b.dir.as_ref().map(|p| p.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    };
+                    if hit.is_some() {
+                        b.abandoned = true;
+                    }
+                    hit
+                };
+                if let Some(path) = stuck {
+                    problematic.lock().unwrap().push(path);
+                    // 释放在途 + 存活 worker -1:可能令 live_workers 归零 → 满足完成判据、解除冻结。
+                    queue.abandon();
+                }
+            }
+        });
+    }
+
+    // 协调线程(本线程):零忙等地等盘点了结,其间交错上报进度;取消则关闭队列。
+    let mut last = 0u64;
+    loop {
+        if cancelled() {
+            queue.cancel();
+            break;
         }
-    });
-    drop(tx); // 关闭通道 → writer 落完尾批退出
-    writer
-        .join()
-        .map_err(|_| "writer 线程 panic".to_string())??;
+        let f = n_files.load(Ordering::Relaxed);
+        if f != last {
+            progress(f, n_bytes.load(Ordering::Relaxed));
+            last = f;
+        }
+        if queue.wait_until_done_for(Duration::from_millis(200)) {
+            break;
+        }
+    }
+    scan_done.store(true, Ordering::SeqCst);
+
+    // 剩余未处理目录:正常为空;若挂载掉线令 worker 卡死而提前了结,这些就是没扫到的目录。
+    let skipped_dirs = queue.drain_remaining();
+    // 仅 join writer(它靠 scan_done 在 ≤150ms 内收尾,有界);worker/看门狗 detach:健康 worker
+    // 此刻在途已归零、即将自行退出,卡死的随其阻塞 syscall 自然回收 —— 绝不 join 卡死线程。
+    writer.join().map_err(|_| "writer 线程 panic".to_string())??;
 
     if cancelled() {
         return Err("已取消".into());
@@ -440,6 +628,14 @@ pub fn scan_root(
 
     let files = n_files.load(Ordering::Relaxed);
     let bytes = n_bytes.load(Ordering::Relaxed);
+    progress(files, bytes); // 收尾再报一次,确保进度条落到最终值
+    let skipped: u64 = {
+        let mut v = problematic.lock().unwrap();
+        for d in skipped_dirs {
+            v.push(d.to_string_lossy().into_owned());
+        }
+        v.len() as u64
+    };
 
     // 护栏:本轮扫到 0 文件 → 几乎一定是「根临时读不到」(NAS 挂载掉线 / 权限抖动 / 路径没挂上),
     // 而非用户真把整个根清空了。此时若照常跑 seen 代际删除,会把该根上一轮的全部记录连同
@@ -450,25 +646,61 @@ pub fn scan_root(
     let removed = if files == 0 {
         0
     } else {
-        conn.execute(
-            "DELETE FROM chunks WHERE file_id IN (SELECT id FROM files WHERE root_id=?1 AND seen<>?2)",
-            rusqlite::params![root_id, gen],
-        )
-        .map_err(|e| e.to_string())?;
-        // P1-2:消失文件同步清出 FTS 倒排(lex 未编入时跳过)。rowid=file_id。
-        if super::lex_available(&conn) {
-            conn.execute(
-                "DELETE FROM lex WHERE rowid IN (SELECT id FROM files WHERE root_id=?1 AND seen<>?2)",
-                rusqlite::params![root_id, gen],
-            )
-            .map_err(|e| e.to_string())?;
+        // 代际清理不能「本轮没扫到就删」:seen<>gen 只代表这一轮没遇见,而「没遇见」
+        // 大多是父目录临时读不到(NAS 掉线 / 外置盘没插 / 权限抖动 / 软链被跳过),
+        // 文件其实还在。照删就会出现「下次登陆,有些数据从知识库里没了」(连向量/倒排一起抹)。
+        // 故改为「逐个 stat 确认真消失」:文件仍在(含读不到、软链)→ 保留;父目录整个
+        // 掉线(子树不可达)→ 保留;仅当「父目录还在、文件确实不存在」才判定真删除。
+        let stale: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, relpath FROM files WHERE root_id=?1 AND seen<>?2")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![root_id, gen], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let root_base = PathBuf::from(&root_canon);
+        let gone: Vec<i64> = stale
+            .into_iter()
+            .filter(|(_, rel)| {
+                // relpath 用 '/',Path::join 在 Windows 上也认 '/',无需替换分隔符。
+                let abs = root_base.join(rel);
+                let parent_ok = abs.parent().map(|p| p.exists()).unwrap_or(false);
+                parent_ok && !abs.exists()
+            })
+            .map(|(id, _)| id)
+            .collect();
+
+        let mut n = 0u64;
+        if !gone.is_empty() {
+            let lex_on = super::lex_available(&conn);
+            // IN 列表分批,避开 SQLite 变量上限(默认 ~999/32766)。
+            for batch in gone.chunks(512) {
+                let ph = vec!["?"; batch.len()].join(",");
+                conn.execute(
+                    &format!("DELETE FROM chunks WHERE file_id IN ({ph})"),
+                    rusqlite::params_from_iter(batch.iter()),
+                )
+                .map_err(|e| e.to_string())?;
+                if lex_on {
+                    // P1-2:消失文件同步清出 FTS 倒排(lex 未编入时跳过)。rowid=file_id。
+                    conn.execute(
+                        &format!("DELETE FROM lex WHERE rowid IN ({ph})"),
+                        rusqlite::params_from_iter(batch.iter()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                n += conn
+                    .execute(
+                        &format!("DELETE FROM files WHERE id IN ({ph})"),
+                        rusqlite::params_from_iter(batch.iter()),
+                    )
+                    .map_err(|e| e.to_string())? as u64;
+            }
         }
-        let n = conn
-            .execute(
-                "DELETE FROM files WHERE root_id=?1 AND seen<>?2",
-                rusqlite::params![root_id, gen],
-            )
-            .map_err(|e| e.to_string())? as u64;
         conn.execute(
             "UPDATE roots SET scanned_at=?2, files=?3, bytes=?4 WHERE id=?1",
             rusqlite::params![root_id, gen, files as i64, bytes as i64],
@@ -482,6 +714,7 @@ pub fn scan_root(
         files,
         bytes,
         removed,
+        skipped,
         seconds: started.elapsed().as_secs_f64(),
         workers,
     })
@@ -639,7 +872,9 @@ pub fn fable_inventory_start(
         picked
     }
     .into_iter()
-    .filter(|r| std::path::Path::new(r).is_dir())
+    // 有界探测:挂载点掉线时 is_dir 会吊死「开始盘点」请求 → 3s 判不可达即剔除(scan_root
+    // 内部还有看门狗兜底,这里先把死根挡在请求路径外,点「盘点」立刻有反应)。
+    .filter(|r| super::sched::dir_reachable(std::path::Path::new(r), 3))
     .collect();
     roots.sort();
     roots.dedup();
@@ -677,6 +912,7 @@ pub fn fable_inventory_start(
         let mut acc_files = 0u64;
         let mut acc_bytes = 0u64;
         let mut acc_removed = 0u64;
+        let mut acc_skipped = 0u64;
         let mut acc_secs = 0.0f64;
         let mut workers = 0usize;
         let mut last_err: Option<String> = None;
@@ -697,6 +933,7 @@ pub fn fable_inventory_start(
                     acc_files += s.files;
                     acc_bytes += s.bytes;
                     acc_removed += s.removed;
+                    acc_skipped += s.skipped;
                     acc_secs += s.seconds;
                     workers = s.workers;
                 }
@@ -715,7 +952,8 @@ pub fn fable_inventory_start(
                 &app,
                 json!({
                     "kind": "done", "files": acc_files, "bytes": acc_bytes,
-                    "removed": acc_removed, "seconds": acc_secs, "workers": workers,
+                    "removed": acc_removed, "skipped": acc_skipped,
+                    "seconds": acc_secs, "workers": workers,
                     "roots": roots.len(),
                 }),
             );
@@ -793,7 +1031,8 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
         app_data_roots().into_iter().map(|r| (r.path, r.label)).collect();
     // 默认勾:知识库根 + NAS 挂载点 + App 数据下载目录(沿用盘点默认根集合)。
     for r in inventory_roots(None) {
-        if !Path::new(&r).is_dir() || !seen.insert(r.clone()) {
+        // 有界探测:NAS 挂载点掉线时 is_dir 会 stat 几十秒吊死选择器 → 3s 判不可达即跳过。
+        if !super::sched::dir_reachable(Path::new(&r), 3) || !seen.insert(r.clone()) {
             continue;
         }
         let label = if r == kb {
@@ -812,7 +1051,8 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
     // default_on 直接沿用 scan_roots 的判断(现在「一个不落」——所有真实存在的盘符/卷默认都勾),
     // 这样首次盘点就能把整机所有可达的盘都纳入,用户想缩小范围再手动取消。
     for sr in crate::scan::scan_roots() {
-        if !Path::new(&sr.path).is_dir() || !seen.insert(sr.path.clone()) {
+        // 同上:挂载点/网络卷可能僵死,有界探测 3s,不可达就不进选择器(绝不卡住面板)。
+        if !super::sched::dir_reachable(Path::new(&sr.path), 3) || !seen.insert(sr.path.clone()) {
             continue;
         }
         out.push(ScanRootInfo { path: sr.path, label: sr.label, default_on: sr.default_on });
@@ -824,6 +1064,10 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
 /// `root` = 所属盘点根(用于算 depth 并回填 FolderNode.root)。
 fn list_child_folders(dir: &Path, root: &str) -> Vec<FolderNode> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    // 只有正浏览「整盘根目录顶层」(如 C:\ 直属子目录)时才叠加 OS 目录黑名单,把 Windows、
+    // Program Files 等藏起来;往里钻一层后(用户自己的文件夹)只剪永远跳的噪音,这样里面名叫
+    // library/boot 的子目录照常显示、可选可盘 ——「文件夹里的都能归类进库」也要在选择器里看得见。
+    let os_top = is_os_disk_root(root) && Path::new(root) == dir;
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
@@ -831,7 +1075,7 @@ fn list_child_folders(dir: &Path, root: &str) -> Vec<FolderNode> {
             continue;
         }
         let name = super::decode_fs(&entry.file_name());
-        if skip_dir_scan(&name) {
+        if skip_dir_always(&name) || (os_top && skip_dir_os(&name)) {
             continue;
         }
         subdirs.push(entry.path());
@@ -849,8 +1093,9 @@ fn list_child_folders(dir: &Path, root: &str) -> Vec<FolderNode> {
                     continue;
                 }
                 if ft2.is_dir() {
+                    // 孙级目录必在顶层之下 → 只看「永远跳」,有真子目录即可展开。
                     let n2 = super::decode_fs(&e2.file_name());
-                    if !skip_dir_scan(&n2) {
+                    if !skip_dir_always(&n2) {
                         has_children = true;
                     }
                 } else if ft2.is_file() {
@@ -887,7 +1132,13 @@ pub fn scan_folders(explicit: Option<String>) -> Result<FolderScan, String> {
     let mut folders: Vec<FolderNode> = Vec::new();
     let mut truncated = false;
     for root in &roots {
-        for node in list_child_folders(Path::new(&root.path), &root.path) {
+        // 列子目录要 read_dir 挂载点,死 NAS 会吊死整个选择器 → 每根加 8s 死线,超时就跳过
+        // 这个根(其它健康根照常展示),用户点「盘点」绝不转圈卡死。
+        let rp = root.path.clone();
+        let children =
+            super::sched::with_deadline(8, move || list_child_folders(Path::new(&rp), &rp))
+                .unwrap_or_default();
+        for node in children {
             folders.push(node);
             if folders.len() >= FOLDER_SCAN_CAP {
                 truncated = true;
@@ -910,11 +1161,16 @@ pub fn fable_scan_folders(root: Option<String>) -> Result<FolderScan, String> {
 /// 懒加载:点开某个文件夹时才扫它的直属子文件夹(支持一层层往下钻到任意深度)。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn fable_scan_folder_children(root: String, path: String) -> Result<Vec<FolderNode>, String> {
-    let p = Path::new(&path);
-    if !p.is_dir() {
-        return Ok(Vec::new());
-    }
-    Ok(list_child_folders(p, &root))
+    // 展开子目录:is_dir + read_dir 都可能卡死 NAS → 整体加 8s 死线,超时返回空(该项显示为
+    // 不可展开),请求线程绝不被吊死。
+    Ok(super::sched::with_deadline(8, move || {
+        let p = Path::new(&path);
+        if !p.is_dir() {
+            return Vec::new();
+        }
+        list_child_folders(p, &root)
+    })
+    .unwrap_or_default())
 }
 
 /// 文件夹递归总量(总文件数 + 总字节数),给选择器里显示「这个文件夹有多大」。
@@ -934,7 +1190,8 @@ fn folder_size_rec(dir: &Path, files: &mut u64, bytes: &mut u64) {
         }
         if ft.is_dir() {
             let name = super::decode_fs(&entry.file_name());
-            if skip_dir_scan(&name) {
+            // 大小要反映「这个文件夹会被归类进库的真实体量」→ 只剪永远跳的噪音(.git/依赖/回收站)。
+            if skip_dir_always(&name) {
                 continue;
             }
             folder_size_rec(&entry.path(), files, bytes);
@@ -951,14 +1208,19 @@ fn folder_size_rec(dir: &Path, files: &mut u64, bytes: &mut u64) {
 /// 前端在选择器里按需、限并发地逐个文件夹调用,把大小填进对应行。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn fable_folder_size(path: String) -> Result<FolderSize, String> {
-    let p = Path::new(&path);
-    if !p.is_dir() {
-        return Ok(FolderSize { files: 0, bytes: 0 });
-    }
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    folder_size_rec(p, &mut files, &mut bytes);
-    Ok(FolderSize { files, bytes })
+    // 递归算大小可能在死 NAS / 超大目录上久卡 → 加 10s 死线,超时返回 0(选择器该行不显示
+    // 大小,而非卡住整个面板)。
+    Ok(super::sched::with_deadline(10, move || {
+        let p = Path::new(&path);
+        if !p.is_dir() {
+            return FolderSize { files: 0, bytes: 0 };
+        }
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        folder_size_rec(p, &mut files, &mut bytes);
+        FolderSize { files, bytes }
+    })
+    .unwrap_or(FolderSize { files: 0, bytes: 0 }))
 }
 
 /// 「按语言归类」回填:给所有还没定语言(lang='')的文件补上语言标签。
@@ -1075,6 +1337,54 @@ mod tests {
         }
         for n in ["Downloads", "Documents", "WeChat Files", "datasets"] {
             assert!(!skip_dir_scan(n), "{n} 不应被剪掉");
+        }
+    }
+
+    #[test]
+    fn two_tier_prune_keeps_user_named_dirs() {
+        // 「永远跳」的噪音:任何根都剪(版本仓/依赖/回收站/NAS/$系统)。
+        for n in [".git", "node_modules", "$Recycle.Bin", "@eaDir", "#recycle", ".venv"] {
+            assert!(skip_dir_always(n), "{n} 应永远剪");
+        }
+        // OS 目录黑名单:只在整盘扫描时叠加,本身不是「永远跳」。
+        for n in ["windows", "program files", "library", "boot", "recovery", "intel"] {
+            assert!(skip_dir_os(n), "{n} 应属 OS 黑名单");
+            assert!(!skip_dir_always(n), "{n} 不该被永远跳(用户同名文件夹要保留)");
+        }
+        // 核心诉求:用户自己挑的文件夹里名叫 library/boot 的子目录 = 真数据,不许永远跳。
+        for n in ["library", "boot", "applications", "我的资料", "项目"] {
+            assert!(!skip_dir_always(n), "{n} 在显式文件夹里应被归类进库");
+        }
+    }
+
+    #[test]
+    fn macos_packages_always_skipped_but_dotted_user_dirs_kept() {
+        // mac 包/库目录(Finder 里像单个文件、内部成千上万碎文件)→ 永远跳,治 macOS 盘点慢。
+        for n in [
+            "Photos Library.photoslibrary", "Polaris.app", "MyKit.framework",
+            "Project.xcodeproj", "Movie.fcpbundle", "Some.bundle", "Debug.dSYM",
+        ] {
+            assert!(is_macos_package_dir(n), "{n} 应判为 mac 包目录");
+            assert!(skip_dir_always(n), "{n} 应永远跳");
+        }
+        // 名字里带点、但不是包扩展的普通用户目录 → 绝不误伤。
+        for n in ["v1.2", "report.final", "我的资料", "data.backup", "2024.照片", "node_modules"] {
+            assert!(!is_macos_package_dir(n), "{n} 不该被当 mac 包误跳");
+        }
+        // macOS 根级系统目录只在整盘扫 `/` 时剪(进 OS 黑名单),本身不「永远跳」(免误伤用户同名夹)。
+        for n in ["system", "private", "cores"] {
+            assert!(skip_dir_os(n), "{n} 应属整盘扫的 OS 黑名单");
+            assert!(!skip_dir_always(n), "{n} 不该被永远跳");
+        }
+    }
+
+    #[test]
+    fn is_os_disk_root_only_whole_disks() {
+        for r in [r"C:\", "C:", r"D:\", "/", "z:/"] {
+            assert!(is_os_disk_root(r), "{r} 应判为整盘根");
+        }
+        for r in [r"C:\Users\me\proj", "/data", "/volume1/photos", r"D:\我的资料", "/Volumes/USB"] {
+            assert!(!is_os_disk_root(r), "{r} 是文件夹/卷,不是整盘根(里面的全归类)");
         }
     }
 

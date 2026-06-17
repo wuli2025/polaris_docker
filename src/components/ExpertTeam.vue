@@ -176,7 +176,10 @@ const emit = defineEmits<{
           <div class="team-tag">{{ tm.tagline }}</div>
           <div class="team-meta">{{ tm.memberIds.length + 1 }} 人 · {{ tm.tags.slice(0, 3).join(" / ") }}</div>
         </div>
-        <span class="dl" title="下载该团 CLAUDE.md" @click="downloadDoc('team', tm.id, tm.name, $event)">⬇</span>
+        <div class="card-actions">
+          <span class="dl-inline" title="下载该团 CLAUDE.md" @click.stop="downloadDoc('team', tm.id, tm.name, $event)">⬇</span>
+          <span class="summon-pill" title="召唤这支团" @click.stop="emit('select-team', tm.id)">召唤</span>
+        </div>
       </button>
     </div>
 
@@ -214,7 +217,10 @@ const emit = defineEmits<{
           </div>
           <div class="exp-role">{{ exp.role }}</div>
         </div>
-        <span class="dl" title="下载该专家 CLAUDE.md" @click="downloadDoc('expert', exp.id, exp.name, $event)">⬇</span>
+        <div class="card-actions">
+          <span class="dl-inline" title="下载该专家 CLAUDE.md" @click.stop="downloadDoc('expert', exp.id, exp.name, $event)">⬇</span>
+          <span class="summon-pill sm" title="召唤这位专家" @click.stop="emit('select-expert', exp.id)">召唤</span>
+        </div>
       </button>
     </div>
   </div>
@@ -347,12 +353,42 @@ const emit = defineEmits<{
 .exp-tier { font-size: 10px; padding: 0 4px; border-radius: 4px; border: 1px solid var(--line); color: var(--faint); white-space: nowrap; }
 .exp-role { font-size: 10.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.dl {
-  position: absolute; top: 6px; right: 8px;
-  font-size: 12px; color: var(--faint);
-  opacity: 0; transition: opacity 0.14s;
-  padding: 1px 4px; border-radius: 5px;
+/* 卡片右侧动作区：下载（hover 浮现）+ 召唤（常驻、显眼） */
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
-.exp-card:hover .dl, .team-card:hover .dl { opacity: 0.7; }
-.dl:hover { opacity: 1 !important; color: var(--gold, #d4b06a); background: rgba(255, 255, 255, 0.08); }
+.dl-inline {
+  font-size: 13px;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity 0.14s;
+  padding: 2px 5px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.team-card:hover .dl-inline, .exp-card:hover .dl-inline { opacity: 0.55; }
+.dl-inline:hover { opacity: 1 !important; color: var(--gold, #d4b06a); background: rgba(255, 255, 255, 0.08); }
+
+.summon-pill {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(212, 176, 106, 0.5);
+  background: rgba(212, 176, 106, 0.12);
+  color: var(--gold, #d4b06a);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.14s;
+}
+.summon-pill:hover {
+  background: rgba(212, 176, 106, 0.25);
+  border-color: rgba(212, 176, 106, 0.85);
+  transform: translateY(-1px);
+}
+.summon-pill.sm { padding: 4px 11px; font-size: 11px; border-radius: 7px; }
 </style>

@@ -75,48 +75,207 @@ fn home_dir() -> Option<std::path::PathBuf> {
     directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
 }
 
+// ───────────── Windows 工业级盘符/卷枚举 ─────────────
+//
+// 旧实现只是 A-Z 逐个 `Path::exists()` 探测,会漏两类盘、且可能卡死:
+//   1. **挂到文件夹的卷 / 存储池**(没有盘符,如 D:\Mounts\Data、Storage Spaces)——
+//      旧法完全看不到。这里用 FindFirstVolume/FindNextVolume 逐卷枚举,一个不落。
+//   2. **掉线的网络驱动器**:`.exists()` 会发真实 IO 卡几十秒;改用 GetLogicalDrives
+//      位掩码(瞬时、纯内核态,不碰介质)+ GetDriveType 归类,绝不卡死。
+// 同时读卷标(GetVolumeInformation)让用户一眼认出哪个盘是哪个,并按盘型给友好后缀。
+#[cfg(target_os = "windows")]
+fn to_wide(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// 读卷标(失败/空 → None)。已用 SetThreadErrorMode 抑制无介质弹窗,可放心对任意盘调用。
+#[cfg(target_os = "windows")]
+fn win_volume_label(wroot: &[u16]) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+    let mut name = [0u16; 256];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wroot.as_ptr(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    (len > 0).then(|| String::from_utf16_lossy(&name[..len]))
+}
+
+/// 某个卷(\\?\Volume{GUID}\)对应的全部挂载路径(双 null 结尾多字符串)。
+#[cfg(target_os = "windows")]
+fn win_volume_mount_paths(volume_name: &[u16]) -> Vec<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNamesForVolumeNameW;
+    let mut buf = vec![0u16; 1024];
+    let mut ret_len: u32 = 0;
+    let ok = unsafe {
+        GetVolumePathNamesForVolumeNameW(
+            volume_name.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut ret_len,
+        )
+    };
+    if ok == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in 0..buf.len() {
+        if buf[i] == 0 {
+            if i == start {
+                break; // 空串 = 列表结束
+            }
+            out.push(String::from_utf16_lossy(&buf[start..i]));
+            start = i + 1;
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn windows_roots() -> Vec<ScanRoot> {
+    use std::collections::HashSet;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDriveTypeW, GetLogicalDrives,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SetThreadErrorMode, SEM_FAILCRITICALERRORS,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+    };
+
+    // 枚举期间抑制「驱动器中没有磁盘」等关键错误弹窗(线程局部,不影响别处)。
+    let mut prev_mode: u32 = 0;
+    unsafe {
+        SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut prev_mode);
+    }
+
+    let mut out: Vec<ScanRoot> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // 桌面(置顶,默认勾)。
+    if let Some(home) = home_dir() {
+        let desk = home.join("Desktop");
+        if desk.exists() {
+            let p = desk.to_string_lossy().to_string();
+            seen.insert(p.clone());
+            out.push(ScanRoot {
+                id: p.clone(),
+                label: "桌面".into(),
+                path: p,
+                kind: "desktop".into(),
+                default_on: true,
+            });
+        }
+    }
+
+    // ① 有盘符的盘:GetLogicalDrives 位掩码 → 逐个 GetDriveType 归类 + 读卷标。
+    let mask = unsafe { GetLogicalDrives() };
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = format!("{}:\\", letter);
+        let wroot = to_wide(&root);
+        let (kind_word, default_on) = match unsafe { GetDriveTypeW(wroot.as_ptr()) } {
+            DRIVE_FIXED => ("本地", true),
+            DRIVE_REMOVABLE => ("可移动", true),
+            DRIVE_REMOTE => ("网络", true),
+            DRIVE_CDROM => ("光驱", false),
+            DRIVE_RAMDISK => ("内存盘", true),
+            _ => ("", true), // unknown / no_root_dir 也照列,绝不漏
+        };
+        let label = match (win_volume_label(&wroot), kind_word.is_empty()) {
+            (Some(v), false) => format!("{letter}: 盘 · {v}({kind_word})"),
+            (Some(v), true) => format!("{letter}: 盘 · {v}"),
+            (None, false) => format!("{letter}: 盘({kind_word})"),
+            (None, true) => format!("{letter}: 盘"),
+        };
+        seen.insert(root.clone());
+        out.push(ScanRoot {
+            id: root.clone(),
+            label,
+            path: root,
+            kind: "drive".into(),
+            default_on,
+        });
+    }
+
+    // ② 无盘符的卷:挂到文件夹的硬盘 / 存储池——旧法完全漏掉,这里逐卷捞回来。
+    let mut name = [0u16; 260];
+    let h = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
+    if h != INVALID_HANDLE_VALUE {
+        loop {
+            for mount in win_volume_mount_paths(&name) {
+                // 盘符根(如 "C:\")上面已收;只补挂到文件夹的挂载点。
+                let is_drive_letter = mount.len() == 3 && mount.as_bytes().get(1) == Some(&b':');
+                if is_drive_letter || seen.contains(&mount) || !Path::new(&mount).is_dir() {
+                    continue;
+                }
+                let shown = mount.trim_end_matches('\\').to_string();
+                let label = win_volume_label(&to_wide(&mount))
+                    .map(|v| format!("卷 · {v}({shown})"))
+                    .unwrap_or_else(|| format!("卷 · {shown}"));
+                seen.insert(mount.clone());
+                out.push(ScanRoot {
+                    id: mount.clone(),
+                    label,
+                    path: mount,
+                    kind: "volume".into(),
+                    default_on: true,
+                });
+            }
+            name = [0u16; 260];
+            if unsafe { FindNextVolumeW(h, name.as_mut_ptr(), name.len() as u32) } == 0 {
+                break;
+            }
+        }
+        unsafe {
+            FindVolumeClose(h);
+        }
+    }
+
+    // 还原线程错误模式。
+    unsafe {
+        SetThreadErrorMode(prev_mode, std::ptr::null_mut());
+    }
+    out
+}
+
 fn roots_impl() -> Vec<ScanRoot> {
     let mut out = Vec::new();
 
     #[cfg(target_os = "windows")]
     {
-        // 桌面
-        if let Some(home) = home_dir() {
-            let desk = home.join("Desktop");
-            if desk.exists() {
-                out.push(ScanRoot {
-                    id: desk.to_string_lossy().to_string(),
-                    label: "桌面".into(),
-                    path: desk.to_string_lossy().to_string(),
-                    kind: "desktop".into(),
-                    default_on: true,
-                });
-            }
-        }
-        // 盘符 A-Z
-        for c in b'A'..=b'Z' {
-            let drive = format!("{}:\\", c as char);
-            if Path::new(&drive).exists() {
-                out.push(ScanRoot {
-                    id: drive.clone(),
-                    label: format!("{}: 盘", c as char),
-                    path: drive.clone(),
-                    kind: "drive".into(),
-                    // 「一个不落」:所有真实存在的盘符默认都勾上,用户想排除再手动取消。
-                    // (系统/缓存目录由 skip_dir_scan 整棵跳过,不会因此把 Windows 卷进来。)
-                    default_on: true,
-                });
-            }
-        }
+        out.extend(windows_roots());
     }
 
     #[cfg(target_os = "macos")]
     {
+        // 个人文件夹常用子目录(默认勾)。HOME 整夹默认不勾(里面有 Library 噪音,按需再开)。
         if let Some(home) = home_dir() {
-            for (sub, label, on) in [
-                ("Desktop", "桌面", true),
-                ("Documents", "文稿", true),
-                ("Downloads", "下载", true),
+            for (sub, label) in [
+                ("Desktop", "桌面"),
+                ("Documents", "文稿"),
+                ("Downloads", "下载"),
+                ("Movies", "影片"),
+                ("Music", "音乐"),
+                ("Pictures", "图片"),
             ] {
                 let p = home.join(sub);
                 if p.exists() {
@@ -125,12 +284,12 @@ fn roots_impl() -> Vec<ScanRoot> {
                         label: label.into(),
                         path: p.to_string_lossy().to_string(),
                         kind: "home".into(),
-                        default_on: on,
+                        default_on: true,
                     });
                 }
             }
         }
-        // 外置卷
+        // 外置 / 网络 / 磁盘映像卷:macOS 一律自动挂到 /Volumes,逐个收 —— 一个不落。
         if let Ok(rd) = fs::read_dir("/Volumes") {
             for e in rd.flatten() {
                 let p = e.path();
@@ -141,42 +300,134 @@ fn roots_impl() -> Vec<ScanRoot> {
                         label: format!("卷 · {name}"),
                         path: p.to_string_lossy().to_string(),
                         kind: "volume".into(),
-                        // mac 外置卷 / 网络卷也默认勾上,跟盘符一视同仁(一个不落)。
                         default_on: true,
                     });
                 }
             }
         }
+        // 系统盘根:可扫但默认不勾(避免一上来就遍历整块系统盘;OS 目录由 skip_dir_scan 跳)。
+        out.push(ScanRoot {
+            id: "/".into(),
+            label: "系统盘 /".into(),
+            path: "/".into(),
+            kind: "drive".into(),
+            default_on: false,
+        });
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        // Linux / Docker: 扫挂载进来的目录。容器看不到宿主盘,
-        // 只能扫被 bind mount 进来的卷(见 NAS 部署: /root/Polaris/nas 等)。
+        // Linux / Docker:容器看不到宿主盘,只能扫 bind mount 进来的卷。
+        // 工业级 = 读 /proc/mounts 发现**所有**真实挂载点(不再只认 5 个写死路径),
+        // 这样用户无论把宿主盘 bind 到哪个容器路径都能被扫到。
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+
         if let Some(home) = home_dir() {
-            out.push(ScanRoot {
-                id: home.to_string_lossy().to_string(),
-                label: "工作区(HOME)".into(),
-                path: home.to_string_lossy().to_string(),
-                kind: "home".into(),
-                default_on: true,
-            });
-        }
-        for cand in ["/root/Polaris/nas", "/data", "/mnt", "/volume1", "/host"] {
-            if Path::new(cand).is_dir() {
+            let p = home.to_string_lossy().to_string();
+            if seen.insert(p.clone()) {
                 out.push(ScanRoot {
-                    id: cand.into(),
-                    label: format!("挂载 · {cand}"),
-                    path: cand.into(),
-                    kind: "mounted".into(),
-                    // Docker / Linux:凡 bind 进来的卷都默认勾上(容器只看得到挂载进来的盘)。
+                    id: p.clone(),
+                    label: "工作区(HOME)".into(),
+                    path: p,
+                    kind: "home".into(),
                     default_on: true,
                 });
             }
         }
+
+        // /proc/mounts 发现的真实挂载 + 约定挂载点(/proc 不可读时兜底)。
+        let mut mounts = proc_mount_roots();
+        for cand in ["/root/Polaris/nas", "/data", "/mnt", "/media", "/volume1", "/host"] {
+            mounts.push(cand.to_string());
+        }
+        mounts.sort();
+        mounts.dedup();
+        for m in mounts {
+            if !Path::new(&m).is_dir() || !seen.insert(m.clone()) {
+                continue;
+            }
+            let label = Path::new(&m)
+                .file_name()
+                .map(|n| format!("挂载 · {}", n.to_string_lossy()))
+                .unwrap_or_else(|| format!("挂载 · {m}"));
+            out.push(ScanRoot {
+                id: m.clone(),
+                label,
+                path: m,
+                kind: "mounted".into(),
+                default_on: true,
+            });
+        }
     }
 
     out
+}
+
+/// 读 `/proc/mounts` 发现所有「真实文件系统」的挂载点(容器里 = 从宿主 bind 进来的盘)。
+/// 跳过伪文件系统(proc/sysfs/tmpfs/overlay…)、容器根 `/`、以及系统路径,只留可当资料盘扫的目录。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn proc_mount_roots() -> Vec<String> {
+    const PSEUDO_FS: &[&str] = &[
+        "proc", "sysfs", "cgroup", "cgroup2", "tmpfs", "devtmpfs", "devpts", "mqueue", "overlay",
+        "shm", "securityfs", "debugfs", "tracefs", "bpf", "pstore", "autofs", "binfmt_misc",
+        "configfs", "fusectl", "hugetlbfs", "rpc_pipefs", "nsfs", "ramfs", "fuse.lxcfs", "squashfs",
+    ];
+    let Ok(text) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let _dev = it.next();
+        let (Some(mnt_raw), Some(fstype)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if PSEUDO_FS.contains(&fstype) {
+            continue;
+        }
+        let mnt = unescape_mount_octal(mnt_raw);
+        if mnt == "/" {
+            continue; // 容器根 overlay,扫它等于扫整个容器
+        }
+        if ["/proc", "/sys", "/dev", "/run", "/etc", "/var/lib/", "/snap", "/boot"]
+            .iter()
+            .any(|p| mnt == p.trim_end_matches('/') || mnt.starts_with(p))
+        {
+            continue;
+        }
+        if Path::new(&mnt).is_dir() {
+            out.push(mnt);
+        }
+    }
+    out
+}
+
+/// `/proc/mounts` 把空格等用八进制转义(`\040`=空格、`\011`=Tab、`\134`=反斜杠),还原之。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unescape_mount_octal(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1].is_ascii_digit()
+            && b[i + 2].is_ascii_digit()
+            && b[i + 3].is_ascii_digit()
+        {
+            if let Some(n) =
+                std::str::from_utf8(&b[i + 1..i + 4]).ok().and_then(|o| u8::from_str_radix(o, 8).ok())
+            {
+                out.push(n);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ───────────────────────── 黑/白名单 ─────────────────────────
@@ -483,4 +734,37 @@ pub fn scan_resources(roots: Vec<String>, max: Option<usize>) -> Result<ScanRepo
         skipped,
         truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 工业级盘符枚举:GetLogicalDrives 报告的每一个盘符都必须出现在 scan_roots 里,
+    /// 一个不落(这是用户的硬要求)。同时回归「桌面」始终在列。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_lists_every_logical_drive() {
+        use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+        let roots = roots_impl();
+        // 打印实测枚举结果,便于人工核对盘标/盘型。
+        for r in &roots {
+            eprintln!("[scan_root] {:<10} {}", r.kind, r.label);
+        }
+        let mask = unsafe { GetLogicalDrives() };
+        for i in 0..26u32 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let want = format!("{}:\\", (b'A' + i as u8) as char);
+            assert!(
+                roots.iter().any(|r| r.path == want),
+                "GetLogicalDrives 报告了 {want} 但 scan_roots 漏掉了它"
+            );
+        }
+        // 没有任何盘符时也不该 panic;有盘符则至少有一个 drive 根。
+        if mask != 0 {
+            assert!(roots.iter().any(|r| r.kind == "drive"));
+        }
+    }
 }

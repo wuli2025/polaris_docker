@@ -302,10 +302,14 @@ export interface KbNode {
   category: string;
   /** "doc" 文档 | "folder" 目录中枢 | "root" 知识库根 */
   kind: "doc" | "folder" | "root" | "feedback";
+  /** 文件中心星图:簇的「一句话画像」(AI 命名时给的温暖概括),选中卡片展示 */
+  summary?: string;
 }
 export interface KbEdge {
   source: string;
   target: string;
+  /** 文件中心星图:簇间语义关系标签(如「方法论 / 进阶 / 同源」);层级/双链边无此字段 */
+  rel?: string;
 }
 export interface KbGraph {
   nodes: KbNode[];
@@ -535,6 +539,11 @@ export interface FileOverview {
   scanning: boolean;
   indexing: boolean;
 }
+/** 智能向导收尾的一条建议:标题 + 注入对话框的用户第一人称提示词 */
+export interface SuggestedFlow {
+  title: string;
+  prompt: string;
+}
 export interface FileCard {
   id: number;
   path: string;
@@ -631,12 +640,19 @@ export const files = {
   /** 重建语义聚类(复用已存向量,纯数学)。后台线程跑,进度走 file:cluster 事件(phase/done/error) */
   clusterBuild: (root?: string | null) =>
     invoke<void>("file_cluster_build", { root: root ?? null }),
+  /** 文件中心 v3 渐进式智能归类:T0 秒级骨架 → T1 AI 初级命名+关系 → T2 全量向量化后语义重聚再命名。
+   *  后台线程跑,进度/各档走 file:cluster 事件(phase/tick/tier/done/error) */
+  smartCluster: (root?: string | null) =>
+    invoke<void>("file_smart_cluster", { root: root ?? null }),
   /** 用已连接的大模型按语义归类(免嵌入 key)+ 桌面生成 HTML 报告;进度走 file:cluster_llm 事件 */
   clusterLlm: (root?: string | null) =>
     invoke<void>("file_cluster_llm", { root: root ?? null }),
   /** 「让 AI 更懂你」:据盘点统计确定性生成知识画像 HTML → 桌面,返回文件路径(同步,不调大模型) */
   profileHtml: (root?: string | null) =>
     invoke<string>("file_profile_html", { root: root ?? null }),
+  /** 智能向导收尾建议:大模型据**真实知识库**智能匹配「我能立刻替你做的事」,失败自动回落确定性建议 */
+  suggestWorkflows: (root?: string | null) =>
+    invoke<SuggestedFlow[]>("file_suggest_workflows", { root: root ?? null }),
   /** 文件中心「星图」:语义簇 + 抽样文件 → 与知识图谱同构的 KbGraph(供星河渲染复用) */
   graph: (root?: string | null) =>
     invoke<KbGraph>("file_graph", { root: root ?? null }),
@@ -674,6 +690,8 @@ export const files = {
   /** 检索枢纽混合检索(grep ∥ 向量 RRF) */
   search: (query: string, topK = 24, mode: "hybrid" | "grep" | "vector" = "hybrid") =>
     invoke<FableSearchResult>("fable_search", { query, topK, mode }),
+  /** 取消当前盘点/索引任务(协作式:循环轮询 CANCEL,几百毫秒内优雅停;索引可再点继续续建) */
+  fableCancel: () => invoke<void>("fable_cancel"),
 };
 
 export interface FableHit {
@@ -1440,6 +1458,24 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         ok: true,
       }));
     }
+    case "echo_briefing_today":
+    case "echo_briefing_dismiss":
+      return [];
+    case "echo_dream_now":
+    case "echo_briefing_run":
+      return undefined;
+    case "echo_status":
+    case "echo_set":
+      return {
+        enabled: false,
+        hour: 8,
+        run_on_boot: true,
+        last_dream_day: "",
+        dreaming: false,
+        memory_count: 0,
+        briefing_today: 0,
+        log: [],
+      };
     case "kb_graph":
       return { nodes: [], edges: [] };
     case "kb_root":

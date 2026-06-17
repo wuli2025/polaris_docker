@@ -77,10 +77,10 @@ fn is_cjk(c: char) -> bool {
 
 /// CJK 功能词/填充词(2 字),作检索词无区分度 —— 从二元组里剔除以降噪(自然句里满是这种)。
 const CJK_STOP: &[&str] = &[
-    "我想", "想了", "了解", "怎么", "么做", "是怎", "做的", "一下", "知道", "什么", "这个",
-    "那个", "可以", "因为", "所以", "但是", "如果", "就是", "没有", "已经", "这样", "一个",
-    "一些", "现在", "时候", "出来", "起来", "相关", "资料", "的话", "进行", "通过", "对于",
-    "以及", "或者", "还是", "为了", "需要", "应该", "如何", "请问", "帮我", "告诉",
+    "我想", "想了", "了解", "怎么", "么做", "是怎", "做的", "一下", "知道", "什么", "这个", "那个",
+    "可以", "因为", "所以", "但是", "如果", "就是", "没有", "已经", "这样", "一个", "一些", "现在",
+    "时候", "出来", "起来", "相关", "资料", "的话", "进行", "通过", "对于", "以及", "或者", "还是",
+    "为了", "需要", "应该", "如何", "请问", "帮我", "告诉",
 ];
 
 /// 把查询切成原子:`(拉丁/数字词, CJK 连续段)`。空白与标点都作分隔符。
@@ -175,7 +175,13 @@ fn fts_query_expr(query: &str) -> Option<String> {
     if terms.is_empty() {
         None
     } else {
-        Some(terms.iter().map(|t| esc(t)).collect::<Vec<_>>().join(" OR "))
+        Some(
+            terms
+                .iter()
+                .map(|t| esc(t))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
     }
 }
 
@@ -217,7 +223,9 @@ fn scan_and_score(
                     }
                 }
                 let abs = std::path::Path::new(&root).join(&rel);
-                let Ok(bytes) = std::fs::read(&abs) else { continue };
+                let Ok(bytes) = std::fs::read(&abs) else {
+                    continue;
+                };
                 if bytes.iter().take(4096).any(|&b| b == 0) {
                     continue; // 二进制伪文本
                 }
@@ -247,8 +255,7 @@ fn scan_and_score(
                         // 命中行 ±2 行拼成上下文窗口(P2-1:让重排专家读到的不只是孤零零一行)。
                         let lo = i.saturating_sub(2);
                         let hi = (i + 3).min(lines.len());
-                        let context: String =
-                            lines[lo..hi].join("\n").chars().take(700).collect();
+                        let context: String = lines[lo..hi].join("\n").chars().take(700).collect();
                         hits.lock().unwrap().push(GrepHit {
                             path: rel.clone(),
                             abspath: abs.to_string_lossy().into_owned(),
@@ -268,7 +275,11 @@ fn scan_and_score(
     });
 
     let mut out = hits.into_inner().unwrap();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(60);
     (out, truncated.load(Ordering::Relaxed))
 }
@@ -304,7 +315,11 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
                 .map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map(rusqlite::params![expr, FTS_CAND_LIMIT], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })
                 .map_err(|e| e.to_string())?;
             for row in rows.flatten() {
@@ -325,8 +340,11 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
     // 比扫 2 万个磁盘文件快一两个数量级(实测 ~1s → 数十 ms)。
     let mut like_cand: Vec<(String, String, i64)> = Vec::new();
     if lex_ok && has_short_terms(&q_full) {
-        let shorts: Vec<&String> =
-            terms.iter().filter(|t| t.chars().count() <= 2).take(8).collect();
+        let shorts: Vec<&String> = terms
+            .iter()
+            .filter(|t| t.chars().count() <= 2)
+            .take(8)
+            .collect();
         let mut stmt = conn
             .prepare(
                 "SELECT r.path, f.relpath, f.size FROM lex l
@@ -339,7 +357,11 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
             let pat = format!("%{t}%");
             let rows = stmt
                 .query_map(rusqlite::params![pat, FTS_CAND_LIMIT], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })
                 .map_err(|e| e.to_string())?;
             for row in rows.flatten() {
@@ -363,10 +385,16 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([MAX_GREP_FILE_BYTES, MAX_GREP_FILES], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })
             .map_err(|e| e.to_string())?;
-        rows.flatten().filter(|row| seen.insert((row.0.clone(), row.1.clone()))).collect()
+        rows.flatten()
+            .filter(|row| seen.insert((row.0.clone(), row.1.clone())))
+            .collect()
     } else {
         Vec::new()
     };
@@ -375,8 +403,7 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
     // 倒排 / LIKE 候选已有界(≤ 几百)→ 无预算、不截断;磁盘兜底候选带字节预算护栏。
     let mut hits = Vec::new();
     let mut truncated = false;
-    let indexed_cand: Vec<(String, String, i64)> =
-        fts_cand.into_iter().chain(like_cand).collect();
+    let indexed_cand: Vec<(String, String, i64)> = fts_cand.into_iter().chain(like_cand).collect();
     if !indexed_cand.is_empty() {
         let (h, _) = scan_and_score(indexed_cand, &q_full, &terms, None);
         hits.extend(h);
@@ -387,7 +414,11 @@ fn grep_lane(query: &str) -> Result<(Vec<GrepHit>, bool), String> {
         truncated = t;
     }
     // 两路命中合并后重排、截断(各路内部已 ≤60,合并后再收一次)。
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(60);
     Ok((hits, truncated))
 }
@@ -400,6 +431,162 @@ struct VecHit {
     seq: i64,
     text: String,
     score: f32,
+}
+
+/// 二值粗筛(P1-1 + 多核):在 `bits` 列上算汉明距离选出 top `cand_n` 个候选 chunk id。
+/// 读量只有 f32 的 1/32。按主键 `id` 区间把扫描分片到 worker_count 个线程并行(各开连接,
+/// WAL 并发读),每片本地留 top cand_n 再归并 —— 此前是单线程,大库下成为瓶颈(grep 车道
+/// 早已多核;IVF 的 cell=-1 子句令「新嵌入未重训」的增量向量每查询全表扫,这条热路尤其受益)。
+///
+/// 归并正确性:全局 top cand_n ⊆ ⋃(各片 top cand_n)—— 任一全局前 cand_n 的元素,在其所在
+/// 分片内排名也 ≤ cand_n(全局更优者至多 cand_n-1 个,落到该片只会更少),故每片留 cand_n 足够。
+/// P2-2 只认与当前模型一致、维度匹配的向量。`probes` 非空 → 只扫探针 cell + 未分配新数据。
+fn coarse_candidates(
+    qbits: &[u8],
+    model: &str,
+    dim: i64,
+    cand_n: usize,
+    probes: &[i64],
+) -> Result<Vec<(i64, u32)>, String> {
+    // cell 过滤片段:片段里的裸 `?` 由 SQLite 续编号在 ?1..?4 之后(?5、?6…),与 probes
+    // 在参数表中的位置对齐。probes 为空 → 无片段(全表回退)。
+    let cell_frag = if probes.is_empty() {
+        String::new()
+    } else {
+        let csv = probes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        format!(" AND (cell=-1 OR cell IN ({csv}))")
+    };
+
+    // 参与粗筛的行的 id 跨度 → 等分给各 worker(id 唯一,跨度 ≥ 行数;跨度小即行数少,单线程即可)。
+    let (id_min, id_max): (Option<i64>, Option<i64>) = {
+        let conn = open_db()?;
+        let sql = format!(
+            "SELECT MIN(id), MAX(id) FROM chunks \
+             WHERE dim=?1 AND model=?2 AND bits IS NOT NULL{cell_frag}"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Integer(dim),
+            rusqlite::types::Value::Text(model.to_string()),
+        ];
+        for p in probes {
+            params.push(rusqlite::types::Value::Integer(*p));
+        }
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        stmt.query_row(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+    };
+    let (Some(lo), Some(hi)) = (id_min, id_max) else {
+        return Ok(Vec::new()); // 该模型无可粗筛的向量
+    };
+    let span = hi - lo + 1;
+    // 小库不分片:省掉多开连接/起线程的固定开销(跨度小 ⇒ 行数少,单线程已够快)。
+    let w = if span < 50_000 { 1 } else { worker_count() };
+    coarse_scan_ranged(qbits, model, dim, cand_n, probes, &cell_frag, lo, hi, w)
+}
+
+/// [`coarse_candidates`] 的分片扫描内核:在 `[lo,hi]` 上按 `w` 路并行做汉明粗筛并归并。
+/// 抽出来是为了让测试能强制 `w>1`(真机库 id 跨度可能小于自动分片阈值),逐位对拍单线程结果。
+#[allow(clippy::too_many_arguments)]
+fn coarse_scan_ranged(
+    qbits: &[u8],
+    model: &str,
+    dim: i64,
+    cand_n: usize,
+    probes: &[i64],
+    cell_frag: &str,
+    lo: i64,
+    hi: i64,
+    w: usize,
+) -> Result<Vec<(i64, u32)>, String> {
+    let w = w.max(1);
+    let span = hi - lo + 1;
+    // [lo, hi] 等分成 w 个左闭右开区间(末片右界 hi+1),覆盖完整且互不相交。
+    // ceil(span/w) 手算(i64::div_ceil 尚不稳定;span≥1、w≥1 无溢出)。
+    let step = ((span + w as i64 - 1) / w as i64).max(1);
+    let ranges: Vec<(i64, i64)> = (0..w as i64)
+        .map(|i| (lo + i * step, (lo + (i + 1) * step).min(hi + 1)))
+        .filter(|(a, b)| a < b)
+        .collect();
+
+    let collected: Mutex<Vec<(i64, u32)>> = Mutex::new(Vec::new());
+    let mut cand: Vec<(i64, u32)> = {
+        let mut first_err: Option<String> = None;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .map(|&(rlo, rhi)| {
+                    let collected = &collected;
+                    s.spawn(move || -> Result<(), String> {
+                        let conn = open_db()?;
+                        let sql = format!(
+                            "SELECT id, bits FROM chunks \
+                             WHERE dim=?1 AND model=?2 AND bits IS NOT NULL \
+                             AND id>=?3 AND id<?4{cell_frag}"
+                        );
+                        let mut params: Vec<rusqlite::types::Value> = vec![
+                            rusqlite::types::Value::Integer(dim),
+                            rusqlite::types::Value::Text(model.to_string()),
+                            rusqlite::types::Value::Integer(rlo),
+                            rusqlite::types::Value::Integer(rhi),
+                        ];
+                        for p in probes {
+                            params.push(rusqlite::types::Value::Integer(*p));
+                        }
+                        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                        let mut rows = stmt
+                            .query(rusqlite::params_from_iter(params.iter()))
+                            .map_err(|e| e.to_string())?;
+                        let mut local: Vec<(i64, u32)> = Vec::with_capacity(cand_n + 1);
+                        let mut worst = u32::MAX;
+                        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                            // 借用读 bits,免去每行一次 Vec<u8> 堆分配(大库百万行 → 省百万次)。
+                            let bits = row
+                                .get_ref(1)
+                                .map_err(|e| e.to_string())?
+                                .as_blob()
+                                .map_err(|e| e.to_string())?;
+                            if bits.len() != qbits.len() {
+                                continue;
+                            }
+                            let h = super::index::hamming(qbits, bits);
+                            if local.len() >= cand_n && h >= worst {
+                                continue;
+                            }
+                            let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                            local.push((id, h));
+                            if local.len() > cand_n {
+                                local.sort_by_key(|x| x.1);
+                                local.truncate(cand_n);
+                                worst = local.last().map(|x| x.1).unwrap_or(u32::MAX);
+                            }
+                        }
+                        collected.lock().unwrap().extend(local);
+                        Ok(())
+                    })
+                })
+                .collect();
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let _ = first_err.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        let _ = first_err.get_or_insert_with(|| "向量粗筛线程 panic".into());
+                    }
+                }
+            }
+        });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        collected.into_inner().unwrap()
+    };
+    cand.sort_by_key(|x| x.1);
+    cand.truncate(cand_n);
+    Ok(cand)
 }
 
 fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
@@ -441,53 +628,10 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
         }
     };
 
-    // ── 第一段 · 二值粗筛(P1-1):只读 bits 算汉明距离(读量约 f32 的 1/32),
-    //    有界 top 表选出候选;P2-2 只认与当前模型一致、维度匹配的向量。 ──
+    // ── 第一段 · 二值粗筛(多核分片,实现见 coarse_candidates)──
     let cand_n = (top_k * 8).max(200);
-    let mut cand: Vec<(i64, u32)> = Vec::with_capacity(cand_n + 1); // (chunk id, hamming)
-    {
-        // probes 非空时只扫探针 cell + 未分配新数据;为空时扫全表(回退)。
-        let stage1_sql = if probes.is_empty() {
-            "SELECT id, bits FROM chunks WHERE dim=?1 AND model=?2 AND bits IS NOT NULL".to_string()
-        } else {
-            let csv = probes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            format!(
-                "SELECT id, bits FROM chunks WHERE dim=?1 AND model=?2 AND bits IS NOT NULL \
-                 AND (cell=-1 OR cell IN ({csv}))"
-            )
-        };
-        let mut params: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Integer(qv.len() as i64),
-            rusqlite::types::Value::Text(model.clone()),
-        ];
-        for p in &probes {
-            params.push(rusqlite::types::Value::Integer(*p));
-        }
-        let mut stmt = conn.prepare(&stage1_sql).map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(params.iter()))
-            .map_err(|e| e.to_string())?;
-        let mut worst = u32::MAX;
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let bits: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
-            if bits.len() != qbits.len() {
-                continue;
-            }
-            let h = super::index::hamming(&qbits, &bits);
-            if cand.len() >= cand_n && h >= worst {
-                continue;
-            }
-            let id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            cand.push((id, h));
-            if cand.len() > cand_n {
-                cand.sort_by_key(|x| x.1);
-                cand.truncate(cand_n);
-                worst = cand.last().map(|x| x.1).unwrap_or(u32::MAX);
-            }
-        }
-    }
-    cand.sort_by_key(|x| x.1);
-    cand.truncate(cand_n);
+    let dim = qv.len() as i64;
+    let cand = coarse_candidates(&qbits, &model, dim, cand_n, &probes)?;
 
     // ── 第二段 · 精排(P1-3):只对候选回读 f32 原始向量算点积(归一化 → 即余弦)──
     let mut top: Vec<VecHit> = Vec::new();
@@ -505,12 +649,15 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
                 .query(rusqlite::params_from_iter(group.iter()))
                 .map_err(|e| e.to_string())?;
             while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                let blob: Vec<u8> = row.get(0).map_err(|e| e.to_string())?;
-                let v = super::index::blob_to_vec(&blob);
-                if v.len() != qv.len() {
+                // 借用 blob 直接算点积,免去 blob_to_vec 的 Vec<f32> 分配;维度不符则跳过。
+                let blob = row
+                    .get_ref(0)
+                    .map_err(|e| e.to_string())?
+                    .as_blob()
+                    .map_err(|e| e.to_string())?;
+                let Some(score) = super::index::dot_blob(&qv, blob) else {
                     continue;
-                }
-                let score: f32 = v.iter().zip(qv.iter()).map(|(a, b)| a * b).sum();
+                };
                 let seq: i64 = row.get(1).map_err(|e| e.to_string())?;
                 let text: String = row.get(2).map_err(|e| e.to_string())?;
                 let rel: String = row.get(3).map_err(|e| e.to_string())?;
@@ -541,12 +688,14 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
             .map_err(|e| e.to_string())?;
         let mut min_score = f32::MIN;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let blob: Vec<u8> = row.get(0).map_err(|e| e.to_string())?;
-            let v = super::index::blob_to_vec(&blob);
-            if v.len() != qv.len() {
+            let blob = row
+                .get_ref(0)
+                .map_err(|e| e.to_string())?
+                .as_blob()
+                .map_err(|e| e.to_string())?;
+            let Some(score) = super::index::dot_blob(&qv, blob) else {
                 continue;
-            }
-            let score: f32 = v.iter().zip(qv.iter()).map(|(a, b)| a * b).sum();
+            };
             if top.len() >= want && score <= min_score {
                 continue;
             }
@@ -555,7 +704,10 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
             let rel: String = row.get(3).map_err(|e| e.to_string())?;
             let root: String = row.get(4).map_err(|e| e.to_string())?;
             top.push(VecHit {
-                abspath: std::path::Path::new(&root).join(&rel).to_string_lossy().into_owned(),
+                abspath: std::path::Path::new(&root)
+                    .join(&rel)
+                    .to_string_lossy()
+                    .into_owned(),
                 path: rel,
                 seq,
                 text,
@@ -563,14 +715,20 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
             });
             if top.len() > want {
                 top.sort_by(|a, b| {
-                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 top.truncate(want);
                 min_score = top.last().map(|h| h.score).unwrap_or(f32::MIN);
             }
         }
     }
-    top.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     top.truncate(want);
     Ok(top)
 }
@@ -644,10 +802,14 @@ pub fn search(
         Err(_) => Vec::new(), // hybrid 下向量车道缺 key/断网 → 静默降级成纯 grep
     };
     // scope 过滤:命中后按相对路径首段筛(妈妈库 wiki / 外库 !wiki / 全盘 None);零回归。
-    let grep_hits: Vec<GrepHit> =
-        grep_hits.into_iter().filter(|h| path_in_scope(&h.path, scope)).collect();
-    let vec_hits: Vec<VecHit> =
-        vec_hits.into_iter().filter(|h| path_in_scope(&h.path, scope)).collect();
+    let grep_hits: Vec<GrepHit> = grep_hits
+        .into_iter()
+        .filter(|h| path_in_scope(&h.path, scope))
+        .collect();
+    let vec_hits: Vec<VecHit> = vec_hits
+        .into_iter()
+        .filter(|h| path_in_scope(&h.path, scope))
+        .collect();
     let (n_grep, n_vec) = (grep_hits.len(), vec_hits.len());
 
     // ── P0-1 修:RRF 融合 key 降到**文件级** ──
@@ -717,7 +879,11 @@ pub fn search(
             });
     }
     let mut merged: Vec<Fused> = fused.into_values().collect();
-    merged.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| {
+        b.rrf
+            .partial_cmp(&a.rrf)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     merged.truncate(RERANK_N);
 
     // ── P2-1 精排闸门(详解 §4/§5):只在「该精排」时才请专家 ──
@@ -736,7 +902,13 @@ pub fn search(
         // 喂**全文**(向量 chunk 全文 / grep 命中行上下文窗口),不再喂展示用 160/220 字碎片。
         let docs: Vec<String> = merged.iter().map(|f| f.doc.clone()).collect();
         // 查询级缓存(P2-1 ③):同一查询 + 同一候选签名命中则跳过这次网络调用。
-        let sig = rerank_sig(query, &merged.iter().map(|f| (&f.hit.path, &f.hit.location)).collect::<Vec<_>>());
+        let sig = rerank_sig(
+            query,
+            &merged
+                .iter()
+                .map(|f| (&f.hit.path, &f.hit.location))
+                .collect::<Vec<_>>(),
+        );
         let order = match rerank_cache_get(&sig) {
             Some(o) => Some(o),
             None => match super::index::rerank(query, &docs, merged.len()) {
@@ -768,7 +940,11 @@ pub fn search(
             }
             for (i, f) in merged.iter().enumerate() {
                 if !taken[i] {
-                    reordered.push(Fused { hit: f.hit.clone(), rrf: f.rrf, doc: f.doc.clone() });
+                    reordered.push(Fused {
+                        hit: f.hit.clone(),
+                        rrf: f.rrf,
+                        doc: f.doc.clone(),
+                    });
                 }
             }
             merged = reordered;
@@ -820,7 +996,11 @@ struct RerankCache {
     order: VecDeque<String>,
 }
 static RERANK_CACHE: Lazy<Mutex<RerankCache>> = Lazy::new(|| {
-    Mutex::new(RerankCache { cap: 128, map: HashMap::new(), order: VecDeque::new() })
+    Mutex::new(RerankCache {
+        cap: 128,
+        map: HashMap::new(),
+        order: VecDeque::new(),
+    })
 });
 
 fn rerank_cache_get(sig: &str) -> Option<Vec<(usize, f32)>> {
@@ -948,6 +1128,98 @@ mod tests {
         assert_ne!(s1, s2);
         assert_ne!(s1, s3);
         assert_eq!(s1, rerank_sig("q", &[(&p1, &l1)])); // 同输入同签名(确定性)
+    }
+
+    /// 真机端到端:用本机已建的 fable.db 验证「分片并行粗筛」与「单线程暴力全扫」选出的
+    /// 候选**距离分布逐位一致**(选最小 cand_n 个距离无歧义,即便边界并列)。强制 w=8 以真正
+    /// 触发分片(真机库 id 跨度可能小于自动阈值)。无库/库太小则跳过,不拖累常规 CI。
+    /// 取一条真实向量的 bits 当查询 → 必含一个距离 0 的自命中。
+    #[test]
+    fn coarse_scan_parallel_matches_bruteforce_on_real_db() {
+        let Ok(conn) = open_db() else { return };
+        let model = "BAAI/bge-m3";
+        let dim: i64 = 1024;
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL",
+                rusqlite::params![model, dim],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if total < 1000 {
+            eprintln!("[real-db] 跳过:本机无足量向量(total={total})");
+            return;
+        }
+        let (lo, hi): (i64, i64) = conn
+            .query_row(
+                "SELECT MIN(id), MAX(id) FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL",
+                rusqlite::params![model, dim],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let (self_id, qbits): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT id, bits FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL \
+                 ORDER BY id LIMIT 1",
+                rusqlite::params![model, dim],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let cand_n = 200usize;
+
+        // 单线程暴力参考(把全部 bits 读进来逐个算汉明,取最小 cand_n)。
+        let t_bf = std::time::Instant::now();
+        let mut bf: Vec<(i64, u32)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, bits FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![model, dim], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap();
+            rows.flatten()
+                .filter(|(_, b)| b.len() == qbits.len())
+                .map(|(id, b)| (id, crate::fable::index::hamming(&qbits, &b)))
+                .collect()
+        };
+        bf.sort_by_key(|x| x.1);
+        bf.truncate(cand_n);
+        let bf_ms = t_bf.elapsed().as_secs_f64() * 1000.0;
+
+        // 被测:单线程(w=1)与分片并行(w=8)两条真实代码路径。
+        let t1 = std::time::Instant::now();
+        let serial = coarse_scan_ranged(&qbits, model, dim, cand_n, &[], "", lo, hi, 1).unwrap();
+        let s_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let t8 = std::time::Instant::now();
+        let par = coarse_scan_ranged(&qbits, model, dim, cand_n, &[], "", lo, hi, 8).unwrap();
+        let p_ms = t8.elapsed().as_secs_f64() * 1000.0;
+
+        // 自命中(距离 0)必须在两路结果里。
+        assert!(serial.iter().any(|&(id, h)| id == self_id && h == 0));
+        assert!(par.iter().any(|&(id, h)| id == self_id && h == 0));
+
+        // 距离分布逐位一致:并行分片归并 == 单线程 == 暴力参考。
+        let dist = |v: &[(i64, u32)]| {
+            let mut d: Vec<u32> = v.iter().map(|x| x.1).collect();
+            d.sort();
+            d
+        };
+        let (ds, dp, db) = (dist(&serial), dist(&par), dist(&bf));
+        assert_eq!(ds.len(), cand_n, "应选满 cand_n 个候选");
+        assert_eq!(ds, db, "单线程粗筛距离分布须与暴力参考一致");
+        assert_eq!(
+            dp, db,
+            "分片并行(w=8)距离分布须与暴力参考一致 —— 分片/归并正确"
+        );
+
+        eprintln!(
+            "[real-db coarse] N={total} cand_n={cand_n} | 暴力(读全f32略)≈{bf_ms:.1}ms \
+             单线程粗筛={s_ms:.1}ms 分片x8={p_ms:.1}ms 提速x{:.2}",
+            s_ms / p_ms.max(0.001)
+        );
     }
 
     #[test]

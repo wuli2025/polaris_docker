@@ -121,6 +121,9 @@ function onViewReady(v: ViewKey) {
 // 起,别和启动的其它活儿抢资源;没待办或读不到总览就安静退出。
 async function autoBuildIndexOnStartup() {
   try {
+    // 用户在任务中心主动「停止」过索引 → 记住,开机不再自动续建,直到他手动再点建索引。
+    // (这条让「停止」是真能关掉的:不会下次开机又自己跑起来。)
+    if (localStorage.getItem("polaris.indexAutoPaused") === "1") return;
     const ov = await fc.overview(null);
     if (ov.indexing || ov.scanning) return; // 已经在跑,别重复
     // 没配嵌入服务商时向量索引无可续建(FTS 倒排首轮已一遍建完),不必每次开机空跑 + 误报。
@@ -216,16 +219,27 @@ const wsDown = ref(false);
 // 启动流程：splash(每次) → onboarding(仅首次) → env(环境检测,健康则无感放行) → ready
 const ONBOARDED_KEY = "polaris.onboarded.v1";
 const phase = ref<"splash" | "onboarding" | "env" | "ready">("splash");
+// 新用户(本次刚走完初始引导)首开:ready 后直接落地「文件中心」并拉起智能向导(可跳过)。
+// onOnboardingDone 只在 polaris.onboarded.v1 缺失时触发,正是「全新用户」的精确信号 ——
+// 老用户(已 onboarded)走 splash→env→ready,routeFcWizard 始终 false,不打扰、不改落地视图。
+const routeFcWizard = ref(false);
 
 function onSplashDone() {
   const done = localStorage.getItem(ONBOARDED_KEY);
   phase.value = done ? "env" : "onboarding";
 }
 function onOnboardingDone() {
+  routeFcWizard.value = true;
   phase.value = "env";
 }
 function onEnvDone() {
   phase.value = "ready";
+  // 全新用户:进文件中心 + 自动开「让 AI 更懂你」向导(向导自带「跳过」)。
+  if (routeFcWizard.value) {
+    routeFcWizard.value = false;
+    app.setView("file_center");
+    wiz.openWizard();
+  }
   // splash → onboarding → env 全部完成后，再检查更新（避免弹窗被盖住）
   checkForUpdate();
 }

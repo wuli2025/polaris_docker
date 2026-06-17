@@ -34,10 +34,19 @@ const CLUSTER_PALETTE: &[&str] = &[
 ];
 
 /// 命名启发式忽略的通用目录段(它们当簇名没区分度)。
+/// 当簇标签会显得「不是给人看」的目录名:① 通用容器名(files/data/新建文件夹)② 技术/格式/
+/// 工程目录名(html/css/js/log/node_modules/target…)。命名与词法向量都跳过它们,免得聚出
+/// 「html」「dist」「log」这类机器味分类——用户要主题(报税/装修),不是格式或工程目录。
 const GENERIC_DIRS: &[&str] = &[
+    // 通用容器
     "raw", "wiki", "output", "memory", "src", "docs", "doc", "data", "assets", "public",
     "dist", "build", "tmp", "temp", "files", "file", "新建文件夹", "downloads", "下载",
-    "documents", "文档", "desktop", "桌面",
+    "documents", "文档", "desktop", "桌面", "untitled", "misc", "other", "others", "杂项", "其它", "其他",
+    // 技术/格式/工程目录(常是软件生成、非人看)
+    "html", "htm", "css", "js", "ts", "jsx", "tsx", "json", "xml", "yaml", "yml",
+    "log", "logs", "cache", "caches", "bin", "obj", "lib", "libs", "include", "vendor",
+    "target", "node_modules", "venv", "__pycache__", ".git", ".idea", ".vscode",
+    "static", "scripts", "styles", "fonts", "icons", "thumbnails", "thumbs", "cache_data",
 ];
 
 // ───────────────────────── 通用小工具 ─────────────────────────
@@ -611,26 +620,28 @@ pub fn thumb(abspath: String, max: u32) -> Result<Option<String>, String> {
 }
 
 /// 视频首帧:best-effort 调系统/渲染版 ffmpeg 抽第 1 秒一帧 → image 解码缩放。缺 ffmpeg 返回 None。
+///
+/// **必须带超时**:损坏 / 半截 / 格式刁钻的视频会让 ffmpeg 永久挂死,而本函数被文件中心 grid
+/// 逐图调用(常跑在多核缩略图线程上)—— 一个挂死的 ffmpeg 进程就能拖死整个 grid 加载、表现为
+/// 「文件中心卡死」。复用 [`crate::forge::run_with_timeout`]:超 15s 即杀进程返回,绝不永久阻塞。
 fn video_frame(p: &Path, max: u32) -> Option<image::DynamicImage> {
     let tmp = std::env::temp_dir().join(format!("polaris-vf-{}.jpg", hash_key(&[&p.to_string_lossy()])));
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-ss",
-            "1",
-            "-i",
-            &p.to_string_lossy(),
-            "-frames:v",
-            "1",
-            "-vf",
-            &format!("scale={max}:-1"),
-            &tmp.to_string_lossy(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    if !status.success() {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-ss",
+        "1",
+        "-i",
+        &p.to_string_lossy(),
+        "-frames:v",
+        "1",
+        "-vf",
+        &format!("scale={max}:-1"),
+        &tmp.to_string_lossy(),
+    ]);
+    // 超时即杀进程(Mac/Win/Docker 同构):坏视频再也卡不死缩略图线程。
+    if crate::forge::run_with_timeout(cmd, 15, "ffmpeg 视频首帧").is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return None;
     }
     let img = image::open(&tmp).ok().map(|i| i.thumbnail(max, max));
@@ -825,10 +836,11 @@ fn hash_token(s: &str) -> u64 {
     h.finish()
 }
 
-/// 文件的词法特征向量:**名字优先**——文件名分词(权重 2.4)主导,文件夹段(0.7)次之,
-/// 扩展名(0.35)只作微调。这样有名字的文件按名字归(用户最熟悉、最快),目录只起辅助;
+/// 文件的词法特征向量:**按意思,不按格式**——文件名分词(权重 2.4)主导,文件夹段(0.7)次之。
+/// **刻意不喂扩展名**:否则一堆 .html / .png / .log 会按「格式」抱团,聚出「网页」「图片」这种
+/// 不是给人看的分类;用户要的是「报税」「装修」这类**主题**分类(格式维度另有「按语言/类型」筛选条)。
 /// 相近命名的文件在余弦下自然靠拢。哈希进 LEX_DIM 维。
-fn lexical_vec(relpath: &str, name: &str, ext: &str) -> Vec<f32> {
+fn lexical_vec(relpath: &str, name: &str, _ext: &str) -> Vec<f32> {
     let mut v = vec![0f32; LEX_DIM];
     let segs: Vec<&str> = relpath.split('/').collect();
     for seg in segs.iter().take(segs.len().saturating_sub(1)) {
@@ -841,17 +853,16 @@ fn lexical_vec(relpath: &str, name: &str, ext: &str) -> Vec<f32> {
     for tok in tokenize(name) {
         v[(hash_token(&tok) % LEX_DIM as u64) as usize] += 2.4;
     }
-    if !ext.is_empty() {
-        v[(hash_token(&ext.to_lowercase()) % LEX_DIM as u64) as usize] += 0.35;
-    }
     v
 }
 
-/// 词法兜底:加载范围内全部文件(上限 6000,mtime 倒序)→ 归一化词法向量。
+/// 词法兜底:加载范围内文件的**样本**(上限 6000)→ 归一化词法向量,用来算 k-means 质心。
+/// 样本不再按 mtime 倒序(只取最近的会漏掉老主题),改用 id 哈希**均匀散布全库**取样,
+/// 让质心覆盖到所有主题;真正的「全覆盖指派」在 [`cluster_build_on`] 里对全部文件做(O(N·k))。
 fn load_lexical_files(conn: &rusqlite::Connection, filter: &str) -> Result<Vec<FileVec>, String> {
     let sql = format!(
         "SELECT f.id, f.root_id, f.relpath, f.name, f.ext FROM files f
-         WHERE 1=1{filter} ORDER BY f.mtime DESC LIMIT 6000"
+         WHERE 1=1{filter} ORDER BY (f.id * 2654435761) % 1000003 LIMIT 6000"
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
@@ -874,13 +885,44 @@ fn load_lexical_files(conn: &rusqlite::Connection, filter: &str) -> Result<Vec<F
     Ok(out)
 }
 
+/// 归类用的「向量来源」:
+/// - `Auto`:有已存嵌入向量走语义、否则自动退词法(默认,向后兼容)。
+/// - `Lexical`:强制走结构/词法(路径+文件名+扩展名哈希),**秒级、零嵌入依赖** —— 文件中心
+///   v3 的 T0「骨架图谱」用它,盘点完立刻出簇,不等任何向量。
+/// - `Semantic`:强制走语义(均值池化已存向量);没向量则优雅退词法,绝不报错卡住流程。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClusterMode {
+    Auto,
+    Lexical,
+    Semantic,
+}
+
 /// 单根/全库重建语义聚类:每文件 = 其 chunk 向量均值池化 → 球面 k-means(余弦) →
 /// 写回 files.cluster_id + clusters 表。纯数学,不调嵌入 API。
 /// 无嵌入向量时自动退化为词法归类(见 [`load_lexical_files`]),保证永远可用。
 pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String> {
+    cluster_build_mode(root, ClusterMode::Auto)
+}
+
+/// 见 [`ClusterMode`]:按指定向量来源重建聚类。`cluster_build` = `Auto`。
+pub fn cluster_build_mode(
+    root: Option<String>,
+    want: ClusterMode,
+) -> Result<ClusterBuildSummary, String> {
     let started = std::time::Instant::now();
     let conn = open_db()?;
     let ids = resolve_root_ids(&conn, &root);
+    cluster_build_on(&conn, &ids, want, started)
+}
+
+/// 聚类核心(可注入连接,便于在隔离 db 上做准确度评测,见 `tests::cluster_eval_*`)。
+/// `cluster_build_mode` 仅负责 open_db + 解析根,再委托本函数。
+fn cluster_build_on(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+    want: ClusterMode,
+    started: std::time::Instant,
+) -> Result<ClusterBuildSummary, String> {
     let filter = if ids.is_empty() {
         String::new()
     } else {
@@ -888,63 +930,70 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
         format!(" AND f.root_id IN ({})", list.join(","))
     };
 
-    // 均值池化:流式累加每个文件的 chunk 向量
-    let mut acc: HashMap<i64, (Vec<f32>, u32, i64, String, String)> = HashMap::new();
-    {
-        let sql = format!(
-            "SELECT c.file_id, c.vec, f.root_id, f.relpath, f.name
-             FROM chunks c JOIN files f ON f.id=c.file_id
-             WHERE f.kind='text'{filter}"
-        );
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let blob: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
-            let v = super::index::blob_to_vec(&blob);
-            let root_id: i64 = row.get(2).map_err(|e| e.to_string())?;
-            let relpath: String = row.get(3).map_err(|e| e.to_string())?;
-            let name: String = row.get(4).map_err(|e| e.to_string())?;
-            let entry = acc
-                .entry(file_id)
-                .or_insert_with(|| (vec![0.0; v.len()], 0, root_id, relpath, name));
-            if entry.0.len() == v.len() {
-                for (a, b) in entry.0.iter_mut().zip(v.iter()) {
-                    *a += b;
-                }
-                entry.1 += 1;
-            }
-        }
-    }
-
-    let mut files: Vec<FileVec> = acc
-        .into_iter()
-        .filter(|(_, (_, n, ..))| *n > 0)
-        .map(|(file_id, (mut v, n, root_id, relpath, name))| {
-            for x in v.iter_mut() {
-                *x /= n as f32;
-            }
-            normalize(&mut v);
-            FileVec { file_id, root_id, relpath, name, vec: v }
-        })
-        .collect();
-
+    // 向量来源:Lexical 直接走结构特征(不读 chunks,秒级);其余先取已存嵌入向量。
     let mut mode = "semantic";
-    if files.len() < 2 {
-        // 没有(足够的)嵌入向量 → 退化为「结构/词法」归类:对全部文件用
-        // 文件夹 + 文件名分词 + 扩展名的哈希特征向量,跑同一套球面 k-means。
-        // 无需任何 key、离线即可用 —— 保证「智能归类」永远点得动、永远能把相似文件放一起;
-        // 配了硅基 key 并建好向量索引后,本函数自动走上面的语义路(更准)。
+    let mut files: Vec<FileVec> = if want == ClusterMode::Lexical {
         mode = "lexical";
-        files = load_lexical_files(&conn, &filter)?;
-        if files.len() < 2 {
-            return Ok(ClusterBuildSummary {
-                clusters: 0,
-                files: files.len(),
-                seconds: started.elapsed().as_secs_f64(),
-                note: "可归类的文件不足(<2),先点「盘点」扫描磁盘文件再归类".into(),
-            });
+        load_lexical_files(&conn, &filter)?
+    } else {
+        // 均值池化:流式累加每个文件的 chunk 向量
+        let mut acc: HashMap<i64, (Vec<f32>, u32, i64, String, String)> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT c.file_id, c.vec, f.root_id, f.relpath, f.name
+                 FROM chunks c JOIN files f ON f.id=c.file_id
+                 WHERE f.kind='text'{filter}"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                let blob: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+                let v = super::index::blob_to_vec(&blob);
+                let root_id: i64 = row.get(2).map_err(|e| e.to_string())?;
+                let relpath: String = row.get(3).map_err(|e| e.to_string())?;
+                let name: String = row.get(4).map_err(|e| e.to_string())?;
+                let entry = acc
+                    .entry(file_id)
+                    .or_insert_with(|| (vec![0.0; v.len()], 0, root_id, relpath, name));
+                if entry.0.len() == v.len() {
+                    for (a, b) in entry.0.iter_mut().zip(v.iter()) {
+                        *a += b;
+                    }
+                    entry.1 += 1;
+                }
+            }
         }
+        let v: Vec<FileVec> = acc
+            .into_iter()
+            .filter(|(_, (_, n, ..))| *n > 0)
+            .map(|(file_id, (mut vec, n, root_id, relpath, name))| {
+                for x in vec.iter_mut() {
+                    *x /= n as f32;
+                }
+                normalize(&mut vec);
+                FileVec { file_id, root_id, relpath, name, vec }
+            })
+            .collect();
+        if v.len() < 2 {
+            // 没有(足够的)嵌入向量 → 退化为「结构/词法」归类:对全部文件用
+            // 文件夹 + 文件名分词 + 扩展名的哈希特征向量,跑同一套球面 k-means。
+            // 无需任何 key、离线即可用 —— 保证「智能归类」永远点得动、永远能把相似文件放一起;
+            // 配了硅基 key 并建好向量索引后,Auto/Semantic 自动走上面的语义路(更准)。
+            mode = "lexical";
+            load_lexical_files(&conn, &filter)?
+        } else {
+            v
+        }
+    };
+
+    if files.len() < 2 {
+        return Ok(ClusterBuildSummary {
+            clusters: 0,
+            files: files.len(),
+            seconds: started.elapsed().as_secs_f64(),
+            note: "可归类的文件不足(<2),先点「盘点」扫描磁盘文件再归类".into(),
+        });
     }
     // 稳定顺序(file_id 升序),让确定性初始化可复现
     files.sort_by_key(|f| f.file_id);
@@ -975,14 +1024,17 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
     };
     let n_parents = parent_of_leaf.iter().copied().max().map(|m| m + 1).unwrap_or(0);
 
-    // 清旧簇(对涉及的根)
+    // 清旧簇(对涉及的根)。簇 id 即将重排,旧关系边一并清掉,免得 cluster_edges 残留指向已删簇
+    // (虽然 build_file_graph 会按现存簇过滤、不会渲染脏边,但清掉更干净、避免长期累积)。
     if ids.is_empty() {
         conn.execute("DELETE FROM clusters", []).ok();
+        conn.execute("DELETE FROM cluster_edges", []).ok();
         conn.execute("UPDATE files SET cluster_id=0", []).ok();
     } else {
         let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
         let inlist = list.join(",");
         conn.execute(&format!("DELETE FROM clusters WHERE root_id IN ({inlist})"), []).ok();
+        conn.execute(&format!("DELETE FROM cluster_edges WHERE root_id IN ({inlist})"), []).ok();
         conn.execute(&format!("UPDATE files SET cluster_id=0 WHERE root_id IN ({inlist})"), []).ok();
     }
 
@@ -1015,7 +1067,9 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
         }
     }
 
-    // 再写叶簇(两级时 parent=父 id 且与父同色;单级时 parent=0)并把文件挂到叶簇。
+    // 再写叶簇(两级时 parent=父 id 且与父同色;单级时 parent=0)并把【样本】文件挂到叶簇。
+    // 同时记下每个叶簇的 (db id, 质心向量),供下面把【全部文件】指派到最近质心(全覆盖)。
+    let mut leaf_db: Vec<(i64, Vec<f32>)> = Vec::with_capacity(n_leaf);
     for (li, mem) in members.iter().enumerate() {
         let (label, keywords) = name_cluster(&files, mem);
         let p = parent_of_leaf[li];
@@ -1039,19 +1093,71 @@ pub fn cluster_build(root: Option<String>) -> Result<ClusterBuildSummary, String
                     .map_err(|e| e.to_string())?;
             }
         }
+        leaf_db.push((cluster_id, leaf_centroids[leaf_idx[li]].clone()));
         new_clusters += 1;
     }
+
+    // ── 全覆盖关键修(治「几分钟路径只归 6000、大库覆盖率暴跌」)──
+    // 词法档:质心由样本(≤6000)算出,但要把**全部文件**指派到最近质心,而非只归样本。
+    // 指派是 O(N·k) 纯点积,弱机也就几秒。语义档不做(无嵌入的文件没向量;全量嵌入交 T2)。
+    let mut total_files = n;
+    if mode == "lexical" && !leaf_db.is_empty() {
+        let sql = format!("SELECT f.id, f.relpath, f.name, f.ext FROM files f WHERE 1=1{filter}");
+        let mut counts: HashMap<i64, i64> = HashMap::new();
+        {
+            let mut sel = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let mut up = conn
+                .prepare_cached("UPDATE files SET cluster_id=?1 WHERE id=?2")
+                .map_err(|e| e.to_string())?;
+            let mut rows = sel.query([]).map_err(|e| e.to_string())?;
+            let mut assigned_all = 0i64;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                let relpath: String = row.get(1).map_err(|e| e.to_string())?;
+                let name: String = row.get(2).map_err(|e| e.to_string())?;
+                let ext: String = row.get(3).map_err(|e| e.to_string())?;
+                let mut v = lexical_vec(&relpath, &name, &ext);
+                normalize(&mut v);
+                let mut best = leaf_db[0].0;
+                let mut best_s = f32::MIN;
+                for (cid, cen) in &leaf_db {
+                    let s = dot(cen, &v);
+                    if s > best_s {
+                        best_s = s;
+                        best = *cid;
+                    }
+                }
+                up.execute(rusqlite::params![best, id]).map_err(|e| e.to_string())?;
+                *counts.entry(best).or_insert(0) += 1;
+                assigned_all += 1;
+            }
+            total_files = assigned_all as usize;
+        }
+        // 叶簇 size = 全量指派后的真实计数;父簇 size = 旗下叶簇之和。
+        let mut psum: HashMap<i64, i64> = HashMap::new();
+        for (li, (cid, _)) in leaf_db.iter().enumerate() {
+            let c = counts.get(cid).copied().unwrap_or(0);
+            conn.execute("UPDATE clusters SET size=?1 WHERE id=?2", rusqlite::params![c, cid]).ok();
+            if two_level {
+                *psum.entry(parent_ids[parent_of_leaf[li]]).or_insert(0) += c;
+            }
+        }
+        for (pid, c) in &psum {
+            conn.execute("UPDATE clusters SET size=?1 WHERE id=?2", rusqlite::params![c, pid]).ok();
+        }
+    }
+
     conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
 
     Ok(ClusterBuildSummary {
         clusters: new_clusters,
-        files: n,
+        files: total_files,
         seconds: started.elapsed().as_secs_f64(),
         note: if mode == "semantic" {
-            format!("已按语义把 {n} 个已嵌入文本归成 {new_clusters} 簇")
+            format!("已按语义把 {total_files} 个已嵌入文本归成 {new_clusters} 簇")
         } else {
             format!(
-                "已按文件夹/名称把 {n} 个文件归成 {new_clusters} 簇 · 配硅基 key 并建向量索引后可升级为语义归类"
+                "已按文件夹/名称把 {total_files} 个文件归成 {new_clusters} 簇 · 配硅基 key 并建向量索引后可升级为语义归类"
             )
         },
     })
@@ -1078,14 +1184,17 @@ fn build_file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> 
         title: "我的资料".into(),
         category: String::new(),
         kind: "root".into(),
+        summary: None,
     });
 
     // 主题簇节点 + 层级边(顶层接 root,子主题接父簇)。category 携带**簇色** → 前端按语义簇着色,
-    // 一眼看出电脑上分了几个语义聚类(每个簇一种颜色,旗下文件同色)。
+    // 一眼看出电脑上分了几个语义聚类(每个簇一种颜色,旗下文件同色);summary 携带 AI 的一句话画像。
+    let mut cluster_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut cluster_ids: Vec<i64> = Vec::new();
     let mut colors: HashMap<i64, String> = HashMap::new();
     {
-        let sql = format!("SELECT id, label, color, parent FROM clusters{cfilter} ORDER BY size DESC");
+        let sql =
+            format!("SELECT id, label, color, parent, summary FROM clusters{cfilter} ORDER BY size DESC");
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
@@ -1094,24 +1203,57 @@ fn build_file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> 
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
-        for (id, label, color, parent) in rows.flatten() {
+        for (id, label, color, parent, summary) in rows.flatten() {
             cluster_ids.push(id);
+            cluster_set.insert(id);
             colors.insert(id, color.clone());
             nodes.push(KbNode {
                 id: format!("c{id}"),
                 title: label,
                 category: color,
                 kind: "folder".into(),
+                summary: (!summary.trim().is_empty()).then_some(summary),
             });
             let src = if parent == 0 { ROOT_ID.to_string() } else { format!("c{parent}") };
-            edges.push(KbEdge { source: src, target: format!("c{id}") });
+            edges.push(KbEdge { source: src, target: format!("c{id}"), rel: None });
         }
     }
     if cluster_ids.is_empty() {
         return Ok(KbGraph { nodes, edges });
+    }
+
+    // 簇间语义关系边(AI 推断:同源/进阶/方法论…),只连两端都在本范围渲染的簇 → 星图成真·关系图谱。
+    {
+        let efilter = if ids.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+            format!(" WHERE root_id IN ({})", list.join(","))
+        };
+        let sql = format!("SELECT src, dst, label FROM cluster_edges{efilter}");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            }) {
+                for (src, dst, label) in rows.flatten() {
+                    if cluster_set.contains(&src) && cluster_set.contains(&dst) {
+                        edges.push(KbEdge {
+                            source: format!("c{src}"),
+                            target: format!("c{dst}"),
+                            rel: Some(if label.trim().is_empty() {
+                                "相关".to_string()
+                            } else {
+                                label
+                            }),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // 抽样文件星点(挂到各自 cluster_id;每簇 ≤PER,总计 ≤CAP),标题优先用 AI 名。
@@ -1152,8 +1294,9 @@ fn build_file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> 
                     title,
                     category: colors.get(&cid).cloned().unwrap_or_default(),
                     kind: "doc".into(),
+                    summary: None,
                 });
-                edges.push(KbEdge { source: format!("c{cid}"), target: format!("f{fid}") });
+                edges.push(KbEdge { source: format!("c{cid}"), target: format!("f{fid}"), rel: None });
             }
         }
     }
@@ -1320,8 +1463,14 @@ fn tokenize(name: &str) -> Vec<String> {
     if cur_cjk.chars().count() >= 2 {
         out.push(cur_cjk);
     }
-    // 过滤纯数字/常见噪声词
-    out.retain(|t| !t.chars().all(|c| c.is_ascii_digit()) && t != "copy" && t != "final");
+    // 过滤纯数字 + 常见噪声词 + **格式/技术词**(html/css/log/exe…)——这些当关键词或兜底簇名
+    // 都是「机器味」,不是给人看的;主题词(报税/装修)才留。
+    const TECH_TOK: &[&str] = &[
+        "copy", "final", "html", "htm", "css", "js", "ts", "jsx", "tsx", "json", "xml", "yaml",
+        "yml", "log", "logs", "tmp", "temp", "exe", "dll", "bin", "obj", "bak", "cache", "min",
+        "index", "deck", "output", "raw", "dist", "build", "node", "vendor", "static",
+    ];
+    out.retain(|t| !t.chars().all(|c| c.is_ascii_digit()) && !TECH_TOK.contains(&t.as_str()));
     out
 }
 
@@ -1656,14 +1805,16 @@ fn cluster_llm_run(app: &AppHandle, root: Option<String>) -> Result<(usize, usiz
 
     emit_llm(app, json!({ "kind": "phase", "text": "写回归类 + 生成桌面报告…" }));
 
-    // 清旧簇(范围内)
+    // 清旧簇(范围内)+ 旧关系边(簇 id 即将重排)。
     if ids.is_empty() {
         conn.execute("DELETE FROM clusters", []).ok();
+        conn.execute("DELETE FROM cluster_edges", []).ok();
         conn.execute("UPDATE files SET cluster_id=0", []).ok();
     } else {
         let inlist: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
         let inlist = inlist.join(",");
         conn.execute(&format!("DELETE FROM clusters WHERE root_id IN ({inlist})"), []).ok();
+        conn.execute(&format!("DELETE FROM cluster_edges WHERE root_id IN ({inlist})"), []).ok();
         conn.execute(&format!("UPDATE files SET cluster_id=0 WHERE root_id IN ({inlist})"), []).ok();
     }
 
@@ -1872,6 +2023,610 @@ overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
         .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
         .ok_or("找不到桌面目录")?;
     let path = desktop.join(format!("文件中心-AI归类报告-{stamp}.html"));
+    std::fs::write(&path, html).map_err(|e| format!("写报告失败: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+// ───────────────── 文件中心 v3 · 簇画像 + 大模型命名/关系(读懂全库,不止 240) ─────────────────
+//
+// 核心洞察:大模型不读「文件」,读「向量聚类后的簇画像」—— 成本与文件数脱钩,几万文件也只看几十段
+// 摘要。[`cluster_build`](全量、无 240 上限)先把库分成簇,本段让模型给每个簇起**亲切的人话名**
+// +一句**温暖的概括** + 推断**簇间关系**。既覆盖全量,又让用户觉得「它很懂我」。
+
+fn kind_cn(k: &str) -> &'static str {
+    match k {
+        "text" => "文本",
+        "doc" => "文档",
+        "image" => "图片",
+        "audio" => "音频",
+        "video" => "视频",
+        "archive" => "压缩包",
+        _ => "其它",
+    }
+}
+
+/// 把大模型给的 id 字段(可能是数字或字符串)宽松解析成簇 id。
+fn loose_i64(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    v.as_str().and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+/// 一个簇的「画像」:喂给大模型命名/关系用。纯结构信号 + 代表文件名,**不抽 gist、不读盘**,
+/// 故秒级可成 —— T1 能快速出第一波。
+struct ClusterDigest {
+    id: i64,
+    parent: i64,
+    label: String,
+    keywords: String,
+    size: i64,
+    folders: Vec<String>,
+    samples: Vec<String>,
+    kinds: Vec<(String, usize)>,
+}
+
+/// 为范围内**每个簇**(大主题 + 子主题)生成画像。大主题的样本取自旗下子簇文件。
+fn collect_cluster_digests(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+) -> Result<Vec<ClusterDigest>, String> {
+    let cfilter = if ids.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        format!(" WHERE root_id IN ({})", list.join(","))
+    };
+    let clusters: Vec<(i64, i64, String, String, i64)> = {
+        let sql =
+            format!("SELECT id, parent, label, keywords, size FROM clusters{cfilter} ORDER BY size DESC");
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.flatten().collect()
+    };
+    if clusters.is_empty() {
+        return Ok(Vec::new());
+    }
+    // parent → 旗下叶簇 id
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (id, parent, ..) in &clusters {
+        if *parent != 0 {
+            children.entry(*parent).or_default().push(*id);
+        }
+    }
+    let mut digests = Vec::with_capacity(clusters.len());
+    for (id, parent, label, keywords, size) in &clusters {
+        let leaf_ids: Vec<i64> = children.get(id).cloned().unwrap_or_else(|| vec![*id]);
+        let inlist: String =
+            leaf_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT f.relpath, f.name, f.kind, t.title
+             FROM files f LEFT JOIN titles t ON t.file_id=f.id
+             WHERE f.cluster_id IN ({inlist})
+             ORDER BY CASE WHEN f.kind IN ('doc','text') THEN 0 WHEN f.kind='video' THEN 1 ELSE 2 END,
+                      f.mtime DESC
+             LIMIT 80"
+        );
+        let mut dir_freq: HashMap<String, usize> = HashMap::new();
+        let mut kind_freq: HashMap<String, usize> = HashMap::new();
+        let mut samples: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for (relpath, name, kind, title) in rows.flatten() {
+                let segs: Vec<&str> = relpath.split('/').collect();
+                for seg in segs.iter().take(segs.len().saturating_sub(1)) {
+                    let s = seg.trim();
+                    if s.is_empty() || GENERIC_DIRS.contains(&s.to_lowercase().as_str()) {
+                        continue;
+                    }
+                    *dir_freq.entry(s.to_string()).or_insert(0) += 1;
+                }
+                *kind_freq.entry(kind).or_insert(0) += 1;
+                if samples.len() < 12 {
+                    let nm = title
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| clean_title(&name));
+                    let nm = nm.trim().to_string();
+                    if !nm.is_empty() && !samples.contains(&nm) {
+                        samples.push(nm);
+                    }
+                }
+            }
+        }
+        let mut folders: Vec<(String, usize)> = dir_freq.into_iter().collect();
+        folders.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let folders: Vec<String> = folders.into_iter().take(4).map(|(d, _)| d).collect();
+        let mut kinds: Vec<(String, usize)> = kind_freq.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        digests.push(ClusterDigest {
+            id: *id,
+            parent: *parent,
+            label: label.clone(),
+            keywords: keywords.clone(),
+            size: *size,
+            folders,
+            samples,
+            kinds,
+        });
+    }
+    Ok(digests)
+}
+
+/// 把簇画像拼成「起名 + 关系」指令(只让模型读这几十段摘要,与文件总数无关)。
+fn digest_directive(digests: &[ClusterDigest]) -> String {
+    let mut body = String::new();
+    for d in digests {
+        let role = if d.parent == 0 { "大主题" } else { "子主题" };
+        body.push_str(&format!(
+            "[id={}] {}(文件 {} 个,现名「{}」)\n",
+            d.id, role, d.size, d.label
+        ));
+        if !d.folders.is_empty() {
+            body.push_str(&format!("  常见目录: {}\n", d.folders.join(" / ")));
+        }
+        if !d.keywords.trim().is_empty() {
+            body.push_str(&format!("  关键词: {}\n", d.keywords.trim()));
+        }
+        if !d.samples.is_empty() {
+            body.push_str(&format!("  代表文件: {}\n", d.samples.join("、")));
+        }
+        if !d.kinds.is_empty() {
+            let ks: Vec<String> =
+                d.kinds.iter().take(4).map(|(k, n)| format!("{}×{}", kind_cn(k), n)).collect();
+            body.push_str(&format!("  类型: {}\n", ks.join(" ")));
+        }
+    }
+    format!(
+        r#"你是用户私人文件库的「知识管家」,非常懂这个人。下面是他文件库里**已经聚好的若干簇**
+(每个簇带:id、是大主题还是子主题、文件数、现有粗略名字、常见目录、关键词、代表文件名、类型分布)。
+
+请为**每一个簇**做两件事,让主人一眼觉得「这个软件太懂我了」:
+1. 起一个**他自己会用的中文大白话名字**(像他平时怎么称呼这堆东西):
+   「我的报税资料」「装修」「考研复习」「孩子的照片」「工作汇报」「副业接单」「合同发票」……
+   - 大主题可带「我的」更亲切;子主题更具体;
+   - **绝不要**英文、技术黑话、或 raw/output/新建文件夹 这类目录原名;也别用「其它/杂项/未分类」。
+   - **绝不要拿文件格式/类型当名字**:哪怕一簇全是网页(html)/图片/视频/压缩包,也要按它们**讲的是什么事**
+     来命名——一堆网页报告叫「项目周报」别叫「网页/html」;一堆图片若是旅行照就叫「旅行照片」别叫「图片」;
+     下面每簇的「类型: …」只是帮你判断内容,**不是让你把格式名写成簇名**。
+   - **用类别名,别用某一个的名字**:一簇大多是同一类东西时,叫这类东西的统称——
+     一堆电影叫「电影」别叫「教父」;一堆照片叫「照片」别叫某张图名;一堆发票/报表叫「发票报表」
+     别只叫「年度利润表」;一堆合同叫「合同」。簇名要能涵盖簇里**大多数**文件,而非只贴合某一个。
+2. 写一句**温暖、具体、像朋友帮你整理完说的话**(summary,12~30 字),例如
+   「你 2023-2024 报税要用的材料都收在这了」「准备考研那阵子刷的题和笔记」。
+
+再**按意思合并**(merges):如果发现**几个簇其实是同一类东西,只是被文件夹/命名拆开了**——
+例「发票」「invoices」「报销单」其实都是发票报销;「2022照片」「2023照片」其实都是照片;
+「考研数学」「考研英语」若你觉得该合在「考研复习」下——就把它们的 id 列成一组放进 merges,
+让它们并成一簇(并完用一个统称命名)。**只在确实同一类时合并,不同主题千万别硬并;宁可不并,不要乱并。**
+
+再**推断簇与簇之间的关系**(relations):如某簇是另一簇的「方法论 / 前置 / 进阶 / 同源 / 印证 / 配套」。
+只在确有关系时连,用簇 id 表方向(from→to);没把握就少连,别硬凑。
+
+**只输出一个 JSON 对象,不要任何额外文字、不要 markdown 围栏**,格式:
+{{"names":[{{"id":簇id,"name":"大白话名字","summary":"一句温暖概括"}}, ...],
+  "merges":[[簇id,簇id,...], ...],
+  "relations":[{{"from":簇id,"to":簇id,"label":"关系(如 方法论/进阶/同源)"}}, ...]}}
+
+簇清单({} 个):
+{body}"#,
+        digests.len()
+    )
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LlmNameRel {
+    #[serde(default)]
+    names: Vec<LlmName>,
+    #[serde(default)]
+    relations: Vec<LlmRel>,
+    /// 「按意思合并」:每组是一串簇 id,模型认为它们其实是同一类东西、只是被文件夹/命名拆开了
+    /// (发票/invoices/报销单 → 一类)。服务端只接受**同父叶簇**的合并(同层、同主题旗下),
+    /// 防把跨主题的簇乱并;并入后该组文件改挂最大簇,余簇删除。见 apply_names_and_relations。
+    #[serde(default)]
+    merges: Vec<Vec<Value>>,
+}
+#[derive(Debug, Deserialize)]
+struct LlmName {
+    #[serde(default)]
+    id: Value,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    summary: String,
+}
+#[derive(Debug, Deserialize)]
+struct LlmRel {
+    #[serde(default)]
+    from: Value,
+    #[serde(default)]
+    to: Value,
+    #[serde(default)]
+    label: String,
+}
+
+/// 校验 + 落库:先按模型给的 merges **按意思合并同义簇**,再把 names/relations 写进
+/// clusters.label/summary + 重建 cluster_edges。纯函数式校验逻辑抽出来便于单测
+/// (见 tests::rename_apply_*)。返回 (改名数, 关系边数, 合并掉的簇数)。
+fn apply_names_and_relations(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+    parsed: &LlmNameRel,
+    valid: &std::collections::HashSet<i64>,
+    croot: &HashMap<i64, i64>,
+    built_at: i64,
+) -> Result<(usize, usize, usize), String> {
+    let mut renamed = 0usize;
+    let mut edges = 0usize;
+    let mut merged = 0usize;
+    conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+
+    // ── 0. 按意思合并(merges):把模型认定「其实是同一类、只是被文件夹/命名拆开」的簇并成一簇 ──
+    // 安全闸:只合并**同父叶簇**(同层、同主题旗下;不动顶层大主题、不动有子簇的父簇),survivor 取最大簇;
+    // 组内文件改挂 survivor,余簇删除。合并是「同父兄弟」之间故父簇总文件数不变(无需重算父 size)。
+    let mut work_valid = valid.clone();
+    let mut remap: HashMap<i64, i64> = HashMap::new(); // 被并旧 id → survivor
+    if !parsed.merges.is_empty() {
+        // 现有簇的 parent / size,以及「谁是别人的父」(父簇不可参与合并,否则孤立其子簇)。
+        let mut pmap: HashMap<i64, i64> = HashMap::new();
+        let mut smap: HashMap<i64, i64> = HashMap::new();
+        let mut parent_set: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT id, parent, size FROM clusters").map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+                .map_err(|e| e.to_string())?;
+            for (id, parent, size) in rows.flatten() {
+                pmap.insert(id, parent);
+                smap.insert(id, size);
+                if parent != 0 {
+                    parent_set.insert(parent);
+                }
+            }
+        }
+        for group in &parsed.merges {
+            // 组内:合法 + 仍存活 + 不是某簇的父 + 在本范围 valid 里的簇 id(去重)。
+            let mut g: Vec<i64> = group
+                .iter()
+                .filter_map(loose_i64)
+                .filter(|id| work_valid.contains(id) && !parent_set.contains(id))
+                .collect();
+            g.sort_unstable();
+            g.dedup();
+            if g.len() < 2 {
+                continue;
+            }
+            // 必须**同父**(同层、同主题旗下)才合并 —— 防把跨主题的叶簇乱并。
+            let par = pmap.get(&g[0]).copied().unwrap_or(-1);
+            if !g.iter().all(|id| pmap.get(id).copied().unwrap_or(-2) == par) {
+                continue;
+            }
+            // survivor = 组内最大簇(size 最大;并列取最小 id,确定性)。
+            g.sort_by(|a, b| {
+                smap.get(b).cmp(&smap.get(a)).then(a.cmp(b))
+            });
+            let survivor = g[0];
+            for &loser in &g[1..] {
+                conn.execute(
+                    "UPDATE files SET cluster_id=?1 WHERE cluster_id=?2",
+                    rusqlite::params![survivor, loser],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute("DELETE FROM clusters WHERE id=?1", rusqlite::params![loser])
+                    .map_err(|e| e.to_string())?;
+                work_valid.remove(&loser);
+                remap.insert(loser, survivor);
+                merged += 1;
+            }
+            // survivor 真实大小重算(= 吸收后旗下文件计数);更新 smap 供后续组判断。
+            conn.execute(
+                "UPDATE clusters SET size=(SELECT COUNT(*) FROM files WHERE cluster_id=?1) WHERE id=?1",
+                rusqlite::params![survivor],
+            )
+            .map_err(|e| e.to_string())?;
+            if let Ok(ns) = conn.query_row(
+                "SELECT size FROM clusters WHERE id=?1",
+                rusqlite::params![survivor],
+                |r| r.get::<_, i64>(0),
+            ) {
+                smap.insert(survivor, ns);
+            }
+        }
+    }
+
+    // 命名:被并旧 id 顺手指到 survivor;校验落在合并后仍存活的簇上。
+    {
+        let mut up = conn
+            .prepare_cached("UPDATE clusters SET label=?1, summary=?2 WHERE id=?3")
+            .map_err(|e| e.to_string())?;
+        for n in &parsed.names {
+            let Some(id0) = loose_i64(&n.id) else { continue };
+            let id = remap.get(&id0).copied().unwrap_or(id0);
+            if !work_valid.contains(&id) {
+                continue;
+            }
+            let name = n.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let name: String = name.chars().take(24).collect();
+            let summary: String = n.summary.trim().chars().take(60).collect();
+            up.execute(rusqlite::params![name, summary, id]).map_err(|e| e.to_string())?;
+            renamed += 1;
+        }
+    }
+    // 清范围内旧关系边,再重建(幂等)。
+    if ids.is_empty() {
+        conn.execute("DELETE FROM cluster_edges", []).ok();
+    } else {
+        let inlist: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        conn.execute(
+            &format!("DELETE FROM cluster_edges WHERE root_id IN ({})", inlist.join(",")),
+            [],
+        )
+        .ok();
+    }
+    {
+        let mut ins = conn
+            .prepare_cached(
+                "INSERT INTO cluster_edges(root_id,src,dst,label,built_at) VALUES(?1,?2,?3,?4,?5)",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut seen: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        for r in &parsed.relations {
+            let (Some(a0), Some(b0)) = (loose_i64(&r.from), loose_i64(&r.to)) else {
+                continue;
+            };
+            // 关系端点也跟着合并重映射(被并簇 → survivor),再去重去自环。
+            let a = remap.get(&a0).copied().unwrap_or(a0);
+            let b = remap.get(&b0).copied().unwrap_or(b0);
+            if a == b || !work_valid.contains(&a) || !work_valid.contains(&b) || !seen.insert((a, b)) {
+                continue;
+            }
+            let label: String = r.label.trim().chars().take(12).collect();
+            let rid = croot.get(&a).copied().unwrap_or(0);
+            ins.execute(rusqlite::params![rid, a, b, label, built_at]).map_err(|e| e.to_string())?;
+            edges += 1;
+            if edges >= 200 {
+                break; // 关系边封顶,防爆图
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    Ok((renamed, edges, merged))
+}
+
+/// 让大模型**读簇画像**给全库的簇起亲切名 + 一句概括 + 簇间关系,然后落库 + 出桌面报告。
+/// 失败可降级:调用方(编排器)捕获错误后保留 cluster_build 的启发式名,不卡流程。
+/// 返回 (改名簇数, 关系边数, 报告路径)。
+fn cluster_rename_llm(
+    app: &AppHandle,
+    root: Option<String>,
+    tier: &str,
+) -> Result<(usize, usize, String), String> {
+    let conn = open_db()?;
+    let ids = resolve_root_ids(&conn, &root);
+    let digests = collect_cluster_digests(&conn, &ids)?;
+    if digests.is_empty() {
+        return Ok((0, 0, String::new()));
+    }
+    let valid: std::collections::HashSet<i64> = digests.iter().map(|d| d.id).collect();
+    // 簇 → 所属根(关系边 root_id 按 src 簇定,范围删除对得上)。
+    let mut croot: HashMap<i64, i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, root_id FROM clusters").map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| e.to_string())?;
+        for (id, rid) in rows.flatten() {
+            croot.insert(id, rid);
+        }
+    }
+    let prompt = digest_directive(&digests);
+
+    let collected = if let Some(cfg) = active_cluster_model() {
+        emit_cluster(
+            app,
+            json!({ "kind": "phase", "tier": tier, "text": format!("用归类模型「{}」读懂 {} 个主题、起名…", cfg.model, digests.len()) }),
+        );
+        chat_complete(&cfg, &prompt)?
+    } else {
+        emit_cluster(
+            app,
+            json!({ "kind": "phase", "tier": tier, "text": format!("AI 正在读懂你的 {} 个主题、起亲切的名字…", digests.len()) }),
+        );
+        let kb_root = PathBuf::from(crate::kb::kb_root());
+        let cwd = if kb_root.exists() { kb_root } else { std::env::temp_dir() };
+        crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _t| {
+            if kind == "delta" {
+                emit_cluster(app, json!({ "kind": "tick", "tier": tier }));
+            }
+        })?
+    };
+    let raw = crate::kb::extract_balanced_json(&collected)
+        .ok_or("大模型没有返回可解析的 JSON(可换更强的模型,或稍后重试)")?;
+    let parsed: LlmNameRel =
+        serde_json::from_str(&raw).map_err(|e| format!("命名 JSON 解析失败: {e}"))?;
+
+    let built_at = chrono::Local::now().timestamp_millis();
+    let (renamed, edges, merged) =
+        apply_names_and_relations(&conn, &ids, &parsed, &valid, &croot, built_at)?;
+    if merged > 0 {
+        emit_cluster(
+            app,
+            json!({ "kind": "phase", "tier": tier, "text": format!("AI 又按意思把 {merged} 个同义簇并进了相近主题") }),
+        );
+    }
+    let report = write_cluster_report_html(&conn, &ids).unwrap_or_default();
+    Ok((renamed, edges, report))
+}
+
+/// 据当前 clusters 状态(AI 命名后)生成自包含 HTML 报告 → 桌面,返回路径。
+/// 直接读库(主题→子主题→样本文件),不依赖某一次归类的内存结构,故 v3 各档都能复用。
+fn write_cluster_report_html(conn: &rusqlite::Connection, ids: &[i64]) -> Result<String, String> {
+    let cfilter = if ids.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        format!(" AND root_id IN ({})", list.join(","))
+    };
+    // 顶层主题(parent=0 且确有旗下文件 / 子簇)。
+    let themes: Vec<(i64, String, String, String, i64)> = {
+        let sql = format!(
+            "SELECT id, label, color, summary, size FROM clusters WHERE parent=0{cfilter} ORDER BY size DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.flatten().collect()
+    };
+    let mut n_sub = 0usize;
+    let mut cards = String::new();
+    for (tid, tlabel, color, tsummary, tsize) in &themes {
+        // 子主题
+        let subs: Vec<(i64, String, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, label, summary, size FROM clusters WHERE parent=?1 ORDER BY size DESC")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([tid], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        // 单级归类:主题自身即叶簇(没有子主题),把它当唯一子主题展示。
+        let leaves: Vec<(i64, String, String, i64)> = if subs.is_empty() {
+            vec![(*tid, tlabel.clone(), tsummary.clone(), *tsize)]
+        } else {
+            subs
+        };
+        let mut sub_html = String::new();
+        for (sid, slabel, ssummary, ssize) in &leaves {
+            n_sub += 1;
+            let names: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT COALESCE(t.title, f.name) FROM files f LEFT JOIN titles t ON t.file_id=f.id
+                         WHERE f.cluster_id=?1 ORDER BY f.mtime DESC LIMIT 6",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([sid], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                rows.flatten().collect()
+            };
+            let files_html: String = names
+                .iter()
+                .map(|n| format!("<li>{}</li>", esc(n)))
+                .collect::<Vec<_>>()
+                .join("");
+            let sm = if ssummary.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<div class=\"ssum\">{}</div>", esc(ssummary))
+            };
+            sub_html.push_str(&format!(
+                r#"<div class="sub"><div class="sub-h"><span class="sn">{label}</span><span class="sc">{size}</span></div>{sm}<ul>{files}</ul></div>"#,
+                label = esc(slabel),
+                size = ssize,
+                sm = sm,
+                files = files_html,
+            ));
+        }
+        let tsum = if tsummary.trim().is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"tsum\">{}</div>", esc(tsummary))
+        };
+        cards.push_str(&format!(
+            r#"<section class="theme" style="--c:{color}"><header><span class="badge">{size}</span><h2>{label}</h2></header>{tsum}<div class="subs">{subs}</div></section>"#,
+            color = esc(color),
+            size = tsize,
+            label = esc(tlabel),
+            tsum = tsum,
+            subs = sub_html,
+        ));
+    }
+
+    let now = chrono::Local::now();
+    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let human = now.format("%Y-%m-%d %H:%M").to_string();
+    let html = format!(
+        r##"<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<title>文件中心 · 知识画像报告</title><style>
+:root{{--bg:#0f1115;--panel:#171a21;--line:#272b36;--ink:#e8eaf0;--mut:#9aa0ad;--gold:#d4b06a}}
+*{{box-sizing:border-box;margin:0}}body{{background:var(--bg);color:var(--ink);
+font-family:-apple-system,'Segoe UI','PingFang SC',sans-serif;padding:40px 20px;line-height:1.6}}
+.wrap{{max-width:1080px;margin:0 auto}}h1{{font-size:26px;font-weight:650}}
+.sub{{color:var(--mut);margin:8px 0 22px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}}
+.theme{{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}}
+.theme header{{display:flex;align-items:center;gap:10px;padding:14px 18px;
+background:color-mix(in srgb,var(--c) 16%,transparent);border-bottom:1px solid var(--line)}}
+.theme header::before{{content:"";width:10px;height:10px;border-radius:50%;background:var(--c);box-shadow:0 0 10px var(--c)}}
+.theme h2{{font-size:16px;margin:0;flex:1}}
+.badge{{font-size:12px;color:#0f1115;background:var(--c);padding:1px 9px;border-radius:99px;font-weight:700}}
+.tsum{{padding:10px 18px 2px;color:var(--gold);font-size:13px}}
+.subs{{padding:6px 0}}
+.sub{{border-bottom:1px solid var(--line);padding:8px 18px}}.sub:last-child{{border-bottom:none}}
+.sub-h{{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600}}
+.sn{{flex:1}}.sc{{font-size:10.5px;color:var(--mut);background:rgba(255,255,255,.06);padding:0 7px;border-radius:99px}}
+.ssum{{color:var(--mut);font-size:12px;margin:2px 0 4px}}
+ul{{list-style:none;margin:4px 0 0;padding:0}}li{{color:var(--mut);font-size:12px;padding:2px 0;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.foot{{margin-top:36px;color:#5a606b;font-size:12px;text-align:center}}
+</style></head><body><div class="wrap">
+<h1>文件中心 · 知识画像报告</h1>
+<div class="sub">AI 读懂你的全部资料后,按你自己的说法重新命名归类 · 生成于 {human}</div>
+<div class="grid">{cards}</div>
+<div class="foot">Polaris 文件中心 · 大模型读「簇画像」全库命名(不止最近 240 个)· 主题 {nt} 个 · 子主题 {ns} 个</div>
+</div></body></html>"##,
+        human = esc(&human),
+        cards = cards,
+        nt = themes.len(),
+        ns = n_sub,
+    );
+
+    let desktop = directories::UserDirs::new()
+        .and_then(|u| u.desktop_dir().map(|d| d.to_path_buf()))
+        .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
+        .ok_or("找不到桌面目录")?;
+    let path = desktop.join(format!("文件中心-知识画像-{stamp}.html"));
     std::fs::write(&path, html).map_err(|e| format!("写报告失败: {e}"))?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -2419,6 +3174,110 @@ fn emit_cluster(app: &AppHandle, payload: Value) {
     let _ = app.emit("file:cluster", payload);
 }
 
+/// 文件中心 v3 渐进式智能归类进行中闸(独立于 CLUSTERING/LLM_CLUSTERING,防双发)。
+static SMART_CLUSTERING: AtomicBool = AtomicBool::new(false);
+
+/// 文件中心 v3 渐进式智能归类:后台一个线程顺序推进三档,全程发 `file:cluster` 事件。
+///  - **T0 骨架**:`cluster_build(Lexical)` 秒级、零嵌入,先把全库分簇 → `tier=skeleton`;
+///  - **T1 初级**:`cluster_rename_llm` 让大模型读簇画像起亲切名 + 关系 → `tier=ai-primary`;
+///  - **T2 精修**:配了嵌入服务商时,`build_index_full` 全量向量化 → `cluster_build(Semantic)`
+///    语义重聚 → `cluster_rename_llm` 再命名 → `tier=semantic`(用户要的「向量化完后再归一次」)。
+///
+/// 每档完成 emit `{kind:"tier", tier, note}` 让前端原地刷新星图;全部结束 emit `kind:"done"`。
+/// LLM 档失败可降级:保留 `cluster_build` 的启发式名、继续后续档,绝不卡住。
+fn smart_cluster_progressive(app: &AppHandle, root: Option<String>) -> Result<(), String> {
+    // ── T0:结构骨架(秒级,零嵌入)──
+    emit_cluster(
+        app,
+        json!({ "kind": "phase", "tier": "skeleton", "text": "正在快速归类(按结构)…几秒就好" }),
+    );
+    let s0 = cluster_build_mode(root.clone(), ClusterMode::Lexical)?;
+    emit_cluster(
+        app,
+        json!({
+            "kind": "tier", "tier": "skeleton", "clusters": s0.clusters, "files": s0.files,
+            "note": format!("已把 {} 个文件快速归成 {} 簇,正在请 AI 起名…", s0.files, s0.clusters),
+        }),
+    );
+
+    // ── T1:AI 初级命名 + 关系(读簇画像,不读文件,成本与文件数无关)──
+    let mut report = String::new();
+    match cluster_rename_llm(app, root.clone(), "ai-primary") {
+        Ok((renamed, edges, rep)) => {
+            report = rep.clone();
+            emit_cluster(
+                app,
+                json!({
+                    "kind": "tier", "tier": "ai-primary", "renamed": renamed, "edges": edges, "report": rep,
+                    "note": format!("AI 已读懂并命名 {renamed} 个主题、理出 {edges} 条关系"),
+                }),
+            );
+        }
+        Err(e) => {
+            // 起名失败不致命:骨架名仍在,提示后继续。
+            emit_cluster(
+                app,
+                json!({
+                    "kind": "tier", "tier": "ai-primary",
+                    "note": format!("AI 命名暂不可用({e}),已先按结构归好;稍后可重试"),
+                }),
+            );
+        }
+    }
+
+    // ── T2:全量向量化 → 语义重聚 → 再命名(配了嵌入能力时;全程后台)──
+    // 「嵌入能力」= 云 API 服务商 **或** 本地开源嵌入(local-embed,离线就能产向量);
+    // 后者此前不被计入 → 纯本地用户永远停在结构归类、走不到「按内容语义」这一档。见 embed_capable。
+    let has_embed = super::index::embed_capable();
+    if has_embed {
+        emit_cluster(
+            app,
+            json!({ "kind": "phase", "tier": "semantic", "text": "后台精修:正在把全部资料向量化(可关页面去忙别的)…" }),
+        );
+        let app_idx = app.clone();
+        let idx = super::index::build_index_full(&move |files, _chunks, pending| {
+            emit_cluster(
+                &app_idx,
+                json!({
+                    "kind": "phase", "tier": "semantic",
+                    "text": format!("后台精修:已向量化 {files} 个文件{}",
+                        if pending > 0 { format!(",还剩约 {pending} 个") } else { String::new() }),
+                }),
+            );
+        });
+        match idx {
+            Ok(_) => {
+                emit_cluster(
+                    app,
+                    json!({ "kind": "phase", "tier": "semantic", "text": "向量化完成,正在按内容语义重新归类…" }),
+                );
+                let s2 = cluster_build_mode(root.clone(), ClusterMode::Semantic)?;
+                let rep2 = match cluster_rename_llm(app, root.clone(), "semantic") {
+                    Ok((_, _, rep)) => rep,
+                    Err(_) => report.clone(),
+                };
+                emit_cluster(
+                    app,
+                    json!({
+                        "kind": "tier", "tier": "semantic", "clusters": s2.clusters, "files": s2.files, "report": rep2,
+                        "note": format!("已按内容语义把 {} 个文件精修归成 {} 簇", s2.files, s2.clusters),
+                    }),
+                );
+                report = rep2;
+            }
+            Err(e) => {
+                emit_cluster(
+                    app,
+                    json!({ "kind": "phase", "tier": "semantic", "text": format!("后台向量化未完成:{e}(已保留 AI 初级归类)") }),
+                );
+            }
+        }
+    }
+
+    emit_cluster(app, json!({ "kind": "done", "report": report, "note": "智能归类完成" }));
+    Ok(())
+}
+
 /// 重建语义/结构聚类(复用已存向量,纯数学,不调嵌入 API)。**后台线程跑**,进度走
 /// `file:cluster` 事件(phase/done/error)—— 切走文件中心也不中断,回来仍见结果。
 ///
@@ -2442,6 +3301,24 @@ pub fn file_cluster_build(app: AppHandle, root: Option<String>) -> Result<(), St
                 }),
             ),
             Err(e) => emit_cluster(&app, json!({ "kind": "error", "message": e })),
+        }
+    });
+    Ok(())
+}
+
+/// 文件中心 v3 渐进式智能归类(秒级骨架 → AI 初级命名+关系 → 全量向量化后语义重聚再命名)。
+/// 后台线程跑,进度/各档完成走 `file:cluster` 事件(phase / tick / tier / done / error);
+/// 切走文件中心也不中断,与 [`file_cluster_build`] / [`file_cluster_llm`] 同构。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn file_smart_cluster(app: AppHandle, root: Option<String>) -> Result<(), String> {
+    let Some(guard) = FlagGuard::acquire(&SMART_CLUSTERING) else {
+        return Err("智能归类正在进行中".into());
+    };
+    emit_cluster(&app, json!({ "kind": "phase", "tier": "skeleton", "text": "正在启动智能归类…" }));
+    std::thread::spawn(move || {
+        let _guard = guard; // panic 栈展开也释放闸,防永久锁死
+        if let Err(e) = smart_cluster_progressive(&app, root) {
+            emit_cluster(&app, json!({ "kind": "error", "message": e }));
         }
     });
     Ok(())
@@ -2570,6 +3447,491 @@ mod tests {
         assert_eq!(b64(b"Man"), "TWFu");
         assert_eq!(b64(b"Ma"), "TWE=");
         assert_eq!(b64(b"M"), "TQ==");
+    }
+
+    // ── 文件中心 v3 渐进式归类 ──
+
+    #[test]
+    fn loose_i64_accepts_num_and_str() {
+        assert_eq!(loose_i64(&Value::from(5i64)), Some(5));
+        assert_eq!(loose_i64(&Value::from("7")), Some(7));
+        assert_eq!(loose_i64(&Value::from(" 9 ")), Some(9));
+        assert_eq!(loose_i64(&Value::from("x")), None);
+        assert_eq!(loose_i64(&Value::Null), None);
+    }
+
+    #[test]
+    fn name_rel_json_parses_mixed_id_types() {
+        // 模型可能把 id 写成数字或字符串,两种都要吃下。
+        let raw = r#"{"names":[{"id":1,"name":"我的报税","summary":"2023 报税材料"},
+                                {"id":"2","name":"装修"}],
+                      "relations":[{"from":1,"to":2,"label":"配套"}]}"#;
+        let p: LlmNameRel = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.names.len(), 2);
+        assert_eq!(p.relations.len(), 1);
+        assert_eq!(loose_i64(&p.names[1].id), Some(2));
+    }
+
+    #[test]
+    fn rename_apply_validates_and_writes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clusters(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0, built_at INTEGER NOT NULL DEFAULT 0, parent INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL DEFAULT '');
+             CREATE TABLE cluster_edges(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                src INTEGER NOT NULL, dst INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', built_at INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO clusters(id,label) VALUES(1,'簇A'),(2,'簇B');",
+        )
+        .unwrap();
+        // id=99 越界、from=3 越界、2→2 自环 —— 都必须被挡掉。
+        let raw = r#"{"names":[{"id":1,"name":"我的报税","summary":"报税材料都在这"},
+                                {"id":99,"name":"越界忽略"}],
+                      "relations":[{"from":1,"to":2,"label":"同源"},
+                                   {"from":2,"to":2,"label":"自环丢"},
+                                   {"from":3,"to":1,"label":"越界丢"}]}"#;
+        let parsed: LlmNameRel = serde_json::from_str(raw).unwrap();
+        let valid: std::collections::HashSet<i64> = [1i64, 2].into_iter().collect();
+        let mut croot = HashMap::new();
+        croot.insert(1i64, 0i64);
+        croot.insert(2i64, 0i64);
+        let (renamed, edges, _merged) =
+            apply_names_and_relations(&conn, &[], &parsed, &valid, &croot, 123).unwrap();
+        assert_eq!(renamed, 1, "只有 id=1 在范围内且有名字");
+        assert_eq!(edges, 1, "只有 1→2 合法(自环 / 越界被丢)");
+        let label: String =
+            conn.query_row("SELECT label FROM clusters WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(label, "我的报税");
+        let summary: String =
+            conn.query_row("SELECT summary FROM clusters WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(summary, "报税材料都在这");
+        // id=2 未被命名 → 保留原名。
+        let label2: String =
+            conn.query_row("SELECT label FROM clusters WHERE id=2", [], |r| r.get(0)).unwrap();
+        assert_eq!(label2, "簇B");
+        let (s, d, l): (i64, i64, String) = conn
+            .query_row("SELECT src,dst,label FROM cluster_edges", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((s, d, l), (1, 2, "同源".to_string()));
+    }
+
+    #[test]
+    fn rename_apply_is_idempotent_rebuild() {
+        // 二次 apply 应清掉旧关系边再重建,不累积。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clusters(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0, built_at INTEGER NOT NULL DEFAULT 0, parent INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL DEFAULT '');
+             CREATE TABLE cluster_edges(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                src INTEGER NOT NULL, dst INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', built_at INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO clusters(id,label) VALUES(1,'A'),(2,'B');",
+        )
+        .unwrap();
+        let raw = r#"{"names":[],"relations":[{"from":1,"to":2,"label":"同源"}]}"#;
+        let parsed: LlmNameRel = serde_json::from_str(raw).unwrap();
+        let valid: std::collections::HashSet<i64> = [1i64, 2].into_iter().collect();
+        let croot: HashMap<i64, i64> = [(1i64, 0i64), (2, 0)].into_iter().collect();
+        apply_names_and_relations(&conn, &[], &parsed, &valid, &croot, 1).unwrap();
+        apply_names_and_relations(&conn, &[], &parsed, &valid, &croot, 2).unwrap();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM cluster_edges", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "重跑不累积关系边");
+    }
+
+    #[test]
+    fn merge_consolidates_same_parent_leaves_and_remaps() {
+        // 按意思合并:同父叶簇 {1,2,3} 并成最大簇(1),文件改挂、余簇删除、size 重算;
+        // 跨父组 [1,4] 被拒;指向被并簇的命名/关系自动重映射到 survivor。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clusters(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0, built_at INTEGER NOT NULL DEFAULT 0, parent INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL DEFAULT '');
+             CREATE TABLE cluster_edges(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                src INTEGER NOT NULL, dst INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', built_at INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE files(id INTEGER PRIMARY KEY, cluster_id INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO clusters(id,parent,size,label) VALUES
+                (10,0,6,'大主题'),(1,10,3,'发票'),(2,10,2,'invoices'),(3,10,1,'报销单'),(4,99,5,'别的');
+             INSERT INTO files(id,cluster_id) VALUES
+                (101,1),(102,1),(103,1),(201,2),(202,2),(301,3);",
+        )
+        .unwrap();
+        // names 指向被并簇 id=2 → 应改到 survivor 1;relation 2→4 → 应映射成 1→4。
+        let raw = r#"{"names":[{"id":2,"name":"发票报销","summary":"发票和报销单都在这"},
+                                {"id":4,"name":"其它东西"}],
+                      "merges":[[1,2,3],[1,4]],
+                      "relations":[{"from":2,"to":4,"label":"配套"}]}"#;
+        let parsed: LlmNameRel = serde_json::from_str(raw).unwrap();
+        let valid: std::collections::HashSet<i64> = [10i64, 1, 2, 3, 4].into_iter().collect();
+        let croot: HashMap<i64, i64> = [(10i64, 0), (1, 0), (2, 0), (3, 0), (4, 0)].into_iter().collect();
+        let (renamed, edges, merged) =
+            apply_names_and_relations(&conn, &[], &parsed, &valid, &croot, 1).unwrap();
+        assert_eq!(merged, 2, "1/2/3 同父并入 survivor=1,合并掉 2 个");
+        // survivor=1(最大簇)留下,2/3 删除。
+        let gone: i64 = conn
+            .query_row("SELECT COUNT(*) FROM clusters WHERE id IN (2,3)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gone, 0, "被并簇 2/3 已删");
+        // survivor 吸收全部 6 个文件,size 重算为 6。
+        let nf: i64 =
+            conn.query_row("SELECT COUNT(*) FROM files WHERE cluster_id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(nf, 6, "原 1/2/3 的文件全改挂 survivor=1");
+        let sz: i64 =
+            conn.query_row("SELECT size FROM clusters WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(sz, 6, "survivor size 重算 = 实际文件数");
+        // 跨父组 [1,4] 被拒 → 4 仍在。
+        let kept: i64 =
+            conn.query_row("SELECT COUNT(*) FROM clusters WHERE id=4", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1, "跨父合并被拒,簇 4 保留");
+        // 命名重映射:id=2 → survivor 1,故 1 被命名「发票报销」。
+        let label1: String =
+            conn.query_row("SELECT label FROM clusters WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(label1, "发票报销");
+        assert_eq!(renamed, 2, "id=2(→1) 与 id=4 各命名一次");
+        // 关系重映射:2→4 变 1→4。
+        assert_eq!(edges, 1);
+        let (s, d): (i64, i64) = conn
+            .query_row("SELECT src,dst FROM cluster_edges", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((s, d), (1, 4), "关系端点跟随合并重映射");
+    }
+
+    #[test]
+    fn merge_skips_parent_clusters() {
+        // 父簇(有子簇者)绝不可被并 —— 否则孤立其子簇。merges 里含父簇 id 的组应被安全跳过。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clusters(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0, built_at INTEGER NOT NULL DEFAULT 0, parent INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL DEFAULT '');
+             CREATE TABLE cluster_edges(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                src INTEGER NOT NULL, dst INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', built_at INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE files(id INTEGER PRIMARY KEY, cluster_id INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO clusters(id,parent,size) VALUES (10,0,1),(20,0,1),(1,10,1),(2,20,1);",
+        )
+        .unwrap();
+        // 两个顶层父簇 10、20 都各有子簇 → 都在 parent_set,合并 [10,20] 必须被拒。
+        let raw = r#"{"merges":[[10,20]],"names":[],"relations":[]}"#;
+        let parsed: LlmNameRel = serde_json::from_str(raw).unwrap();
+        let valid: std::collections::HashSet<i64> = [10i64, 20, 1, 2].into_iter().collect();
+        let croot: HashMap<i64, i64> = HashMap::new();
+        let (_r, _e, merged) =
+            apply_names_and_relations(&conn, &[], &parsed, &valid, &croot, 1).unwrap();
+        assert_eq!(merged, 0, "父簇不参与合并");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM clusters", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 4, "无簇被删");
+    }
+
+    #[test]
+    fn digest_directive_includes_ids_and_samples() {
+        let d = ClusterDigest {
+            id: 7,
+            parent: 0,
+            label: "财务".into(),
+            keywords: "发票 报税".into(),
+            size: 12,
+            folders: vec!["财务/2023".into()],
+            samples: vec!["增值税申报表".into()],
+            kinds: vec![("doc".into(), 10)],
+        };
+        let s = digest_directive(&[d]);
+        assert!(s.contains("id=7"));
+        assert!(s.contains("增值税申报表"));
+        assert!(s.contains("发票 报税"));
+        assert!(s.contains("文档×10"));
+    }
+
+    // ───────────────────────── 聚类准确度评测台(真大模型介入) ─────────────────────────
+    //
+    // 目标:量化「几分钟路径」(T0 词法骨架 + T1 大模型命名)在**贴近真人杂乱硬盘**的语料上的
+    //   ① 覆盖率(是否真把全部文件都归了,不再 240/6000 截断)
+    //   ② 聚类纯度(同主题文件是否落进同一簇)
+    //   ③ 命名准确度(AI 簇名是否命中该簇主导主题 + 是否亲切中文)
+    //   ④ 关系边数量
+    // 隔离:用临时 db,绝不碰用户真实 ~/Polaris/data/fable.db。
+    // 触发:仅当置 POLARIS_CLUSTER_EVAL=1 才跑(普通 cargo test 跳过);真大模型走 run_claude_readonly
+    //   (置 EVAL_NO_LLM=1 则只测 T0,不调模型)。结果按 EVAL_OUT 追加一行 JSON。
+
+    fn env_u64(k: &str, d: u64) -> u64 {
+        std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+    }
+    // 可复现 LCG(避免 rand 依赖,种子可控)。
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s >> 33
+    }
+
+    struct EvalTopic {
+        id: usize,
+        folder: &'static str,
+        ext: &'static str,
+        kind: &'static str,
+        stems: &'static [&'static str],
+        aliases: &'static [&'static str],
+    }
+    fn eval_topics() -> Vec<EvalTopic> {
+        vec![
+            EvalTopic { id: 0, folder: "财务/报税", ext: "xlsx", kind: "doc",
+                stems: &["增值税申报表", "个税专项扣除", "年度利润表", "记账凭证", "京东发票", "报销单", "工资表", "对账单"],
+                aliases: &["报税", "财务", "税", "发票", "报销", "账", "工资", "对账", "凭证", "利润", "扣除", "报表", "单据"] },
+            EvalTopic { id: 1, folder: "装修/新房", ext: "jpg", kind: "image",
+                stems: &["客厅效果图", "水电改造预算", "家具清单", "施工合同", "瓷砖选样", "全屋定制报价", "卫生间布局"],
+                aliases: &["装修", "房", "家具", "施工", "效果图", "户型", "布局", "选材", "报价", "预算"] },
+            EvalTopic { id: 2, folder: "考研/复习", ext: "pdf", kind: "doc",
+                stems: &["数学强化讲义", "英语真题2022", "政治大纲笔记", "专业课总结", "错题本", "肖四肖八", "高数公式"],
+                aliases: &["考研", "复习", "真题", "笔记", "讲义", "学习", "数学", "英语", "政治", "错题", "公式"] },
+            EvalTopic { id: 3, folder: "照片/宝宝", ext: "jpg", kind: "image",
+                stems: &["周岁照", "幼儿园运动会", "全家福", "第一次走路", "生日蛋糕", "公园游玩"],
+                aliases: &["照片", "宝宝", "孩子", "娃", "家庭", "全家福"] },
+            EvalTopic { id: 4, folder: "工作/汇报", ext: "pptx", kind: "doc",
+                stems: &["季度汇报", "周报", "项目方案v3", "OKR复盘", "需求评审纪要", "述职报告"],
+                aliases: &["工作", "汇报", "项目", "报告", "周报", "方案", "复盘", "述职", "纪要", "评审"] },
+            EvalTopic { id: 5, folder: "副业/接单", ext: "psd", kind: "image",
+                stems: &["logo设计稿", "客户需求", "报价单", "海报终稿", "名片排版", "公众号配图"],
+                aliases: &["副业", "接单", "客户", "设计", "海报", "logo", "名片", "排版", "配图"] },
+            EvalTopic { id: 6, folder: "旅行/日本", ext: "pdf", kind: "doc",
+                stems: &["行程单", "机票确认", "东京攻略", "酒店预订", "签证材料", "美食清单"],
+                aliases: &["旅行", "旅游", "行程", "攻略", "机票", "日本", "酒店", "住宿", "签证", "美食", "东京"] },
+            EvalTopic { id: 7, folder: "code/polaris", ext: "rs", kind: "text",
+                stems: &["main", "lib", "server", "README", "cluster_build", "retrieve"],
+                aliases: &["代码", "项目", "开发", "程序", "code", "源码"] },
+            EvalTopic { id: 8, folder: "movies", ext: "mkv", kind: "video",
+                stems: &["复仇者联盟", "星际穿越", "盗梦空间", "教父", "肖申克的救赎"],
+                aliases: &["电影", "影视", "视频", "剧", "movie", "大片", "片", "科幻", "经典", "动作"] },
+            EvalTopic { id: 9, folder: "合同", ext: "docx", kind: "doc",
+                stems: &["租房合同", "劳动合同", "保密协议", "采购合同", "服务协议"],
+                aliases: &["合同", "协议", "法律", "租房", "劳动"] },
+        ]
+    }
+
+    struct EvalFile {
+        relpath: String,
+        name: String,
+        ext: String,
+        kind: String,
+        size: i64,
+        mtime: i64,
+        topic: usize,
+    }
+
+    // 按场景生成贴近真人硬盘的语料 + 真值主题标签。
+    //  organized = 按主题文件夹整齐摆放(文件夹信号强);flat = 全堆根目录(只靠文件名);
+    //  messy = 混合 + ~15% 乱名噪声(IMG_/微信图片/副本);multiling = 含英文命名主题。
+    fn gen_corpus(scenario: &str, seed: u64, size: usize) -> (Vec<EvalFile>, Vec<EvalTopic>) {
+        let topics = eval_topics();
+        let mut rng = seed.wrapping_add(0x9e3779b9);
+        let mut out: Vec<EvalFile> = Vec::with_capacity(size);
+        let noise = scenario == "messy";
+        let flat = scenario == "flat";
+        for i in 0..size {
+            let t = &topics[(lcg(&mut rng) as usize) % topics.len()];
+            let stem = t.stems[(lcg(&mut rng) as usize) % t.stems.len()];
+            let variant = lcg(&mut rng) % 9000 + 1000; // 后缀,造出大量不同文件名
+            let garbled = noise && (lcg(&mut rng) % 100) < 15;
+            let name = if garbled {
+                // 乱名(无主题信号)→ 仍标真值主题,考验「靠文件夹/同簇邻居兜底」
+                let kinds = ["IMG_", "微信图片_", "DSC", "副本_未命名"];
+                format!("{}{}.{}", kinds[(lcg(&mut rng) as usize) % kinds.len()], variant, t.ext)
+            } else {
+                format!("{stem}_{variant}.{}", t.ext)
+            };
+            let folder_flat = flat || (noise && (lcg(&mut rng) % 100) < 30);
+            let relpath = if folder_flat {
+                name.clone()
+            } else {
+                format!("{}/{}", t.folder, name)
+            };
+            out.push(EvalFile {
+                relpath,
+                name: name.clone(),
+                ext: t.ext.to_string(),
+                kind: t.kind.to_string(),
+                size: 1024 + (variant as i64) * 7,
+                mtime: (size - i) as i64, // 越靠前 mtime 越大(新)
+                topic: t.id,
+            });
+        }
+        (out, topics)
+    }
+
+    fn eval_schema(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE roots(id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE files(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 1,
+                relpath TEXT NOT NULL, name TEXT NOT NULL, ext TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'other', size INTEGER NOT NULL DEFAULT 0,
+                mtime INTEGER NOT NULL DEFAULT 0, cluster_id INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE clusters(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '', keywords TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0, built_at INTEGER NOT NULL DEFAULT 0, parent INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL DEFAULT '');
+             CREATE TABLE cluster_edges(id INTEGER PRIMARY KEY, root_id INTEGER NOT NULL DEFAULT 0,
+                src INTEGER NOT NULL, dst INTEGER NOT NULL, label TEXT NOT NULL DEFAULT '', built_at INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE titles(file_id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', made_at INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cluster_eval_run() {
+        if std::env::var("POLARIS_CLUSTER_EVAL").is_err() {
+            return; // 普通 cargo test 跳过
+        }
+        let seed = env_u64("EVAL_SEED", 1);
+        let size = env_u64("EVAL_SIZE", 800) as usize;
+        let scenario = std::env::var("EVAL_SCENARIO").unwrap_or_else(|_| "organized".into());
+        let use_llm = std::env::var("EVAL_NO_LLM").is_err();
+
+        let (corpus, topics) = gen_corpus(&scenario, seed, size);
+        let dbp = std::env::temp_dir().join(format!("polaris_eval_{seed}_{size}_{scenario}.db"));
+        let _ = std::fs::remove_file(&dbp);
+        let conn = rusqlite::Connection::open(&dbp).unwrap();
+        eval_schema(&conn);
+        conn.execute("INSERT INTO roots(id,path) VALUES(1,'/eval')", []).unwrap();
+        {
+            let mut ins = conn
+                .prepare("INSERT INTO files(id,root_id,relpath,name,ext,kind,size,mtime,cluster_id) VALUES(?1,1,?2,?3,?4,?5,?6,?7,0)")
+                .unwrap();
+            for (i, f) in corpus.iter().enumerate() {
+                ins.execute(rusqlite::params![
+                    (i + 1) as i64, f.relpath, f.name, f.ext, f.kind, f.size, f.mtime
+                ])
+                .unwrap();
+            }
+        }
+        let topic_of: HashMap<i64, usize> =
+            corpus.iter().enumerate().map(|(i, f)| ((i + 1) as i64, f.topic)).collect();
+
+        // ── T0:词法骨架(真生产函数)──
+        let t0 = std::time::Instant::now();
+        let summ = cluster_build_on(&conn, &[], ClusterMode::Lexical, std::time::Instant::now())
+            .expect("cluster_build_on");
+        let t0_ms = t0.elapsed().as_millis();
+
+        // 读回归簇
+        let assign: HashMap<i64, i64> = {
+            let mut stmt = conn.prepare("SELECT id, cluster_id FROM files").unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap();
+            rows.flatten().collect()
+        };
+        let total = corpus.len();
+        let covered = assign.values().filter(|&&c| c > 0).count();
+        let coverage = covered as f64 / total as f64;
+
+        // 叶簇(有文件挂着的簇)→ 各簇成员 + 主导主题。
+        let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (&fid, &cid) in &assign {
+            if cid > 0 {
+                members.entry(cid).or_default().push(fid);
+            }
+        }
+        // 纯度:每簇主导主题占比之和 / 已归类文件数。
+        let mut pure_hits = 0usize;
+        let mut cluster_dom: HashMap<i64, usize> = HashMap::new();
+        for (&cid, mem) in &members {
+            let mut tf: HashMap<usize, usize> = HashMap::new();
+            for &fid in mem {
+                *tf.entry(topic_of[&fid]).or_insert(0) += 1;
+            }
+            let (dom, cnt) = tf.into_iter().max_by_key(|&(_, c)| c).unwrap();
+            pure_hits += cnt;
+            cluster_dom.insert(cid, dom);
+        }
+        let purity = if covered > 0 { pure_hits as f64 / covered as f64 } else { 0.0 };
+        let leaf_n = members.len();
+
+        // ── T1:真大模型命名(读簇画像)──
+        let mut name_acc = -1.0f64; // -1 = 未跑 LLM
+        let mut name_acc_w = -1.0f64;
+        let mut named_leaf = 0usize;
+        let mut edges_n = 0usize;
+        let mut samples: Vec<(String, String, bool)> = Vec::new(); // (主导主题文件夹, AI名, 命中)
+        let mut llm_err = String::new();
+        if use_llm {
+            let digests = collect_cluster_digests(&conn, &[]).unwrap();
+            let prompt = digest_directive(&digests);
+            let cwd = std::env::temp_dir();
+            match crate::kb::run_claude_readonly(&cwd, &prompt, |_, _| {}) {
+                Ok(text) => match crate::kb::extract_balanced_json(&text) {
+                    Some(raw) => match serde_json::from_str::<LlmNameRel>(&raw) {
+                        Ok(parsed) => {
+                            let valid: std::collections::HashSet<i64> =
+                                digests.iter().map(|d| d.id).collect();
+                            let croot: HashMap<i64, i64> =
+                                digests.iter().map(|d| (d.id, 1i64)).collect();
+                            let (_r, e, _m) =
+                                apply_names_and_relations(&conn, &[], &parsed, &valid, &croot, 0)
+                                    .unwrap();
+                            edges_n = e;
+                            // 读回每个叶簇的 AI 名,核对是否命中其主导主题别名。
+                            let labels: HashMap<i64, String> = {
+                                let mut stmt =
+                                    conn.prepare("SELECT id, label FROM clusters").unwrap();
+                                let rows = stmt
+                                    .query_map([], |r| {
+                                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                                    })
+                                    .unwrap();
+                                rows.flatten().collect()
+                            };
+                            let mut hit = 0usize;
+                            let mut hit_w = 0usize;
+                            for (&cid, mem) in &members {
+                                let dom = cluster_dom[&cid];
+                                let label = labels.get(&cid).cloned().unwrap_or_default();
+                                if !label.trim().is_empty() {
+                                    named_leaf += 1;
+                                }
+                                let ok = topics[dom].aliases.iter().any(|a| label.contains(a));
+                                if ok {
+                                    hit += 1;
+                                    hit_w += mem.len();
+                                }
+                                if samples.len() < 40 {
+                                    samples.push((topics[dom].folder.to_string(), label, ok));
+                                }
+                            }
+                            name_acc = if leaf_n > 0 { hit as f64 / leaf_n as f64 } else { 0.0 };
+                            name_acc_w = if covered > 0 { hit_w as f64 / covered as f64 } else { 0.0 };
+                        }
+                        Err(e) => llm_err = format!("json parse: {e}"),
+                    },
+                    None => llm_err = "no json in model output".into(),
+                },
+                Err(e) => llm_err = format!("llm call: {e}"),
+            }
+        }
+
+        let result = json!({
+            "scenario": scenario, "seed": seed, "size": total,
+            "t0_ms": t0_ms, "clusters": summ.clusters, "leaf_clusters": leaf_n,
+            "coverage": (coverage * 1000.0).round() / 1000.0,
+            "purity": (purity * 1000.0).round() / 1000.0,
+            "name_acc": (name_acc * 1000.0).round() / 1000.0,
+            "name_acc_weighted": (name_acc_w * 1000.0).round() / 1000.0,
+            "named_leaf": named_leaf, "edges": edges_n,
+            "llm_err": llm_err, "samples": samples.iter().map(|(f,n,ok)| json!({"topic_folder":f,"ai_name":n,"hit":ok})).collect::<Vec<_>>(),
+        });
+        let line = serde_json::to_string(&result).unwrap();
+        println!("EVAL_RESULT {line}");
+        if let Ok(out) = std::env::var("EVAL_OUT") {
+            use std::io::Write as _;
+            if let Ok(mut f) =
+                std::fs::OpenOptions::new().create(true).append(true).open(&out)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        let _ = std::fs::remove_file(&dbp);
+        let _ = std::fs::remove_file(dbp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(dbp.with_extension("db-shm"));
     }
 
     #[test]

@@ -2,7 +2,6 @@
 import { onMounted, ref, computed } from "vue";
 import {
   MessagesSquare,
-  Library,
   Database,
   Clock,
   Puzzle,
@@ -45,8 +44,9 @@ type NavItem = { key: typeof app.view; label: string; icon: any };
 // 常驻主项（仿豆包：顶层精简）。统一用 lucide 线性图标，去掉杂乱的 Unicode 字符，求一致的高级线条感。
 const primaryNav: NavItem[] = [
   { key: "chat", label: "对话", icon: MessagesSquare },
-  { key: "wiki", label: "知识库", icon: Library },
-  // 文件中心:把整台电脑当成数据库 —— 可视化文件库 + 智能归类 + 语义检索
+  // 「知识库」已整体并入「文件中心 · 核心层」tab（体验一致），故不再单列侧栏项;
+  // wiki 视图与路由仍保留(文件中心「打开完整知识库」仍可跳),只是从侧栏隐藏。
+  // 文件中心:把整台电脑当成数据库 —— 可视化文件库 + 智能归类 + 语义检索 + 核心层(知识库本体)
   { key: "file_center", label: "文件中心", icon: Database },
   // 图谱已并入「知识库」顶部 tab(当一个小功能键),不再单列侧栏项
   { key: "automation", label: "自动化", icon: Clock },

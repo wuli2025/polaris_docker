@@ -258,6 +258,18 @@ pub fn active_embed_model() -> Option<String> {
     crate::sense::active_provider("embed").map(|p| p.default_model)
 }
 
+/// 是否**具备把文本变向量的能力** —— 本地开源嵌入(local-embed)**或**云 API 嵌入服务商。
+/// `active_provider("embed")` 只认 `kind=api`+有 key 的云服务商,**不计本地档**;但本地档
+/// (v1.4.2,bge-m3 ONNX)离线就能产向量。渐进式「智能归类」据此决定要不要跑「全量向量化 →
+/// 按内容语义重聚」——只看云 key 会让纯本地用户永远停在结构归类、永远走不到「按意思」。
+pub fn embed_capable() -> bool {
+    #[cfg(feature = "local-embed")]
+    if crate::fable::embed_local::enabled() {
+        return true;
+    }
+    crate::sense::active_provider("embed").is_some()
+}
+
 // ───────────────────────── 查询嵌入缓存(P1-5)─────────────────────────
 
 /// 极简 LRU:HashMap 存值 + VecDeque 记最近使用顺序。容量满时淘汰最久未用。

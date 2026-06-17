@@ -7,6 +7,8 @@
  * 数据全部复用检索枢纽 fable.db,聚类复用已存向量(零新增嵌入),缩略图磁盘缓存。
  */
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, defineAsyncComponent } from "vue";
+import { RecycleScroller } from "vue-virtual-scroller";
+import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import {
   Search,
   LayoutGrid,
@@ -35,8 +37,6 @@ import {
   Check,
   RotateCcw,
   Network,
-  ShieldCheck,
-  BookOpen,
 } from "@lucide/vue";
 import {
   files as fc,
@@ -53,6 +53,9 @@ import { useWizardStore } from "../stores/wizard";
 import { useFileTasksStore } from "../stores/fileTasks";
 // 星图(星河图谱)按需加载:依赖 cytoscape(~562KB),只在点开「星图」时才拉。
 const KnowledgeGraph = defineAsyncComponent(() => import("./KnowledgeGraph.vue"));
+// 核心层 = 整套知识库(llmwiki)本体:点「核心层」tab 直接内嵌完整知识库,体验与独立知识库一致。
+// 按需加载,只在切到核心层时才挂载、初始化。
+const WikiBrowse = defineAsyncComponent(() => import("./WikiBrowse.vue"));
 
 const app = useAppStore();
 const wiz = useWizardStore();
@@ -146,9 +149,6 @@ const ontoSchemasWithData = computed(() => ontoSchemas.value.filter((s) => s.tri
 function openFullKb() {
   app.setView("wiki");
 }
-watch(view, (v) => {
-  if (v === "core" && !ontoSchemas.value.length) void loadCore();
-});
 const overview = ref<FileOverview | null>(null);
 const cards = ref<FileCard[]>([]);
 const page = ref(0);
@@ -202,7 +202,9 @@ const building = computed(() => tasks.running.index);
 const buildMsg = computed(() => tasks.detail.index);
 const llmClustering = computed(() => tasks.running.clusterLlm);
 const llmMsg = computed(() => tasks.detail.clusterLlm);
-const reportPath = computed(() => tasks.reportPath.clusterLlm);
+const reportPath = computed(() => tasks.reportPath.cluster || tasks.reportPath.clusterLlm);
+// 星图重挂载键:归类每完成一档,doneTick 自增 → key 变 → KnowledgeGraph 重载新数据,星图原地升级。
+const graphRefreshKey = computed(() => tasks.doneTick.cluster + tasks.doneTick.clusterLlm);
 
 // 折叠状态(均持久化记住用户选择):头部横幅(体积/数量/统计)· 语义分类 · 类型筛选。
 // 默认把横幅收起 → 功能键整体上移、把纵向空间让给下方可观看的文件网格。
@@ -292,11 +294,46 @@ const detailThumb = ref<string | null>(null);
 const thumbCache = reactive(new Map<string, string>());
 const thumbPending = new Set<string>();
 
-let thumbObs: IntersectionObserver | null = null;
-let moreObs: IntersectionObserver | null = null;
-const sentinel = ref<HTMLElement | null>(null);
-const elCard = new WeakMap<Element, FileCard>();
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ── 虚拟滚动:画廊/列表只在 DOM 里保留视口内的几十张卡片,几十万文件也不卡 ──
+// 旧实现把 cards 全量 v-for 进 DOM(无限滚动一直 concat),470K 库滚几屏就上千节点、
+// 每张卡片读响应式 thumbCache + 内联 :ref,任何一次缩略图回填都触发整片重渲染 → 卡死。
+// 改成 RecycleScroller:画廊走 grid 模式(列数随宽度算)、列表走定高行,常数级 DOM。
+const bodyEl = ref<HTMLElement | null>(null);
+const bodyW = ref(0);
+let bodyRO: ResizeObserver | null = null;
+const GALLERY_MIN_CELL = 196; // 单元格(含间距)最小宽度
+const GALLERY_CELL_H = 208; // 单元格(含间距)固定高度:缩略图 + 元信息 + 间距
+// 可用内容宽:扣掉滚动条 padding 余量(~20px),避免 cols×cellW 溢出反而催出横向滚动条
+const galleryInnerW = computed(() => Math.max(GALLERY_MIN_CELL, bodyW.value - 20));
+const galleryCols = computed(() => Math.max(1, Math.floor(galleryInnerW.value / GALLERY_MIN_CELL)));
+const galleryCellW = computed(() => Math.floor(galleryInnerW.value / galleryCols.value));
+
+// 视口内(含缓冲)范围的缩略图按需预取;只对当前渲染的几十张发起,且 fetchThumb 自带去重。
+function onGalleryRange(start: number, end: number) {
+  for (let i = start; i < end && i < cards.value.length; i++) {
+    const c = cards.value[i];
+    if (c && c.thumbable && !thumbCache.has(c.abspath)) fetchThumb(c);
+  }
+}
+// 滚到底(RecycleScroller 在末项进入缓冲区时触发,配合 buffer 提前预载)→ 续翻下一页。
+function onGridEnd() {
+  if (view.value === "gallery" || view.value === "list") loadGrid(false);
+}
+// 内容区(.fc-body)挂载/卸载时挂上/摘下 ResizeObserver:量宽度供画廊算列数。
+// .fc-body 在空库时不渲染,故不能只在 onMounted 挂一次——用 watch 跟随其出现。
+watch(bodyEl, (el) => {
+  bodyRO?.disconnect();
+  bodyRO = null;
+  if (!el) return;
+  bodyW.value = el.clientWidth;
+  bodyRO = new ResizeObserver((entries) => {
+    const w = entries[0]?.contentRect.width ?? 0;
+    if (w > 0) bodyW.value = w;
+  });
+  bodyRO.observe(el);
+});
 
 // 任务完成(store doneTick 自增)→ 刷新文件中心数据,让新盘点/新索引/新归类结果显示出来。
 // 监听全局 store,故即便任务是在别的视图发起、本组件后挂载,回来也会因 tick 变化而刷新。
@@ -892,48 +929,11 @@ async function fetchThumb(card: FileCard) {
   }
 }
 
-function setupObservers() {
-  thumbObs = new IntersectionObserver(
-    (entries) => {
-      for (const en of entries) {
-        if (en.isIntersecting) {
-          const card = elCard.get(en.target);
-          if (card) fetchThumb(card);
-          thumbObs?.unobserve(en.target);
-        }
-      }
-    },
-    { rootMargin: "300px" },
-  );
-  moreObs = new IntersectionObserver(
-    (entries) => {
-      if (
-        entries.some((e) => e.isIntersecting) &&
-        (view.value === "gallery" || view.value === "list") &&
-        !semActive.value
-      ) {
-        loadGrid(false);
-      }
-    },
-    { rootMargin: "600px" },
-  );
-}
-
-function registerTile(el: Element | null, card: FileCard) {
-  if (!el || !thumbObs) return;
-  elCard.set(el, card);
-  if (card.thumbable && !thumbCache.has(card.abspath)) thumbObs.observe(el);
-}
-
-// 视口内可见的卡片批量预热(进入网格/翻页后调用)
+// 首屏/翻页后批量预热缩略图(服务端多线程生成 jpg,后续 fc.thumb 命中即快)。
 function warmVisible() {
   const slice = cards.value.filter((c) => c.thumbable && !thumbCache.has(c.abspath)).slice(0, 24);
   if (slice.length) fc.warmThumbs(slice.map((c) => c.abspath), 360).catch(() => {});
 }
-
-watch(sentinel, (el) => {
-  if (el && moreObs) moreObs.observe(el);
-});
 
 // ───────────────────────── 详情 ─────────────────────────
 async function openDetail(card: FileCard) {
@@ -1007,7 +1007,6 @@ const headerStats = computed(() => {
 });
 
 onMounted(async () => {
-  setupObservers();
   await loadOverview();
   await loadGrid(true);
   // 后台补齐文稿自然语言(不阻塞首屏;代码/媒体的按语言归类已即时可用)
@@ -1019,8 +1018,8 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  thumbObs?.disconnect();
-  moreObs?.disconnect();
+  bodyRO?.disconnect();
+  bodyRO = null;
   // 任务事件监听已托管给全局 fileTasks store(App 级注册一次,永不在此退订)——
   // 这正是「切走文件中心,盘点/建索引/归类仍在后台跑、进度不丢」的关键。
   if (tipTimer) clearTimeout(tipTimer);
@@ -1029,8 +1028,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="fc">
-    <!-- 顶部琉璃横幅(可收起:收起后只留一条,显示文件数/总量) -->
-    <div class="fc-banner glass" :class="{ collapsed: !bannerOpen }">
+    <!-- 顶部琉璃横幅(可收起:收起后只留一条,显示文件数/总量)—— 核心层是知识库本体,不要文件库的横幅统计 -->
+    <div v-show="view !== 'core'" class="fc-banner glass" :class="{ collapsed: !bannerOpen }">
       <div class="fc-title-wrap">
         <div class="fc-title"><Orbit :size="17" :stroke-width="1.6" /> 文件中心</div>
         <div v-if="bannerOpen" class="fc-sub">同类数据自动归在一起 · 缩略图 / 首帧 / 类型图标 · 智能检索</div>
@@ -1067,7 +1066,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div class="search">
+      <div v-show="view !== 'core'" class="search">
         <Search :size="15" :stroke-width="1.8" class="search-ic" />
         <input
           v-model="searchText"
@@ -1085,7 +1084,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div class="sortwrap">
+      <div v-show="view !== 'core'" class="sortwrap">
         <ArrowDownWideNarrow :size="14" :stroke-width="1.7" class="sort-ic" />
         <select :value="sort" @change="setSort(($event.target as HTMLSelectElement).value as any)">
           <option value="recent">最近修改</option>
@@ -1095,7 +1094,7 @@ onBeforeUnmount(() => {
         </select>
       </div>
 
-      <div class="actions">
+      <div v-show="view !== 'core'" class="actions">
         <button
           class="tool-btn wizard"
           title="让 AI 更懂你:盘点 → 智能归类 → 知识图谱 → 建索引 → 进对话,一条龙引导"
@@ -1127,8 +1126,8 @@ onBeforeUnmount(() => {
           class="tool-btn accent"
           :disabled="clustering || llmClustering || !overview?.totalFiles"
           :title="overview?.hasEmbedProvider
-            ? '已配嵌入 key:用语义模型自动归类(复用已有向量)并在桌面生成报告'
-            : '未配 API key:按文件夹 / 名称离线归类;到设置页配硅基 key(免费)后自动升级为语义 AI 归类'"
+            ? '智能归类:先秒级按结构出星图骨架 → AI 读懂你的资料、起亲切名字并理清关系 → 后台把全部资料向量化后再按语义精修一次(全程后台,可关页面)'
+            : '智能归类:先秒级按结构出星图骨架 → AI 读懂并起名;到设置页配硅基 key(免费)后,还会在后台按内容语义精修一次'"
           @click="doSmartCluster"
         >
           <LoaderCircle v-if="clustering || llmClustering" :size="14" class="spin" />
@@ -1161,14 +1160,14 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- AI 整理名称进度 -->
-    <div v-if="titleMsg" class="fc-llm">
+    <div v-if="titleMsg && view !== 'core'" class="fc-llm">
       <Sparkles :size="14" :stroke-width="1.8" class="llm-ic" />
       <span class="llm-text">{{ titleMsg }}</span>
       <button v-if="titleDone" class="link-btn" @click="resetTitles">撤销 AI 名称</button>
     </div>
 
-    <!-- AI 归类进度 / 报告 -->
-    <div v-if="llmMsg" class="fc-llm">
+    <!-- AI 归类进度 / 报告(旧向导 file:cluster_llm 路径) -->
+    <div v-if="llmMsg && view !== 'core'" class="fc-llm">
       <Brain :size="14" :stroke-width="1.8" class="llm-ic" />
       <span class="llm-text">{{ llmMsg }}</span>
       <button v-if="reportPath" class="link-btn" @click="openReport">
@@ -1176,18 +1175,27 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
+    <!-- 智能归类(v3 渐进式:骨架→AI 命名→后台语义精修)进度 / 报告 -->
+    <div v-if="(clustering || reportPath) && !llmMsg && view !== 'core'" class="fc-llm">
+      <Brain :size="14" :stroke-width="1.8" class="llm-ic" />
+      <span class="llm-text">{{ clusterMsg || "智能归类已就绪" }}</span>
+      <button v-if="reportPath" class="link-btn" @click="openReport">
+        <FileText :size="13" :stroke-width="1.8" /> 打开桌面报告
+      </button>
+    </div>
+
     <!-- 归类小提示:默认不常驻,只在点「智能归类 / AI 归类」时弹一下解释能力 -->
     <transition name="tip">
-      <div v-if="tip.show && hasFiles" class="fc-tip">
+      <div v-if="tip.show && hasFiles && view !== 'core'" class="fc-tip">
         <button class="tip-x" title="关闭" @click="closeTip"><X :size="12" :stroke-width="2" /></button>
         <template v-if="tip.kind === 'cluster'">
           <Wand2 :size="14" :stroke-width="1.8" class="tip-ic" />
           <span class="tip-body">
-            <template v-if="(overview?.embeddedFiles ?? 0) > 0">
-              按<b>内容语义</b>把相似文件归成两级主题树(复用已有向量,零新增嵌入)。
+            <template v-if="overview?.hasEmbedProvider">
+              <b>三步走</b>:先<b>秒级</b>按结构出星图骨架 → AI 读懂你的资料、起<b>亲切名字</b>并理清主题间关系 → 后台把<b>全部资料向量化</b>后再按<b>内容语义</b>精修一次(可关页面)。
             </template>
             <template v-else>
-              <b>未配置 API key</b>,当前按<b>文件夹 / 名称</b>离线归类。到设置页配硅基 key(<b>免费</b>)后,「智能归类」会自动升级为按<b>内容语义</b>的 AI 归类。
+              先<b>秒级</b>按结构归好、AI 起<b>亲切名字</b>。到设置页配硅基 key(<b>免费</b>)后,还会在后台把全部资料向量化、按<b>内容语义</b>再精修一次。
             </template>
           </span>
           <button v-if="overview && !overview.hasEmbedProvider" class="tip-act" @click="app.setView('sense_api')">
@@ -1207,16 +1215,16 @@ onBeforeUnmount(() => {
         <template v-else>
           <Brain :size="14" :stroke-width="1.8" class="tip-ic ai" />
           <span class="tip-body">
-            用已连接的大模型按<b>思想主题</b>归成两级树(<b>免 key</b>),完成后桌面出 HTML 报告。
+            先<b>秒级</b>出星图骨架 → AI 读懂你的资料、起<b>亲切名字</b>并理清关系 → 后台向量化全部资料后再按<b>语义</b>精修一次。完成后桌面出 HTML 画像报告。
           </span>
         </template>
       </div>
     </transition>
 
-    <div v-if="scanMsg || clusterMsg || buildMsg || opMsg" class="fc-note">{{ buildMsg || clusterMsg || scanMsg || opMsg }}</div>
+    <div v-if="(scanMsg || buildMsg || opMsg) && view !== 'core'" class="fc-note">{{ buildMsg || scanMsg || opMsg }}</div>
 
     <!-- 语义文件夹:同主题归一格,点开看子主题,再点筛选画廊 -->
-    <div v-if="hasFiles && hasClusters" class="fc-folders">
+    <div v-if="hasFiles && hasClusters && view !== 'core'" class="fc-folders">
       <div class="fld-bar">
         <button class="fld-toggle" :class="{ open: foldersOpen }" :title="foldersOpen ? '收起分类' : '展开分类'" @click="foldersOpen = !foldersOpen">
           <ChevronDown :size="14" :stroke-width="1.8" :class="{ flip: !foldersOpen }" />
@@ -1266,13 +1274,13 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </div>
-    <div v-else-if="hasFiles" class="fld-hint">
+    <div v-else-if="hasFiles && view !== 'core'" class="fld-hint">
       <Layers :size="14" :stroke-width="1.7" />
       <span>还没按主题归类。点上方 <b>「智能归类」</b>,文件会按内容主题自动归进文件夹(配了 API key 走语义 AI 归类,没配则按文件夹 / 名称离线归)。</span>
     </div>
 
     <!-- 按类型筛选(可收起,默认收起,腾出下方空间) -->
-    <div v-if="hasFiles" class="fc-kinds">
+    <div v-if="hasFiles && view !== 'core'" class="fc-kinds">
       <button class="kinds-toggle" :class="{ open: kindOpen }" @click="kindOpen = !kindOpen">
         <SlidersHorizontal :size="13" :stroke-width="1.8" />
         <span>按类型筛选</span>
@@ -1300,7 +1308,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 按语言归类(编程语言 / 自然语言 / 媒体大类)—— 比「按类型」更细,按语言分门别类 -->
-    <div v-if="hasFiles" class="fc-kinds">
+    <div v-if="hasFiles && view !== 'core'" class="fc-kinds">
       <button class="kinds-toggle" :class="{ open: langOpen }" @click="langOpen = !langOpen">
         <Languages :size="13" :stroke-width="1.8" />
         <span>按语言归类</span>
@@ -1327,8 +1335,12 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <!-- 核心层 = 知识库本体:直接内嵌整套 llmwiki 知识库(就是你资料的大脑),
+         体验与独立「知识库」完全一致,只是住在文件中心里。空库与否都照常进知识库。 -->
+    <WikiBrowse v-if="view === 'core'" class="fc-core-wiki" />
+
     <!-- 空库引导 -->
-    <div v-if="!hasFiles" class="fc-empty glass">
+    <div v-else-if="!hasFiles" class="fc-empty glass">
       <div class="empty-orb"><FolderSearch :size="30" :stroke-width="1.3" /></div>
       <div class="empty-title">文件中心还是空的</div>
       <div class="empty-sub">点「盘点」先扫一眼文件夹,勾选要盘点的目录(可选知识库之外的盘符/文件夹),建成可视化文件库;<br />已嵌入文本可再点「智能归类」把相似数据自动放在一起。</div>
@@ -1340,7 +1352,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 内容区 -->
-    <div v-else class="fc-body">
+    <div v-else ref="bodyEl" class="fc-body">
       <!-- 语义检索结果带 -->
       <div v-if="semActive" class="sem-strip">
         <div class="sem-head">
@@ -1364,45 +1376,57 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 画廊 -->
-      <div v-show="view === 'gallery'" class="gallery">
-        <div
-          v-for="card in cards"
-          :key="card.id"
-          class="tile glass"
-          :style="{ '--accent': accentFor(card) }"
-          :ref="(el) => registerTile(el as Element, card)"
-          @click="openDetail(card)"
-        >
-          <div class="thumb">
-            <img
-              v-if="card.thumbable && thumbCache.get(card.abspath)"
-              :src="thumbCache.get(card.abspath)"
-              class="thumb-img"
-              loading="lazy"
-              alt=""
-            />
-            <div v-else class="thumb-glyph">
-              <div class="glyph-halo" />
-              <svg viewBox="0 0 48 48" class="glyph" v-html="GLYPHS[glyphFor(card)]" />
-              <div v-if="card.thumbable && !thumbCache.has(card.abspath)" class="shimmer" />
+      <!-- 画廊(虚拟滚动:grid 模式,列数随宽度算,DOM 只保留视口内几十张)-->
+      <RecycleScroller
+        v-show="view === 'gallery'"
+        class="gallery-vs"
+        :items="cards"
+        :item-size="GALLERY_CELL_H"
+        :grid-items="galleryCols"
+        :item-secondary-size="galleryCellW"
+        key-field="id"
+        :buffer="900"
+        :emit-update="true"
+        @update="onGalleryRange"
+        @scroll-end="onGridEnd"
+        v-slot="{ item: card }"
+      >
+        <div class="tile-cell" @click="openDetail(card)">
+          <div class="tile glass" :style="{ '--accent': accentFor(card) }">
+            <div class="thumb">
+              <img
+                v-if="card.thumbable && thumbCache.get(card.abspath)"
+                :src="thumbCache.get(card.abspath)"
+                class="thumb-img"
+                loading="lazy"
+                alt=""
+              />
+              <div v-else class="thumb-glyph">
+                <div class="glyph-halo" />
+                <svg viewBox="0 0 48 48" class="glyph" v-html="GLYPHS[glyphFor(card)]" />
+                <div v-if="card.thumbable && !thumbCache.has(card.abspath)" class="shimmer" />
+              </div>
+              <span class="ext-badge">{{ card.ext || card.kind }}</span>
+              <span v-if="card.source" class="src-badge">{{ card.source }}</span>
+              <span v-if="card.kind === 'video'" class="play-badge">▶</span>
             </div>
-            <span class="ext-badge">{{ card.ext || card.kind }}</span>
-            <span v-if="card.kind === 'video'" class="play-badge">▶</span>
-          </div>
-          <div class="tile-meta">
-            <div class="tile-name" :title="card.name">{{ card.title || card.name }}</div>
-            <div class="tile-sub">
-              <span v-if="card.clusterId > 0 && clusterColor[card.clusterId]" class="tile-cluster" :style="{ color: clusterColor[card.clusterId].color }">
-                {{ clusterColor[card.clusterId].label }}
-              </span>
-              <span v-else class="tile-kind">{{ KIND_LABEL[card.kind] || card.kind }}</span>
-              <span class="tile-size">{{ card.sizeH }}</span>
+            <div class="tile-meta">
+              <div class="tile-name" :title="card.name">{{ card.title || card.name }}</div>
+              <div class="tile-sub">
+                <span v-if="card.clusterId > 0 && clusterColor[card.clusterId]" class="tile-cluster" :style="{ color: clusterColor[card.clusterId].color }">
+                  {{ clusterColor[card.clusterId].label }}
+                </span>
+                <span v-else class="tile-kind">{{ KIND_LABEL[card.kind] || card.kind }}</span>
+                <span class="tile-size">{{ card.sizeH }}</span>
+              </div>
             </div>
           </div>
         </div>
-        <div v-if="loading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</div>
-        <div v-if="!cards.length && !loading" class="grid-empty">该筛选下没有文件</div>
+      </RecycleScroller>
+      <div v-show="view === 'gallery'" class="grid-status">
+        <span v-if="loading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</span>
+        <span v-else-if="!cards.length" class="grid-empty">该筛选下没有文件</span>
+        <span v-else-if="exhausted" class="grid-done">已显示全部 {{ total.toLocaleString() }} 个</span>
       </div>
 
       <!-- 分类树状图 -->
@@ -1481,7 +1505,7 @@ onBeforeUnmount(() => {
         </template>
       </div>
 
-      <!-- 列表 -->
+      <!-- 列表(虚拟滚动:定高行,表头固定,DOM 只保留视口内几十行)-->
       <div v-show="view === 'list'" class="listview">
         <div class="lv-head">
           <span class="lv-c-name">名称</span>
@@ -1490,84 +1514,37 @@ onBeforeUnmount(() => {
           <span class="lv-c-size">大小</span>
           <span class="lv-c-time">修改</span>
         </div>
-        <div
-          v-for="card in cards"
-          :key="card.id"
-          class="lv-row"
-          :style="{ '--accent': accentFor(card) }"
-          @click="openDetail(card)"
+        <RecycleScroller
+          class="lv-scroll"
+          :items="cards"
+          :item-size="42"
+          key-field="id"
+          :buffer="900"
+          @scroll-end="onGridEnd"
+          v-slot="{ item: card }"
         >
-          <span class="lv-c-name">
-            <svg viewBox="0 0 48 48" class="glyph lv-glyph" v-html="GLYPHS[glyphFor(card)]" />
-            <span class="lv-name" :title="card.name">{{ card.title || card.name }}</span>
-          </span>
-          <span class="lv-c-cluster">
-            <span v-if="card.clusterId > 0 && clusterColor[card.clusterId]" class="lv-tag" :style="{ '--c': clusterColor[card.clusterId].color }">
-              {{ clusterColor[card.clusterId].label }}
+          <div
+            class="lv-row"
+            :style="{ '--accent': accentFor(card) }"
+            @click="openDetail(card)"
+          >
+            <span class="lv-c-name">
+              <svg viewBox="0 0 48 48" class="glyph lv-glyph" v-html="GLYPHS[glyphFor(card)]" />
+              <span class="lv-name" :title="card.name">{{ card.title || card.name }}</span>
             </span>
-            <span v-else class="lv-dim">—</span>
-          </span>
-          <span class="lv-c-kind">{{ KIND_LABEL[card.kind] || card.kind }}</span>
-          <span class="lv-c-size">{{ card.sizeH }}</span>
-          <span class="lv-c-time">{{ fmtTime(card.mtime) }}</span>
-        </div>
-        <div v-if="loading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</div>
+            <span class="lv-c-cluster">
+              <span v-if="card.clusterId > 0 && clusterColor[card.clusterId]" class="lv-tag" :style="{ '--c': clusterColor[card.clusterId].color }">
+                {{ clusterColor[card.clusterId].label }}
+              </span>
+              <span v-else class="lv-dim">—</span>
+            </span>
+            <span class="lv-c-kind">{{ KIND_LABEL[card.kind] || card.kind }}</span>
+            <span class="lv-c-size">{{ card.sizeH }}</span>
+            <span class="lv-c-time">{{ fmtTime(card.mtime) }}</span>
+          </div>
+        </RecycleScroller>
+        <div v-if="loading" class="grid-status"><span class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</span></div>
       </div>
-
-      <!-- 核心层 · 知识体系(整套知识库系统的家) -->
-      <div v-show="view === 'core'" class="coreview">
-        <div class="core-hero glass">
-          <div class="ch-ic"><Network :size="24" :stroke-width="1.5" /></div>
-          <div class="ch-main">
-            <div class="ch-t">核心层 · 知识体系</div>
-            <div class="ch-d">
-              这是你资料的「大脑」——散落的文件经过编译,连成一张互联的知识网。
-              个人库自动归出你常用的主题;企业库在行业框内抽出可溯源的实体与关系。
-            </div>
-          </div>
-          <button class="ch-open" @click="openFullKb"><BookOpen :size="14" :stroke-width="1.8" /> 打开完整知识库</button>
-        </div>
-
-        <div v-if="ontoLoading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 读取知识体系…</div>
-
-        <!-- 企业:Schema-Guided 抽出的关系三元组(中文、可溯源) -->
-        <template v-else-if="ontoSchemasWithData.length">
-          <div class="core-section-h">
-            <ShieldCheck :size="14" :stroke-width="1.8" />
-            <b>已建立的关系网</b>
-            <span class="csh-fine">共 {{ ontoTotal }} 条 · 每条都标了置信度与来源,可审计</span>
-          </div>
-          <div v-for="sc in ontoSchemasWithData" :key="sc.id" class="onto-card glass">
-            <button class="oc-head" @click="toggleSchema(sc.id)">
-              <span class="oc-name">{{ sc.name }}</span>
-              <span class="oc-ind">{{ sc.industry }}</span>
-              <span class="oc-cnt">{{ sc.triples }} 条关系</span>
-              <ChevronDown class="oc-chev" :class="{ flip: openSchema === sc.id }" :size="15" :stroke-width="2" />
-            </button>
-            <div v-if="openSchema === sc.id" class="oc-body">
-              <div v-if="triplesLoading" class="grid-loading"><LoaderCircle :size="16" class="spin" /> 加载关系…</div>
-              <div v-else class="triple-list">
-                <div v-for="(tp, i) in schemaTriples" :key="i" class="triple-row">
-                  <span class="tr-sub">{{ tp.subject }}</span>
-                  <span class="tr-rel">{{ tp.predicate }}</span>
-                  <span class="tr-obj">{{ tp.object }}</span>
-                  <span v-if="tp.sourceFile" class="tr-src" :title="tp.sourceFile">{{ tp.sourceFile.split('/').pop() }}</span>
-                  <span class="tr-conf" :title="'置信度'">{{ Math.round(tp.confidence * 100) }}%</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </template>
-
-        <!-- 还没有知识体系:引导去构建 -->
-        <div v-else class="core-empty">
-          <Sparkles :size="26" :stroke-width="1.3" />
-          <p>还没有构建知识体系。点「智能向导」,个人库自动归出常用主题,企业库在行业框内抽实体关系。</p>
-          <button class="ch-open" @click="openWizard"><Wand2 :size="14" :stroke-width="1.8" /> 打开智能向导</button>
-        </div>
-      </div>
-
-      <div ref="sentinel" class="sentinel" />
     </div>
 
     <!-- 详情抽屉 -->
@@ -1716,7 +1693,8 @@ onBeforeUnmount(() => {
           <span class="galaxy-title"><Orbit :size="16" :stroke-width="1.7" /> 我的资料 · 星图</span>
           <button class="galaxy-close" title="关闭" @click="galaxyOpen = false"><X :size="18" :stroke-width="2" /></button>
         </div>
-        <KnowledgeGraph source="files" :embedded="true" />
+        <!-- key 绑定归类档位:智能归类每完成一档(骨架/AI 初级/语义精修)就重挂载,星图「原地长准」。 -->
+        <KnowledgeGraph :key="graphRefreshKey" source="files" :embedded="true" />
       </div>
     </transition>
   </div>
@@ -2392,17 +2370,29 @@ onBeforeUnmount(() => {
 .fc-body {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  padding: 4px 6px 28px;
+  /* 改为 flex 列 + 自身不滚:由内部各视图(画廊/列表虚拟滚动、分类树)各自滚动,
+     这样虚拟滚动容器才有确定高度,DOM 只保留视口内的卡片。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 核心层 = 内嵌整套知识库(WikiBrowse):占满文件中心剩余高度,
+   覆盖 .wiki 自带的 height:100%(否则会顶出工具条溢出)。 */
+.fc-core-wiki {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
 }
 
 /* 语义带 */
 .sem-strip {
+  flex: none;
   background: color-mix(in srgb, var(--primary) 7%, var(--panel));
   border: 1px solid color-mix(in srgb, var(--primary) 22%, transparent);
   border-radius: 14px;
   padding: 12px 14px;
-  margin-bottom: 16px;
+  margin: 4px 6px 12px;
 }
 .sem-head {
   display: flex;
@@ -2456,13 +2446,24 @@ onBeforeUnmount(() => {
 }
 .lane.vector { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary); }
 
-/* ── 画廊 ── */
-.gallery {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
-  gap: 16px;
+/* ── 画廊(虚拟滚动)── */
+.gallery-vs {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 6px;
+}
+/* 每个虚拟单元格:用 8px 内边距撑出 16px 卡片间距,卡片填满余下空间(定高) */
+.tile-cell {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 8px;
 }
 .tile {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
   border-radius: 16px;
   overflow: hidden;
   cursor: pointer;
@@ -2470,7 +2471,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border-soft);
 }
 .tile:hover {
-  transform: translateY(-4px);
+  transform: translateY(-3px);
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   box-shadow:
     0 14px 34px -14px color-mix(in srgb, var(--accent) 55%, transparent),
@@ -2478,7 +2479,8 @@ onBeforeUnmount(() => {
 }
 .thumb {
   position: relative;
-  aspect-ratio: 4 / 3;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
   background:
     radial-gradient(110% 120% at 50% 0%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%),
@@ -2565,7 +2567,7 @@ onBeforeUnmount(() => {
   animation: shimmer 1.4s infinite;
 }
 @keyframes shimmer { to { background-position: -220% 0; } }
-.tile-meta { padding: 10px 12px 12px; }
+.tile-meta { flex: none; padding: 10px 12px 12px; }
 .tile-name {
   font-size: 12.5px;
   color: var(--text);
@@ -2594,22 +2596,29 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
   flex: none;
 }
-.sentinel { grid-column: 1 / -1; height: 1px; }
-.grid-loading, .grid-empty {
-  grid-column: 1 / -1;
+/* 画廊/列表底部状态条:加载中 / 空 / 已到底(虚拟滚动后不再是网格内的格子)。 */
+.grid-status {
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: center;
+  min-height: 26px;
+  padding: 6px 12px 12px;
+}
+.grid-loading, .grid-empty, .grid-done {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
-  padding: 22px;
   color: var(--muted);
   font-size: 12.5px;
 }
+.grid-done { color: var(--dim); }
 
 /* ── 分类树状图 ── */
 .clustree {
-  height: calc(100vh - 320px);
-  min-height: 420px;
+  /* 填满 .fc-body 剩余高度(其已是 flex 列);内部 .tree-scroll 绝对定位自滚 */
+  flex: 1;
+  min-height: 0;
   position: relative;
   overflow: hidden;
   background:
@@ -2833,27 +2842,28 @@ onBeforeUnmount(() => {
 .star-hint { font-size: 12px; max-width: 360px; line-height: 1.7; }
 
 /* ── 列表 ── */
-.listview { display: flex; flex-direction: column; }
+.listview { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 4px 6px; }
+.lv-scroll { flex: 1; min-height: 0; overflow-y: auto; }
 .lv-head, .lv-row {
   display: grid;
   grid-template-columns: 1fr 160px 80px 90px 130px;
   gap: 10px;
   align-items: center;
-  padding: 9px 12px;
 }
 .lv-head {
+  flex: none;
+  padding: 9px 12px;
   font-size: 11px;
   color: var(--muted);
   letter-spacing: 0.5px;
   border-bottom: 1px solid var(--hairline);
-  position: sticky;
-  top: 0;
   background: color-mix(in srgb, var(--bg) 80%, transparent);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
-  z-index: 2;
 }
 .lv-row {
+  /* 定高行:必须与 RecycleScroller 的 item-size(42)一致,否则会错位/重叠 */
+  height: 42px;
+  box-sizing: border-box;
+  padding: 0 12px;
   border-radius: 10px;
   cursor: pointer;
   font-size: 12.5px;

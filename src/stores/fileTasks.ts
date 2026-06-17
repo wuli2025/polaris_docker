@@ -83,14 +83,28 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
       ),
     );
     unlisteners.push(
-      await listen<{ kind: string; text?: string; clusters?: number; note?: string; message?: string }>(
-        "file:cluster",
-        (p) => {
-          if (p.kind === "phase") detail.cluster = p.text ?? "";
-          else if (p.kind === "done") finish("cluster", p.note || "归类完成");
-          else if (p.kind === "error") fail("cluster", `归类失败:${p.message ?? ""}`);
-        },
-      ),
+      await listen<{
+        kind: string;
+        text?: string;
+        tier?: string;
+        clusters?: number;
+        note?: string;
+        report?: string;
+        message?: string;
+      }>("file:cluster", (p) => {
+        if (p.kind === "phase") detail.cluster = p.text ?? detail.cluster;
+        else if (p.kind === "tick") {
+          /* 心跳(AI 输出中):保活,不改文案 */
+        } else if (p.kind === "tier") {
+          // v3 某一档(骨架/AI 初级/语义精修)完成 → 刷新星图/网格(doneTick),但任务继续。
+          if (p.note) detail.cluster = p.note;
+          if (p.report) reportPath.cluster = p.report;
+          doneTick.cluster++;
+        } else if (p.kind === "done") {
+          if (p.report) reportPath.cluster = p.report;
+          finish("cluster", p.note || "归类完成");
+        } else if (p.kind === "error") fail("cluster", `归类失败:${p.message ?? ""}`);
+      }),
     );
     unlisteners.push(
       await listen<{ kind: string; text?: string; clusters?: number; assigned?: number; report?: string; message?: string }>(
@@ -141,6 +155,8 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
   }
   async function startIndex() {
     if (running.index) return;
+    // 用户手动开建 → 解除「开机不自动续建」的暂停标记(见 App.vue 的开机续建)。
+    try { localStorage.removeItem("polaris.indexAutoPaused"); } catch { /* ignore */ }
     await ensureListeners();
     begin("index", "正在构建向量索引(硅基 BGE-M3 滴灌嵌入)…");
     try {
@@ -169,11 +185,19 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
       fail("clusterLlm", `AI 归类失败:${e?.message ?? e}`);
     }
   }
-  // 统一「智能归类」入口:配了嵌入 key → AI 语义归类(出桌面报告);没配 → 离线纯数学归类。
-  async function startSmartCluster(hasEmbedProvider: boolean) {
+  // 统一「智能归类」入口(v3 渐进式):后端一条龙 T0 秒级骨架 → T1 AI 初级命名+关系 →
+  // T2 全量向量化后语义重聚再命名,全程后台、进度走 file:cluster 事件(tier 分档)。
+  // 配不配嵌入 key 都点得动:没配则止于结构骨架 + AI 命名;配了自动接 T2 精修。
+  // (hasEmbedProvider 参数保留兼容旧调用,实际由后端按服务商在不在自行决定是否做 T2。)
+  async function startSmartCluster(_hasEmbedProvider?: boolean) {
     if (running.cluster || running.clusterLlm) return;
-    if (hasEmbedProvider) await startClusterLlm();
-    else await startCluster();
+    await ensureListeners();
+    begin("cluster", "正在启动智能归类…");
+    try {
+      await fc.smartCluster(null);
+    } catch (e: any) {
+      fail("cluster", `归类失败:${e?.message ?? e}`);
+    }
   }
   async function startTitles() {
     if (running.titles) return;
@@ -195,6 +219,27 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     } catch (e: any) {
       fail("ontology", `构建失败:${e?.message ?? e}`);
     }
+  }
+
+  // 停止/关闭某后台任务。
+  //   盘点 / 建索引:走协作式取消(fable_cancel —— 循环每几百 ms 轮询 CANCEL 优雅停)。
+  //     索引是「可续建」的:停了再点一次即从断点继续 → 等价于「暂停 / 继续」。
+  //   AI 归类 / 整理名 / 构建体系:后端暂不轮询取消(且多为一次性 LLM 调用),这里把它从
+  //     面板乐观收起,后台那一轮会自然跑完,不影响已落库数据。
+  async function cancel(id: FileTaskId) {
+    if (!running[id]) return;
+    detail[id] = "正在停止…";
+    // 主动停索引 → 记住,下次开机不自动续建(否则关了又自己跑起来,等于关不掉)。
+    // 手动再点「建索引」会清掉这个标记(见 startIndex)。
+    if (id === "index") {
+      try { localStorage.setItem("polaris.indexAutoPaused", "1"); } catch { /* ignore */ }
+    }
+    try {
+      await fc.fableCancel();
+    } catch {
+      /* 取消是尽力而为,失败也不抛给用户 */
+    }
+    if (id !== "inventory" && id !== "index") finish(id, "已停止");
   }
 
   // 任一归类(离线 / AI)进行中。
@@ -222,5 +267,6 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     startSmartCluster,
     startTitles,
     startOntology,
+    cancel,
   };
 });

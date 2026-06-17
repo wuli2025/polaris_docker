@@ -54,42 +54,27 @@ onMounted(async () => {
 });
 watch(projectId, loadRecommendation);
 
-async function applyRecommended() {
-  const pid = projectId.value;
+// 召唤 = 把这支团/这位专家入驻到当前项目并切回对话区(由 ChatPanel 统一落地:
+// expert.apply/teamApply + 设模式 + 记最近召唤 + 显示专家团工作台)。没有当前项目则提示。
+function summonTeam(id: string) {
+  if (!app.currentProjectId) { toast.error("请先在对话区选择或新建一个项目，再召唤专家团"); return; }
+  app.requestSummon("team", id);
+}
+function summonExpert(id: string) {
+  if (!app.currentProjectId) { toast.error("请先在对话区选择或新建一个项目，再召唤专家"); return; }
+  app.requestSummon("expert", id);
+}
+function applyRecommended() {
   const team = rec.value?.team;
-  if (!pid || !team) {
-    toast.error("请先在左侧选择一个项目");
-    return;
-  }
-  try {
-    await expert.teamApply(pid, team.id, true);
-    toast.success(`已为「${activeProject.value?.name ?? "项目"}」入驻「${team.name}」`);
-  } catch (e) {
-    toast.error(`入驻失败：${e}`);
-  }
+  if (!team) return;
+  summonTeam(team.id);
 }
 
-async function onSelectTeam(id: string) {
-  const pid = projectId.value;
-  if (!pid) { toast.error("请先选择一个项目"); return; }
-  try {
-    await expert.teamApply(pid, id, true);
-    const name = (await expert.teamGet(id))?.name ?? "专家团";
-    toast.success(`已入驻「${name}」到「${activeProject.value?.name ?? "项目"}」`);
-  } catch (e) {
-    toast.error(`入驻失败：${e}`);
-  }
+function onSelectTeam(id: string) {
+  summonTeam(id);
 }
-async function onSelectExpert(id: string) {
-  const pid = projectId.value;
-  if (!pid) { toast.error("请先选择一个项目"); return; }
-  try {
-    await expert.apply(pid, id, true);
-    const name = (await expert.get(id))?.name ?? "专家";
-    toast.success(`已入驻专家「${name}」到「${activeProject.value?.name ?? "项目"}」`);
-  } catch (e) {
-    toast.error(`入驻失败：${e}`);
-  }
+function onSelectExpert(id: string) {
+  summonExpert(id);
 }
 </script>
 
