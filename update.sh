@@ -104,27 +104,39 @@ r2_helper() {
 
   local parts; parts="$(mf_get parts)"; parts="${parts:-1}"
   if [ "${parts:-1}" -gt 1 ]; then
-    hlog "下载镜像体（$parts 个分片，断点续传）..."
-    : > "$file"
-    local i=0 p
+    # 并行下载所有分片(各自断点续传)→ 聚合带宽,比顺序单连接快数倍;全成才拼接。
+    hlog "下载镜像体（$parts 个分片，并行 + 断点续传）..."
+    local i=0 p pids=""
     while [ "$i" -lt "$parts" ]; do
       p="$(printf '%s.part%02d' "$file" "$i")"
-      hlog "  分片 $((i+1))/$parts: $p"
-      curl -fL --retry 8 --retry-delay 3 -C - -o "$p" "$base/$p"
-      cat "$p" >> "$file"
-      rm -f "$p"
+      curl -fsSL --retry 8 --retry-delay 3 -C - -o "$p" "$base/$p" &
+      pids="$pids $!"
+      i=$((i+1))
+    done
+    local fail=0 pid
+    for pid in $pids; do wait "$pid" || fail=1; done
+    [ "$fail" = 0 ] || { hlog "❌ 分片下载失败（运行容器未动）"; exit 1; }
+    : > "$file"; i=0
+    while [ "$i" -lt "$parts" ]; do
+      p="$(printf '%s.part%02d' "$file" "$i")"
+      cat "$p" >> "$file"; rm -f "$p"
       i=$((i+1))
     done
   else
     hlog "下载镜像体（断点续传）..."
-    curl -fL --retry 8 --retry-delay 3 -C - -o "$file" "$base/$file"
+    curl -fsSL --retry 8 --retry-delay 3 -C - -o "$file" "$base/$file"
   fi
 
   hlog "校验 sha256 ..."
   echo "$sha  $file" | sha256sum -c - || { hlog "❌ sha256 不匹配，已中止（运行容器未动）"; rm -f "$file"; exit 1; }
 
+  # docker save 的层已是压缩态,镜像体优先用「裸 tar」(不再 gzip,体积更小、省两端 CPU);
+  # 仍兼容旧的 .tar.gz(gunzip 解)。按文件名后缀分流。
   hlog "docker load ..."
-  gunzip -c "$file" | docker load
+  case "$file" in
+    *.gz) gunzip -c "$file" | docker load ;;
+    *)    docker load -i "$file" ;;
+  esac
 
   hlog "备份旧镜像以便回滚 ..."
   local oldimg
