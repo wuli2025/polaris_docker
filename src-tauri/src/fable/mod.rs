@@ -36,6 +36,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 // ───────────────────────── 全局任务闸 ─────────────────────────
 
@@ -76,6 +77,14 @@ impl Drop for FlagGuard {
 // ───────────────────────── SQLite 地基 ─────────────────────────
 
 pub fn db_path() -> Option<PathBuf> {
+    // 测试/高级用法可经 `POLARIS_FABLE_DB` 把库指到别处(默认 `~/Polaris/data/fable.db`),
+    // 让增量盘点等端到端测试用临时库验证,绝不碰用户真实知识库。
+    if let Ok(p) = std::env::var("POLARIS_FABLE_DB") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
     UserDirs::new().map(|u| u.home_dir().join("Polaris").join("data").join("fable.db"))
 }
 
@@ -99,9 +108,25 @@ pub(crate) fn open_db() -> Result<Connection, String> {
     conn.pragma_update(None, "mmap_size", 2_147_483_648i64).ok(); // 2 GiB
     conn.pragma_update(None, "cache_size", -65_536i64).ok(); // 64 MiB(负值=KiB)
     conn.pragma_update(None, "wal_autocheckpoint", 20_000i64).ok();
-    migrate(&conn)?;
+    // 模式迁移每进程只跑一次。migrate 含十余条 CREATE TABLE/INDEX、6 次列探测 SELECT、
+    // 以及 FTS5 建虚表 —— 而 open_db 在检索热路径被高频调用(单次 hybrid 查询光向量粗筛就按
+    // worker 数开十余个连接,每个旧实现都重跑整套迁移,纯浪费)。双检锁:快路径一次原子读
+    // (绝大多数连接走这里,零迁移开销);仅进程内首个连接进锁内做一次迁移 —— 既免重复,
+    // 又避免并发首开时两连接同时 `ALTER TABLE ADD COLUMN` 互撞(后者会报 duplicate column)。
+    // PRAGMA 仍每连接设(mmap/cache/busy_timeout 等是连接级状态,必须每次)。
+    if !MIGRATED.load(Ordering::Acquire) {
+        let _g = MIGRATE_LOCK.lock().unwrap();
+        if !MIGRATED.load(Ordering::Relaxed) {
+            migrate(&conn)?;
+            MIGRATED.store(true, Ordering::Release);
+        }
+    }
     Ok(conn)
 }
+
+/// 进程级「fable.db 模式已就绪」闸 + 串行化锁(配合 [`open_db`] 的双检锁,见其注释)。
+static MIGRATED: AtomicBool = AtomicBool::new(false);
+static MIGRATE_LOCK: Mutex<()> = Mutex::new(());
 
 fn migrate(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -128,6 +153,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind);
         CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+        -- 增量盘点缓存:每个目录(相对根路径)的 mtime + 直属文件数/字节 + 见过代际。
+        -- 重扫时先比对目录 mtime —— 没变 → 整个目录跳过 read_dir(及里面所有文件的逐个 stat),
+        -- 直接把直属文件标记「还在」、只递归进子目录;改过的目录才真正 read_dir。NAS 上把
+        -- 「每个目录一次 read_dir + 每个文件一次往返」降到「每个目录一次 stat」,重扫快一个数量级。
+        -- fcount/fbytes 让跳过的目录仍能把直属文件计入进度/总量(报数不缩水)。seen 同 files 代际,
+        -- 本轮没确认的(目录消失 / 没扫到)随对账清出。第一次盘点无缓存 → 全量;之后只摸动过的子树。
+        CREATE TABLE IF NOT EXISTS dirs(
+            root_id INTEGER NOT NULL,
+            relpath TEXT NOT NULL,
+            mtime   INTEGER NOT NULL DEFAULT 0,
+            fcount  INTEGER NOT NULL DEFAULT 0,
+            fbytes  INTEGER NOT NULL DEFAULT 0,
+            seen    INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(root_id, relpath)
+        );
         CREATE TABLE IF NOT EXISTS chunks(
             id      INTEGER PRIMARY KEY,
             file_id INTEGER NOT NULL,
@@ -260,6 +300,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_files_embed_pending ON files(kind, chunked, size);
         -- 倒排待办/计数:WHERE kind='text' AND ftsed=0 AND size<=? 同理。
         CREATE INDEX IF NOT EXISTS idx_files_lex_pending   ON files(kind, ftsed, size);
+        -- 最近活动序:文件中心默认网格、晨报「最近在动的文件」、recent digest 均 ORDER BY mtime DESC
+        -- LIMIT n。无此索引时大库(几十万行)要全表排序;有了它走反向索引扫描,读 ~n 行即停。
+        CREATE INDEX IF NOT EXISTS idx_files_mtime         ON files(mtime);
+        -- 文件中心首屏 overview:`GROUP BY kind` 取 COUNT/SUM(size)。把 size 也纳入索引 →
+        -- 覆盖索引,纯走索引算聚合,免在百万行 files 表上整表扫(冷启动后台索引满负荷时,整表
+        -- GROUP BY 单次可达数秒,会把 spawn_blocking 池占满拖垮 UI 取数)。
+        CREATE INDEX IF NOT EXISTS idx_files_kind_size     ON files(kind, size);
+        -- overview「按语言」:`GROUP BY lang, ext, kind` 取 COUNT/SUM(size)。同为覆盖索引,
+        -- 把这条百万行三列聚合从全表扫降为索引扫。
+        CREATE INDEX IF NOT EXISTS idx_files_lang          ON files(lang, ext, kind, size);
         -- 向量车道按 (model, cell) 取候选:IVF 探针命中的 cell 直接走索引。
         CREATE INDEX IF NOT EXISTS idx_chunks_cell         ON chunks(model, cell);
         -- IVF 二值质心:每模型 K 个 cell,bits=按位多数表决得到的二值码,分配/找最近 cell 都用汉明。
@@ -294,11 +344,19 @@ pub(crate) fn lex_available(conn: &Connection) -> bool {
     .is_ok()
 }
 
-/// 启动时调用(桌面 setup / server main):只确保库可开、表就位,不做扫描。
+/// 启动时调用(桌面 setup / server main):**后台**确保库可开、表/索引就位,绝不阻塞启动。
+///
+/// open_db 首调会跑一次 migrate,其中含在大库上 `CREATE INDEX idx_files_mtime` —— 几十万行的库
+/// 这一下可达数秒。此前 init 在桌面 setup 主线程里同步调它,首启时窗口要等索引建完才出现 ——
+/// 用户感知就是「一点开就卡死几分钟」。故改丢后台线程预热:启动瞬时返回,索引在后台默默备好;
+/// 期间偶有检索/晨报命令撞上,会在 open_db 的 MIGRATE_LOCK 上短暂等一下(那些命令走 Tauri worker
+/// 线程,不冻 UI 主线程),索引建好后全程走快路。server main 亦同 —— 请求路径自身也会兜底建表。
 pub fn init() {
-    if let Err(e) = open_db() {
-        eprintln!("[fable] init: {e}");
-    }
+    std::thread::spawn(|| {
+        if let Err(e) = open_db() {
+            eprintln!("[fable] init: {e}");
+        }
+    });
 }
 
 /// 文件系统名/路径段 → 显示用 String。修「Docker/NAS 上非 UTF-8 文件名(多为 Windows/
@@ -345,7 +403,17 @@ pub(crate) fn reencode_fs_path(display_abspath: &str) -> std::path::PathBuf {
 }
 
 /// 并行度:留一个核给 UI/主循环,封顶 12(NAS 盘 IO 先饱和)。
+///
+/// 限速旋钮:`POLARIS_FABLE_WORKERS` 可显式压低盘点/语言回填/检索粗筛的并发线程数
+/// (clamp 到 [1,64])。百万级大库冷启动时后台盘点/索引会占满全部核心,把 UI 线程的
+/// CPU 时间片挤到几乎为零 → 主线程消息泵错过 5s 窗口被判无响应。想让后台「轻一点、
+/// 别和 UI 抢核」就设小一点(例如 `POLARIS_FABLE_WORKERS=2`),重启 app 生效。
 pub(crate) fn worker_count() -> usize {
+    if let Ok(v) = std::env::var("POLARIS_FABLE_WORKERS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n.clamp(1, 64);
+        }
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -472,7 +540,18 @@ pub fn status() -> Result<FableStatus, String> {
 
 // ───────────────────────── 命令(薄包装)─────────────────────────
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+// 桌面端一律 async + spawn_blocking:status() 在百万行 files 表上连打 8 条 COUNT(*)
+// (多为全表/无覆盖索引扫描),后台索引器持写锁或满负荷跑时这一下可达数秒。直接当同步
+// Tauri 命令会在 WebView 主线程上跑 → 阻塞 >5s 被 Windows 判「无响应」强杀(AppHangB1)。
+// server flavor 无 UI 主线程、且 dispatch 本就在 spawn_blocking 中,保持同步直调即可。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn fable_status() -> Result<FableStatus, String> {
+    tauri::async_runtime::spawn_blocking(status)
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn fable_status() -> Result<FableStatus, String> {
     status()
 }

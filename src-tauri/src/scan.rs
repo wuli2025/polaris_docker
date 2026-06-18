@@ -250,11 +250,191 @@ fn windows_roots() -> Vec<ScanRoot> {
         }
     }
 
+    // ③ 同一台 NAS 上「没映射成盘符」的其它共享。
+    // 用户把群晖映射成 Z:(=tx 共享)后,docker / web / web_packages 等共享**不会**自动出现 →
+    // 平台就漏扫了那几百 GB(数据集全在 docker 共享里)。这里据已映射的网络盘反解出 NAS 主机,
+    // 枚举该主机的全部磁盘共享,把「还没映射的」补成可勾选的盘点根(UNC 路径,凭据复用当前已登录
+    // 会话,无需另外输账号密码)。整段有界(8s):NAS 掉线 / 慢也只是「这次没发现额外共享」,
+    // 绝不冻结选择器。
+    if let Some(shares) = with_timeout(8, windows_discover_nas_shares) {
+        for sr in shares {
+            if seen.insert(sr.path.clone()) {
+                out.push(sr);
+            }
+        }
+    }
+
     // 还原线程错误模式。
     unsafe {
         SetThreadErrorMode(prev_mode, std::ptr::null_mut());
     }
     out
+}
+
+/// 把可能阻塞(WNet 网络枚举)的活儿放后台线程跑,超死线就放弃,绝不吊死调用方(选择器线程)。
+/// 超时的线程被 detach:它阻塞在 WNet syscall 上,随网络恢复 / 进程退出自然回收。
+#[cfg(windows)]
+fn with_timeout<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+}
+
+/// `\\host\share` → `\\host`(取 UNC 主机段)。
+#[cfg(windows)]
+fn unc_host(unc: &str) -> Option<String> {
+    let rest = unc.strip_prefix(r"\\")?;
+    let host = rest.split('\\').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!(r"\\{host}"))
+    }
+}
+
+/// 已映射的网络盘符(如 `Z:`)反解出它指向的 UNC(`\\host\share`)。
+#[cfg(windows)]
+fn win_drive_unc(letter: char) -> Option<String> {
+    use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    let local = to_wide(&format!("{letter}:")); // 注意:不带结尾反斜杠
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: local 以 NUL 结尾;buf/len 是有效可写缓冲。
+    let rc = unsafe { WNetGetConnectionW(local.as_ptr(), buf.as_mut_ptr(), &mut len) };
+    if rc != 0 {
+        return None; // 非 NO_ERROR
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    let s = String::from_utf16_lossy(&buf[..end]);
+    if s.starts_with(r"\\") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// 枚举某 NAS 主机(`\\host`)上的全部磁盘共享,返回各共享的 UNC(`\\host\share`)。
+/// 用 WNet 枚举(等同 `net view \\host`),凭据复用当前登录会话已缓存的那份。
+#[cfg(windows)]
+fn win_host_disk_shares(host_unc: &str) -> Vec<String> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::NetworkManagement::WNet::{
+        WNetCloseEnum, WNetEnumResourceW, WNetOpenEnumW, NETRESOURCEW, RESOURCETYPE_DISK,
+        RESOURCEUSAGE_CONTAINER, RESOURCE_GLOBALNET,
+    };
+    let mut out = Vec::new();
+    let mut remote = to_wide(host_unc);
+    // SAFETY: NETRESOURCEW 是 POD,zeroed 合法;随后只填我们关心的字段。
+    let mut nr: NETRESOURCEW = unsafe { std::mem::zeroed() };
+    nr.dwScope = RESOURCE_GLOBALNET;
+    nr.dwType = RESOURCETYPE_DISK;
+    nr.dwUsage = RESOURCEUSAGE_CONTAINER;
+    nr.lpRemoteName = remote.as_mut_ptr();
+    let mut handle: *mut c_void = std::ptr::null_mut();
+    // SAFETY: &nr 在调用期间有效;handle 是有效可写指针。
+    let rc = unsafe { WNetOpenEnumW(RESOURCE_GLOBALNET, RESOURCETYPE_DISK, 0, &nr, &mut handle) };
+    if rc != 0 {
+        return out;
+    }
+    const CAP: usize = 256;
+    // 用 Vec<NETRESOURCEW> 当缓冲 → 保证 8 字节对齐(结构含指针);枚举结果的字符串紧随结构尾部,
+    // 指针回指本缓冲,只要 count<=CAP 就都在界内。
+    let mut buf: Vec<NETRESOURCEW> = Vec::with_capacity(CAP);
+    loop {
+        let mut count: u32 = u32::MAX; // -1 = 尽量多塞
+        let mut size: u32 = (CAP * std::mem::size_of::<NETRESOURCEW>()) as u32;
+        // SAFETY: handle 有效;count/size 可写;buf 有 CAP 容量、size 与之匹配。
+        let rc = unsafe {
+            WNetEnumResourceW(handle, &mut count, buf.as_mut_ptr() as *mut c_void, &mut size)
+        };
+        if rc != 0 || count == 0 {
+            break; // ERROR_NO_MORE_ITEMS 或出错或本批为空
+        }
+        for i in 0..count as usize {
+            // SAFETY: i<count<=CAP,entry 在缓冲界内;lpRemoteName 指向缓冲尾部的合法宽串。
+            let entry = unsafe { &*buf.as_ptr().add(i) };
+            if entry.lpRemoteName.is_null() {
+                continue;
+            }
+            let name = unsafe { wide_ptr_to_string(entry.lpRemoteName) };
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+    }
+    // SAFETY: handle 由 WNetOpenEnumW 取得,尚未关闭。
+    unsafe {
+        WNetCloseEnum(handle);
+    }
+    out
+}
+
+/// 读 NUL 结尾的宽字符串。SAFETY: 调用方保证 p 指向合法、以 NUL 结尾的宽串。
+#[cfg(windows)]
+unsafe fn wide_ptr_to_string(p: *const u16) -> String {
+    let mut len = 0usize;
+    while *p.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+}
+
+/// 发现「已映射网络盘所在 NAS 主机上、尚未映射成盘符」的其它磁盘共享,补成盘点根。
+#[cfg(windows)]
+fn windows_discover_nas_shares() -> Vec<ScanRoot> {
+    use std::collections::HashSet;
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+    let mut roots = Vec::new();
+    let mask = unsafe { GetLogicalDrives() };
+    let mut mapped: HashSet<String> = HashSet::new(); // 已映射成盘符的共享 UNC(小写、去尾\)
+    let mut hosts: Vec<String> = Vec::new(); // 去重的 \\host
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = format!("{letter}:\\");
+        if unsafe { GetDriveTypeW(to_wide(&root).as_ptr()) } != DRIVE_REMOTE {
+            continue;
+        }
+        let Some(unc) = win_drive_unc(letter) else {
+            continue;
+        };
+        mapped.insert(unc.trim_end_matches('\\').to_lowercase());
+        if let Some(host) = unc_host(&unc) {
+            let hl = host.to_lowercase();
+            if !hosts.iter().any(|h| h.to_lowercase() == hl) {
+                hosts.push(host);
+            }
+        }
+    }
+    for host in &hosts {
+        for share_unc in win_host_disk_shares(host) {
+            let norm = share_unc.trim_end_matches('\\').to_lowercase();
+            if mapped.contains(&norm) {
+                continue; // 已映射(如 Z:=tx)→ 由盘符那条扫,别重复
+            }
+            let share_name = norm.rsplit('\\').next().unwrap_or("");
+            // 跳过隐藏管理共享(C$ / ADMIN$ / IPC$ 等以 $ 结尾)。
+            if share_name.is_empty() || share_name.ends_with('$') {
+                continue;
+            }
+            let shown = share_unc.trim_end_matches('\\').to_string();
+            let host_disp = unc_host(&shown).unwrap_or_default();
+            roots.push(ScanRoot {
+                id: shown.clone(),
+                label: format!("NAS 共享 · {share_name}({host_disp})"),
+                path: shown,
+                kind: "mounted".into(),
+                default_on: true,
+            });
+        }
+    }
+    roots
 }
 
 fn roots_impl() -> Vec<ScanRoot> {
@@ -765,6 +945,19 @@ mod tests {
         // 没有任何盘符时也不该 panic;有盘符则至少有一个 drive 根。
         if mask != 0 {
             assert!(roots.iter().any(|r| r.kind == "drive"));
+        }
+    }
+
+    /// 真机探查(默认 ignore,需连着 NAS 时手动 `--ignored --nocapture` 跑):打印自动发现的
+    /// 「同一台 NAS 上未映射成盘符」的其它共享。用于验证 WNet 枚举真能捞到 docker/web 等共享。
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore]
+    fn windows_discovers_sibling_nas_shares() {
+        let shares = windows_discover_nas_shares();
+        eprintln!("发现 {} 个未映射的 NAS 共享:", shares.len());
+        for s in &shares {
+            eprintln!("  [{}] {} -> {}", s.kind, s.label, s.path);
         }
     }
 }

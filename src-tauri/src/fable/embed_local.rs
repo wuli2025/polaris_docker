@@ -31,6 +31,27 @@ fn ensure_cache_env() {
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("FASTEMBED_CACHE_DIR", dir);
     }
+    cap_onnx_threads();
+}
+
+/// 限速旋钮：`POLARIS_EMBED_THREADS` 限制 ONNX Runtime 的推理线程数。本地 bge-m3 嵌入/重排是
+/// CPU 密集，ORT 默认会吃满全部逻辑核 → 百万级大库后台索引连续跑时，UI 线程几乎拿不到 CPU
+/// 时间片，消息泵错过 5s 窗口被 Windows 判无响应(AppHangB1)。把它设成「核数 - 2」之类给 UI
+/// 留头寸。必须在模型(ORT session)创建**之前**设进环境；OpenMP 构建的 onnxruntime 读
+/// `OMP_NUM_THREADS`，故同时写入这两个变量(已被显式设过则尊重用户值，不覆盖)。
+fn cap_onnx_threads() {
+    let Ok(v) = std::env::var("POLARIS_EMBED_THREADS") else { return };
+    let Ok(n) = v.trim().parse::<usize>() else { return };
+    if n == 0 {
+        return;
+    }
+    let n = n.to_string();
+    if std::env::var_os("OMP_NUM_THREADS").is_none() {
+        std::env::set_var("OMP_NUM_THREADS", &n);
+    }
+    if std::env::var_os("ORT_INTRA_OP_NUM_THREADS").is_none() {
+        std::env::set_var("ORT_INTRA_OP_NUM_THREADS", &n);
+    }
 }
 
 static EMBED: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();

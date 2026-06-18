@@ -233,8 +233,7 @@ fn type_views(defs: &[OntoTypeDef]) -> Vec<OntoTypeView> {
 }
 
 /// 列出全部内置行业 schema(企业路径选「框」用),附各自已落库三元组数。
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn ontology_schemas() -> Result<Vec<SchemaView>, String> {
+fn schemas_inner() -> Result<Vec<SchemaView>, String> {
     let conn = open_db()?;
     let mut out = Vec::new();
     for s in schemas() {
@@ -257,6 +256,26 @@ pub fn ontology_schemas() -> Result<Vec<SchemaView>, String> {
     Ok(out)
 }
 
+fn overview_inner() -> Result<OntologyOverview, String> {
+    let schemas = schemas_inner()?;
+    let total = schemas.iter().map(|s| s.triples).sum();
+    Ok(OntologyOverview { total_triples: total, schemas })
+}
+
+// 桌面端 async + spawn_blocking:每个 schema 一条 `COUNT(*) FROM triples`,在后台索引满负荷
+// 时同步直调会阻塞 UI 主线程。server flavor 保持同步直调内层。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn ontology_schemas() -> Result<Vec<SchemaView>, String> {
+    tauri::async_runtime::spawn_blocking(schemas_inner)
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
+pub fn ontology_schemas() -> Result<Vec<SchemaView>, String> {
+    schemas_inner()
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OntologyOverview {
@@ -264,12 +283,17 @@ pub struct OntologyOverview {
     pub schemas: Vec<SchemaView>,
 }
 
-/// 本体总览:各 schema 的三元组数(给「核心层」/ 企业首页用)。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// 本体总览:各 schema 的三元组数(给「核心层」/ 企业首页用)。桌面端 async + spawn_blocking。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn ontology_overview() -> Result<OntologyOverview, String> {
+    tauri::async_runtime::spawn_blocking(overview_inner)
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn ontology_overview() -> Result<OntologyOverview, String> {
-    let schemas = ontology_schemas()?;
-    let total = schemas.iter().map(|s| s.triples).sum();
-    Ok(OntologyOverview { total_triples: total, schemas })
+    overview_inner()
 }
 
 /// 把某 schema 的类型清单写进 onto_types(幂等:先清同 schema 再写)。让本体类型可被

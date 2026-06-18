@@ -34,6 +34,18 @@ const EMBED_BATCH: usize = 16;
 /// 几十上百批,旧实现严格串行 → 总耗时 ≈ 批数 × 单批延迟。embed_texts 是纯网络调用、无共享
 /// 态 → 可并发;限到 3 路兼顾吞吐与免费档限速(每批内部仍有 429 指数退避兜底)。
 const EMBED_CONCURRENCY: usize = 3;
+
+/// 实际并发嵌入度:`POLARIS_EMBED_CONCURRENCY` 可覆盖(clamp 到 [1,16])。本地 ONNX 嵌入
+/// (POLARIS_LOCAL_EMBED)是 CPU 密集,冷启动满负荷会抢光核心拖垮 UI;设 `=1` 让嵌入串行、
+/// 给 UI 留核(配合 POLARIS_EMBED_THREADS 限 ONNX 内部线程效果更好)。
+fn embed_concurrency() -> usize {
+    if let Ok(v) = std::env::var("POLARIS_EMBED_CONCURRENCY") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            return n.clamp(1, 16);
+        }
+    }
+    EMBED_CONCURRENCY
+}
 /// 单次 build 处理的文件数上限(FTS-only 文件不耗嵌入预算,需独立护栏,幂等续跑)。
 const MAX_FILES_PER_BUILD: u64 = 8000;
 /// P1-4 文件类型分流:这些扩展名是大体量、低语义价值的数据/日志类,**不花钱做向量**
@@ -46,11 +58,20 @@ fn embeddable(ext: &str, size: i64) -> bool {
 
 // ───────────────────────── 嵌入 / 重排客户端 ─────────────────────────
 
-fn agent_http() -> ureq::Agent {
+/// 进程级共享 HTTP Agent。ureq::Agent 内部是 Arc + 连接池,Clone 廉价、Send+Sync,**复用同一个
+/// 即可在多次请求间保活 TCP/TLS 连接**。此前每次调用都 `build()` 一个全新 Agent → 连接池形同
+/// 虚设,每个嵌入批 / 每次查询嵌入都要重做一次 TLS 握手(对 siliconflow 这类 HTTPS 往返,握手
+/// 本身就是几十~上百 ms)。索引构建会打成千上万批(且 EMBED_CONCURRENCY 路并发共享此池),
+/// 查询冷路也复用暖连接 —— 嵌入吞吐与首字延迟同时受益。
+static HTTP_AGENT: Lazy<ureq::Agent> = Lazy::new(|| {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(120))
         .build()
+});
+
+fn agent_http() -> ureq::Agent {
+    HTTP_AGENT.clone()
 }
 
 /// 批量嵌入。429 退避重试 3 次;其余错误直接报(可读信息,UI 原样展示)。
@@ -468,7 +489,7 @@ pub fn build_index(
                             let next = std::sync::atomic::AtomicUsize::new(0);
                             let collected: Mutex<Vec<(usize, Result<Vec<Vec<f32>>, String>)>> =
                                 Mutex::new(Vec::with_capacity(groups.len()));
-                            let nthreads = EMBED_CONCURRENCY.min(groups.len()).max(1);
+                            let nthreads = embed_concurrency().min(groups.len()).max(1);
                             std::thread::scope(|s| {
                                 for _ in 0..nthreads {
                                     s.spawn(|| loop {

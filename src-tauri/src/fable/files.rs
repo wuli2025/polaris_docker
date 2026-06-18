@@ -2987,12 +2987,51 @@ fn titles_llm_run(app: &AppHandle, root: Option<String>) -> Result<usize, String
 
 // ───────────────────────── 命令(薄包装;三壳共用) ─────────────────────────
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+// 文件中心几个「读大库 / 读盘上文件(可能是慢 SMB 的 NAS 盘)」的命令:桌面端一律 async +
+// spawn_blocking,把重活挪离 Tauri 主线程,绝不冻 WebView 消息泵(否则大库 GROUP BY 或 NAS
+// 一抖,主线程阻塞 >5s 就被 Windows 判「无响应」强杀)。server flavor 无 UI 主线程可冻、且
+// dispatch_sync 本就在 spawn_blocking 中,保持同步直调内层即可。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn file_overview(root: Option<String>) -> Result<FileOverview, String> {
+    tauri::async_runtime::spawn_blocking(move || overview(root))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn file_overview(root: Option<String>) -> Result<FileOverview, String> {
     overview(root)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn file_grid(
+    root: Option<String>,
+    cluster_id: Option<i64>,
+    kind: Option<String>,
+    lang: Option<String>,
+    sort: Option<String>,
+    query: Option<String>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+) -> Result<FileGridPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        grid(
+            root,
+            cluster_id,
+            kind,
+            lang,
+            sort,
+            query,
+            page.unwrap_or(0),
+            page_size.unwrap_or(60),
+        )
+    })
+    .await
+    .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 #[allow(clippy::too_many_arguments)]
 pub fn file_grid(
     root: Option<String>,
@@ -3016,12 +3055,26 @@ pub fn file_grid(
     )
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn file_thumb(abspath: String, max: Option<u32>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || thumb(abspath, max.unwrap_or(360)))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn file_thumb(abspath: String, max: Option<u32>) -> Result<Option<String>, String> {
     thumb(abspath, max.unwrap_or(360))
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn file_gist(abspath: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || gist(abspath))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn file_gist(abspath: String) -> Result<String, String> {
     gist(abspath)
 }
@@ -3207,12 +3260,28 @@ pub async fn file_suggest_workflows(root: Option<String>) -> Result<Vec<Suggeste
 }
 
 /// 文件中心「星图」:语义簇 + 抽样文件 → 与知识图谱同构的 KbGraph(供 KnowledgeGraph.vue 星河渲染)。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// 桌面端 async + spawn_blocking,大库建图不冻 UI 主线程(理由同 [`file_overview`])。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> {
+    tauri::async_runtime::spawn_blocking(move || build_file_graph(root))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn file_graph(root: Option<String>) -> Result<crate::kb::KbGraph, String> {
     build_file_graph(root)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// 缩略图预取:批量解码盘上图片(可能是慢 NAS 盘),桌面端 async + spawn_blocking 不冻 UI。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn file_warm_thumbs(paths: Vec<String>, max: Option<u32>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || warm_thumbs(paths, max.unwrap_or(360)))
+        .await
+        .map_err(|e| format!("任务调度失败: {e}"))
+}
+#[cfg(not(feature = "desktop"))]
 pub fn file_warm_thumbs(paths: Vec<String>, max: Option<u32>) -> Result<usize, String> {
     Ok(warm_thumbs(paths, max.unwrap_or(360)))
 }

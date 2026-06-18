@@ -153,10 +153,16 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
                 "inventory" => {
                     let root = req(rest, "root")?;
                     let exclude = std::collections::HashSet::new();
-                    let summary =
-                        app::fable::inventory::scan_root(&root, &exclude, &|files, bytes| {
+                    // CLI 一次性盘点 → 默认完整(每目录都 read_dir;顺带建立目录缓存供后续增量)。
+                    let incremental = flag(rest, "incremental").is_some();
+                    let summary = app::fable::inventory::scan_root(
+                        &root,
+                        &exclude,
+                        !incremental,
+                        &|files, bytes| {
                             eprintln!("[fable] 已盘点 {files} 个文件 / {:.1} GB", bytes as f64 / 1e9);
-                        })?;
+                        },
+                    )?;
                     serde_json::to_value(summary).map_err(|e| e.to_string())
                 }
                 "index" => {

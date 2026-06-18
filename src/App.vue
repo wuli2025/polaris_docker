@@ -116,13 +116,18 @@ function onViewReady(v: ViewKey) {
   if (switchLoader.value === v) switchLoader.value = null;
 }
 
-// 开机静默续建索引:盘点过、还有没嵌完的文本(embeddedFiles < textFiles)才接着建,
-// 走全局 fileTasks store(任务中心可见、跨视图后台跑)。给一句温和 toast 提醒。延后几秒
-// 起,别和启动的其它活儿抢资源;没待办或读不到总览就安静退出。
+// 开机续建索引 ——「默认关闭」。
+// 为什么默认不自动跑:后台向量嵌入会长时间持有 SQLite 写事务,期间任何读命令(总览/晨报/
+// 检索)若在 UI 主线程上撞到写锁,会等 busy_timeout(最长 20s),主线程消息泵停摆 → 被
+// Windows 判「无响应」强杀(用户反馈的「开机没多久就卡死」)。把它从「开机自动」改成
+// 「纯手动」:用户要让 AI 检索更聪明,就去文件中心点「建索引」(任务中心可见、可随时停),
+// 自己掌控什么时候让机器吃这份重活,而不是一开机就被动卡。
+// 想恢复旧的「开机静默续建」行为的高级用户可设 localStorage.polaris.indexAutoResume="1"。
 async function autoBuildIndexOnStartup() {
   try {
+    // 默认:开机不碰索引(连总览都不读,启动最轻)。仅显式开了开关才走旧行为。
+    if (localStorage.getItem("polaris.indexAutoResume") !== "1") return;
     // 用户在任务中心主动「停止」过索引 → 记住,开机不再自动续建,直到他手动再点建索引。
-    // (这条让「停止」是真能关掉的:不会下次开机又自己跑起来。)
     if (localStorage.getItem("polaris.indexAutoPaused") === "1") return;
     const ov = await fc.overview(null);
     if (ov.indexing || ov.scanning) return; // 已经在跑,别重复
@@ -149,9 +154,9 @@ onMounted(() => {
   // 脱离任何视图生命周期 → 在文件中心点了任务后切走/关掉该视图,进度照常推进、回来即见,
   // 全局任务中心浮层也据此随处显示「还在跑」。
   tasks.ensureListeners();
-  // 开机自动续建检索索引:只要盘点过、还有没嵌完的文本,就在后台静默接着建(幂等续跑,
-  // 不动用户原文件——只把内容切块嵌进本地 SQLite)。给用户一句温和提醒「索引在后台构建」,
-  // 让 AI 检索越用越聪明。没有待办(全嵌完/没盘点过)就什么都不做、不打扰。
+  // 向量索引「默认不开机自启」(见 autoBuildIndexOnStartup 注释):后台嵌入持写锁会让主线程
+  // 读命令卡 busy 锁 → 窗口无响应被强杀。建索引改纯手动(文件中心点「建索引」)。这里仅在
+  // 用户显式开了 polaris.indexAutoResume 开关时才走旧的开机续建,默认是个立即返回的空操作。
   void autoBuildIndexOnStartup();
   // markdown 区域事件委托(代码复制/展开/外链系统浏览器打开),全 v-html 区域一次覆盖
   unMdDelegate = installMarkdownDelegation(document, (url) => {

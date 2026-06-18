@@ -682,9 +682,10 @@ export const files = {
     invoke<FolderNode[]>("fable_scan_folder_children", { root, path }),
   /** 某文件夹的递归总量(文件数 + 字节);选择器里按需限并发调用显示大小 */
   folderSize: (path: string) => invoke<FolderSize>("fable_folder_size", { path }),
-  /** 开始盘点:roots=勾选要盘点的文件夹/盘符(空=默认知识库+NAS);exclude=范围内取消的子文件夹。进度走 fable:inventory 事件 */
-  inventoryStart: (roots?: string[], exclude?: string[]) =>
-    invoke<void>("fable_inventory_start", { roots: roots ?? [], exclude: exclude ?? [] }),
+  /** 开始盘点:roots=勾选要盘点的文件夹/盘符(空=默认知识库+NAS);exclude=范围内取消的子文件夹;
+   *  full=完整盘点(忽略目录缓存,每个目录都重扫;默认 false=智能增量,只摸 mtime 变过的子树)。进度走 fable:inventory 事件 */
+  inventoryStart: (roots?: string[], exclude?: string[], full?: boolean) =>
+    invoke<void>("fable_inventory_start", { roots: roots ?? [], exclude: exclude ?? [], full: full ?? false }),
   /** 构建/续建向量索引(文本 chunk → 硅基 BGE-M3 嵌入),进度走 fable:index 事件 */
   indexStart: (maxChunks?: number) =>
     invoke<void>("fable_index_start", { maxChunks: maxChunks ?? null }),

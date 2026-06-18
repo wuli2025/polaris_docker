@@ -73,7 +73,12 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
           else if (p.kind === "done") {
             lastUnreachable.value = p.unreachable ?? [];
             finish("inventory", `盘点完成 · ${p.files ?? 0} 个文件`);
-          } else if (p.kind === "error") fail("inventory", `盘点失败:${p.message ?? ""}`);
+          } else if (p.kind === "error") {
+            // 用户主动取消时后端发的也是 error{message:"已取消"};这是「停止」不是「失败」,
+            // 按 done 口径优雅收尾(否则任务中心红字报「盘点失败」,误导)。
+            if ((p.message ?? "").includes("已取消")) finish("inventory", "盘点已停止");
+            else fail("inventory", `盘点失败:${p.message ?? ""}`);
+          }
         },
       ),
     );
@@ -144,12 +149,13 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
   }
 
   // ── 启动各任务(进行中重复调用直接忽略,后端 FlagGuard 也会兜底拒绝双发)──
-  async function startInventory(roots: string[], exclude: string[]) {
+  async function startInventory(roots: string[], exclude: string[], full = false) {
     if (running.inventory) return;
     await ensureListeners();
-    begin("inventory", exclude.length ? `正在盘点(已跳过 ${exclude.length} 个文件夹)…` : "正在盘点磁盘…");
+    const how = full ? "完整盘点(逐目录重扫)" : "盘点磁盘";
+    begin("inventory", exclude.length ? `正在${how}(已跳过 ${exclude.length} 个文件夹)…` : `正在${how}…`);
     try {
-      await fc.inventoryStart(roots, exclude);
+      await fc.inventoryStart(roots, exclude, full);
     } catch (e: any) {
       fail("inventory", `盘点失败:${e?.message ?? e}`);
     }

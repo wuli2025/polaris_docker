@@ -35,6 +35,7 @@ import {
   FolderTree,
   Check,
   RotateCcw,
+  RefreshCw,
   Network,
   Info,
   WifiOff,
@@ -156,6 +157,9 @@ const page = ref(0);
 const total = ref(0);
 const loading = ref(false);
 const exhausted = ref(false);
+// reset 请求撞上飞行中的分页加载时,不能直接丢弃(否则归类/盘点完成的 watch 调 loadGrid(true)
+// 会被早退,filter 已清空但网格残留旧数据)。先记下,等当前加载收尾立刻补跑一次重载。
+const pendingReset = ref(false);
 
 const activeKind = ref<string | null>(null);
 const activeLang = ref<string | null>(null);
@@ -494,7 +498,11 @@ async function ensureLangBackfill() {
 }
 
 async function loadGrid(reset = false) {
-  if (loading.value) return;
+  if (loading.value) {
+    // 飞行中又来了重载请求:记下,等收尾补跑(分页 loadGrid(false) 撞上不算,无需重载)。
+    if (reset) pendingReset.value = true;
+    return;
+  }
   if (reset) {
     page.value = 0;
     cards.value = [];
@@ -525,6 +533,11 @@ async function loadGrid(reset = false) {
     /* 静默:空库时网格为空 */
   } finally {
     loading.value = false;
+    // 加载期间有被搁置的重载请求(filter 已变)→ 用最新 filter 重跑,覆盖刚拼进来的旧数据。
+    if (pendingReset.value) {
+      pendingReset.value = false;
+      loadGrid(true);
+    }
   }
 }
 
@@ -585,10 +598,11 @@ function onSearchInput() {
 
 // ───────────────────────── 盘点(扫描 + 选目录 + 建库)─────────────────────────
 // 「盘点」点开 → 扫一眼文件夹结构 → 勾选要盘点的目录 → 开始建库。
-async function doScan(roots: string[], exclude: string[]) {
+async function doScan(roots: string[], exclude: string[], full = false) {
   // 真身在全局 store:后台线程跑、事件 App 级监听。切走文件中心也不中断,完成由
   // watch(doneTick.inventory) 刷新本页;全局任务中心浮层全程显示进度。
-  await tasks.startInventory(roots, exclude);
+  // full=false(默认)走智能增量(只摸 mtime 变过的子树,重扫快一个数量级);full=true 逐目录完整重扫。
+  await tasks.startInventory(roots, exclude, full);
 }
 
 // ── 打开「盘点」:先扫文件夹结构(根+第一层),让用户勾选 / 逐层点开要盘点的目录 ──
@@ -835,10 +849,10 @@ function collectInventoryArgs(): { roots: string[]; exclude: string[] } {
   }
   return { roots, exclude };
 }
-async function startInventoryFromPicker() {
+async function startInventoryFromPicker(full = false) {
   const { roots, exclude } = collectInventoryArgs();
   pickerOpen.value = false;
-  await doScan(roots, exclude);
+  await doScan(roots, exclude, full);
 }
 
 // 以下任务全部委托给全局 store(后台线程 + App 级事件监听):切走文件中心也不中断,
@@ -1714,7 +1728,20 @@ onBeforeUnmount(() => {
               <RotateCcw :size="13" :stroke-width="1.8" /> 恢复默认
             </button>
             <span class="pk-count">已选 <b>{{ pickerSelected }}</b> 个文件夹</span>
-            <button class="pk-go" :disabled="pickerLoading || !pickerHasSelection" @click="startInventoryFromPicker">
+            <button
+              class="pk-full"
+              :disabled="pickerLoading || !pickerHasSelection"
+              title="完整盘点:忽略目录缓存,逐个目录重扫一遍。比智能增量慢,但能补回极少数「原地追加写入、没改动目录」的文件"
+              @click="startInventoryFromPicker(true)"
+            >
+              <RefreshCw :size="13" :stroke-width="1.8" /> 完整盘点
+            </button>
+            <button
+              class="pk-go"
+              :disabled="pickerLoading || !pickerHasSelection"
+              title="智能增量:只重扫修改时间变过的子树,没变的整棵跳过。重扫快一个数量级"
+              @click="startInventoryFromPicker(false)"
+            >
               <FolderSearch :size="14" :stroke-width="1.8" /> 开始盘点
             </button>
           </div>
@@ -3406,6 +3433,23 @@ onBeforeUnmount(() => {
 }
 .pk-go:hover:not(:disabled) { transform: translateY(-1px); }
 .pk-go:disabled { opacity: 0.55; cursor: default; }
+/* 完整盘点:次级描边钮(智能增量才是默认主钮)。 */
+.pk-full {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 34px;
+  padding: 0 13px;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--text-2);
+  border-radius: 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.16s, color 0.16s;
+}
+.pk-full:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
+.pk-full:disabled { opacity: 0.45; cursor: default; }
 
 /* ── 动效 ── */
 .spin { animation: spin 0.9s linear infinite; }

@@ -370,6 +370,46 @@ struct FileRow {
     mtime: i64,
 }
 
+/// walker → writer 的消息(增量盘点三态)。
+enum Msg {
+    /// 一个文件:照常 upsert 进 files(mtime/size 没变则保留 chunked/ftsed 标记)。
+    File(FileRow),
+    /// 一个**改过/新**的目录:read_dir 完后记下它的 mtime + 直属文件数/字节,供下次增量比对。
+    Dir { rel: String, mtime: i64, fcount: i64, fbytes: i64 },
+    /// 一个**没变**的目录(mtime 命中缓存,整棵跳过 read_dir):把它的直属文件标记「本轮见过」
+    /// (否则代际对账会把它们误判消失而删),并 touch 自己的 dirs 行(mtime 不变,只刷 seen)。
+    Skip { rel: String },
+}
+
+// 工作单元 = `(待扫目录绝对路径, 它的 mtime)`。mtime 由父目录的 read_dir 顺手带出,免再 stat;
+// 0 = 未知(根 / 跳过路径排进来的子目录),pop 时现 stat 一次。增量盘点据 mtime 判定「变没变」。
+
+/// 一个目录的修改时间(Unix 秒;读不到返回 0)。增量盘点据此判定「这个目录变没变」。
+fn dir_mtime(p: &Path) -> i64 {
+    std::fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 目录绝对路径 → 相对盘点根的路径('/' 分隔;根自身 = "")。dirs 缓存的主键就是它。
+fn rel_of(p: &Path, root: &Path) -> String {
+    p.strip_prefix(root)
+        .ok()
+        .map(|r| super::decode_fs(r.as_os_str()).replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+/// 相对路径的父目录(顶层 / 根 → "")。从 dirs 缓存的全部 key 反推「父→子目录」邻接表用。
+fn parent_rel(rel: &str) -> &str {
+    match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanSummary {
     pub root: String,
@@ -383,9 +423,16 @@ pub struct ScanSummary {
     pub workers: usize,
 }
 
-/// 同步全量扫描一个根(CLI 直接调;桌面/Docker 由 `fable_inventory_start` 包后台线程)。
+/// 同步扫描一个根(CLI 直接调;桌面/Docker 由 `fable_inventory_start` 包后台线程)。
 /// `progress(files, bytes)` 每 ~5000 个文件回调一次。
 /// `exclude` = 用户在「扫描」步骤里取消勾选的文件夹绝对路径集合,整棵跳过(空集=全盘点)。
+///
+/// `full=false`(默认/智能增量):重扫时**目录 mtime 命中 dirs 缓存就整棵跳过 read_dir**——
+/// 该目录的增删改名必然没变(目录 mtime 在直属项变动时才刷新),只把直属文件标记「还在」、
+/// 递归进子目录继续比对。改过的目录才真正 read_dir。第一次盘点无缓存 → 等同全量。
+/// 唯一抓不到的:某文件被「原地追加写入、且不碰其所在目录」(罕见,如日志续写)——其内容
+/// 变了但增量察觉不到,要等一次 `full=true` 才更新。`full=true`(完整盘点):忽略缓存,
+/// 每个目录都 read_dir,顺带刷新 dirs 缓存供下次增量。
 ///
 /// 剪枝分两档(治「文件夹里的东西要全归类进库」):
 /// - **永远跳**(版本仓 / 依赖 / 回收站 / NAS / `$` 系统目录):任何根都跳。
@@ -395,6 +442,7 @@ pub struct ScanSummary {
 pub fn scan_root(
     root: &str,
     exclude: &HashSet<String>,
+    full: bool,
     progress: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<ScanSummary, String> {
     // 是否叠加 OS 目录黑名单:整盘扫描 = 重剪;显式文件夹/卷/挂载点 = 只剪永远跳的噪音。
@@ -420,6 +468,43 @@ pub fn scan_root(
     let root_id: i64 = conn
         .query_row("SELECT id FROM roots WHERE path=?1", [&root_canon], |r| r.get(0))
         .map_err(|e| e.to_string())?;
+
+    // ── 增量盘点:载入上一轮的目录缓存(rel → mtime + 直属文件数/字节)──────────────
+    // 这一笔查询(~目录数行,几万级,本地 SQLite 毫秒级)换来重扫时「没变的子树整棵免遍历」。
+    // `full=true` 或第一次盘点(缓存空)→ 不命中,等同全量。`dir_children` 由全部 key 反推父子
+    // 邻接表:跳过某目录时据它把子目录排进队列(自己不 read_dir 也能继续往下钻、逐个比对)。
+    let mut dir_mt: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut dir_stat: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    if !full {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT relpath, mtime, fcount, fbytes FROM dirs WHERE root_id=?1")
+        {
+            if let Ok(rows) = stmt.query_map([root_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            }) {
+                for (rel, mt, fc, fb) in rows.flatten() {
+                    dir_mt.insert(rel.clone(), mt);
+                    dir_stat.insert(rel, (fc as u64, fb as u64));
+                }
+            }
+        }
+    }
+    let mut dir_children: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for rel in dir_mt.keys() {
+        if rel.is_empty() {
+            continue; // 根没有父
+        }
+        dir_children.entry(parent_rel(rel).to_string()).or_default().push(rel.clone());
+    }
+    let dir_mt = Arc::new(dir_mt);
+    let dir_stat = Arc::new(dir_stat);
+    let dir_children = Arc::new(dir_children);
     drop(conn);
 
     // ── 工业级协作调度(永不冻结)──────────────────────────────────────────
@@ -429,11 +514,12 @@ pub fn scan_root(
     //   · worker 卡在某目录超 [`dir_deadline`] → 看门狗判定卡死、记账释放、列入「已跳过」;
     //   · 完成判据 `in_flight==0 && (队空 || 存活 worker==0)` 数学上保证协调线程必然返回;
     //   · 真·僵死的 worker 线程被 detach(不 join),其阻塞 syscall 随挂载恢复/进程退出回收。
-    let (tx, rx) = mpsc::channel::<FileRow>();
+    let (tx, rx) = mpsc::channel::<Msg>();
     let n_files = Arc::new(AtomicU64::new(0));
     let n_bytes = Arc::new(AtomicU64::new(0));
     let workers = worker_count();
-    let queue = Arc::new(WorkQueue::new(vec![root_path.clone()]));
+    // 工作单元带 mtime(根的未知 → 0,pop 时现 stat);子目录由父 read_dir 顺手带出其 mtime。
+    let queue = Arc::new(WorkQueue::new(vec![(root_path.clone(), 0i64)]));
     queue.set_live_workers(workers);
     let beats: Arc<Vec<Mutex<Beat>>> = Arc::new(
         (0..workers)
@@ -456,14 +542,14 @@ pub fn scan_root(
         let scan_done = scan_done.clone();
         std::thread::spawn(move || -> Result<(), String> {
             let conn = open_db()?;
-            let mut batch: Vec<FileRow> = Vec::with_capacity(2048);
-            let flush = |conn: &rusqlite::Connection, batch: &mut Vec<FileRow>| -> Result<(), String> {
+            let mut batch: Vec<Msg> = Vec::with_capacity(2048);
+            let flush = |conn: &rusqlite::Connection, batch: &mut Vec<Msg>| -> Result<(), String> {
                 if batch.is_empty() {
                     return Ok(());
                 }
                 conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
                 {
-                    let mut stmt = conn
+                    let mut ins_file = conn
                         .prepare_cached(
                             "INSERT INTO files(root_id,relpath,name,ext,kind,lang,size,mtime,chunked,seen)
                              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,?9)
@@ -478,12 +564,71 @@ pub fn scan_root(
                                size=excluded.size, mtime=excluded.mtime, seen=excluded.seen",
                         )
                         .map_err(|e| e.to_string())?;
-                    for row in batch.drain(..) {
-                        stmt.execute(rusqlite::params![
-                            root_id, row.relpath, row.name, row.ext, row.kind, row.lang,
-                            row.size as i64, row.mtime, gen
-                        ])
+                    // 改过/新目录:记下 mtime + 直属文件数/字节(供下次增量比对),刷 seen。
+                    let mut up_dir = conn
+                        .prepare_cached(
+                            "INSERT INTO dirs(root_id,relpath,mtime,fcount,fbytes,seen)
+                             VALUES(?1,?2,?3,?4,?5,?6)
+                             ON CONFLICT(root_id,relpath) DO UPDATE SET
+                               mtime=excluded.mtime, fcount=excluded.fcount,
+                               fbytes=excluded.fbytes, seen=excluded.seen",
+                        )
                         .map_err(|e| e.to_string())?;
+                    // 没变目录:只刷自己 dirs 行的 seen(mtime/计数不变,保留)。
+                    let mut touch_dir = conn
+                        .prepare_cached("UPDATE dirs SET seen=?3 WHERE root_id=?1 AND relpath=?2")
+                        .map_err(|e| e.to_string())?;
+                    // 没变目录:把它的**直属**文件 seen 刷成本轮代际(否则代际对账会误删)。
+                    // 用 [lo,hi) 区间走 UNIQUE(root_id,relpath) 索引(BINARY 比较),instr/substr
+                    // 把范围收窄到「直属」(子目录里的文件由各自目录处理,不在此刷,避免越权遮蔽删除)。
+                    // substr/length/instr 在 SQLite 里按字符算,故 off 用 rel 的字符数 +2(跳 rel + '/')。
+                    let mut bump_files = conn
+                        .prepare_cached(
+                            "UPDATE files SET seen=?1 WHERE root_id=?2
+                             AND relpath>=?3 AND relpath<?4 AND instr(substr(relpath,?5),'/')=0",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    // 根的直属文件(relpath 不含 '/'):无前缀区间可用,直接 instr 过滤(根至多跳一次)。
+                    let mut bump_root = conn
+                        .prepare_cached(
+                            "UPDATE files SET seen=?2 WHERE root_id=?1 AND instr(relpath,'/')=0",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for msg in batch.drain(..) {
+                        match msg {
+                            Msg::File(row) => {
+                                ins_file
+                                    .execute(rusqlite::params![
+                                        root_id, row.relpath, row.name, row.ext, row.kind, row.lang,
+                                        row.size as i64, row.mtime, gen
+                                    ])
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            Msg::Dir { rel, mtime, fcount, fbytes } => {
+                                up_dir
+                                    .execute(rusqlite::params![
+                                        root_id, rel, mtime, fcount, fbytes, gen
+                                    ])
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            Msg::Skip { rel } => {
+                                touch_dir
+                                    .execute(rusqlite::params![root_id, rel, gen])
+                                    .map_err(|e| e.to_string())?;
+                                if rel.is_empty() {
+                                    bump_root
+                                        .execute(rusqlite::params![root_id, gen])
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    let lo = format!("{rel}/");
+                                    let hi = format!("{rel}0"); // '0' = '/'(0x2F)+1 → [lo,hi) 恰好框住 rel/* 全部直属及更深项
+                                    let off = rel.chars().count() as i64 + 2; // 1-based:跳过 rel + '/'
+                                    bump_files
+                                        .execute(rusqlite::params![gen, root_id, lo, hi, off])
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                        }
                     }
                 }
                 conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
@@ -491,8 +636,8 @@ pub fn scan_root(
             };
             loop {
                 match rx.recv_timeout(Duration::from_millis(150)) {
-                    Ok(row) => {
-                        batch.push(row);
+                    Ok(msg) => {
+                        batch.push(msg);
                         if batch.len() >= 2048 {
                             flush(&conn, &mut batch)?;
                         }
@@ -500,8 +645,8 @@ pub fn scan_root(
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if scan_done.load(Ordering::SeqCst) {
                             // 收尾:把刚到的尾巴排空再退,绝不漏行。
-                            while let Ok(row) = rx.try_recv() {
-                                batch.push(row);
+                            while let Ok(msg) = rx.try_recv() {
+                                batch.push(msg);
                                 if batch.len() >= 2048 {
                                     flush(&conn, &mut batch)?;
                                 }
@@ -528,9 +673,12 @@ pub fn scan_root(
         let n_bytes = n_bytes.clone();
         let exclude = exclude_arc.clone();
         let root_path = root_arc.clone();
+        let dir_mt = dir_mt.clone();
+        let dir_stat = dir_stat.clone();
+        let dir_children = dir_children.clone();
         std::thread::spawn(move || {
             while let Some(job) = queue.pop() {
-                let dir = job.item;
+                let (dir, known_mtime) = job.item;
                 {
                     let mut b = beats[i].lock().unwrap();
                     b.dir = Some(dir.clone());
@@ -539,71 +687,118 @@ pub fn scan_root(
                 // 取到新目录:计数 +1,让看门狗看到「有进度」从而重置该 worker 的死线基线
                 // (否则可能拿上一件活儿留下的旧基线,刚接手就被误判卡死)。
                 progressed[i].fetch_add(1, Ordering::Relaxed);
-                match std::fs::read_dir(&dir) {
-                    Ok(rd) => {
-                        for entry in rd.flatten() {
-                            // 每吐一项就记一次进度:只要还在稳定吐项,看门狗就知道没卡死。
-                            progressed[i].fetch_add(1, Ordering::Relaxed);
-                            let Ok(ft) = entry.file_type() else { continue };
-                            if ft.is_symlink() {
+
+                // 增量盘点:本目录 mtime 命中缓存 → 整棵跳过 read_dir(及里面所有文件的逐项 stat)。
+                // mtime 由父目录的 read_dir 顺手带出(known_mtime,免再 stat);根 / 跳过路径排进来的
+                // 子目录 known=0 → 现 stat 一次拿 mtime(NAS 上一次往返,远比 read_dir 整个目录省)。
+                let rel = rel_of(&dir, root_path.as_path());
+                let cur_mtime = if known_mtime != 0 { known_mtime } else { dir_mtime(&dir) };
+                let unchanged = cur_mtime != 0
+                    && dir_mt.get(&rel).map(|m| *m == cur_mtime).unwrap_or(false);
+                if unchanged {
+                    // 直属文件没变:从缓存把它们的数量/字节计入进度(报数不缩水),并标记「本轮见过」;
+                    // 子目录排进队列各自比对(它们的内层可能变了——目录 mtime 只反映直属项的增删改名)。
+                    if let Some((fc, fb)) = dir_stat.get(&rel) {
+                        n_files.fetch_add(*fc, Ordering::Relaxed);
+                        n_bytes.fetch_add(*fb, Ordering::Relaxed);
+                    }
+                    let _ = tx.send(Msg::Skip { rel: rel.clone() });
+                    if let Some(children) = dir_children.get(&rel) {
+                        for c in children {
+                            let child = root_path.join(c);
+                            // 本轮被取消勾选的子文件夹 → 不再往里钻(与 read_dir 路径一致地尊重 exclude)。
+                            if !exclude.is_empty()
+                                && exclude.contains(child.to_string_lossy().as_ref())
+                            {
                                 continue;
                             }
-                            // 非 UTF-8 名(Linux/Docker 上的 GBK 中文名)解回中文,避免乱码 �。
-                            let name = super::decode_fs(&entry.file_name());
-                            if ft.is_dir() {
-                                // 永远跳的噪音任何根都剪;OS 目录黑名单只在整盘扫描时叠加,
-                                // 这样显式挑的文件夹里的东西「全归类进库」。
-                                if skip_dir_always(&name) || (heavy_prune && skip_dir_os(&name)) {
-                                    continue;
-                                }
-                                let child = entry.path();
-                                // 用户在「扫描」步骤取消勾选的文件夹 → 整棵跳过。
-                                if !exclude.is_empty()
-                                    && exclude.contains(child.to_string_lossy().as_ref())
-                                {
-                                    continue;
-                                }
-                                queue.push(child);
-                            } else if ft.is_file() {
-                                let Ok(meta) = entry.metadata() else { continue };
-                                let p = entry.path();
-                                let rel = p
-                                    .strip_prefix(root_path.as_path())
-                                    .map(|r| super::decode_fs(r.as_os_str()).replace('\\', "/"))
-                                    .unwrap_or_else(|_| name.clone());
-                                let ext = p
-                                    .extension()
-                                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                                    .unwrap_or_default();
-                                let mtime = meta
-                                    .modified()
-                                    .ok()
-                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0);
-                                let size = on_disk_size(&p, &meta, remote);
-                                n_files.fetch_add(1, Ordering::Relaxed);
-                                n_bytes.fetch_add(size, Ordering::Relaxed);
-                                let kind = classify(&ext);
-                                let _ = tx.send(FileRow {
-                                    relpath: rel,
-                                    name,
-                                    kind,
-                                    lang: quick_lang(&ext, kind), // 代码/媒体当场定;文稿留 "" 待回填
-                                    ext,
-                                    size,
-                                    mtime,
-                                });
-                            }
+                            progressed[i].fetch_add(1, Ordering::Relaxed);
+                            queue.push((child, 0)); // known=0 → pop 时现 stat 比对
                         }
                     }
-                    Err(_) => {
-                        // 读目录失败(权限抖动 / NAS 瞬断):不丢弃也不原地卡住别人,而是降级到
-                        // 队尾「最后再试」;超过 [`MAX_DIR_ATTEMPTS`] 仍失败才列为「已跳过」。
-                        if job.attempts < MAX_DIR_ATTEMPTS {
-                            queue.demote(dir.clone(), job.attempts + 1);
-                        } else {
-                            problematic.lock().unwrap().push(dir.to_string_lossy().into_owned());
+                    // 落到下方共享的「结算心跳 + complete」收尾(不 read_dir)。
+                } else {
+                    match std::fs::read_dir(&dir) {
+                        Ok(rd) => {
+                            // 改过/新目录:边扫边累计直属文件数/字节,扫完写回 dirs 缓存供下次增量。
+                            let mut fcount = 0i64;
+                            let mut fbytes = 0i64;
+                            for entry in rd.flatten() {
+                                // 每吐一项就记一次进度:只要还在稳定吐项,看门狗就知道没卡死。
+                                progressed[i].fetch_add(1, Ordering::Relaxed);
+                                let Ok(ft) = entry.file_type() else { continue };
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                // 非 UTF-8 名(Linux/Docker 上的 GBK 中文名)解回中文,避免乱码 �。
+                                let name = super::decode_fs(&entry.file_name());
+                                if ft.is_dir() {
+                                    // 永远跳的噪音任何根都剪;OS 目录黑名单只在整盘扫描时叠加,
+                                    // 这样显式挑的文件夹里的东西「全归类进库」。
+                                    if skip_dir_always(&name) || (heavy_prune && skip_dir_os(&name)) {
+                                        continue;
+                                    }
+                                    let child = entry.path();
+                                    // 用户在「扫描」步骤取消勾选的文件夹 → 整棵跳过。
+                                    if !exclude.is_empty()
+                                        && exclude.contains(child.to_string_lossy().as_ref())
+                                    {
+                                        continue;
+                                    }
+                                    // 子目录的 mtime 顺手从本次 read_dir 的项里取出(Windows/SMB 上免额外
+                                    // 往返),带进队列 → 子目录 pop 时无需再 stat 即可比对增量。
+                                    let cmt = entry
+                                        .metadata()
+                                        .ok()
+                                        .and_then(|m| m.modified().ok())
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
+                                    queue.push((child, cmt));
+                                } else if ft.is_file() {
+                                    let Ok(meta) = entry.metadata() else { continue };
+                                    let p = entry.path();
+                                    let frel = p
+                                        .strip_prefix(root_path.as_path())
+                                        .map(|r| super::decode_fs(r.as_os_str()).replace('\\', "/"))
+                                        .unwrap_or_else(|_| name.clone());
+                                    let ext = p
+                                        .extension()
+                                        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                                        .unwrap_or_default();
+                                    let mtime = meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
+                                    let size = on_disk_size(&p, &meta, remote);
+                                    n_files.fetch_add(1, Ordering::Relaxed);
+                                    n_bytes.fetch_add(size, Ordering::Relaxed);
+                                    fcount += 1;
+                                    fbytes += size as i64;
+                                    let kind = classify(&ext);
+                                    let _ = tx.send(Msg::File(FileRow {
+                                        relpath: frel,
+                                        name,
+                                        kind,
+                                        lang: quick_lang(&ext, kind), // 代码/媒体当场定;文稿留 "" 待回填
+                                        ext,
+                                        size,
+                                        mtime,
+                                    }));
+                                }
+                            }
+                            let _ = tx.send(Msg::Dir { rel, mtime: cur_mtime, fcount, fbytes });
+                        }
+                        Err(_) => {
+                            // 读目录失败(权限抖动 / NAS 瞬断):不丢弃也不原地卡住别人,而是降级到
+                            // 队尾「最后再试」;超过 [`MAX_DIR_ATTEMPTS`] 仍失败才列为「已跳过」。
+                            if job.attempts < MAX_DIR_ATTEMPTS {
+                                queue.demote((dir.clone(), known_mtime), job.attempts + 1);
+                            } else {
+                                problematic.lock().unwrap().push(dir.to_string_lossy().into_owned());
+                            }
                         }
                     }
                 }
@@ -712,7 +907,7 @@ pub fn scan_root(
     progress(files, bytes); // 收尾再报一次,确保进度条落到最终值
     let skipped: u64 = {
         let mut v = problematic.lock().unwrap();
-        for d in skipped_dirs {
+        for (d, _mt) in skipped_dirs {
             v.push(d.to_string_lossy().into_owned());
         }
         v.len() as u64
@@ -782,6 +977,11 @@ pub fn scan_root(
                     .map_err(|e| e.to_string())? as u64;
             }
         }
+        // 目录缓存对账:本轮没确认(seen<>gen)的 dirs 行清掉 —— 目录已消失,或本轮没扫到
+        // (挂载掉线 / 反复读失败被跳过)。后者只是丢掉它的「免遍历」资格,下次重扫当成新目录
+        // 完整 read_dir 再补回缓存,绝不波及 files(文件的删除另由上面「逐个 stat 确认真消失」把关)。
+        conn.execute("DELETE FROM dirs WHERE root_id=?1 AND seen<>?2", rusqlite::params![root_id, gen])
+            .map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE roots SET scanned_at=?2, files=?3, bytes=?4 WHERE id=?1",
             rusqlite::params![root_id, gen, files as i64, bytes as i64],
@@ -832,6 +1032,13 @@ fn strip_extended_prefix(s: &str) -> String {
 /// 本就常失败回退,但它**每个文件一次网络往返**——成千上万文件串起来能把一个目录的处理时间
 /// 拖到几十秒、撞上看门狗死线被判卡死整棵丢掉。网络盘上稀疏/压缩文件少见,逻辑大小够用,
 /// 省掉这趟往返让 NAS 扫描快上数量级,也才扫得全。
+///
+/// 本地盘提速:`GetCompressedFileSizeW` 是按路径的额外系统调用(内部要打开文件查实占),
+/// 大库上几十万文件累计是单文件主要开销。但「逻辑大小 ≠ 实占」**只发生在稀疏 / NTFS 压缩
+/// 文件**上,而这两类在文件属性里有标志位(SPARSE / COMPRESSED),已随目录枚举缓存进 `meta`
+/// (`file_attributes()` 零额外 syscall)。于是:普通文件(99%+)直接用 `meta.len()`,只对
+/// 真·稀疏/压缩文件才掏这趟实占查询 —— 既保住「稀疏盘不虚高」的正确性,又把绝大多数文件的
+/// 那次额外 syscall 省掉,本地全盘扫描显著加速。
 fn on_disk_size(path: &Path, meta: &std::fs::Metadata, remote: bool) -> u64 {
     if remote {
         return meta.len();
@@ -839,8 +1046,16 @@ fn on_disk_size(path: &Path, meta: &std::fs::Metadata, remote: bool) -> u64 {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::MetadataExt;
         use windows_sys::Win32::Foundation::GetLastError;
-        use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetCompressedFileSizeW, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_SPARSE_FILE,
+            INVALID_FILE_SIZE,
+        };
+        // 非稀疏、非压缩 → 实占≈逻辑大小,免掉按路径的 GetCompressedFileSizeW 系统调用。
+        if meta.file_attributes() & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED) == 0 {
+            return meta.len();
+        }
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let mut high: u32 = 0;
         // SAFETY: wide 是以 NUL 结尾的合法宽字符串;high 是有效可写指针。
@@ -955,6 +1170,8 @@ fn app_data_roots() -> Vec<ScanRootInfo> {
 /// - `roots` = 用户在选择器里勾选的要盘点的文件夹/盘符(可以是知识库之外的任意目录);
 ///   缺省/空 → 退回默认(知识库根 + 约定的 NAS 挂载点)。
 /// - `exclude` = 勾选范围内又被取消的子文件夹绝对路径(整棵跳过)。
+/// - `full` = 是否完整盘点(忽略目录缓存、每个目录都 read_dir);缺省/false = 智能增量
+///   (只摸 mtime 变过的子树,见 [`scan_root`]),日常重扫快一个数量级。
 ///
 /// **`(async)`**:函数体里对每个根做 [`dir_reachable`] 有界探测(死 NAS 上每根最多卡
 /// `probe_secs`≈12s)。同步 tauri 命令跑在主线程会冻住 UI;标 `(async)` 让 tauri 把这段
@@ -964,7 +1181,9 @@ pub fn fable_inventory_start(
     app: AppHandle,
     roots: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
+    full: Option<bool>,
 ) -> Result<(), String> {
+    let full = full.unwrap_or(false);
     // 显式勾选优先;没传则退回默认根集合。去重 + 只留真实目录。
     let picked: Vec<String> = roots
         .unwrap_or_default()
@@ -1047,7 +1266,7 @@ pub fn fable_inventory_start(
             let app_p = app.clone();
             let base_f = acc_files;
             let base_b = acc_bytes;
-            match scan_root(r, &exclude, &move |files, bytes| {
+            match scan_root(r, &exclude, full, &move |files, bytes| {
                 emit(
                     &app_p,
                     json!({ "kind": "progress", "files": base_f + files, "bytes": base_b + bytes }),
@@ -1087,6 +1306,7 @@ pub fn fable_inventory_start(
                     "seconds": acc_secs, "workers": workers,
                     "roots": roots.len(),
                     "unreachable": unreachable,
+                    "full": full,
                 }),
             );
         }
@@ -1788,5 +2008,184 @@ mod tests {
         ));
         // 前缀像但非真子目录(data2 不是 data 的子目录)→ 不覆盖。
         assert!(!covered_by(r"C:\data", r"C:\data2\x"));
+    }
+
+    // ───────────────────────── 增量盘点 ─────────────────────────
+
+    #[test]
+    fn parent_rel_walks_up_one_level() {
+        assert_eq!(parent_rel("a/b/c"), "a/b");
+        assert_eq!(parent_rel("a/b"), "a");
+        assert_eq!(parent_rel("a"), ""); // 顶层 → 根
+        assert_eq!(parent_rel(""), ""); // 根 → 根
+        assert_eq!(parent_rel("资料/项目/稿"), "资料/项目"); // CJK 同样按 '/' 分段
+    }
+
+    #[test]
+    fn rel_of_is_root_relative_slash_path() {
+        let root = Path::new(r"C:\kb");
+        assert_eq!(rel_of(Path::new(r"C:\kb"), root), ""); // 根自身 = ""
+        assert_eq!(rel_of(Path::new(r"C:\kb\a"), root), "a");
+        assert_eq!(rel_of(Path::new(r"C:\kb\a\b"), root), "a/b"); // 反斜杠归一成 '/'
+    }
+
+    /// 增量「跳过没变目录」最易错的一步:把某目录的**直属**文件 seen 刷成本轮代际,
+    /// 而**不**波及它的子目录文件(那些由各自目录处理)、也不碰兄弟目录。这里用内存 SQLite
+    /// 照搬 writer 里的区间 + instr 直属过滤,断言只命中直属、CJK 路径也对。
+    #[test]
+    fn skip_bump_touches_only_direct_children() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files(root_id INTEGER, relpath TEXT, seen INTEGER);
+             INSERT INTO files VALUES
+               (1,'a.txt',1),          -- 根直属
+               (1,'d/b.txt',1),        -- d 直属(应被刷)
+               (1,'d/e/c.txt',1),      -- d 的孙级(不该刷,留给 d/e 自己)
+               (1,'d2/x.txt',1),       -- 兄弟目录 d2(不该刷)
+               (1,'资料/f.txt',1),     -- CJK 直属(应被刷)
+               (1,'资料/子/g.txt',1);  -- CJK 孙级(不该刷)
+             ",
+        )
+        .unwrap();
+        let gen = 99i64;
+        // 与 writer 的 bump_files 完全同款 SQL。
+        let bump = |conn: &rusqlite::Connection, rel: &str| {
+            let lo = format!("{rel}/");
+            let hi = format!("{rel}0");
+            let off = rel.chars().count() as i64 + 2;
+            conn.execute(
+                "UPDATE files SET seen=?1 WHERE root_id=?2
+                 AND relpath>=?3 AND relpath<?4 AND instr(substr(relpath,?5),'/')=0",
+                rusqlite::params![gen, 1i64, lo, hi, off],
+            )
+            .unwrap();
+        };
+        bump(&conn, "d");
+        bump(&conn, "资料");
+        // 根直属用另一条(无前缀区间)。
+        conn.execute(
+            "UPDATE files SET seen=?2 WHERE root_id=?1 AND instr(relpath,'/')=0",
+            rusqlite::params![1i64, gen],
+        )
+        .unwrap();
+
+        let seen = |rel: &str| -> i64 {
+            conn.query_row("SELECT seen FROM files WHERE relpath=?1", [rel], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(seen("a.txt"), gen, "根直属应被刷");
+        assert_eq!(seen("d/b.txt"), gen, "d 的直属应被刷");
+        assert_eq!(seen("资料/f.txt"), gen, "CJK 直属应被刷");
+        assert_eq!(seen("d/e/c.txt"), 1, "孙级不该被 d 的 bump 波及(留给 d/e)");
+        assert_eq!(seen("资料/子/g.txt"), 1, "CJK 孙级同理不该被波及");
+        assert_eq!(seen("d2/x.txt"), 1, "兄弟目录 d2 绝不被 d 的区间扫到");
+    }
+
+    /// 端到端(默认 `#[ignore]`,**单独**手动跑,避开进程级 DB / MIGRATED 竞争):
+    /// `cargo test --manifest-path src-tauri/Cargo.toml --lib incremental_rescan_e2e -- --ignored --exact --nocapture`
+    ///
+    /// 真盘一棵临时目录树(库指到临时文件,绝不碰用户库)→ 改动 → 增量重扫,验证:
+    /// ① 改过目录里「新增/删除」被正确反映;② 没变目录里的文件**不被代际对账误删**;
+    /// ③ 文件总数/dirs 缓存正确;④ 记录的取舍:某文件被「原地改写、没碰其所在目录」时增量
+    /// 察觉不到(其 DB mtime 不变),而一次完整盘点(full=true)能补回。
+    #[test]
+    #[ignore]
+    fn incremental_rescan_e2e() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("polaris_inv_e2e_{}", std::process::id()));
+        let root = base.join("root");
+        let db = base.join("fable_test.db");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(root.join("A")).unwrap();
+        std::fs::create_dir_all(root.join("B").join("SUB")).unwrap();
+        let write = |p: &Path, s: &str| {
+            let mut f = std::fs::File::create(p).unwrap();
+            f.write_all(s.as_bytes()).unwrap();
+        };
+        write(&root.join("top.txt"), "top");
+        write(&root.join("A").join("a1.txt"), "a1");
+        write(&root.join("A").join("a2.txt"), "a2");
+        write(&root.join("B").join("b1.txt"), "b1");
+        write(&root.join("B").join("SUB").join("s1.txt"), "s1-original");
+
+        std::env::set_var("POLARIS_FABLE_DB", &db);
+        let root_s = root.to_string_lossy().to_string();
+        let empty = HashSet::new();
+        let noop = |_f: u64, _b: u64| {};
+
+        // ① 首扫(无缓存 → 等同全量):6 个文件,4 个目录(""/A/B/B/SUB)。
+        let s1 = scan_root(&root_s, &empty, false, &noop).unwrap();
+        assert_eq!(s1.files, 5, "首扫应有 5 个文件");
+        let conn = open_db().unwrap();
+        let root_id: i64 =
+            conn.query_row("SELECT id FROM roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        let nfiles = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM files WHERE root_id=?1", [root_id], |r| r.get(0)).unwrap()
+        };
+        let ndirs = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM dirs WHERE root_id=?1", [root_id], |r| r.get(0)).unwrap()
+        };
+        let has = |c: &rusqlite::Connection, rel: &str| -> bool {
+            c.query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id=?1 AND relpath=?2",
+                rusqlite::params![root_id, rel],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        let mtime_of = |c: &rusqlite::Connection, rel: &str| -> i64 {
+            c.query_row(
+                "SELECT mtime FROM files WHERE root_id=?1 AND relpath=?2",
+                rusqlite::params![root_id, rel],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(nfiles(&conn), 5);
+        assert_eq!(ndirs(&conn), 4, "应缓存 4 个目录(根/A/B/B/SUB)");
+        let s1_mtime_scan1 = mtime_of(&conn, "B/SUB/s1.txt");
+
+        // 等过 1 秒边界(mtime 按秒存),保证后续改动的目录 mtime 与首扫记录不同秒,增量必察觉。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // ② 改动:A 加文件(A 目录 mtime 变)、删 B/b1(B 目录 mtime 变)、**原地改写** B/SUB/s1
+        //    (只动文件、不动 B/SUB 目录 → 增量该「跳过 B/SUB」从而察觉不到 s1 的内容变化)。
+        write(&root.join("A").join("a3.txt"), "a3-new");
+        std::fs::remove_file(root.join("B").join("b1.txt")).unwrap();
+        {
+            // 原地改写:truncate + 写,不删不改名,B/SUB 目录 mtime 不变。
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(root.join("B").join("SUB").join("s1.txt"))
+                .unwrap();
+            f.write_all(b"s1-modified-in-place-much-longer").unwrap();
+        }
+
+        // ③ 增量重扫。
+        let s2 = scan_root(&root_s, &empty, false, &noop).unwrap();
+        assert!(has(&conn, "A/a3.txt"), "增量应发现新增文件 A/a3.txt");
+        assert!(!has(&conn, "B/b1.txt"), "增量应删除已消失的 B/b1.txt");
+        assert!(has(&conn, "top.txt"), "没变目录里的 top.txt 绝不能被代际对账误删");
+        assert!(has(&conn, "A/a1.txt") && has(&conn, "A/a2.txt"), "A 里旧文件仍在");
+        assert!(has(&conn, "B/SUB/s1.txt"), "没变目录里的 s1 仍在");
+        assert_eq!(nfiles(&conn), 5, "top + A(a1/a2/a3) + B/SUB/s1 = 5");
+        assert_eq!(s2.files, 5, "增量汇报的文件数含跳过子树,口径不缩水");
+        assert_eq!(
+            mtime_of(&conn, "B/SUB/s1.txt"),
+            s1_mtime_scan1,
+            "记录的取舍:原地改写、没碰目录 → 增量察觉不到,s1 的 DB mtime 应仍是首扫的旧值"
+        );
+
+        // ④ 完整盘点(full=true)忽略缓存逐目录重扫 → 补回 s1 的新 mtime。
+        let _s3 = scan_root(&root_s, &empty, true, &noop).unwrap();
+        assert!(
+            mtime_of(&conn, "B/SUB/s1.txt") > s1_mtime_scan1,
+            "完整盘点应补回原地改写文件的新 mtime"
+        );
+
+        drop(conn);
+        std::env::remove_var("POLARIS_FABLE_DB");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -485,6 +485,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             app,
             Some(vec_str(a, "roots")),
             Some(vec_str(a, "exclude")),
+            a.get("full").and_then(|v| v.as_bool()),
         )?),
         "fable_scan_folders" => ok(fable::inventory::fable_scan_folders(opt_str(a, "root"))?),
         "fable_scan_folder_children" => ok(fable::inventory::fable_scan_folder_children(
