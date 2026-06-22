@@ -304,9 +304,27 @@ const selected = ref<FileCard | null>(null);
 const detailGist = ref("");
 const detailThumb = ref<string | null>(null);
 
-// 缩略图缓存:abspath → dataURL('' = 已尝试但无图)
+// 缩略图缓存:abspath → dataURL('' = 已尝试但无图)。
+// 关键内存治理:每条 value 是 360px 的 base64 data URL(~30–150KB),旧实现是无上限
+// reactive Map 且永不清理 —— 滚一个十万图的库就把几 GB base64 永久钉在 WebView 堆里
+// (Mac WKWebView 回收又懒),是桌面内存膨胀的主因之一。改成带上限的 LRU:
+// Map 的迭代序即插入序,fetchThumb 命中缺失才重取并重新插到队尾 → 插入序≈最近使用序,
+// 超 CAP 时从队首淘汰最久未用的。被淘汰项再进视口会重取(服务端已落盘 jpg,极快),
+// 以「偶尔重取」换「内存恒定」。CAP 取 600:足够覆盖几屏视口 + 缓冲,峰值约几十 MB。
+const THUMB_CACHE_CAP = 600;
 const thumbCache = reactive(new Map<string, string>());
 const thumbPending = new Set<string>();
+function thumbCacheSet(key: string, val: string) {
+  // 重取已存在的键:先删再插,使其移到迭代序队尾(刷新为「最近使用」)。
+  if (thumbCache.has(key)) thumbCache.delete(key);
+  thumbCache.set(key, val);
+  // 超额淘汰:从队首(最久未用)删,直到回到上限。
+  while (thumbCache.size > THUMB_CACHE_CAP) {
+    const oldest = thumbCache.keys().next().value;
+    if (oldest === undefined) break;
+    thumbCache.delete(oldest);
+  }
+}
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -947,9 +965,9 @@ async function fetchThumb(card: FileCard) {
   thumbPending.add(card.abspath);
   try {
     const url = await fc.thumb(card.abspath, 360);
-    thumbCache.set(card.abspath, url ?? "");
+    thumbCacheSet(card.abspath, url ?? "");
   } catch {
-    thumbCache.set(card.abspath, "");
+    thumbCacheSet(card.abspath, "");
   } finally {
     thumbPending.delete(card.abspath);
   }
@@ -1056,6 +1074,12 @@ onBeforeUnmount(() => {
   // 任务事件监听已托管给全局 fileTasks store(App 级注册一次,永不在此退订)——
   // 这正是「切走文件中心,盘点/建索引/归类仍在后台跑、进度不丢」的关键。
   if (tipTimer) clearTimeout(tipTimer);
+  // 内存治理:切走文件中心即主动清空缩略图缓存(几百条 base64 data URL,可达几十 MB),
+  // 让 WebView 立刻能回收,而不是等组件实例被 GC 才释放(Mac WKWebView 回收偏懒)。
+  // 回到文件中心时视口内缩略图会按需重取(服务端已落盘 jpg,极快)。
+  thumbCache.clear();
+  thumbPending.clear();
+  cards.value = [];
 });
 </script>
 

@@ -17,6 +17,13 @@ import {
 export const useKbStore = defineStore("kb", () => {
   const compiling = ref(false);
   const compileLog = ref<string[]>([]);
+  // 内存治理:日志数组封顶 200 行,且单条裁到 2000 字 —— 否则异常堆栈 / 整页文本回显这类
+  // 超长单条 × 200 行仍能堆出几十 MB。集中走这个 helper,两个监听器(compile / enrich)共用。
+  function pushCompileLog(line: string) {
+    compileLog.value.push(line.length > 2000 ? line.slice(0, 2000) + " …(已截断)" : line);
+    if (compileLog.value.length > 200)
+      compileLog.value.splice(0, compileLog.value.length - 200);
+  }
   const compileMsg = ref("");
   const compileRunId = ref("");
   // 编译后重扫的文档总数(done 时回填),供 WikiBrowse 更新计数
@@ -30,10 +37,15 @@ export const useKbStore = defineStore("kb", () => {
   const pipelineStage = ref<"" | "compile" | "enrich" | "dedup">("");
 
   let unlisten: (() => void) | null = null;
+  // 同步「正在挂载」闸:guard 若只看 unlisten,它要等 await listen() 兑现后才被赋值,
+  // 两个并发调用会在 await 之前都通过 guard → 重复订阅(同一事件回调触发两次)。在 await 前
+  // 同步置真才真正幂等(fileTasks.ts 的 wired 同款做法)。
+  let wiringCompile = false;
 
   // 全局只注册一次 kb:compile 监听
   async function ensureListener() {
-    if (unlisten) return;
+    if (unlisten || wiringCompile) return;
+    wiringCompile = true;
     unlisten = await listen<KbCompileEvent>("kb:compile", (ev) => {
       // invoke 回执(run_id)可能比后端首个事件晚到 → 此刻 compileRunId 仍空, 早到的事件(含
       // done)会被下面的 runId 过滤丢弃, 致 compiling 永卡 true。运行中且尚未拿到 id 时,
@@ -60,9 +72,7 @@ export const useKbStore = defineStore("kb", () => {
             : ev.kind === "phase"
               ? "▸ "
               : "· ";
-      compileLog.value.push(icon + t);
-      if (compileLog.value.length > 200)
-        compileLog.value.splice(0, compileLog.value.length - 200);
+      pushCompileLog(icon + t);
     });
   }
 
@@ -125,8 +135,12 @@ export const useKbStore = defineStore("kb", () => {
   // ── 维护知识网: 自动补双链 (enrich) / 智能去重 (dedup) ──
   // 借鉴 llm_wiki「AI 出决策、代码执行」。复用上面的进度日志 UI (同时只跑一个维护操作)。
   let unlistenMaintain: (() => void)[] = [];
+  // 同步幂等闸(理由同 wiringCompile):数组要等两个 await listen() 都兑现才非空,
+  // 并发调用会在此之前都通过 length 判断 → enrich/dedup 各被订阅两次。
+  let wiringMaintain = false;
   async function ensureMaintainListener() {
-    if (unlistenMaintain.length) return;
+    if (unlistenMaintain.length || wiringMaintain) return;
+    wiringMaintain = true;
     const handle = (ev: KbMaintainEvent) => {
       // 同 kb:compile: 回执晚到时采纳首个事件的 runId, 防早到的 done 被丢、卡死 compiling。
       if (!compileRunId.value && compiling.value) compileRunId.value = ev.runId;
@@ -152,9 +166,7 @@ export const useKbStore = defineStore("kb", () => {
       }
       const icon =
         ev.kind === "error" ? "⚠ " : ev.kind === "phase" ? "▸ " : "· ";
-      compileLog.value.push(icon + t);
-      if (compileLog.value.length > 200)
-        compileLog.value.splice(0, compileLog.value.length - 200);
+      pushCompileLog(icon + t);
     };
     unlistenMaintain.push(await listen<KbMaintainEvent>("kb:enrich", handle));
     unlistenMaintain.push(await listen<KbMaintainEvent>("kb:dedup", handle));

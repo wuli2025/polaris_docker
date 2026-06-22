@@ -2518,25 +2518,40 @@ fn understanding_lines(ov: &FileOverview) -> Vec<String> {
 
 // ── 智能向导收尾「建议工作流」:大模型据**真实知识库**智能匹配,而非固定阈值套话 ──
 
-/// 一条注入对话框的建议:标题 + 用户第一人称的提示词。
+/// 一条注入对话框的建议:标题 + 「为什么是你」的依据 + 用户第一人称的提示词。
+/// why = 一句话点名「他的哪个主题/文件夹/多少个文件」让我提这条 —— 收尾页据此让用户一眼觉得
+/// 「这是独属于我的任务」,而不是放之四海皆准的套话(`#[serde(default)]`:模型漏给也不炸,空着即可)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SuggestedFlow {
     pub title: String,
+    #[serde(default)]
+    pub why: String,
     pub prompt: String,
 }
 
 impl SuggestedFlow {
     /// 兜底:LLM 不可用 / 解析失败时,用确定性的类型阈值建议(workflow_hints)转一份,绝不空手。
+    /// why 取 detail 的首句(如「你有 12 个视频」),依旧是据他真实文件的依据,不是空话。
     fn fallback(ov: &FileOverview) -> Vec<SuggestedFlow> {
         workflow_hints(ov)
             .into_iter()
-            .map(|h| SuggestedFlow {
-                title: h.title,
-                prompt: format!(
-                    "{}\n\n请基于我的知识库,先说清你打算怎么做、会用到我哪些资料,再开始。",
-                    h.detail
-                ),
+            .map(|h| {
+                let why = h
+                    .detail
+                    .split(['。', ',', ',', '.'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                SuggestedFlow {
+                    title: h.title,
+                    why,
+                    prompt: format!(
+                        "{}\n\n请基于我的知识库,先说清你打算怎么做、会用到我哪些资料,再开始。",
+                        h.detail
+                    ),
+                }
             })
             .collect()
     }
@@ -2679,8 +2694,10 @@ fn suggest_workflows_directive(ov: &FileOverview, recent: &str) -> String {
 {recent}
 你可以(可选)用 Grep / Read 抽查几个文件,让建议更贴他的真实内容(别超过 3~4 次,够用就停)。
 
-每条建议给两个字段:
+每条建议给三个字段:
 - title:6~18 字中文短语,点名他的**具体主题 + 这件事的动作**(如「给《XX 落地页》加高级入场动效」「对《YY 项目》跑高强度压测」,而不是「整理学习资料」);
+- why:8~24 字中文,**点名依据**——他的哪个主题 / 文件夹 / 多少个文件让你提这条,让他一眼觉得「这是冲着我来的」
+  (如「你最近在动的《预算》文件夹有 12 个改动」「你有 320 张设计稿」),**必须引用上面画像里的真实数字 / 名字**,不能空泛;
 - prompt:**用户第一人称**写的、可直接发给我执行的指令。**不要怕长**——把「整个解决问题的工作流」写清楚:
   目标 → 我希望你走的步骤 → 期望产出 → 怎么算做完(验收标准),并要求我先讲计划再动手。
   点名他的具体主题 / 文件夹 / 文件名,让这条像是为他量身定的。
@@ -2699,7 +2716,7 @@ fn suggest_workflows_directive(ov: &FileOverview, recent: &str) -> String {
 - 绝不能是「整理文档 / 总结资料」这种换谁都成立的套话;全用中文。
 
 **只输出一个 JSON 数组,不要任何额外文字、不要 markdown 代码围栏**:
-[{{"title":"…","prompt":"…"}}, ...]"#,
+[{{"title":"…","why":"…","prompt":"…"}}, ...]"#,
         total = ov.total_files,
         bytes = human_bytes(ov.total_bytes),
         kinds = if kinds.is_empty() { "—".into() } else { kinds.join("、") },

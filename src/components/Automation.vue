@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onBeforeUnmount, ref } from "vue";
 import {
   Clock,
   Plus,
@@ -83,16 +83,31 @@ async function briefNow() {
 }
 const dreamHours = Array.from({ length: 24 }, (_, i) => i);
 
-onMounted(() => {
+// echo:dream 监听器的解绑句柄。此前整个组件无 onBeforeUnmount,每次进出本视图都新挂
+// 一个监听且不解绑 → 监听器/回调逐周累积(Docker/Web 模式进无界 Set 更严重)。
+let unlistenDream: (() => void) | null = null;
+
+onMounted(async () => {
   if (!app.projects.length) app.refreshProjects();
   auto.startScheduler();
   loadEcho();
   // 桌面 / Docker 两条路径都直接回传 payload 本体(见 tauri.ts),读 p.kind;
   // 旧代码读 p.payload.kind 多包一层取不到,且 isTauri 闸把 Docker 一并误杀。
-  listen("echo:dream", (p: any) => {
+  unlistenDream = await listen("echo:dream", (p: any) => {
     const k = p?.kind ?? p?.payload?.kind;
     if (k === "done" || k === "error") loadEcho();
   });
+});
+
+onBeforeUnmount(() => {
+  // 对称回收:解绑 echo:dream 监听,杜绝重复挂载累积。
+  // 注意:**不**停 auto.stopScheduler() —— 调度定时器是 app 级后台设施(切走本视图后
+  // 计划任务仍须按时触发),startScheduler 自身幂等不会叠加,故让单个 app 生命周期定时器
+  // 常驻才是正确行为;停掉会导致离开本页后自动化静默失效。
+  if (unlistenDream) {
+    unlistenDream();
+    unlistenDream = null;
+  }
 });
 
 const ICONS: Record<string, any> = {

@@ -81,26 +81,37 @@ function glowPad(size: number): number {
   return Math.max(3, Math.round(size * 0.42 * jitter));
 }
 
-const fcoseLayout = {
-  name: "fcose",
-  quality: "default",
-  animate: true,
-  animationDuration: 800,
-  randomize: true,
-  fit: true,
-  padding: 60,
-  nodeRepulsion: 6500,
-  idealEdgeLength: 72,
-  edgeElasticity: 0.45,
-  gravity: 0.6, // 向心 → 收成圆盘
-  gravityRange: 3.6,
-  gravityCompound: 1.2,
-  gravityRangeCompound: 1.5,
-  numIter: 2500,
-  packComponents: true,
-  nodeSeparation: 80,
-  nodeDimensionsIncludeLabels: false,
-} as any;
+// fcose 力导向布局是同步重计算:numIter 轮迭代全在主线程上跑,几千节点 × 2500 轮可达秒级卡顿
+// (代码里曾兜底 3.5s 才收加载条,等于自认会卡)。改成「按节点数自适应」:节点越多,迭代越少、
+// 质量降档(fcose 的 quality:"draft" 比 "default" 快数倍),把单次布局的主线程占用压在百毫秒量级 ——
+// 节点多时画面精度略降(肉眼几乎无感),但绝不再让「打开/重排星图」把整个 UI 卡死。
+function layoutFor(nodeCount: number): any {
+  const big = nodeCount > 1200;
+  const mid = nodeCount > 300;
+  return {
+    name: "fcose",
+    quality: big ? "draft" : "default",
+    animate: !big, // 大图不做入场动画,直接定位,省一段主线程动画开销
+    animationDuration: 800,
+    randomize: true,
+    fit: true,
+    padding: 60,
+    nodeRepulsion: 6500,
+    idealEdgeLength: 72,
+    edgeElasticity: 0.45,
+    gravity: 0.6, // 向心 → 收成圆盘
+    gravityRange: 3.6,
+    gravityCompound: 1.2,
+    gravityRangeCompound: 1.5,
+    // 迭代数随规模递减:小图 2500(精)、中图 1000、大图 400(快)
+    numIter: big ? 400 : mid ? 1000 : 2500,
+    packComponents: true,
+    nodeSeparation: 80,
+    nodeDimensionsIncludeLabels: false,
+  };
+}
+// 安全上限:超过此节点数只渲染「连接最多的前 N 个」,避免 20 万节点的病态库把布局/渲染卡死。
+const MAX_GRAPH_NODES = 2500;
 
 // 颜色按字面量 selector 下发 (避免 data() 颜色映射的运行时风险)
 const palSelectors = Object.entries(PAL).map(([k, v]) => ({
@@ -123,11 +134,11 @@ function render() {
 
   const keepFolders = showFolders.value;
   // 文档与回声记忆始终显示;目录/根节点仅在「目录结构」开启时显示
-  const nodes = graphData.nodes.filter(
+  let nodes = graphData.nodes.filter(
     (n) => keepFolders || n.kind === "doc" || n.kind === "feedback"
   );
-  const keepIds = new Set(nodes.map((n) => n.id));
-  const edges = graphData.edges.filter(
+  let keepIds = new Set(nodes.map((n) => n.id));
+  let edges = graphData.edges.filter(
     (e) => keepIds.has(e.source) && keepIds.has(e.target)
   );
 
@@ -136,6 +147,16 @@ function render() {
   for (const e of edges) {
     deg[e.source] = (deg[e.source] || 0) + 1;
     deg[e.target] = (deg[e.target] || 0) + 1;
+  }
+
+  // 安全上限:超大图(几万~几十万节点)布局/渲染会卡死主线程。只保留「连接最多的前 N 个」
+  // (度数=语义/结构枢纽,留它们最能代表全局),并据此重算保留集,把规模钉在可流畅渲染的量级。
+  if (nodes.length > MAX_GRAPH_NODES) {
+    nodes = [...nodes]
+      .sort((a, b) => (deg[b.id] || 0) - (deg[a.id] || 0))
+      .slice(0, MAX_GRAPH_NODES);
+    keepIds = new Set(nodes.map((n) => n.id));
+    edges = edges.filter((e) => keepIds.has(e.source) && keepIds.has(e.target));
   }
 
   stats.value = {
@@ -295,7 +316,7 @@ function render() {
         style: { opacity: 0.95, width: 2, "text-opacity": 1, "line-color": "#e8c878" },
       },
     ],
-    layout: fcoseLayout,
+    layout: layoutFor(nodes.length),
   });
 
   wireInteractions(cy);
@@ -359,7 +380,8 @@ function wireInteractions(c: Core) {
 
 // ── 工具栏动作 ──────────────────────────────────────────────
 function relayout() {
-  cy?.layout(fcoseLayout).run();
+  if (!cy) return;
+  cy.layout(layoutFor(cy.nodes().length)).run();
 }
 function fit() {
   if (cy) cy.animate({ fit: { eles: cy.elements(), padding: 60 }, duration: 350 });

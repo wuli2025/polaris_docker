@@ -20,6 +20,7 @@ import ToastHost from "./components/ToastHost.vue";
 import VoiceOverlay from "./components/VoiceOverlay.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import TaskCenter from "./components/TaskCenter.vue";
+import FaultBoundary from "./components/FaultBoundary.vue";
 import { useHotkeys } from "./composables/useHotkeys";
 import { installMarkdownDelegation } from "./lib/markdown";
 import { openUrl, onWsStatus, isTauri, files as fc } from "./tauri";
@@ -148,6 +149,10 @@ async function autoBuildIndexOnStartup() {
 // 这样切走/未挂载 ChatPanel 时后台任务仍持续流式推进、完成有提醒。
 let unMdDelegate: (() => void) | null = null;
 let unWsStatus: (() => void) | null = null;
+// 周期性内存兜底:App 是全程挂载的根组件,WebView 可连开数周。即便用户从不切对话/不切后台
+// (visibilitychange 兜底永远不触发),也每 5 分钟主动收一次 LRU,杜绝长周期内存缓慢爬升。
+// trimMemory 只回收陈旧、非发送中的对话,纯回收无副作用。
+let trimTimer: number | undefined;
 onMounted(() => {
   chatStore.init();
   // 文件中心长任务(盘点/建索引/智能归类/AI 整理名称)的全局事件监听:App 级注册一次,
@@ -164,12 +169,28 @@ onMounted(() => {
   });
   // Docker/Web 模式:WS 断线 → 顶部细条提示(自动重连由 tauri.ts 负责)
   if (!isTauri) unWsStatus = onWsStatus((ok) => (wsDown.value = !ok));
+  // 内存治理「最后保险」:App 被切到后台(最小化 / 切窗 / 标签页隐藏)是天然的空闲点,
+  // 此刻主动把对话气泡缓存收回到 LRU 上限。visibilitychange 在 WKWebView(Mac)/
+  // WebView2(Win)/浏览器(Docker)三端都可靠触发,纯回收无副作用(切回时按需重取)。
+  document.addEventListener("visibilitychange", onVisibilityTrim);
+  trimTimer = window.setInterval(() => {
+    try {
+      chatStore.trimMemory?.();
+    } catch {
+      /* 收回失败不影响应用运行,静默跳过,等下一个周期 */
+    }
+  }, 5 * 60 * 1000);
 });
+function onVisibilityTrim() {
+  if (document.visibilityState === "hidden") chatStore.trimMemory();
+}
 onBeforeUnmount(() => {
   unMdDelegate?.();
   unWsStatus?.();
+  if (trimTimer !== undefined) clearInterval(trimTimer);
   clearTimeout(loaderSafety);
   window.removeEventListener("mousemove", onAuroraPointer);
+  document.removeEventListener("visibilitychange", onVisibilityTrim);
   if (edgeRaf) cancelAnimationFrame(edgeRaf);
 });
 
@@ -316,6 +337,10 @@ function startSbDrag(e: MouseEvent) {
            四个工坊也缓存：生成/修改是多轮流程(phase/convId/产物预览都在组件态里)，
            切去对话看进度再切回来必须还能「继续修改」，销毁重建=流程报废。
            mountedView 让重视图冷启时滞后两帧挂载，先把加载条画出来再扛卡顿。 -->
+      <!-- 故障舱壁:任一功能视图在渲染/生命周期抛错时,只把当前视图换成可重试卡片,
+           绝不让异常冒泡到 app 根白屏 → 侧栏/任务中心/右抽屉及其它功能键照常可用。
+           viewKey 让它感知视图切换并在切走时自愈(再切回=自动重试)。 -->
+      <FaultBoundary :view-key="mountedView">
       <KeepAlive :include="['KnowledgeGraph', 'SandboxStatus', 'DeckStudio', 'WebStudio', 'MediaOps', 'VideoCourseStudio']">
         <ChatPanel v-if="mountedView === 'chat'" />
         <WikiBrowse v-else-if="mountedView === 'wiki'" />
@@ -343,6 +368,7 @@ function startSbDrag(e: MouseEvent) {
         <DeckStudio v-else-if="mountedView === 'deck'" />
         <WebStudio v-else-if="mountedView === 'web_studio'" />
       </KeepAlive>
+      </FaultBoundary>
 
       <!-- 点击重视图即刻浮现的快速加载条（盖住挂载/建图卡顿） -->
       <Transition name="vl">
@@ -353,7 +379,10 @@ function startSbDrag(e: MouseEvent) {
         />
       </Transition>
     </main>
-    <RightDrawer />
+    <!-- 右抽屉渲染用户产物预览(HTML/PPT/网页),是常见崩溃源;独立舱壁兜底,崩了不白屏整窗 -->
+    <FaultBoundary>
+      <RightDrawer />
+    </FaultBoundary>
 
     <!-- 自动更新提示条（发现新版本时浮出） -->
     <UpdateBanner />
@@ -365,6 +394,7 @@ function startSbDrag(e: MouseEvent) {
 
     <!-- 全局任务中心:盘点/建索引/智能归类等后台任务,无论切到哪个视图都常驻可见、可点回去 -->
     <TaskCenter />
+
 
     <!-- Docker/Web 模式断线提示条 -->
     <div v-if="wsDown" class="ws-down">连接已断开,正在自动重连…</div>

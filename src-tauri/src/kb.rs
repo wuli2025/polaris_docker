@@ -43,6 +43,10 @@ pub struct KbDoc {
     pub wikilinks: Vec<String>,
 }
 
+/// 单篇正文按需读的字节上限(与 kb_read 同口径)。GB 级日志/数据集若被无上限
+/// 直读会 OOM(弱 NAS 尤甚),搜索打分对超大文件也只需前若干字节即可命中。
+const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 按需读取 KB 中某篇 wiki 的完整正文(不走 INDEX, 直接读磁盘)。
 fn read_doc_body(rel_path: &str) -> Option<String> {
     let root = KB_ROOT.read();
@@ -51,11 +55,26 @@ fn read_doc_body(rel_path: &str) -> Option<String> {
         return None;
     }
     // 去除 frontmatter, 只返回正文(与 parse_doc 保持一致)
-    let raw = fs::read_to_string(&full).ok()?;
+    let raw = read_text_capped(&full)?;
     match RE_FRONTMATTER.captures(&raw) {
         Some(c) => Some(raw[c.get(0)?.end()..].to_string()),
         None => Some(raw),
     }
+}
+
+/// 有界读文本: 超过 MAX_BODY_BYTES 只按 UTF-8 边界安全截读前 8 MiB,
+/// 避免巨型文件一次性撑爆内存(与 kb_read 的护栏同口径)。
+fn read_text_capped(full: &Path) -> Option<String> {
+    let meta = fs::metadata(full).ok()?;
+    if meta.len() > MAX_BODY_BYTES {
+        use std::io::Read;
+        let mut f = fs::File::open(full).ok()?;
+        let mut buf = vec![0u8; MAX_BODY_BYTES as usize];
+        let n = f.read(&mut buf).ok()?;
+        buf.truncate(n);
+        return Some(String::from_utf8_lossy(&buf).into_owned());
+    }
+    fs::read_to_string(full).ok()
 }
 
 static INDEX: Lazy<RwLock<Vec<KbDoc>>> = Lazy::new(|| RwLock::new(Vec::new()));
@@ -458,13 +477,25 @@ pub fn kb_set_root(new_path: String) -> Result<usize, String> {
     Ok(n)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn kb_scan() -> Result<usize, String> {
+/// 同步核: 全量重扫 KB 并刷新 INDEX。
+/// `scan_all` 走 `thread::scope` 并阻塞到所有解析 join(10k+ 文档的大 NAS 库要 10-60s)。
+/// desktop 端由下面的 async 包装挪到 spawn_blocking,别冻 UI 主线程;
+/// server flavor 由 server.rs 直调本同步核。
+pub fn kb_scan_sync() -> Result<usize, String> {
     let root = KB_ROOT.read().clone();
     let docs = scan_all(&root);
     let n = docs.len();
     *INDEX.write() = docs;
     Ok(n)
+}
+
+/// desktop 端命令: 把阻塞的全量重扫挪到 blocking 线程池,避免冻结窗口主线程。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn kb_scan() -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(kb_scan_sync)
+        .await
+        .map_err(|e| format!("扫描任务异常退出: {e}"))?
 }
 
 // ───────────────────────── 构建知识网 (摄入即编译 Ingest=Compile) ─────────────────────────
@@ -1905,9 +1936,20 @@ pub struct KbHit {
     pub score: f64,
 }
 
+/// 单次搜索最多读多少篇正文。10k 文档的 NAS 库上,旧版对**每篇**都
+/// `fs::read_to_string` + `to_lowercase` → 主线程冻 30-60s,且是 DoS 面。
+/// 先按廉价的标题/category 命中排序,只对最有希望的前 MAX_SEARCH_DOCS 篇读全文打分;
+/// 正常小库(篇数 ≤ 2000)行为与旧版完全一致。
+const MAX_SEARCH_DOCS: usize = 2000;
+
 /// PRD §8.8 关键词加权评分: 标题 +10 / category +8 / 正文 +1
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn kb_search(query: String, top_k: Option<usize>) -> Vec<KbHit> {
+    kb_search_sync(query, top_k)
+}
+
+/// 同步核(server flavor 直调,desktop 由上面的 #[tauri::command] 薄包装转发)。
+pub fn kb_search_sync(query: String, top_k: Option<usize>) -> Vec<KbHit> {
     // CJK 感知切词(与寓言检索同口径):中文无空格,旧版 split_whitespace 把整句当一个词,
     // 「公司的退款政策是怎样的」永远 contains 不到 → 妈妈库自然语言提问零召回。现在切成
     // 概念词(退款/政策…)+ 拉丁词,逐词 contains 算分,自然句也能命中权威 wiki。
@@ -1918,8 +1960,12 @@ pub fn kb_search(query: String, top_k: Option<usize>) -> Vec<KbHit> {
     let terms: Vec<&str> = owned.iter().map(String::as_str).collect();
     let topk = top_k.unwrap_or(8);
     let idx = INDEX.read();
-    let mut scored: Vec<(f64, String, String, String)> = Vec::new(); // score, path, title, snippet
-    for d in idx.iter() {
+
+    // ── Pass 1: 廉价打分(只看内存里的标题/category,零磁盘 IO)。
+    // 记录每篇的廉价分,据此挑出最值得读全文的候选,避免对全库每篇都读盘。
+    // (cheap_score, index)
+    let mut cheap: Vec<(f64, usize)> = Vec::with_capacity(idx.len());
+    for (i, d) in idx.iter().enumerate() {
         let title_lc = d.title.to_lowercase();
         let cat_lc = d.category.to_lowercase();
         let mut score = 0.0;
@@ -1931,8 +1977,26 @@ pub fn kb_search(query: String, top_k: Option<usize>) -> Vec<KbHit> {
                 score += 8.0;
             }
         }
-        // 按需读正文: 标题/category 已命中需要 snippet; 没命中需要确认正文是否命中
-        let body_opt = read_doc_body(&d.rel_path);
+        cheap.push((score, i));
+    }
+    // 廉价命中的优先(标题/category 命中的排前面),其余按 INDEX 原序紧随。
+    // 这样在受限读盘预算下,优先把全文 IO 花在最相关的文档上。
+    cheap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ── Pass 2: 只对前 MAX_SEARCH_DOCS 篇候选读全文(有界字节)打正文分。
+    let mut scored: Vec<(f64, String, String, String)> = Vec::new(); // score, path, title, snippet
+    let mut bodies_read = 0usize;
+    for (cheap_score, i) in cheap.into_iter() {
+        let d = &idx[i];
+        let mut score = cheap_score;
+        // 受限读盘预算:超过上限就不再读正文,仅凭廉价分参与排序
+        // (廉价分为 0 的尾部文档此时已读不到正文,自然被 score<1 过滤掉)。
+        let body_opt = if bodies_read < MAX_SEARCH_DOCS {
+            bodies_read += 1;
+            read_doc_body(&d.rel_path) // 内部已对单篇做 8 MiB 上限截读
+        } else {
+            None
+        };
         if let Some(ref body) = body_opt {
             let body_lc = body.to_lowercase();
             for t in &terms {
@@ -3123,7 +3187,7 @@ pub fn kb_quarantine(rel_path: String) -> Result<String, String> {
 
 /// 用于 chat_send: 把 search hits 渲染成 system prompt KB 块
 pub fn render_kb_context(query: &str, top_k: usize) -> String {
-    let hits = kb_search(query.to_string(), Some(top_k));
+    let hits = kb_search_sync(query.to_string(), Some(top_k));
     if hits.is_empty() {
         return String::new();
     }

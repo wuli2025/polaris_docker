@@ -8,7 +8,7 @@
 //! - 两车道 `thread::scope` 真并行,先到先等,RRF(k=60)塌平融合;
 //! - 有重排服务商时对融合 top-40 精排一次,失败静默保持 RRF 序(可降级)。
 
-use super::{lex_available, open_db, worker_count};
+use super::{lex_available, open_db, open_db_gauged, worker_count};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -524,7 +524,9 @@ fn coarse_scan_ranged(
                 .map(|&(rlo, rhi)| {
                     let collected = &collected;
                     s.spawn(move || -> Result<(), String> {
-                        let conn = open_db()?;
+                        // 计量连接:这是并发开连接的热点(最多 w≤12 路同时持有),
+                        // 守卫 drop 时自减,超软上限只告警不阻塞 —— 让用户能看见最坏并发度。
+                        let conn = open_db_gauged()?;
                         let sql = format!(
                             "SELECT id, bits FROM chunks \
                              WHERE dim=?1 AND model=?2 AND bits IS NOT NULL \
@@ -716,51 +718,72 @@ fn vector_lane(query: &str, top_k: usize) -> Result<Vec<VecHit>, String> {
         }
     } else {
         // 兜底:同模型向量里没有任何 bits(理论上不出现,留作健壮性)→ 暴力精扫,仍按 model 过滤。
+        //
+        // 内存治理:旧实现一条 SQL 就 JOIN + SELECT 整列 `text`(每 chunk 1–2KB),粗筛初期
+        // min_score=MIN 几乎每行都过闸 → 把成千上万行的整段文本 String 全 materialize 进堆,
+        // 在百万级 chunk 库上可吃掉数 GB。改两段式:
+        //   stage-1 只读 (id, vec) 算分,维护 top-want 的 (id,score)(零文本、零 JOIN);
+        //   stage-2 仅对最终入选的 ~want 条回读 text + 路径。文本驻留从「全表」降到「want 条」。
+        let mut cand: Vec<(i64, f32)> = Vec::with_capacity(want + 1);
+        {
+            let mut stmt = conn
+                .prepare("SELECT c.id, c.vec FROM chunks c WHERE c.dim=?1 AND c.model=?2")
+                .map_err(|e| e.to_string())?;
+            let mut rows = stmt
+                .query(rusqlite::params![qv.len() as i64, model])
+                .map_err(|e| e.to_string())?;
+            let mut min_score = f32::MIN;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                let blob = row
+                    .get_ref(1)
+                    .map_err(|e| e.to_string())?
+                    .as_blob()
+                    .map_err(|e| e.to_string())?;
+                let Some(score) = super::index::dot_blob(&qv, blob) else {
+                    continue;
+                };
+                if cand.len() >= want && score <= min_score {
+                    continue;
+                }
+                let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                cand.push((id, score));
+                if cand.len() > want {
+                    cand.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    cand.truncate(want);
+                    min_score = cand.last().map(|c| c.1).unwrap_or(f32::MIN);
+                }
+            }
+        }
+        // stage-2:仅回读入选 chunk 的文本与路径(逐条按主键查,命中索引,数量 ≤ want)。
         let mut stmt = conn
             .prepare(
-                "SELECT c.vec, c.seq, c.text, f.relpath, r.path FROM chunks c
+                "SELECT c.seq, c.text, f.relpath, r.path FROM chunks c
                  JOIN files f ON f.id=c.file_id JOIN roots r ON r.id=f.root_id
-                 WHERE c.dim=?1 AND c.model=?2",
+                 WHERE c.id=?1",
             )
             .map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query(rusqlite::params![qv.len() as i64, model])
-            .map_err(|e| e.to_string())?;
-        let mut min_score = f32::MIN;
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let blob = row
-                .get_ref(0)
-                .map_err(|e| e.to_string())?
-                .as_blob()
-                .map_err(|e| e.to_string())?;
-            let Some(score) = super::index::dot_blob(&qv, blob) else {
-                continue;
-            };
-            if top.len() >= want && score <= min_score {
-                continue;
-            }
-            let seq: i64 = row.get(1).map_err(|e| e.to_string())?;
-            let text: String = row.get(2).map_err(|e| e.to_string())?;
-            let rel: String = row.get(3).map_err(|e| e.to_string())?;
-            let root: String = row.get(4).map_err(|e| e.to_string())?;
-            top.push(VecHit {
-                abspath: std::path::Path::new(&root)
-                    .join(&rel)
-                    .to_string_lossy()
-                    .into_owned(),
-                path: rel,
-                seq,
-                text,
-                score,
+        for (id, score) in cand {
+            let row = stmt.query_row(rusqlite::params![id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             });
-            if top.len() > want {
-                top.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+            if let Ok((seq, text, rel, root)) = row {
+                top.push(VecHit {
+                    abspath: std::path::Path::new(&root)
+                        .join(&rel)
+                        .to_string_lossy()
+                        .into_owned(),
+                    path: rel,
+                    seq,
+                    text,
+                    score,
                 });
-                top.truncate(want);
-                min_score = top.last().map(|h| h.score).unwrap_or(f32::MIN);
             }
         }
     }
@@ -929,6 +952,10 @@ pub fn search(
     // ── P2-1 精排闸门(详解 §4/§5):只在「该精排」时才请专家 ──
     // 条件:混检 + 有重排服务商 + 候选≥3 + 前两名分数咬得紧(难分高下,正是粗筛分不清、
     // 精排价值最大的场景)。一骑绝尘 / 候选过少 / 服务不可用 → 直接保持融合序(优雅降级)。
+    // 重排仅在 mode 恰为 "hybrid" 时触发。**契约**: 想要「双车道融合但不重排」的快档(快速模式
+    // 召回走这条, 见 chat::forced_recall_block), 传一个既非 "grep" 也非 "vector" 的多车道 mode
+    // (如 "grep_vec") —— want_grep/want_vec 都为真(两腿都跑), 但因 != "hybrid" 直接跳过这层网络
+    // 重排, 把召回从 ~1.8s 降到 ~250ms。改这里的判断前请同步 forced_recall_block。
     let mut reranked = false;
     let gate_close = merged.len() >= 2 && {
         let (r1, r2) = (merged[0].rrf, merged[1].rrf);

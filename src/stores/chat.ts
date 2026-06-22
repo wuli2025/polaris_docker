@@ -78,14 +78,22 @@ export const useChatStore = defineStore("chatRuntime", () => {
   const tokensByConv = ref<Record<string, number>>({});
   // 等待某对话「本轮 done」的 resolver 队列（分批编排循环逐轮 await）。
   const doneWaiters: Record<string, Array<() => void>> = {};
+  // 每对话一个「无声死亡」看门狗(setInterval id)。后端子进程崩溃 / done 事件丢失时,
+  // done/cancel/fail 都不会触发 → await waitForDone 永久挂起 → 该对话进度条卡死。
+  const watchdogs: Record<string, number> = {};
+  // 持续静默(无任何流式心跳)超过此阈值即判本轮异常终止并熔断。设得足够宽,避免误杀
+  // 「单个长工具(如几分钟的 ffmpeg 渲染)期间无 stdout」这类合法静默。
+  const SILENCE_LIMIT_MS = 300_000; // 5 分钟完全无心跳
   // 流式监听的「就绪 promise」。缓存它(而非一个 started 布尔), 让所有调用方 await 的是
   // 「监听器真正挂上」这一刻 —— 而不是仅仅把标志位置真。否则首条消息的 delta 可能在
   // listen() 完成注册之前就到达 → 丢帧(现象: 第一次发消息看不到流式输出, 但后台照常运行)。
   let initPromise: Promise<void> | null = null;
 
-  /** 等到指定对话「本轮跑完(done)」。当前不在发送态则立即兑现。 */
+  /** 等到指定对话「本轮跑完(done)」。当前不在发送态则立即兑现。
+   *  挂起期间启动心跳看门狗:后端无声死亡时熔断,确保 await 不会永久挂起。 */
   function waitForDone(convId: string): Promise<void> {
     if (!sendingByConv.value[convId]) return Promise.resolve();
+    armWatchdog(convId);
     return new Promise<void>((resolve) => {
       (doneWaiters[convId] ??= []).push(resolve);
     });
@@ -93,11 +101,56 @@ export const useChatStore = defineStore("chatRuntime", () => {
   /** 唤醒并清空某对话的 done 等待队列。done / cancel / 发送失败都必须调用,
    *  否则正在 await waitForDone 的分批编排循环会永久挂起(进度条卡死)。 */
   function wakeWaiters(convId: string) {
+    stopWatchdog(convId);
     const waiters = doneWaiters[convId];
+    // 删键(而非仅清空数组):清空只回收数组元素,键本身仍永久残留 —— 后端崩溃/done 丢失时
+    // 这些键会逐月累积成上百条死条目。先 delete 再调用 resolver,顺带防 resolver 内重入。
     if (waiters && waiters.length) {
-      doneWaiters[convId] = [];
+      delete doneWaiters[convId];
       for (const w of waiters) w();
+    } else {
+      delete doneWaiters[convId];
     }
+  }
+  /** 启动某对话的无声死亡看门狗(幂等:已存在则不重复挂)。每 15s 巡检一次,
+   *  仍在发送态且持续静默超阈值 → 判后端异常终止,熔断收尾。 */
+  function armWatchdog(convId: string) {
+    if (watchdogs[convId]) return;
+    watchdogs[convId] = window.setInterval(() => {
+      if (!sendingByConv.value[convId]) {
+        stopWatchdog(convId);
+        return;
+      }
+      if (Date.now() - activityAt(convId) >= SILENCE_LIMIT_MS) failSilent(convId);
+    }, 15_000);
+  }
+  function stopWatchdog(convId: string) {
+    const t = watchdogs[convId];
+    if (t) {
+      window.clearInterval(t);
+      delete watchdogs[convId];
+    }
+  }
+  /** 后端无声死亡的熔断收尾:合成超时气泡 + 置终态 + 唤醒等待者。
+   *  镜像 done/cancel/fail 的终态处理,让分批编排循环得以收尾(可重发从断点续跑)。 */
+  function failSilent(convId: string) {
+    stopWatchdog(convId);
+    if (!sendingByConv.value[convId]) return;
+    const arr = ensureArr(convId);
+    arr.push({
+      role: "assistant",
+      text: "[本轮超时] 后端长时间无响应，已停止该轮（可重发从断点续跑）。",
+      at: Date.now(),
+    });
+    sendingByConv.value[convId] = false;
+    delete reqByConv.value[convId];
+    touchActivity(convId);
+    try {
+      useSessionsStore().finish(convId);
+    } catch {
+      /* ignore */
+    }
+    wakeWaiters(convId);
   }
   function inputTokens(convId: string | null): number {
     if (!convId) return 0;
@@ -132,6 +185,34 @@ export const useChatStore = defineStore("chatRuntime", () => {
     ensureArr(convId).push(b);
   }
 
+  // 内存治理:byConv 旧实现按 convId 无上限累积气泡,多开 / 长时间使用后会有几万~几十万
+  // 气泡对象常驻(每个还被 Vue reactive Proxy 包一层,Mac WKWebView 回收又懒 → 额外放大),
+  // 长期贡献数百 MB ~ GB。改对话级 LRU:只让最近活跃的 MAX_LIVE_CONVS 个对话的气泡留在
+  // 内存,其余卸载(消息后端已持久化,切回时 loadHistory 会按需重取)。正在流式发送的对话
+  // 恒受保护(必须留住实时气泡),刚被访问 / 收到事件的对话因 activeAt 最新而排在最前、不会被卸。
+  const MAX_LIVE_CONVS = 16;
+  function evictStaleConversations() {
+    const ids = Object.keys(byConv.value);
+    if (ids.length <= MAX_LIVE_CONVS) return;
+    // 候选 = 非发送中的对话,按最近活跃时间降序(发送中的对话不参与淘汰、永远留住)。
+    const ranked = ids
+      .filter((id) => !sendingByConv.value[id])
+      .sort((a, b) => (activeAtByConv.value[b] ?? 0) - (activeAtByConv.value[a] ?? 0));
+    const sendingCount = ids.length - ranked.length;
+    const keep = Math.max(0, MAX_LIVE_CONVS - sendingCount);
+    for (const id of ranked.slice(keep)) {
+      delete byConv.value[id]; // 释放重头:气泡数组
+      loadedByConv.value[id] = false; // 下次切回触发 loadHistory 重取
+      delete tokensByConv.value[id];
+      delete historyErrorByConv.value[id];
+      // 长跑泄漏收口:这些 per-conv 字典此前漏在 evict 之外 → 只增不减。被淘汰的对话
+      // 必非发送中(ranked 已滤掉发送态),其活跃时间戳/请求 id/等待者均可安全回收。
+      delete activeAtByConv.value[id];
+      delete reqByConv.value[id];
+      delete doneWaiters[id];
+    }
+  }
+
   // 历史加载失败的对话集合:别假装是空对话,对话区给「重试」入口
   const historyErrorByConv = ref<Record<string, string>>({});
   function historyError(convId: string | null): string | null {
@@ -153,6 +234,9 @@ export const useChatStore = defineStore("chatRuntime", () => {
 
   async function loadHistory(convId: string | null, force = false) {
     if (!convId) return;
+    // 访问即刷新最近活跃时间:让正在查看的对话排在 LRU 最前、绝不被卸载(放在守卫前,
+    // 命中缓存的查看也算一次访问)。
+    touchActivity(convId);
     // 正在运行的对话别用历史覆盖实时气泡
     if (sendingByConv.value[convId]) return;
     if (loadedByConv.value[convId] && !force) return;
@@ -171,6 +255,7 @@ export const useChatStore = defineStore("chatRuntime", () => {
       });
       loadedByConv.value[convId] = true;
       delete historyErrorByConv.value[convId];
+      evictStaleConversations(); // 刚加载一个对话 → 顺手卸载最久未用的,封顶常驻内存
     } catch (e: any) {
       byConv.value[convId] = [];
       historyErrorByConv.value[convId] = e?.message ?? String(e);
@@ -192,6 +277,7 @@ export const useChatStore = defineStore("chatRuntime", () => {
       batchBuild?: boolean;
       batchSize?: number;
       agentMode?: string;
+      workMode?: string;
     }
   ) {
     // 关键: 先确保流式监听已挂上, 否则本轮的 delta 可能早于监听器注册而丢失
@@ -207,6 +293,9 @@ export const useChatStore = defineStore("chatRuntime", () => {
       at: Date.now(),
     });
     sendingByConv.value[convId] = true;
+    // 清掉上一轮可能残留的 reqId(若用户在 chat_send resolve 前就取消, send 可能晚于
+    // cancel 删除条目后落地, 留下永不清理的孤儿 reqId)。新一轮开始前先抹掉, 关掉这个活锁竞态。
+    delete reqByConv.value[convId];
     touchActivity(convId);
     sessions.start(convId, displayText.slice(0, 18));
     try {
@@ -220,6 +309,7 @@ export const useChatStore = defineStore("chatRuntime", () => {
         batchBuild: opts.batchBuild,
         batchSize: opts.batchSize,
         agentMode: opts.agentMode,
+        workMode: opts.workMode,
         conversationId: convId,
       });
       reqByConv.value[convId] = reqId;
@@ -261,6 +351,7 @@ export const useChatStore = defineStore("chatRuntime", () => {
     initPromise = listen<ChatStreamEvent>("chat:stream", (ev) => {
       const cid = ev.conversationId;
       if (!cid) return; // 无会话归属的事件无法路由（理论上不会出现）
+      touchActivity(cid); // 任何流式事件都算心跳:喂给无声死亡看门狗,证明后端仍活着
       const arr = ensureArr(cid);
       if (ev.kind === "delta") {
         const last = arr[arr.length - 1];
@@ -312,9 +403,17 @@ export const useChatStore = defineStore("chatRuntime", () => {
         app.markUnread(cid);
         // 唤醒分批编排循环：本轮已结束，可读清单决定续不续
         wakeWaiters(cid);
+        // 本轮结束 → 该对话不再受「发送中」保护,顺手做一次 LRU 卸载(封顶常驻气泡)。
+        evictStaleConversations();
       }
     }).then(() => undefined);
     return initPromise;
+  }
+
+  /** 内存治理:外部(如 App 在后台化时)主动触发的轻量回收 —— 立刻卸载最久未用对话的气泡,
+   *  把常驻内存收回到 LRU 上限。安全:正在发送 / 最近活跃的对话恒受保护,卸载的切回时重取。 */
+  function trimMemory() {
+    evictStaleConversations();
   }
 
   return {
@@ -332,5 +431,6 @@ export const useChatStore = defineStore("chatRuntime", () => {
     init,
     waitForDone,
     inputTokens,
+    trimMemory,
   };
 });

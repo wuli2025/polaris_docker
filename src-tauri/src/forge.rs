@@ -351,10 +351,19 @@ pub fn forge_preflight() -> Value {
 
 // ───────────── Forge 渲染命令(跨平台:win/mac/docker 同一份) ─────────────
 
-/// 把一组幻灯图打成 .pptx(纯 Rust OOXML,替 pptxgenjs)。三平台字节级一致。
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn forge_build_pptx(images: Vec<String>, out: String) -> Result<Value, String> {
+/// 把一组幻灯图打成 .pptx 的同步内核。server 命令路由(本就在阻塞线程池里)直调这里。
+pub fn build_pptx_sync(images: Vec<String>, out: String) -> Result<Value, String> {
     crate::forge_pptx::build_pptx(&images, &out)
+}
+
+/// 把一组幻灯图打成 .pptx(纯 Rust OOXML,替 pptxgenjs)。三平台字节级一致。
+/// async + spawn_blocking:多图打包要时间,同步命令默认跑主线程会冻 UI → 丢进阻塞线程池。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn forge_build_pptx(images: Vec<String>, out: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || build_pptx_sync(images, out))
+        .await
+        .map_err(|e| format!("打包任务异常退出: {e}"))?
 }
 
 /// deck.html → 多页 .pptx 的同步内核。server 命令路由(本就在阻塞线程池里)直调这里。
@@ -417,10 +426,9 @@ pub async fn forge_spec_to_pptx(spec: String, out: String) -> Result<Value, Stri
         .map_err(|e| format!("生成任务异常退出: {e}"))?
 }
 
-/// deck.html → .mp4(逐页截图 + ffmpeg 编码)。配音:audio=现成音频 / narration=文本走 TTS / 都无=无声。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// deck.html → .mp4 的同步内核。server 命令路由(本就在阻塞线程池里)直调这里。
 #[allow(clippy::too_many_arguments)]
-pub fn forge_deck_to_video(
+pub fn deck_to_video_sync(
     deck: String,
     out: String,
     seconds_per_slide: Option<f64>,
@@ -448,9 +456,36 @@ pub fn forge_deck_to_video(
     )
 }
 
-/// deck 某页 CSS 动画 → 逐帧真动画视频(__fx.seek + chromium 逐帧截图 + ffmpeg,无需 chromiumoxide)。
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn forge_deck_fx_video(
+/// deck.html → .mp4(逐页截图 + ffmpeg 编码)。配音:audio=现成音频 / narration=文本走 TTS / 都无=无声。
+/// async + spawn_blocking:逐页截图+ffmpeg 编码要几十秒到几分钟,同步命令默认跑主线程会冻 UI → 丢进阻塞线程池。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_deck_to_video(
+    deck: String,
+    out: String,
+    seconds_per_slide: Option<f64>,
+    fps: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    slides: Option<usize>,
+    audio: Option<String>,
+    narration: Option<String>,
+    transition: Option<f64>,
+    motion: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        deck_to_video_sync(
+            deck, out, seconds_per_slide, fps, width, height, slides, audio, narration,
+            transition, motion,
+        )
+    })
+    .await
+    .map_err(|e| format!("出片任务异常退出: {e}"))?
+}
+
+/// deck 某页 CSS 动画 → 逐帧真动画视频的同步内核。server 命令路由(本就在阻塞线程池里)直调这里。
+pub fn deck_fx_video_sync(
     deck: String,
     out: String,
     fps: Option<u32>,
@@ -470,15 +505,49 @@ pub fn forge_deck_fx_video(
     )
 }
 
-/// 文本 → mp3 配音(MiniMax T2A,纯 Rust)。无 key 时返回明确错误。
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn forge_tts(
+/// deck 某页 CSS 动画 → 逐帧真动画视频(__fx.seek + chromium 逐帧截图 + ffmpeg,无需 chromiumoxide)。
+/// async + spawn_blocking:逐帧截图(可达数百帧)+ffmpeg 编码耗时,同步命令默认跑主线程会冻 UI → 丢进阻塞线程池。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn forge_deck_fx_video(
+    deck: String,
+    out: String,
+    fps: Option<u32>,
+    duration_ms: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    slide: Option<usize>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        deck_fx_video_sync(deck, out, fps, duration_ms, width, height, slide)
+    })
+    .await
+    .map_err(|e| format!("逐帧出片任务异常退出: {e}"))?
+}
+
+/// 文本 → mp3 配音的同步内核。server 命令路由(本就在阻塞线程池里)直调这里。
+pub fn forge_tts_sync(
     text: String,
     out: String,
     voice: Option<String>,
     language_boost: Option<String>,
 ) -> Result<Value, String> {
     crate::forge_tts::synth(&text, &out, voice.as_deref(), language_boost.as_deref())
+}
+
+/// 文本 → mp3 配音(MiniMax T2A,纯 Rust)。无 key 时返回明确错误。
+/// async + spawn_blocking:T2A 网络往返(长文本切块多次调用)耗时,同步命令默认跑主线程会冻 UI → 丢进阻塞线程池。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn forge_tts(
+    text: String,
+    out: String,
+    voice: Option<String>,
+    language_boost: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || forge_tts_sync(text, out, voice, language_boost))
+        .await
+        .map_err(|e| format!("配音任务异常退出: {e}"))?
 }
 
 /// 用 chromium/chrome headless 给 URL/本地 HTML 截图(Forge capture 原始能力)。

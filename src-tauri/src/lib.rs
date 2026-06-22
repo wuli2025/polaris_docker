@@ -77,6 +77,28 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // 全局 panic 钩子(24/7 长稳第一道):任何后台线程(盘点/索引/做梦/热键/采集等)
+            // panic 时,不再被默默吞掉成「死掉的子系统」,而是 eprintln + best-effort 追加到
+            // 临时目录下的 polaris-panics.log(留耐久记录便于事后复盘)。链上一手以保留默认行为,
+            // 不改 unwind 语义(绝不 abort)。std panic 钩子在运行时执行,故 SystemTime::now() 可用。
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let msg = format!("[panic] {info}");
+                eprintln!("{msg}");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::env::temp_dir().join("polaris-panics.log"))
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let _ = writeln!(f, "{ts} {msg}");
+                }
+                prev(info);
+            }));
             let h = app.handle();
             kb::init(h).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             // 注入 KbLocator 给 sandbox 板块 (须在 kb::init 之后, 命令执行之前)
@@ -361,6 +383,10 @@ pub fn run() {
             ) {
                 chat::kill_all_children();
                 feishu::shutdown_on_exit(); // 回收飞书 node 桥,防其 autoReconnect 空转成孤儿烧 CPU
+                // 释放全局键盘热键监听:置 ENABLED=false,退出时不再处理热键事件
+                //(rdev::listen 无法干净中止是已知限制,置闸 + 进程退出即可接受的清理)。
+                #[cfg(feature = "voice-live")]
+                voice_live::stop();
             }
         });
 }

@@ -35,7 +35,7 @@ use directories::UserDirs;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
 // ───────────────────────── 全局任务闸 ─────────────────────────
@@ -99,14 +99,16 @@ pub(crate) fn open_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.pragma_update(None, "synchronous", "NORMAL").ok();
     conn.busy_timeout(std::time::Duration::from_secs(20)).ok();
-    // ── 20TB 级调优 ──
-    // 大库下(向量 BLOB 可达上百 GB)让 SQLite 内存映射读 + 加大页缓存,显著加速向量车道
-    // 对 bits/vec 列的顺序扫描;临时表放内存;WAL 自动检查点抬高,减少长事务被频繁打断。
-    // cache 取每连接 64 MiB(worker 多连接累加仍可控,弱 NAS 不致 OOM);mmap 取 2 GiB
-    // (虚拟映射,实际占用由 OS 页缓存按需管理,过大会被编译期上限静默 clamp)。
+    // ── 内存预算(随平台缩放)──
+    // 关键:mmap_size / cache_size 是「每连接」状态,而一次 hybrid 检索的向量粗筛会按
+    // worker 数(最高 12)同时开十余个连接 —— 旧值 mmap=2GiB、cache=64MiB「每连接」在桌面
+    // 被乘成 ~24GiB 映射 + ~768MiB 堆,16/32GB 的 Mac/Win 直接被撑爆。
+    // 现按外壳取预算:server(Docker/大内存)沿用大值吃满吞吐;桌面用克制值(总量受控),
+    // 都可经 POLARIS_FABLE_MMAP_MB / POLARIS_FABLE_CACHE_MB 覆写(单位 MiB,mmap=0 关映射)。
+    let (mmap_bytes, cache_kib) = db_mem_budget();
     conn.pragma_update(None, "temp_store", "MEMORY").ok();
-    conn.pragma_update(None, "mmap_size", 2_147_483_648i64).ok(); // 2 GiB
-    conn.pragma_update(None, "cache_size", -65_536i64).ok(); // 64 MiB(负值=KiB)
+    conn.pragma_update(None, "mmap_size", mmap_bytes).ok();
+    conn.pragma_update(None, "cache_size", -cache_kib).ok(); // 负值 = KiB
     conn.pragma_update(None, "wal_autocheckpoint", 20_000i64).ok();
     // 模式迁移每进程只跑一次。migrate 含十余条 CREATE TABLE/INDEX、6 次列探测 SELECT、
     // 以及 FTS5 建虚表 —— 而 open_db 在检索热路径被高频调用(单次 hybrid 查询光向量粗筛就按
@@ -122,6 +124,92 @@ pub(crate) fn open_db() -> Result<Connection, String> {
         }
     }
     Ok(conn)
+}
+
+// ──────────────────── 并发连接计量(纯观测,绝不阻塞)────────────────────
+
+/// 进程内「此刻热路径打开的 fable.db 连接数」。仅观测用 —— 向量粗筛按 worker 数(≤12)
+/// 并发开连接,每连接吃一份 cache 堆;若前台检索与后台索引/另一次检索重叠,连接数可叠加。
+/// 本计数器让我们在连接数异常偏高时给用户一个信号(降 `POLARIS_FABLE_WORKERS`),
+/// 而**绝不**节流/等待 —— 单纯 `eprintln!` 警告,热路径零阻塞。
+pub(crate) static OPEN_DB_CONNS: AtomicI64 = AtomicI64::new(0);
+
+/// 软上限:超过即告警(不阻塞)。默认 24(≈ 两轮 12 路粗筛重叠)。可经
+/// `POLARIS_FABLE_MAX_CONNECTIONS` 覆写。仅用于 `eprintln!` 阈值,从不据此拒绝/等待。
+fn max_connections_soft_cap() -> i64 {
+    std::env::var("POLARIS_FABLE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(24)
+}
+
+/// 已计量的连接 RAII 守卫:`Deref` 到内部 `Connection`(对调用方透明,当普通连接用),
+/// drop 时(含线程 panic 栈展开)自减计数器 —— 计数永不泄漏。
+/// 这是纯算术 + 一次条件 `eprintln!`,**不含任何锁/信号量/Condvar**,因此绝不会卡住查询线程。
+pub(crate) struct ConnGuard(Connection);
+
+impl std::ops::Deref for ConnGuard {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        OPEN_DB_CONNS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 与 [`open_db`] 等价,但把本连接计入 [`OPEN_DB_CONNS`] 并在 drop 时自减。
+/// 在并发粗筛等「同时开多个连接」的热点用它,即可观测最坏并发度。
+/// 超软上限只 `eprintln!` 一行告警(每进程最多打一次,免刷屏),**不阻塞不节流**。
+pub(crate) fn open_db_gauged() -> Result<ConnGuard, String> {
+    let conn = open_db()?;
+    let now = OPEN_DB_CONNS.fetch_add(1, Ordering::Relaxed) + 1;
+    let cap = max_connections_soft_cap();
+    if now > cap && !OVER_CAP_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[fable] 警告:fable.db 并发连接数达 {now}(软上限 {cap})。\
+             每连接占一份 SQLite cache 堆,过高会推高内存。\
+             如内存吃紧可调小 POLARIS_FABLE_WORKERS(或 POLARIS_FABLE_CACHE_MB)。\
+             这是纯告警,不会限速。"
+        );
+    }
+    Ok(ConnGuard(conn))
+}
+
+/// 过上限告警只打一次(避免热路径刷屏);纯标志位,不阻塞。
+static OVER_CAP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// 每连接 SQLite 内存预算 → `(mmap_size 字节, cache_size KiB)`。
+///
+/// 这两个 PRAGMA 是连接级状态,而向量检索按 [`worker_count`](最高 12)并发开连接,
+/// 故必须按「单连接 × 连接数」估总量。默认值:
+/// - **server(Docker / 大内存服务器)**:mmap 2GiB、cache 64MiB —— 吃满大库顺序扫吞吐;
+/// - **桌面(Mac/Win,通常 16/32GB)**:mmap 256MiB、cache 8MiB —— 12 连接累加仍仅
+///   ~3GiB 映射(且映射只在真正触碰页时驻留)+ ~96MiB 堆,远低于撑爆线。
+///
+/// 覆写:`POLARIS_FABLE_MMAP_MB`(MiB,0=关 mmap)、`POLARIS_FABLE_CACHE_MB`(MiB,下限 1)。
+/// 小内存桌面想再省 → 设 `POLARIS_FABLE_MMAP_MB=0 POLARIS_FABLE_CACHE_MB=4`;
+/// Docker 大库想更激进 → 调高二者。
+fn db_mem_budget() -> (i64, i64) {
+    // 平台默认:server feature 给大值,其余(桌面)给克制值。
+    #[cfg(feature = "server")]
+    let (def_mmap_mb, def_cache_mb): (i64, i64) = (2048, 64);
+    // 桌面:cache 从 16MiB 降到 8MiB —— 向量粗筛按 worker 数(≤12)并发开连接,cache 是
+    // 「每连接」真实堆,16MiB 时 12 连接最坏 ~192MiB;降到 8MiB 后 12×8=96MiB 最坏(对半砍),
+    // 命中缓存仍绰绰有余(单查询工作集远小于 8MiB)。env 覆写不变。
+    #[cfg(not(feature = "server"))]
+    let (def_mmap_mb, def_cache_mb): (i64, i64) = (256, 8);
+
+    let env_mb = |k: &str| -> Option<i64> {
+        std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).filter(|n| *n >= 0)
+    };
+    let mmap_mb = env_mb("POLARIS_FABLE_MMAP_MB").unwrap_or(def_mmap_mb).max(0);
+    let cache_mb = env_mb("POLARIS_FABLE_CACHE_MB").unwrap_or(def_cache_mb).max(1);
+    (mmap_mb * 1024 * 1024, cache_mb * 1024)
 }
 
 /// 进程级「fable.db 模式已就绪」闸 + 串行化锁(配合 [`open_db`] 的双检锁,见其注释)。

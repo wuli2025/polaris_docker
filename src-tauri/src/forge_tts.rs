@@ -130,8 +130,11 @@ fn synth_minimax(
         body["language_boost"] = json!(b);
     }
 
+    // 显式 connect+read 超时(各 30s),避免网络挂死时单一 overall 超时拖到 60s 才返回;
+    // 任一阶段卡住都能在 30s 内被掐断,绝不永久阻塞(配合 spawn_blocking 不冻 UI)。
     let resp = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(30))
         .build()
         .post(&endpoint)
         .set("Authorization", &format!("Bearer {key}"))

@@ -385,7 +385,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "kb_root" => ok(kb::kb_root()),
         "kb_default_root" => ok(kb::kb_default_root()),
         "kb_set_root" => ok(kb::kb_set_root(req_str(a, "newPath")?)?),
-        "kb_scan" => ok(kb::kb_scan()?),
+        "kb_scan" => ok(kb::kb_scan_sync()?),
         "kb_compile" => ok(kb::kb_compile(app)?),
         "kb_list" => ok(kb::kb_list(opt_str(a, "subdir"))),
         "kb_read" => ok(kb::kb_read(req_str(a, "relPath")?)?),
@@ -717,7 +717,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         // ── Forge 渲染能力 preflight：跨平台「能出 PPT/视频吗、缺啥降级」透明上报 ──
         "forge_preflight" => ok(forge::forge_preflight()),
         // ── Forge 渲染：截图 + 纯 Rust OOXML 打 .pptx（三平台同一份，替 pptxgenjs）──
-        "forge_build_pptx" => forge::forge_build_pptx(vec_str(a, "images"), req_str(a, "out")?),
+        "forge_build_pptx" => forge::build_pptx_sync(vec_str(a, "images"), req_str(a, "out")?),
         "forge_screenshot" => forge::forge_screenshot(
             req_str(a, "url")?,
             req_str(a, "out")?,
@@ -736,7 +736,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             a.get("searchable").and_then(|v| v.as_bool()),
             opt_usize(a, "slides"),
         ),
-        "forge_deck_to_video" => forge::forge_deck_to_video(
+        "forge_deck_to_video" => forge::deck_to_video_sync(
             req_str(a, "deck")?,
             req_str(a, "out")?,
             a.get("secondsPerSlide").and_then(|v| v.as_f64()),
@@ -749,7 +749,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             a.get("transition").and_then(|v| v.as_f64()),
             a.get("motion").and_then(|v| v.as_bool()),
         ),
-        "forge_deck_fx_video" => forge::forge_deck_fx_video(
+        "forge_deck_fx_video" => forge::deck_fx_video_sync(
             req_str(a, "deck")?,
             req_str(a, "out")?,
             opt_usize(a, "fps").map(|n| n as u32),
@@ -758,7 +758,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
             opt_usize(a, "height").map(|n| n as u32),
             opt_usize(a, "slide"),
         ),
-        "forge_tts" => forge::forge_tts(
+        "forge_tts" => forge::forge_tts_sync(
             req_str(a, "text")?,
             req_str(a, "out")?,
             opt_str(a, "voice"),

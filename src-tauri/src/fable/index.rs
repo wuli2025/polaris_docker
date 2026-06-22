@@ -754,22 +754,24 @@ pub fn optimize_vectors() -> Result<OptimizeSummary, String> {
     let sample_n = IVF_SAMPLE.min(n as usize);
     let stride = (n as usize / sample_n.max(1)).max(1);
     let sample: Vec<Vec<u8>> = {
+        // 内存治理:旧实现 SELECT 整列后在 Rust 侧 `i % stride` 抽样 —— 虽然 `out` 有上限,
+        // 但 query_map 闭包对**每一行**都 `get::<Vec<u8>>` 把 bits BLOB 拷进堆再丢弃,
+        // 千万级 chunk 下白白 materialize 整列(每条 ~128B,合计 ~GB 的瞬时分配 + 透 mmap
+        // 读穿整列)。把等距抽样下推到 SQL:`id % stride = 0` 让引擎只为命中行取 BLOB,
+        // BLOB 读取量从「全表」降到「sample_n 条」。stride=1(小库)时恒真,等价取全部 ≤ LIMIT。
         let mut stmt = conn
-            .prepare("SELECT bits FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL")
+            .prepare(
+                "SELECT bits FROM chunks WHERE model=?1 AND dim=?2 AND bits IS NOT NULL \
+                 AND (id % ?3)=0 LIMIT ?4",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![model, dim], |r| r.get::<_, Vec<u8>>(0))
+            .query_map(
+                rusqlite::params![model, dim, stride as i64, sample_n as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
             .map_err(|e| e.to_string())?;
-        let mut out = Vec::with_capacity(sample_n);
-        for (i, b) in rows.flatten().enumerate() {
-            if i % stride == 0 {
-                out.push(b);
-                if out.len() >= sample_n {
-                    break;
-                }
-            }
-        }
-        out
+        rows.flatten().collect()
     };
     let centroids = train_binary_centroids(&sample, k, IVF_ITERS);
     if centroids.is_empty() {
@@ -905,9 +907,27 @@ pub fn fable_index_start(app: AppHandle, max_chunks: Option<usize>) -> Result<()
     Ok(())
 }
 
-/// 重建向量 IVF 倒排单元(20TB 级 ANN 的「优化/建索引」步)。同步返回汇总;
+/// 重建向量 IVF 倒排单元(20TB 级 ANN 的「优化/建索引」步)。返回汇总;
 /// 与构建/盘点共用 INDEXING 闸(进行中则拒绝),用 RAII 守卫确保 panic 也释放闸。
-#[cfg_attr(feature = "desktop", tauri::command)]
+///
+/// 桌面端一律 async + spawn_blocking:optimize_vectors() 要跑二值 k-means(最多 8 轮、
+/// 采样上 10 万行)再全表分批 UPDATE chunks.cell,中库(5000 万 chunk)可达 5~15s。直接当
+/// 同步 Tauri 命令会在 WebView 主线程上跑 → 阻塞 >5s 被 Windows 判「无响应」强杀(AppHangB1)。
+/// server flavor 无 UI 主线程、dispatch 本就在 spawn_blocking 中,保持同步直调即可。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn fable_index_optimize() -> Result<OptimizeSummary, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(_guard) = FlagGuard::acquire(&INDEXING) else {
+            return Err("索引任务进行中,稍后再优化".into());
+        };
+        CANCEL.store(false, Ordering::SeqCst);
+        optimize_vectors()
+    })
+    .await
+    .map_err(|e| format!("任务调度失败: {e}"))?
+}
+#[cfg(not(feature = "desktop"))]
 pub fn fable_index_optimize() -> Result<OptimizeSummary, String> {
     let Some(_guard) = FlagGuard::acquire(&INDEXING) else {
         return Err("索引任务进行中,稍后再优化".into());

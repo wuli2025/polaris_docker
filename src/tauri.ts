@@ -542,6 +542,8 @@ export interface FileOverview {
 /** 智能向导收尾的一条建议:标题 + 注入对话框的用户第一人称提示词 */
 export interface SuggestedFlow {
   title: string;
+  /** 「为什么是你」:点名依据(他的哪个主题/文件夹/多少个文件触发了这条建议),让任务像是为他量身定的 */
+  why?: string;
   prompt: string;
 }
 export interface FileCard {
@@ -749,6 +751,9 @@ export interface ChatSendArgs {
   batchSize?: number;
   /** 智能体模式："auto-match"(默认智能匹配) | "expert-team" | "single-expert" | "single-agent"。 */
   agentMode?: string;
+  /** 工作模式："office"(默认·办公·精简工具面) | "coding"(编程·全套工具)。
+   *  办公模式弃用开发向冗余工具(Task/NotebookEdit/Glob/Grep)并跳过可运行项目约定 → 更快更聚焦。 */
+  workMode?: string;
 }
 
 export interface ChatStreamEvent {

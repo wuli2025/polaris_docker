@@ -79,6 +79,23 @@ fn allowed_tools_for(perm: &str, with_task: bool) -> String {
     tools
 }
 
+/// 快速模式弃用的冗余工具(传给 `--disallowedTools`)。
+/// 快速模式 = 快速调用知识库 + 快速回答, 工具面要小: 砍掉多智能体扇出(Task, 启动慢且贵)、
+/// Jupyter(NotebookEdit, 纯数据科学)。Read/Write/Edit/Glob/Grep/Bash/Web 都保留 —— 仍能查库、
+/// 看文件、做轻量产出; 检索提速靠 `search_convention` + KB 根 `.ignore`(ripgrep 缩范围), 不靠砍
+/// Glob/Grep。disallowedTools 优先级高于 allowedTools, 即便 acceptEdits 也拦得住。
+/// 返回 None = 工作模式(纯 Claude Code, 放开全套工具)。with_task(动态编排)为真时不禁 Task。
+fn disallowed_tools_for(work_full: bool, with_task: bool) -> Option<String> {
+    if work_full {
+        return None;
+    }
+    let mut tools = vec!["NotebookEdit"];
+    if !with_task {
+        tools.push("Task");
+    }
+    Some(tools.join(","))
+}
+
 /// 创作型 skill: 任务 = 做成品(PPT/网页/视频/图),不是知识问答。命中任一(显式点选或
 /// 意图自动激活)即进入「创作模式」: 豁免 KB-First 强制取证 + Codex 扁平回复风格
 /// (两者的「先查库再作答」「压缩字数」倾向会稀释创作注意力、把成品文案写干瘪 ——
@@ -151,6 +168,15 @@ pub struct ChatSendArgs {
     /// 专家团模式下自动检测任务复杂度，必要时注入多专家召集信息。
     #[serde(default)]
     pub agent_mode: Option<String>,
+    /// 工作模式: "fast"(默认·快速) | "work"(工作·纯 Claude Code)。
+    /// - 快速模式: 强制快速调用知识库(快档召回, 跳重排 ~1.8s→~0.25s)+ 快速回答; 工具精简
+    ///   (弃 Task/NotebookEdit)、提示词瘦身(跳「可运行项目」「长任务」约定)、上下文预算调小、
+    ///   权限默认自动批准 —— 一切为「秒级查库 + 秒级回答」。
+    /// - 工作模式: 纯 Claude Code —— 放开全套工具、注入全部约定(可运行项目/长任务)、KB 召回走
+    ///   全质量 hybrid(带重排), 面向写代码/跑项目/产出复杂成品。
+    /// None 视为 fast —— 不带此字段的旧调用方(如分批长任务)默认走快速预设。
+    #[serde(default)]
+    pub work_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +270,14 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
         .iter()
         .any(|id| CREATIVE_SKILL_IDS.contains(&id.as_str()));
 
+    // 工作模式: 仅 "work" 进工作模式(纯 Claude Code), 其余(含 None)一律快速模式。决定:
+    // ①禁用哪些冗余工具 ②注入哪些约定(可运行项目/长任务仅工作模式)③KB 召回快档 vs 全质量
+    // ④上下文预算 ⑤权限/模型默认(前端)。
+    let work_full = args.work_mode.as_deref() == Some("work");
+    // 快速模式强制调用知识库(这是该模式的本职「快速调用知识库」)——即便前端没开 KB 开关;
+    // 工作模式(纯 Claude Code)则尊重用户的 use_kb 开关, 默认不注入 KB。
+    let kb_recall = (args.use_kb || !work_full) && !creative;
+
     // 0. KB 顶层指令 (写死, 优先级最高)
     // 普通对话 = KB-First 全量: 知识库是真相源, 必须先 4 步取证再作答、脚注溯源。
     // 创作模式 = 精简版: 只保留「数据/指令隔离」安全条款(提示词注入防线, 不随模式豁免),
@@ -277,19 +311,20 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
     final_prompt.push_str("\n\n---\n\n");
 
     // 2.1 可运行项目约定 (板块⑮) — 要跑起来的应用(尤其前后端)打包成带运行清单的项目文件夹,
-    //     用户在右侧点「运行」即一键启动前后端并内嵌预览, 不必再拖文件、再说「打开项目」。
-    //     创作模式跳过: 成品就是单文件(deck.html/.pptx/站点/图), 项目清单指令只会添乱。
-    if !creative {
+    //     用户在右侧点「运行」即一键启动前后端并内嵌预览。创作模式跳过(成品是单文件);
+    //     **仅工作模式注入**: 快速模式只为「查库+答」, 不打包工程, 注入只会膨胀 prompt。
+    if !creative && work_full {
         final_prompt.push_str(&project_convention(&art_dir));
         final_prompt.push_str("\n\n---\n\n");
     }
 
-    // 2.2 长任务铁律 (always-on): 回合结束 = claude 退出 = 其整棵子进程树被回收(kill_tree,
-    //     防孤儿的安全设计)。模型若把出片/上传/下载等耗时任务放后台然后结束回复, 任务必死
-    //     且无人知晓(实证: 课件视频两次出片均死于回复落库的同一秒)。注入「自动识别长任务 +
-    //     同步跑完 + 分段 + 幂等续跑 + 进度可见」五条铁律, 从行为层面根治。
-    final_prompt.push_str(longtask_convention());
-    final_prompt.push_str("\n\n---\n\n");
+    // 2.2 长任务铁律: 回合结束 = claude 退出 = 其整棵子进程树被回收(防孤儿)。模型若把出片/上传/
+    //     下载等耗时任务放后台再结束回复, 任务必死且无人知晓。**工作模式 + 创作模式注入**(那里
+    //     才有长产出); 快速模式只做秒级问答、无长任务, 跳过这段 → 提示词更短、首 token 更快。
+    if work_full || creative {
+        final_prompt.push_str(longtask_convention());
+        final_prompt.push_str("\n\n---\n\n");
+    }
 
     // 2.21 脚本执行公约 (always-on): 模型爱写临时脚本干活, 但用户机器上的 `python`/`python3`
     //      极可能是 Microsoft Store 的 0 字节占位符(实证截图: python3.exe 是占位符 → 做 PPT
@@ -299,10 +334,18 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
     final_prompt.push_str(script_convention());
     final_prompt.push_str("\n\n---\n\n");
 
-    // 2.22 大文件下载公约 (always-on): >200MB 大文件禁单线 wget, 必须 aria2c 多连接分段并行
-    //      —— 跨境链路按连接限速, 单线几百 KB/s, 16 连接可叠到十几 MB/s(用户的「分布式下载」直觉)。
-    //      详细跨平台配方在 turbo-download 技能, 下载意图命中时自动注入(见 skills::detect_download_intent)。
-    final_prompt.push_str(download_convention());
+    // 2.22 大文件下载公约 (按需注入): >200MB 大文件禁单线 wget, 必须 aria2c 多连接分段并行。
+    //      此前每轮都注入, 但绝大多数对话(尤其办公)从不下大文件 —— 改成**仅下载意图命中才注入**,
+    //      办公/日常提示词随之瘦身, 首 token 更快、也少一段无关上下文诱导模型跑题。
+    if skills::detect_download_intent(&args.prompt) {
+        final_prompt.push_str(download_convention());
+        final_prompt.push_str("\n\n---\n\n");
+    }
+
+    // 2.23 高效检索公约 (always-on): 大库上 grep/glob 全树盲扫会慢 —— 注入「先缩范围(path+
+    //      glob/type 过滤)+ 结果封顶 + 用 rg 不用 GNU grep」铁律, 配合 KB 根的 .ignore 让
+    //      Grep 工具(底层 ripgrep)默认就跳重目录, 检索默认快。
+    final_prompt.push_str(search_convention());
     final_prompt.push_str("\n\n---\n\n");
 
     // 2.15 分批长任务: 超长生成(60 页 PPT 这类)拆成有界批次, 每轮只建 ≤K 个 pending 单元,
@@ -409,11 +452,17 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
         }
     }
 
-    // 3.2 双库强制召回(开知识库 + 非创作模式): 后端先替模型查两个库(妈妈库 wiki 权威 +
-    //     外库 raw/output 混检 40→重排取优), 命中片段直接喂进上下文 —— 不再靠模型自觉去检索,
-    //     从根上解决「像只认妈妈库」。创作模式跳过(素材已在 prompt 里, 强制召回只会稀释)。
-    if args.use_kb && !creative {
-        let recall = forced_recall_block(&args.prompt, FORCED_RECALL_BUDGET);
+    // 3.2 双库强制召回: 后端先替模型查两个库(妈妈库 wiki 权威 + 外库 raw/output 混检), 命中
+    //     片段直接喂进上下文。快速模式 kb_recall 恒真(本职就是「快速调用知识库」); 工作模式仅
+    //     用户开了 KB 才查。创作模式跳过(素材已在 prompt 里)。
+    if kb_recall {
+        // 快速模式提速核心: 召回走「快档」—— 双车道(grep + 向量)融合但**跳过重排 API**, 把这步
+        // 从网络主导的 ~1.8s 砍到 ~250ms(重排是 hybrid 唯一的慢源, 见 retrieve::search 的
+        // mode=="hybrid" 闸)。预算也调小, 片段少 → 提示词更短、首 token 更快。
+        // 工作模式(纯 Claude Code, 手动开 KB)走全质量 hybrid(带重排)。
+        let fast_recall = !work_full;
+        let recall_budget = if work_full { FORCED_RECALL_BUDGET } else { FAST_RECALL_BUDGET };
+        let recall = forced_recall_block(&args.prompt, recall_budget, fast_recall);
         if !recall.is_empty() {
             final_prompt.push_str(&recall);
             final_prompt.push_str("\n\n---\n\n");
@@ -445,7 +494,10 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
     // 3.6 对话历史: 本对话最近若干轮原文(预算封顶), 让同一对话能接上文 ——
     //     此前每轮都是无状态新进程, claude 看不到上一句, 这里补上。
     if let Some(cid) = args.conversation_id.as_deref() {
-        let hist = history_block(cid, HISTORY_CTX_BUDGET);
+        // 快速模式历史预算调小: 秒级问答用不到大段历史/代码上下文, 少喂 → 输入 token 少 → 更快;
+        // 工作模式要更全的上下文(多文件/多轮重构), 保留较大预算。
+        let hist_budget = if work_full { HISTORY_CTX_BUDGET } else { FAST_HISTORY_BUDGET };
+        let hist = history_block(cid, hist_budget);
         if !hist.is_empty() {
             final_prompt.push_str(&hist);
             final_prompt.push_str("\n\n---\n\n");
@@ -473,8 +525,10 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
         },
     );
 
-    // 默认走宿主机执行（沙箱可选，但默认关闭）；动态编排时放行 Task 子代理
-    let mut child = spawn_on_host(&final_prompt, perm, &art_dir, args.dynamic_workflow)?;
+    // 默认走宿主机执行（沙箱可选，但默认关闭）；动态编排时放行 Task 子代理；
+    // work_full 决定快速模式是否禁用冗余工具(disallowedTools)、是否传按模式的 --model。
+    let mut child =
+        spawn_on_host(&final_prompt, perm, &art_dir, args.dynamic_workflow, work_full)?;
 
     // prompt 经 stdin 喂给 claude (而非命令行参数): 大 prompt 不会撞 Windows 命令行
     // 长度上限, 也不会因 prompt 以 `-` 开头被当成 flag。spawn 后立刻写 + drop, claude 读到 EOF 就开始处理。
@@ -513,7 +567,11 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
     let watchdog_timeout = std::env::var("POLARIS_CHAT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
+        // 桌面此前默认 0=不启用 → 挂死的 claude 子进程(及其 cwd=/ 子代理)永不超时,
+        // 一年长跑里偶发网络故障累积出几十个吊死进程+阻塞线程,耗尽句柄/FD。改为默认常开:
+        // 桌面 600s(留足长任务空间;判据是「连续空闲」非总时长,不误杀几分钟的 ffmpeg)、容器 180s。
+        // 仍可经 POLARIS_CHAT_TIMEOUT_SECS 覆写(设 0 显式关闭)。
+        .unwrap_or(if cfg!(feature = "desktop") { 600 } else { 180 });
     if watchdog_timeout > 0 {
         let wd_req = req_id.clone();
         let wd_activity = last_activity.clone();
@@ -649,8 +707,29 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
         // 等子进程退出, 检查 exit code (不能持锁 wait, 否则 chat_cancel 死锁)
         let child_opt = CHILDREN.lock().remove(&req_out);
         let exit_msg: Option<String> = if let Some(mut child) = child_opt {
-            match child.wait() {
-                Ok(status) => {
+            // 有界等待: 卡死的孙进程 (占着管道不退) 绝不能把这个读线程永久钉住,
+            // 否则一年里每次卡死都泄漏一个 ~2MB 栈的线程 → 终将 OOM。
+            // 非阻塞 try_wait 轮询 + 硬死线, 到点强杀回收 (关管道) 再走异常退出路径。
+            // 注意: 这里只补一道兜底, stdout/stderr 的读取与 emit、看门狗、事件载荷全不变。
+            let wait_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(900);
+            let waited: std::io::Result<Option<std::process::ExitStatus>> = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(Some(status)),
+                    Ok(None) => {
+                        if std::time::Instant::now() >= wait_deadline {
+                            let _ = child.kill(); // 强杀回收: 关掉管道, 不让本线程泄漏
+                            let _ = child.wait(); // 杀后做一次简短最终 reap
+                            // 拿不到真实状态就当超时异常 (走下方 None 分支 → 同款错误事件)
+                            break Ok(child.try_wait().ok().flatten());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            match waited {
+                Ok(Some(status)) => {
                     if !status.success() {
                         let stderr_txt = stderr_buf_for_done.lock().clone();
                         Some(format!(
@@ -665,6 +744,17 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
                     } else {
                         None
                     }
+                }
+                Ok(None) => {
+                    let stderr_txt = stderr_buf_for_done.lock().clone();
+                    Some(format!(
+                        "claude 进程等待超时, 已强制回收\n--- stderr ---\n{}",
+                        if stderr_txt.is_empty() {
+                            "(stderr 为空)".to_string()
+                        } else {
+                            stderr_txt
+                        }
+                    ))
                 }
                 Err(e) => Some(format!("等待 claude 进程失败: {}", e)),
             }
@@ -988,13 +1078,22 @@ fn spawn_in_sandbox(prompt: &str, perm: &str) -> Result<Child, String> {
     Ok(child)
 }
 
-fn spawn_on_host(prompt: &str, perm: &str, art_dir: &Path, with_task: bool) -> Result<Child, String> {
+fn spawn_on_host(
+    prompt: &str,
+    perm: &str,
+    art_dir: &Path,
+    with_task: bool,
+    work_full: bool,
+) -> Result<Child, String> {
     let perm_flag = format!("--permission-mode={}", perm);
     // cwd = polaris-app 根 (env!("CARGO_MANIFEST_DIR") 的父级),
     // 这样 claude CLI 自动信任整棵 polaris-app/ 子树, 包括 PolarisKB/
     let cwd = claude_md::project_root().unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
+
+    // KB 根写一份 .ignore(幂等), 让 ripgrep(Grep 工具/rg)自动跳 output/二进制/大素材 → 检索更快
+    ensure_kb_search_ignore();
 
     // 如果 KB root 不在 cwd 子树下(用户可能把 KB 移到别处), 用 --add-dir 显式放行
     let kb_root = std::path::PathBuf::from(kb::kb_root());
@@ -1020,6 +1119,19 @@ fn spawn_on_host(prompt: &str, perm: &str, art_dir: &Path, with_task: bool) -> R
     // 否则 headless 下连 `python xxx.py` 都被拒, .pptx/.xlsx 这类成品根本产不出来。
     args.push("--allowedTools".into());
     args.push(allowed_tools_for(perm, with_task));
+    // 快速模式: 弃用冗余工具(Task/NotebookEdit)。disallowedTools 优先级高于 allowedTools。
+    if let Some(disallowed) = disallowed_tools_for(work_full, with_task) {
+        args.push("--disallowedTools".into());
+        args.push(disallowed);
+    }
+    // 模型档跟随模式(可选, 默认不启用): 多模型供应商上可让快速模式走快档(便宜快)、工作模式走强档。
+    // 仅当对应环境变量显式设了 model id 才传 --model —— 单模型网关/未配置时**保持原样**(供应商
+    // 钉死的模型), 绝不因传错 model 名把请求打挂。POLARIS_WORK_MODEL / POLARIS_FAST_MODEL。
+    let model_env = if work_full { "POLARIS_WORK_MODEL" } else { "POLARIS_FAST_MODEL" };
+    if let Some(m) = std::env::var(model_env).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        args.push("--model".into());
+        args.push(m);
+    }
     args.push(perm_flag);
     // ⚠️ prompt 不再塞 argv 末尾 —— 走 stdin。
     // Windows CreateProcessW 的 lpCommandLine 上限 32767 字符, 你 KB 全文 + 多轮对话历史
@@ -1185,8 +1297,12 @@ fn dir_snapshot(dir: &Path) -> HashMap<PathBuf, SystemTime> {
 // 两块都从已持久化的消息派生(产物路径早已存在 assistant 正文的 ARTIFACT marker 里), 零新存储。
 
 /// 单块历史预算(字符): 超了就丢最旧的几轮。stdin 喂 prompt, 不受命令行 32k 限制,
-/// 但仍要控总 context, 故封顶。
+/// 但仍要控总 context, 故封顶。编程模式用这个(要更全的多文件/多轮上下文)。
 const HISTORY_CTX_BUDGET: usize = 8000;
+/// 快速模式历史预算: 秒级问答用不到大段历史, 调小 → 输入更少 → 更快。
+const FAST_HISTORY_BUDGET: usize = 5000;
+/// 快速模式强制召回预算: 比工作档小, 片段少一点 → 提示词更短、首 token 更快。
+const FAST_RECALL_BUDGET: usize = 2400;
 /// 单条消息正文上限(字符): 太长的回答只留开头, 避免一条吃掉整个预算。
 const HISTORY_MSG_CAP: usize = 1500;
 /// 跨对话产物地图预算(字符)。
@@ -1437,11 +1553,19 @@ fn kb_overview_block() -> String {
 /// - **外面整个库(RAG)**: 优先 fable 混检全盘 40 候选 → 重排打分取最优;没盘点则退化为
 ///   `kb_search` 的非 wiki(raw/output)命中 —— 保证「外库」无论如何都被查到。
 /// `budget` 为本块字符预算上限(token 成本可控);两路命中均按 path 去重。
-fn forced_recall_block(query: &str, budget: usize) -> String {
+/// `fast=true`(办公模式): 召回走快档 —— 仍跑 grep + 向量双车道融合, 但**跳过重排 API**。
+/// 重排是 hybrid 唯一的网络慢源(~0.6~1.8s); 跳过后召回从「网络主导」回到「本地+一次查询嵌入」
+/// 量级(~250ms, 查询嵌入还有 LRU 缓存)。质量仍由双车道 RRF 融合保证, 只是不做最后那层精排。
+/// 实现: retrieve::search 仅在 `mode=="hybrid"` 时重排, 故传非 hybrid 的多车道 mode 即跳过重排
+/// (见 retrieve.rs 的重排闸注释)。`fast=false`(编程手动开 KB): 全质量 hybrid(带重排)。
+fn forced_recall_block(query: &str, budget: usize, fast: bool) -> String {
     let q = query.trim();
     if q.chars().count() < 2 {
         return String::new();
     }
+    // 快档用的多车道无重排 mode: grep+向量都跑(want_grep/want_vec 只在 mode 等于另一条腿名时关),
+    // 但因 != "hybrid" 不触发重排。
+    let rag_mode = if fast { "grep_vec" } else { "hybrid" };
     // 一次 kb_search 取较多, 再按路拆分(wiki 权威 / 非 wiki 资料)。
     let kb_hits = crate::kb::kb_search(q.to_string(), Some(40));
     let mut wiki: Vec<(String, String, String)> = Vec::new(); // (title, path, snippet)
@@ -1460,7 +1584,7 @@ fn forced_recall_block(query: &str, budget: usize) -> String {
     // 非 wiki(raw/output)关键词命中兜底, 保证「外库」始终被查到且零延迟代价。
     let fable_ready = matches!(crate::fable::status(), Ok(s) if s.chunks_total > 0 || s.lex_files > 0);
     let rag: Vec<(String, String, String)> = if fable_ready {
-        match crate::fable::retrieve::search(q, 40, "hybrid", Some("!wiki")) {
+        match crate::fable::retrieve::search(q, 40, rag_mode, Some("!wiki")) {
             Ok(r) if !r.hits.is_empty() => r
                 .hits
                 .into_iter()
@@ -1767,6 +1891,73 @@ fn download_convention() -> &'static str {
 都装不了再回退 `curl -r` 分段并行, 最次才单线并明确告诉用户慢。\n\
 5. **断点续传 + 进度可见**: 中断重跑不从头来; 每段/每 5% 输出一行进度(配合长任务铁律防误判挂死)。\n\n\
 完整跨平台配方见 **turbo-download** 技能(下载意图会自动注入)。"
+}
+
+/// 高效检索公约 (Polaris, always-on) —— 让 grep/glob 在大库上也飞快。
+///
+/// 背景: 用户的知识库可能有几十万文件。Claude Code 的 `Grep` 工具底层**就是 ripgrep**
+/// (已是最快的 grep, 比 GNU grep 快数倍、自动跳二进制/.gitignore/.ignore), 所以「换成
+/// shell grep」反而更慢 —— 真正决定快慢的是**有没有限定范围**: 全树盲扫几十万文件再快也慢,
+/// 限定到一个子目录 + 文件类型 + 结果上限就秒回。本公约把「先缩范围再搜」写进每轮指令;
+/// 配合 `ensure_kb_search_ignore` 在 KB 根写的 `.ignore`(ripgrep 自动跳 output/二进制/大素材),
+/// 两手让检索默认就快, 不必模型每次都记得调参。
+fn search_convention() -> &'static str {
+    "## 高效检索公约 (Polaris) —— 必须遵守\n\n\
+查找文件 / 搜索内容时, 知识库可能有**几十万文件**, 全树盲扫会很慢。`Grep` 工具底层**就是 \
+ripgrep**(已是最快的 grep), 所以**不要**改用 shell 的 `grep`(GNU grep 更慢); 要快靠的是**缩范围**:\n\
+1. **永远限定范围, 不要全库盲搜**: `Grep` / `Glob` 调用务必带 `path`(锁到最可能的子目录), \
+能带就再加 `glob`(如 `*.md`/`*.{ts,vue}`) 或 `type`(如 `md`/`rust`) 过滤文件类型。\n\
+2. **结果封顶**: 只为定位时用 `head_limit`(如 20~50)/ `output_mode:\"files_with_matches\"` 先拿命中文件名, \
+确认后再精读, 别一次把成百上千行匹配灌进上下文。\n\
+3. **先窄后宽**: 先在最相关目录搜; 真没命中再逐步放宽范围, 而不是开局就扫根目录。\n\
+4. **要在 shell 里搜也用 `rg`(ripgrep)而非 `grep`**: 可加 `-g '*.md'` 限类型、`-m 20` 限每文件命中数、\
+`--max-filesize 5M` 跳大文件、`-l` 只列文件名; 多核默认已开, 不用手动调线程。\n\
+5. **知识库语义检索别用 grep**: grep 只能逐字匹配; 要按「意思」找内容, 优先用对话已注入的知识库召回结果 \
+(后端已替你检索好), 或应用内置的知识库搜索, grep 留给「找确切关键词/文件名」。"
+}
+
+/// 在知识库根目录幂等写一份 `.ignore`, 让 ripgrep(Grep 工具 + shell `rg`)自动跳过
+/// output/conversations/.git/二进制/大素材等「搜了也没意义」的目录与文件 —— 不必模型每次
+/// 记得加 `--glob !...`, 大库检索默认就快。
+///
+/// 用 `.ignore` 而非 `.gitignore`: ripgrep **无论是否 git 仓库**都读 `.ignore`/`.rgignore`,
+/// 而 `.gitignore` 只在 git 仓库内生效 —— 用户的 KB 根多半不是 git 仓库, 故必须用 `.ignore`。
+/// 仅在文件缺失时创建(不覆盖用户自定义), KB 根不存在 / 不可写则静默跳过, 绝不致命。
+fn ensure_kb_search_ignore() {
+    let root = kb::kb_root();
+    if root.is_empty() {
+        return;
+    }
+    let root = std::path::PathBuf::from(root);
+    if !root.is_dir() {
+        return;
+    }
+    let ignore = root.join(".ignore");
+    if ignore.exists() {
+        return; // 已存在(用户可能改过)→ 不动
+    }
+    let body = "# Polaris 自动生成 —— 让 ripgrep(Grep 工具/rg)跳过搜了也没意义的目录与文件, 大库检索更快。\n\
+# 想恢复全扫: 删掉本文件, 或搜索时显式 --no-ignore。\n\
+output/\n\
+conversations/\n\
+.polaris/\n\
+.git/\n\
+node_modules/\n\
+# 二进制 / 大素材(grep 本就跳二进制, 这里连同显式列出, 连 glob 枚举也省)\n\
+*.zip\n\
+*.tar\n\
+*.gz\n\
+*.7z\n\
+*.mp4\n\
+*.mov\n\
+*.mkv\n\
+*.png\n\
+*.jpg\n\
+*.jpeg\n\
+*.pdf\n\
+*.sqlite\n\
+*.db\n";
+    let _ = std::fs::write(&ignore, body);
 }
 
 /// 粗估文本 token 数(无需 tokenizer 依赖)。ASCII 约 4 字符/token; 非 ASCII(中日韩等)

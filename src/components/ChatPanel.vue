@@ -44,6 +44,8 @@ import {
   Flag,
   FolderTree,
   RefreshCw,
+  Zap,
+  Code2,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import {
@@ -193,6 +195,10 @@ const renderTurns = computed<Turn[]>(() => {
   const out: Turn[] = [];
   let cur: Turn | undefined;
   let k = 0;
+  // 当前回合已收录产物的去重集:产物只往「当前回合」追加,故单个随回合重置的 Set 即可。
+  // 把原先 `artifacts.includes(a)` 的 O(N) 线性查改成 O(1) 命中,整轮去重从 O(N²) 降到 O(N) ——
+  // 长对话 + 多产物时不再越聊越顿。
+  let curArtSet = new Set<string>();
   const startTurn = (user?: Bubble): Turn => {
     const turn: Turn = {
       key: k++,
@@ -206,6 +212,7 @@ const renderTurns = computed<Turn[]>(() => {
     };
     out.push(turn);
     cur = turn;
+    curArtSet = new Set<string>();
     return turn;
   };
   for (const b of bubbles.value) {
@@ -238,7 +245,11 @@ const renderTurns = computed<Turn[]>(() => {
         t.hasAssistant = true;
       }
       if (b.artifacts) {
-        for (const a of b.artifacts) if (!t.artifacts.includes(a)) t.artifacts.push(a);
+        for (const a of b.artifacts)
+          if (!curArtSet.has(a)) {
+            curArtSet.add(a);
+            t.artifacts.push(a);
+          }
       }
     }
   }
@@ -302,6 +313,7 @@ async function regenerate(t: Turn) {
     skillIds: Array.from(skillsStore.enabledSkills),
     useKb: kbMode.value || undefined,
     agentMode: agentMode.value,
+    workMode: workMode.value,
   });
 }
 function editTurn(t: Turn) {
@@ -560,6 +572,7 @@ async function runBriefing(s: Suggestion) {
     skillIds: Array.from(skillsStore.enabledSkills),
     useKb: kbMode.value || undefined,
     agentMode: agentMode.value,
+    workMode: workMode.value,
   });
 }
 // ─────────── 空对话页的「下一步工作流」推荐(仿豆包的建议气泡)───────────
@@ -634,12 +647,16 @@ onMounted(async () => {
   // 做梦/晨报生成完 → 刷新建议,并主动弹出让用户第一时间看到新内容。
   // 桌面走 Tauri 事件、Docker/Web 走 WS,两条路径的 listen 包装都直接回传 payload 本体
   // (见 tauri.ts),所以读 p.kind;旧代码读 p.payload.kind 多包一层、永远取不到。
-  listen("echo:dream", async (p: any) => {
-    if ((p?.kind ?? p?.payload?.kind) === "done") {
-      await loadBriefings();
-      if (briefings.value.length) briefOpen.value = true;
-    }
-  });
+  // 捕获 unlisten 并纳入 voiceUnlisteners(onBeforeUnmount 统一回收):此前未解绑,
+  // KeepAlive 反复挂载会逐月累积上千个 echo:dream 监听器及其闭包 → 内存爬升。
+  voiceUnlisteners.push(
+    await listen("echo:dream", async (p: any) => {
+      if ((p?.kind ?? p?.payload?.kind) === "done") {
+        await loadBriefings();
+        if (briefings.value.length) briefOpen.value = true;
+      }
+    })
+  );
 });
 
 // ─────────── 分批长任务（Batch Build）模式开关 ───────────
@@ -907,6 +924,48 @@ const activeModeSummary = computed(() => {
   if (batchMode.value) on.push("分批");
   return on.join(" · ");
 });
+
+// ─────────── 工作模式: 快速 / 工作 ───────────
+// 快速模式(默认): 「快速调用知识库 + 快速回答」。强制走知识库召回的「快档」(双车道融合但跳过
+//   重排 API, ~1.8s→~0.25s)+ 工具精简(弃 Task/NotebookEdit)+ 提示词瘦身(跳「可运行项目」「长
+//   任务」约定)+ 上下文预算调小 + 默认自动批准 —— 一切为秒级查库、秒级回答。
+// 工作模式: 纯 Claude Code —— 放开全套工具 + 注入全部约定(可运行项目/长任务)+ 全质量召回(带
+//   重排)+ 手动授权, 面向写代码 / 跑项目 / 产出复杂成品。随设备记忆(localStorage), 默认快速。
+type WorkMode = "fast" | "work";
+const workMode = ref<WorkMode>(
+  localStorage.getItem("polaris.workMode") === "work" ? "work" : "fast"
+);
+const showWorkModePanel = ref(false);
+watch(workMode, (m) => localStorage.setItem("polaris.workMode", m));
+const workModeLabel = computed(() =>
+  workMode.value === "work" ? "工作模式" : "快速模式"
+);
+const workModeOptions: { mode: WorkMode; name: string; desc: string }[] = [
+  {
+    mode: "fast",
+    name: "快速模式",
+    desc: "快速查库 + 快速回答：召回走快档(跳重排)、工具精简、提示词瘦身、自动批准；日常问答/找资料/速览首选",
+  },
+  {
+    mode: "work",
+    name: "工作模式",
+    desc: "纯 Claude Code：全套工具 + 全部约定 + 全质量召回 + 手动授权；写代码·跑项目·产复杂成品时切到这",
+  },
+];
+// 切换工作模式即套用该模式的聪明默认(用户随后仍可手动覆盖):
+//   快速 = 自动批准编辑(少弹窗) + 默认开知识库(本模式本职就是快速调用知识库);
+//   工作 = 手动授权(纯 Claude Code, 改东西逐步确认) + 默认关知识库(要查再开)。
+function applyModeDefaults(m: WorkMode) {
+  permMode.value = m === "work" ? "manual" : "auto_current";
+  kbMode.value = m === "fast";
+}
+function pickWorkMode(m: WorkMode) {
+  workMode.value = m;
+  applyModeDefaults(m);
+  showWorkModePanel.value = false;
+}
+// 初始按记忆的模式套一次默认(权限/知识库本就每次挂载重置, 这里只是按模式给更合适的初值)
+applyModeDefaults(workMode.value);
 
 // ─────────── 工作流包「使用」→ 填入输入框 ───────────
 // 右侧「工作流包」点「使用」时，store 发来拼装好的提示词：已有内容则追加，否则填入；
@@ -1239,6 +1298,7 @@ async function send() {
     dynamicWorkflow: orchestrateMode.value || undefined,
     useKb: kbMode.value || undefined,
     agentMode: agentMode.value,
+    workMode: workMode.value,
   });
 }
 
@@ -1854,6 +1914,35 @@ async function deleteCurrentConv() {
         </div>
       </div>
 
+      <!-- 「模式」切换器：快速 / 工作 两套预设 -->
+      <div v-if="showWorkModePanel" class="mode-panel work-mode-panel">
+        <div class="skill-panel-head">
+          <span class="skill-panel-title">模式</span>
+          <button class="skill-panel-close" @click="showWorkModePanel = false">
+            <X :size="14" :stroke-width="2" />
+          </button>
+        </div>
+        <div class="mode-list">
+          <button
+            v-for="opt in workModeOptions"
+            :key="opt.mode"
+            class="mode-row exclusive"
+            :class="{ on: workMode === opt.mode }"
+            @click="pickWorkMode(opt.mode)"
+          >
+            <span class="mr-ic">
+              <Zap v-if="opt.mode === 'fast'" :size="17" :stroke-width="1.8" />
+              <Code2 v-else :size="17" :stroke-width="1.8" />
+            </span>
+            <span class="mr-tx">
+              <span class="mr-nm">{{ opt.name }}<span v-if="opt.mode === 'fast'" class="mr-default">默认</span></span>
+              <span class="mr-ds">{{ opt.desc }}</span>
+            </span>
+            <span class="mr-radio" :class="{ on: workMode === opt.mode }"></span>
+          </button>
+        </div>
+      </div>
+
       <!-- 「智能体」切换器：基础模式 + 召唤专家（单专家 / 专家团合并，仿 WorkBuddy） -->
       <div v-if="showAgentPanel" class="mode-panel agent-panel">
         <div class="skill-panel-head">
@@ -1982,6 +2071,23 @@ async function deleteCurrentConv() {
         ></textarea>
         <div class="toolbar">
           <div class="toolbar-left">
+            <button
+              class="toolbar-btn work-mode-btn"
+              :class="{ active: showWorkModePanel, work: workMode === 'work' }"
+              @click="showWorkModePanel = !showWorkModePanel"
+            >
+              <Zap v-if="workMode === 'fast'" :size="14" :stroke-width="1.8" />
+              <Code2 v-else :size="14" :stroke-width="1.8" />
+              <span>{{ workModeLabel }}</span>
+              <div class="btn-tooltip">
+                <div class="btn-tooltip-inner">
+                  快速 / 工作 两套预设
+                  <div class="btn-tooltip-sub">
+                    快速模式：强制快速查库 + 快速回答（精简工具、跳重排、瘦身提示词、自动批准）；工作模式：纯 Claude Code 全套
+                  </div>
+                </div>
+              </div>
+            </button>
             <button
               class="toolbar-btn"
               :class="{ active: showSkillPanel }"
@@ -3530,6 +3636,14 @@ html[data-theme="aurora-dark"] .bm-card:hover {
 /* 「智能体」互斥切换器 */
 .agent-panel { left: auto; right: 8px; width: 320px; }
 .mode-row.exclusive { align-items: center; }
+/* 工作模式时给模式键一抹冷色, 与快速(暖金/默认)区分, 一眼可辨当前预设 */
+.work-mode-btn.work:not(.active) {
+  color: #2563eb;
+}
+html[data-theme="dark"] .work-mode-btn.work:not(.active),
+html[data-theme="aurora-dark"] .work-mode-btn.work:not(.active) {
+  color: #7aa2ff;
+}
 .mr-default {
   display: inline-block;
   margin-left: 6px;

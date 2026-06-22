@@ -62,7 +62,7 @@ pub fn render_deck_fx_video(
             "--virtual-time-budget=800",
             &url,
         ]);
-        if let Err(e) = crate::forge::run_with_timeout(cmd, 60, &format!("fx 第{f}帧")) {
+        if let Err(e) = crate::forge::run_with_timeout(cmd, 15, &format!("fx 第{f}帧")) {
             let _ = std::fs::remove_dir_all(&frames);
             return Err(format!("第 {f}/{n_frames} 帧截图失败: {e}"));
         }
