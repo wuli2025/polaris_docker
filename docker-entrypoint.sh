@@ -25,23 +25,6 @@ seed_feishu_bridge() {
   fi
 }
 
-# 本地模型 seed：同飞书桥思路——命名卷/bind mount 会盖掉镜像里 /root/Polaris/models,
-# 故构建期把模型预烤在 /opt/polaris-models,这里在卷挂好后补进卷内。容器首启即离线可用,
-# 不再触发运行时联网下载(NAS 出网受限常失败)。缺源目录(slim 未预烤)则静默跳过。
-# 预烤的是 fastembed(BGE-M3 嵌入 + bge-reranker-v2-m3 重排);ASR 包暂未预装,留作后续。
-seed_local_models() {
-  SRC=/opt/polaris-models
-  DST=/root/Polaris/models
-  [ -d "$SRC" ] || return 0
-  for pack in fastembed sensevoice-small paraformer-zh; do
-    if [ -d "$SRC/$pack" ] && [ ! -d "$DST/$pack" ]; then
-      mkdir -p "$DST"
-      cp -a "$SRC/$pack" "$DST/"
-      echo "[entrypoint] 已 seed 本地模型 $pack → $DST/$pack"
-    fi
-  done
-}
-
 if [ -n "$PUID" ] && [ -n "$PGID" ]; then
   # ── 非 root 模式（群晖推荐）──────────────────────────────────
   if ! getent group "$PGID" >/dev/null 2>&1; then
@@ -53,7 +36,6 @@ if [ -n "$PUID" ] && [ -n "$PGID" ]; then
   fi
   ensure_dirs
   seed_feishu_bridge
-  seed_local_models
   # HOME(/root) 及数据目录归属运行用户，确保 claude 配置/缓存可写。
   chown "$PUID:$PGID" /root 2>/dev/null || true
   for d in $DATA_DIRS; do chown -R "$PUID:$PGID" "$d" 2>/dev/null || true; done
@@ -86,6 +68,5 @@ fi
 # ── 默认：root 模式（未设 PUID/PGID，与既有行为一致）─────────────
 ensure_dirs
 seed_feishu_bridge
-seed_local_models
 echo "[entrypoint] 以 root 运行（未设 PUID/PGID）"
 exec polaris-server "$@"

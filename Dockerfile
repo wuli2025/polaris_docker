@@ -212,10 +212,6 @@ COPY --from=server /usr/local/bin/polaris-forge  /usr/local/bin/polaris-forge
 #   onnxruntime 1.24 匹配 ort 2.0.0-rc.12;bookworm(glibc2.36/libstdc++12)满足其依赖。
 ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
 ENV FASTEMBED_CACHE_DIR=/root/Polaris/models/fastembed
-# Docker/NAS 默认走本地嵌入/重排:大存储 + 免云 key/免限速。模型已在镜像内预烤(见下)、
-# entrypoint 把它 seed 进数据卷即用。要回退云 API:compose 里设 POLARIS_LOCAL_EMBED=0。
-# 安全网:embed_texts/rerank 有「本地→云」优雅降级——本地缺模型而配了云 key 时自动走云。
-ENV POLARIS_LOCAL_EMBED=1
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* ; \
     ( set -e; ORT_VER=1.26.0; \
@@ -227,22 +223,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 ca-cer
       && echo "[onnxruntime] ${ORT_VER} ready (local-embed available)" ) \
     || echo "[onnxruntime] download/install failed -> local-embed unavailable (默认走云,不影响启动)" ; \
     rm -f /tmp/ort.tgz
-
-# ── 预烤本地嵌入/重排模型(BAAI/bge-m3 + bge-reranker-v2-m3,约 600MB)──────────────
-#   让 fastembed 自己在构建期(CI/Windows 有网)下载 + 加载一次 → 缓存落 /opt/polaris-models/
-#   fastembed(镜像层,**非命名卷**,运行时不会被卷覆盖)。docker-entrypoint.sh 在卷挂好后
-#   seed 进 /root/Polaris/models/fastembed,容器首启即离线可用、零联网。
-#   为何在镜像里预烤:NAS 容器出网常受限,运行时首用从 HF 拉模型会超时/极慢。
-#   HF_ENDPOINT 走 hf-mirror 国内直连;best-effort——失败不 fail build(运行时仍可回退云
-#   API 或首用再下,见 embed_texts 的「本地→云」优雅降级)。需 polaris-forge + onnxruntime(上方已就绪)。
-RUN ( set -e; \
-      HF_ENDPOINT=https://hf-mirror.com \
-      POLARIS_LOCAL_EMBED=1 \
-      FASTEMBED_CACHE_DIR=/opt/polaris-models/fastembed \
-      polaris-forge fable warmup \
-      && echo "[warmup] 本地嵌入/重排模型已预烤 → /opt/polaris-models/fastembed" \
-      && du -sh /opt/polaris-models/fastembed 2>/dev/null || true ) \
-    || echo "[warmup] 预烤失败(运行时回退云 API 或首用再下,不影响启动)"
 
 COPY --from=web    /app/dist /srv/web
 COPY src-tauri/resources /app/resources

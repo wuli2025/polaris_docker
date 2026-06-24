@@ -77,19 +77,9 @@ fn agent_http() -> ureq::Agent {
 /// 批量嵌入。429 退避重试 3 次;其余错误直接报(可读信息,UI 原样展示)。
 pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     // 本地开源嵌入(POLARIS_LOCAL_EMBED=1):绕开云 API 限速/网络往返;模型同源(bge-m3)故向量兼容。
-    // 优雅降级:本地模型/onnxruntime 缺失时,若配了云服务商则退回云 API,否则抛本地错误。
-    // 这让 Docker 默认开 POLARIS_LOCAL_EMBED=1 是安全的——有模型就本地、没模型且有 key 就走云。
     #[cfg(feature = "local-embed")]
     if crate::fable::embed_local::enabled() {
-        match crate::fable::embed_local::embed(texts) {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if crate::sense::active_provider("embed").is_none() {
-                    return Err(e);
-                }
-                eprintln!("[embed] 本地嵌入不可用,降级云 API:{e}");
-            }
-        }
+        return crate::fable::embed_local::embed(texts);
     }
     let p = crate::sense::active_provider("embed")
         .ok_or("没有可用的嵌入服务商:在「设置 › 寓言计划 API」给硅基流动填 key(免费),或检查云感官总闸")?;
@@ -141,18 +131,9 @@ pub fn embed_texts(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
 /// 重排:返回按相关度降序的 (原 index, 分数)。失败属可降级(调用方保持原序)。
 pub fn rerank(query: &str, docs: &[String], top_n: usize) -> Result<Vec<(usize, f32)>, String> {
     // 本地开源重排(POLARIS_LOCAL_EMBED=1):本地 bge-reranker-v2-m3,省 ~600ms API 往返。
-    // 优雅降级同嵌入:本地不可用且配了云服务商则退回云 API,否则抛本地错误(调用方仍可保持原序)。
     #[cfg(feature = "local-embed")]
     if crate::fable::embed_local::enabled() {
-        match crate::fable::embed_local::rerank(query, docs, top_n) {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if crate::sense::active_provider("rerank").is_none() {
-                    return Err(e);
-                }
-                eprintln!("[rerank] 本地重排不可用,降级云 API:{e}");
-            }
-        }
+        return crate::fable::embed_local::rerank(query, docs, top_n);
     }
     let p = crate::sense::active_provider("rerank").ok_or("没有可用的重排服务商")?;
     let key = crate::sense::effective_key(&p);
