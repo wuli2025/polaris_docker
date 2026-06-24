@@ -1,0 +1,13 @@
+{
+  "_说明": "复制为 wx_config.json 并按你机器填好路径。master_key 由 wx_setup.py 自动写入，首次留空。",
+  "weixin_exe": "D:\\weixin\\Weixin.exe",
+  "db_dir": "C:\\Users\\你\\Documents\\xwechat_files\\wxid_xxx\\db_storage",
+  "wx_key_dir": "D:\\path\\to\\wx_key_release",
+  "tools_dir": "D:\\path\\to\\wechat-decrypt",
+  "venv_python": "D:\\path\\to\\wechat-decrypt\\.venv\\Scripts\\python.exe",
+  "exported_dir": "D:\\path\\to\\wechat-decrypt\\exported_chats",
+  "master_key": "",
+  "my_nicks": ["你的群昵称", "你的微信名"],
+  "window_days": 7,
+  "max_tasks": 8
+}

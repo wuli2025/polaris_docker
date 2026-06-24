@@ -39,6 +39,7 @@ import {
   Network,
   Info,
   WifiOff,
+  Server,
 } from "@lucide/vue";
 import {
   files as fc,
@@ -58,6 +59,9 @@ const KnowledgeGraph = defineAsyncComponent(() => import("./KnowledgeGraph.vue")
 // 核心层 = 整套知识库(llmwiki)本体:点「核心层」tab 直接内嵌完整知识库,体验与独立知识库一致。
 // 按需加载,只在切到核心层时才挂载、初始化。
 const WikiBrowse = defineAsyncComponent(() => import("./WikiBrowse.vue"));
+// 盘管理:NAS 网络盘的记忆与一键映射,按需加载(只在点开时才挂载)。
+const NasManager = defineAsyncComponent(() => import("./NasManager.vue"));
+const nasOpen = ref(false);
 
 const app = useAppStore();
 const wiz = useWizardStore();
@@ -1215,8 +1219,19 @@ onBeforeUnmount(() => {
           <Sparkles v-else :size="14" :stroke-width="1.8" />
           <span>{{ llmTitling ? "整理中" : "AI 整理名称" }}</span>
         </button>
+        <button
+          class="tool-btn"
+          title="盘管理:记住你登陆过的 NAS(主机/共享/账号),一键映射成网络盘,挂上后就能被「盘点」扫到"
+          @click="nasOpen = true"
+        >
+          <Server :size="14" :stroke-width="1.8" />
+          <span>盘管理</span>
+        </button>
       </div>
     </div>
+
+    <!-- 盘管理:NAS 网络盘的记忆与一键映射 -->
+    <NasManager v-if="nasOpen" @close="nasOpen = false" />
 
     <!-- AI 整理名称进度 -->
     <div v-if="titleMsg && view !== 'core'" class="fc-llm">
@@ -2231,7 +2246,7 @@ onBeforeUnmount(() => {
   outline: none;
   cursor: pointer;
 }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tool-btn {
   display: inline-flex;
   align-items: center;

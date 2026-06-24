@@ -17,6 +17,7 @@ pub mod forge_video;
 pub mod fable;
 pub mod infer;
 pub mod kb;
+pub mod nas;
 pub mod palette;
 pub mod persona;
 pub mod expert;
@@ -127,6 +128,9 @@ pub fn run() {
             // 确保「壹伴排版优化」技能落盘（含 wechat_yiban.py：壹伴样式引擎 + CloakBrowser 驱动，
             // spawn 的 claude agent 才能在磁盘上直接 python 跑它）。best-effort，不阻断启动。
             skills::seed_wechat_typesetter_skill();
+            // 确保「微信聊天 · 每日待办」技能落盘（含 wx_daily.py / wx_setup.py：本地解密微信→挖待办→
+            // 写晨报，配套每日自动化流程触发）。best-effort，不阻断启动；不覆盖用户的 wx_config.json。
+            skills::seed_wechat_tasks_skill();
             // 老用户迁移：早期版本首启播种过毛主席资料库的，补装 consult-mao 技能
             //（改版后该技能随「毛主席」名人资料包一起装，老用户没装过会失效）。
             skills::migrate_consult_mao_for_seeded_kb();
@@ -232,6 +236,12 @@ pub fn run() {
             // 自媒体「账号管理」: 探测平台登录态 + 解绑（删 profile）
             accounts::media_accounts_status,
             accounts::media_account_forget,
+            // 「盘管理」: 记住登陆过的 NAS(SMB) + 一键映射/断开网络盘
+            nas::nas_list,
+            nas::nas_save,
+            nas::nas_forget,
+            nas::nas_connect,
+            nas::nas_disconnect,
             // Chat
             chat::chat_send,
             chat::chat_cancel,
@@ -269,6 +279,7 @@ pub fn run() {
             provider::provider_save,
             provider::provider_delete,
             provider::usage_summary,
+            provider::provider_balance,
             provider::codex_status,
             provider::codex_start_login,
             provider::codex_poll_login,

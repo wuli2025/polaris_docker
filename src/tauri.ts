@@ -288,6 +288,55 @@ export const mediaAccounts = {
 };
 
 // ──────────────────────────────────────────────────────────────
+// 盘管理（NAS 网络盘记忆 + 一键映射）
+// ──────────────────────────────────────────────────────────────
+export interface NasRecord {
+  id: string;
+  label: string;
+  host: string;
+  share: string;
+  username: string;
+  /** 明文密码（仅本机）；保存表单留空 = 沿用旧密码 */
+  password?: string;
+  /** 偏好盘符，单字母如 "Z"（空 = 自动挑空闲盘符） */
+  drive: string;
+  persistent: boolean;
+  lastConnected: number | null;
+}
+export interface NasView {
+  id: string;
+  label: string;
+  host: string;
+  share: string;
+  username: string;
+  hasPassword: boolean;
+  drive: string;
+  persistent: boolean;
+  lastConnected: number | null;
+  /** \\host\share */
+  unc: string;
+  connected: boolean;
+  currentDrive: string | null;
+  /** 系统里自动发现、尚未保存的（连一下即记住） */
+  discovered: boolean;
+  status: string;
+}
+export const nas = {
+  /** 列出已记住 + 系统里自动发现的 NAS（带实时连接态） */
+  list: () => invoke<NasView[]>("nas_list"),
+  /** 保存/更新一条 NAS 档（留空密码 = 沿用旧密码） */
+  save: (record: Partial<NasRecord>) => invoke<NasRecord>("nas_save", { record }),
+  /** 忘记一条 NAS 档（只删记忆，不动当前映射） */
+  forget: (id: string) => invoke<string>("nas_forget", { id }),
+  /** 连接：把 SMB 共享映射成盘符（成功后即记住） */
+  connect: (record: Partial<NasRecord>) =>
+    invoke<string>("nas_connect", { record }),
+  /** 断开：取消盘符映射 */
+  disconnect: (record: Partial<NasRecord>) =>
+    invoke<string>("nas_disconnect", { record }),
+};
+
+// ──────────────────────────────────────────────────────────────
 // KB module
 // ──────────────────────────────────────────────────────────────
 export interface KbHit {
@@ -754,6 +803,10 @@ export interface ChatSendArgs {
   /** 工作模式："office"(默认·办公·精简工具面) | "coding"(编程·全套工具)。
    *  办公模式弃用开发向冗余工具(Task/NotebookEdit/Glob/Grep)并跳过可运行项目约定 → 更快更聚焦。 */
   workMode?: string;
+  /** 本对话选定的供应商 id（来自左下角「API 供应商」中心，自动识别已配的那些）。
+   *  省略 / "" / "auto" = Auto 档（沿用应用全局当前供应商）；具体 id = 本对话钉死这家，
+   *  后端逐命令注入其 env，实现「每个对话各用各的 API」真隔离。 */
+  providerId?: string;
 }
 
 export interface ChatStreamEvent {
@@ -1303,6 +1356,20 @@ export interface UsageSummary {
   year: TokenBucket;
   daily: DailyUsage[];
 }
+/** 某供应商的「套餐额度 / 实时余额」查询结果 */
+export interface ProviderBalance {
+  id: string;
+  /** 是否取到了真实可量化的额度数字(kind === "balance") */
+  available: boolean;
+  /** balance | alive | unsupported | no_key | error */
+  kind: "balance" | "alive" | "unsupported" | "no_key" | "error";
+  /** 主显示文案(如 "¥48.59" / "已激活 · 套餐有效") */
+  label: string;
+  /** 次级说明(如 "代金券 ¥46.59 · 现金 ¥3.00") */
+  detail: string;
+  /** 控制台 / 官网链接(可空) */
+  consoleUrl: string;
+}
 export interface CodexStatus {
   installed: boolean;
   loggedIn: boolean;
@@ -1333,6 +1400,8 @@ export const provider = {
     invoke<string>("provider_save", { input }),
   delete: (id: string) => invoke<void>("provider_delete", { id }),
   usage: () => invoke<UsageSummary>("usage_summary"),
+  /** 查询某供应商套餐额度 / 实时余额(各家接口不同, 后端逐家适配 + 优雅降级) */
+  balance: (id: string) => invoke<ProviderBalance>("provider_balance", { id }),
   codexStatus: () => invoke<CodexStatus>("codex_status"),
   codexStartLogin: () => invoke<CodexDeviceLogin>("codex_start_login"),
   codexPollLogin: (deviceCode: string, userCode: string) =>
@@ -1765,6 +1834,12 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         year: { input: 1900000, output: 520000, cacheRead: 44000000, cacheCreation: 2800000, total: 49220000, requests: 1894, cost: 980.5 },
         daily,
       };
+    }
+    case "provider_balance": {
+      const pid = (_args as { id?: string })?.id ?? "";
+      if (pid === "kimi-for-coding")
+        return { id: pid, available: false, kind: "alive", label: "已激活 · 套餐有效", detail: "(browser stub) 额度见 Kimi Code 控制台", consoleUrl: "https://www.kimi.com/code/console" };
+      return { id: pid, available: true, kind: "balance", label: "¥48.59", detail: "(browser stub) 代金券 ¥46.59 · 现金 ¥3.00", consoleUrl: "" };
     }
     case "expert_list":
     case "expert_groups":

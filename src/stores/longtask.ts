@@ -20,6 +20,7 @@ export interface BatchOpts {
   permissionMode: PermissionMode;
   skillIds: string[];
   useKb?: boolean;
+  providerId?: string;
 }
 
 /** 长任务启发式判定：「N 页/张/章/…」且 N ≥ 阈值，单轮就该拆批。 */
@@ -95,6 +96,7 @@ export const useLongTaskStore = defineStore("longTask", () => {
       permissionMode: opts.permissionMode,
       skillIds: opts.skillIds,
       useKb: opts.useKb,
+      providerId: opts.providerId,
       batchBuild: true,
     };
 

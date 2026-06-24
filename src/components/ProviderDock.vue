@@ -20,9 +20,10 @@ import {
   Sparkles,
   CircleAlert,
   Star,
+  Wallet,
 } from "@lucide/vue";
 import { useProvidersStore } from "../stores/providers";
-import type { ProviderView, TokenBucket, CodexDeviceLogin } from "../tauri";
+import type { ProviderView, TokenBucket, ProviderBalance, CodexDeviceLogin } from "../tauri";
 
 const props = defineProps<{ collapsed?: boolean }>();
 const store = useProvidersStore();
@@ -60,6 +61,7 @@ watch(open, (v) => {
     store.refreshUsage();
     store.refreshCodex();
     store.refreshCodexProxy();
+    if (store.currentId) store.refreshBalance(store.currentId);
     nextTick(() => window.addEventListener("keydown", onEsc));
   } else {
     codexOpen.value = false;
@@ -67,6 +69,13 @@ watch(open, (v) => {
     window.removeEventListener("keydown", onEsc);
   }
 });
+// 切换供应商后,自动拉取新当前供应商的额度(面板开着时才查,省请求)
+watch(
+  () => store.currentId,
+  (id) => {
+    if (open.value && id && !store.balances[id]) store.refreshBalance(id);
+  }
+);
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onEsc);
   stopCodexPoll();
@@ -144,6 +153,21 @@ const filtered = computed(() => {
 
 const current = computed(() => store.current);
 const todayTotal = computed(() => store.usage?.today.total ?? 0);
+const currentBalance = computed<ProviderBalance | null>(
+  () => store.balances[store.currentId] ?? null
+);
+/** 额度结果 → 数字颜色类 */
+function balClass(b?: ProviderBalance | null): string {
+  if (!b) return "muted";
+  if (b.kind === "balance") return "ok";
+  if (b.kind === "alive") return "alive";
+  if (b.kind === "error") return "err";
+  return "muted";
+}
+/** 仅 key/official 类供应商有「额度」概念(codex/copilot 走授权,无额度数字) */
+const showBalance = computed(
+  () => !!current.value && current.value.kind !== "codex" && current.value.kind !== "copilot"
+);
 const currentModel = computed(() => {
   const c = current.value;
   if (!c) return "";
@@ -407,6 +431,27 @@ function subtitleOf(p: ProviderView): string {
                     <div class="now-num">{{ fmt(todayTotal) }}</div>
                     <div class="now-lab">今日 token</div>
                   </div>
+                </div>
+
+                <!-- 套餐额度 / 实时余额(当前供应商,自动查) -->
+                <div v-if="showBalance" class="now-balance">
+                  <Wallet :size="12" :stroke-width="1.9" class="nb-ic" />
+                  <span class="nb-label" :class="balClass(currentBalance)">
+                    {{ currentBalance?.label ?? "查询额度…" }}
+                  </span>
+                  <span v-if="currentBalance?.detail" class="nb-detail">{{ currentBalance.detail }}</span>
+                  <button
+                    v-if="currentBalance?.consoleUrl"
+                    class="nb-console"
+                    title="打开控制台"
+                    @click.stop="openSite(currentBalance.consoleUrl)"
+                  >
+                    <ExternalLink :size="11" :stroke-width="1.8" />
+                  </button>
+                  <button class="nb-refresh" title="刷新额度" @click.stop="store.refreshBalance(current.id)">
+                    <span v-if="store.balanceBusy[current.id]" class="spinner sm" />
+                    <RefreshCw v-else :size="11" :stroke-width="1.8" />
+                  </button>
                 </div>
 
                 <!-- codex 未授权时,大绿主操作(全卡可点) -->
@@ -864,6 +909,29 @@ function subtitleOf(p: ProviderView): string {
 .now-today { text-align: right; flex-shrink: 0; }
 .now-num { font-family: var(--mono); font-size: 14px; font-weight: 600; color: var(--primary-deep); letter-spacing: -0.3px; }
 .now-lab { font-size: 9.5px; color: var(--dim); }
+/* 当前供应商套餐额度行 */
+.now-balance {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+.nb-ic { color: var(--muted); flex-shrink: 0; }
+.nb-label { font-family: var(--mono); font-size: 12.5px; font-weight: 700; letter-spacing: -0.2px; flex-shrink: 0; }
+.nb-label.ok { color: #16a34a; }
+.nb-label.alive { color: var(--primary-deep); }
+.nb-label.err { color: var(--vermilion); }
+.nb-label.muted { color: var(--muted); }
+.nb-detail { flex: 1; min-width: 0; font-size: 10px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-console, .nb-refresh {
+  border: none; background: transparent; color: var(--muted);
+  width: 22px; height: 22px; border-radius: 5px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.nb-console:hover, .nb-refresh:hover { background: var(--selection-bg); color: var(--primary); }
+.spinner.sm { width: 11px; height: 11px; border-width: 2px; }
+
 .now-cta {
   width: 100%;
   display: inline-flex; align-items: center; justify-content: center; gap: 5px;

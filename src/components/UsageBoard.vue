@@ -7,9 +7,11 @@ import {
   DollarSign,
   Layers,
   Database,
+  Wallet,
+  ExternalLink,
 } from "@lucide/vue";
 import { useProvidersStore } from "../stores/providers";
-import type { TokenBucket } from "../tauri";
+import type { TokenBucket, ProviderBalance } from "../tauri";
 
 const store = useProvidersStore();
 
@@ -34,13 +36,34 @@ const periods: { key: Period; label: string }[] = [
 // 我们的数据全部来自 ~/.claude/projects(Claude Code)。
 const hasData = computed(() => source.value === "all" || source.value === "claude");
 
-onMounted(() => {
+onMounted(async () => {
   store.refreshUsage();
+  if (!store.providers.length) await store.refresh();
+  store.refreshConfiguredBalances();
   window.addEventListener("keydown", onEsc);
 });
 onBeforeUnmount(() => window.removeEventListener("keydown", onEsc));
 function onEsc(e: KeyboardEvent) {
   if (e.key === "Escape") store.closeUsage();
+}
+
+// ── 套餐额度 / 实时余额 ──────────────────────────
+/** 已配 key 的供应商(即「有套餐」的)—— 每个都查实时额度 */
+const planProviders = computed(() =>
+  store.providers.filter(
+    (p) => p.hasKey && p.kind !== "codex" && p.kind !== "copilot"
+  )
+);
+/** 额度结果 → 样式类(决定数字颜色) */
+function balClass(b?: ProviderBalance): string {
+  if (!b) return "muted";
+  if (b.kind === "balance") return "ok";
+  if (b.kind === "alive") return "alive";
+  if (b.kind === "error") return "err";
+  return "muted";
+}
+function openUrl(url: string) {
+  if (url) window.open(url, "_blank");
 }
 
 const bucket = computed<TokenBucket | null>(() => {
@@ -112,6 +135,48 @@ function cacheTotal(b: TokenBucket): number {
         </div>
 
         <div class="ub-body">
+          <!-- 套餐额度 / 实时余额:每个已配置供应商查各自的额度接口 -->
+          <section class="plans">
+            <div class="plans-head">
+              <span class="sec-title"><Wallet :size="13" :stroke-width="2" /> 套餐额度</span>
+              <button class="ghost-btn" title="刷新全部供应商额度" @click="store.refreshConfiguredBalances()">
+                <RefreshCw :size="13" :stroke-width="1.8" /> 刷新额度
+              </button>
+            </div>
+            <div v-if="planProviders.length" class="plan-grid">
+              <div v-for="p in planProviders" :key="p.id" class="plan-card">
+                <div class="plan-top">
+                  <span class="plan-dot" :style="{ background: p.color }" />
+                  <span class="plan-name">{{ p.name }}</span>
+                  <button
+                    class="mini-refresh"
+                    :title="`刷新 ${p.name} 额度`"
+                    @click="store.refreshBalance(p.id)"
+                  >
+                    <span v-if="store.balanceBusy[p.id]" class="mini-spin" />
+                    <RefreshCw v-else :size="11" :stroke-width="1.8" />
+                  </button>
+                </div>
+                <div class="plan-val" :class="balClass(store.balances[p.id])">
+                  {{ store.balances[p.id]?.label ?? "—" }}
+                </div>
+                <div class="plan-detail">
+                  {{ store.balances[p.id]?.detail ?? "点右上角刷新查询额度" }}
+                </div>
+                <button
+                  v-if="store.balances[p.id]?.consoleUrl"
+                  class="plan-console"
+                  @click="openUrl(store.balances[p.id]!.consoleUrl)"
+                >
+                  控制台 <ExternalLink :size="10" :stroke-width="1.8" />
+                </button>
+              </div>
+            </div>
+            <div v-else class="plans-empty">
+              尚未配置任何带 Key 的供应商 · 配好后这里逐家显示套餐额度
+            </div>
+          </section>
+
           <template v-if="bucket">
             <!-- 4 卡片 -->
             <div class="cards">
@@ -332,6 +397,121 @@ function cacheTotal(b: TokenBucket): number {
   overflow-y: auto;
   padding: 4px 20px 22px;
 }
+/* ── 套餐额度 ─────────────────────────── */
+.plans {
+  margin-bottom: 20px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.plans-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.plans-head .sec-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+}
+.plan-card {
+  background: linear-gradient(165deg, var(--panel) 0%, var(--bg-soft) 100%);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 12px 13px 11px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.plan-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.plan-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.plan-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mini-refresh {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.mini-refresh:hover { background: var(--selection-bg); color: var(--primary); }
+.mini-spin {
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.plan-val {
+  font-family: var(--mono);
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: -0.4px;
+  line-height: 1.15;
+  margin-top: 4px;
+}
+.plan-val.ok { color: #16a34a; }
+.plan-val.alive { color: var(--primary-deep); }
+.plan-val.err { color: var(--vermilion); }
+.plan-val.muted { color: var(--dim); }
+.plan-detail {
+  font-size: 10.5px;
+  color: var(--muted);
+  line-height: 1.5;
+  min-height: 16px;
+}
+.plan-console {
+  align-self: flex-start;
+  margin-top: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.plan-console:hover { border-color: var(--primary); color: var(--primary); }
+.plans-empty {
+  font-size: 11.5px;
+  color: var(--dim);
+  text-align: center;
+  padding: 14px 0;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

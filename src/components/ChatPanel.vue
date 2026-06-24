@@ -76,6 +76,7 @@ import { useAppStore } from "../stores/app";
 import { useSkillsStore } from "../stores/skills";
 import { useArtifactsStore } from "../stores/artifacts";
 import { useChatStore, type Bubble } from "../stores/chat";
+import { useProvidersStore } from "../stores/providers";
 import { useWorkflowsStore } from "../stores/workflows";
 import { useLongTaskStore, detectLongTask } from "../stores/longtask";
 import { useFileDrop } from "../composables/useFileDrop";
@@ -314,6 +315,7 @@ async function regenerate(t: Turn) {
     useKb: kbMode.value || undefined,
     agentMode: agentMode.value,
     workMode: workMode.value,
+    providerId: providerForConv(convId),
   });
 }
 function editTurn(t: Turn) {
@@ -573,6 +575,7 @@ async function runBriefing(s: Suggestion) {
     useKb: kbMode.value || undefined,
     agentMode: agentMode.value,
     workMode: workMode.value,
+    providerId: providerForConv(c.id),
   });
 }
 // ─────────── 空对话页的「下一步工作流」推荐(仿豆包的建议气泡)───────────
@@ -967,6 +970,80 @@ function pickWorkMode(m: WorkMode) {
 // 初始按记忆的模式套一次默认(权限/知识库本就每次挂载重置, 这里只是按模式给更合适的初值)
 applyModeDefaults(workMode.value);
 
+// ─────────── API/模型切换:每个对话各用各的供应商(真隔离) ───────────
+// 选项**自动来自左下角「API 供应商」中心**(只列已配好 Key / 已授权的那些)。每个对话各记一份
+// 选择,发消息时透传 providerId,后端逐命令注入该家 env → 多对话并发也互不串台。
+// "auto" = 沿用应用全局当前供应商(新对话默认)。空白页(还没建对话)选的暂存到 pending,
+// 首次发送创建对话后迁移给它。
+const providersStore = useProvidersStore();
+const showProviderPanel = ref(false);
+const PROVIDER_BIND_KEY = "polaris.convProvider.v1";
+function loadConvProvider(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(PROVIDER_BIND_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+// convId → providerId 绑定表(持久化, 切对话/重启都记得)
+const convProvider = ref<Record<string, string>>(loadConvProvider());
+watch(
+  convProvider,
+  (v) => localStorage.setItem(PROVIDER_BIND_KEY, JSON.stringify(v)),
+  { deep: true }
+);
+// 空白页(无 currentConvId)时用户先选的供应商, 首次发送时落到新对话
+const pendingProvider = ref<string>("auto");
+
+function providerForConv(convId: string | null | undefined): string {
+  if (!convId) return pendingProvider.value;
+  return convProvider.value[convId] || "auto";
+}
+function hostOf(url: string): string {
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  }
+}
+function providerSub(p: { kind: string; baseUrl: string }): string {
+  if (p.kind === "official") return "Claude 官方订阅";
+  if (p.kind === "codex") return "ChatGPT · GPT-5.5";
+  return hostOf(p.baseUrl) || p.kind;
+}
+// 自动识别:只列已配 Key / 可用的供应商(official 恒可用;key 类需 hasKey;codex 需已授权)
+const availableProviders = computed(() =>
+  providersStore.providers.filter(
+    (p) => p.hasKey || (p.kind === "codex" && providersStore.codex?.loggedIn)
+  )
+);
+// 切换器选项 = Auto + 已配供应商
+const providerOptions = computed(() => [
+  { id: "auto", name: "Auto", sub: "跟随左下角当前默认供应商", auto: true },
+  ...availableProviders.value.map((p) => ({
+    id: p.id,
+    name: p.name,
+    sub: providerSub(p),
+    auto: false,
+  })),
+]);
+const currentProviderId = computed(() => providerForConv(app.currentConvId));
+const currentProviderName = computed(() => {
+  const id = currentProviderId.value;
+  if (id === "auto") return "Auto";
+  return providersStore.providers.find((x) => x.id === id)?.name || "Auto";
+});
+function pickProvider(id: string) {
+  const cid = app.currentConvId;
+  if (cid) {
+    convProvider.value = { ...convProvider.value, [cid]: id };
+  } else {
+    pendingProvider.value = id;
+  }
+  showProviderPanel.value = false;
+}
+
 // ─────────── 工作流包「使用」→ 填入输入框 ───────────
 // 右侧「工作流包」点「使用」时，store 发来拼装好的提示词：已有内容则追加，否则填入；
 // 随后聚焦并把光标移到末尾。带 nonce 以便重复使用同一包也能触发。
@@ -1224,6 +1301,9 @@ onMounted(async () => {
   await chatStore.init(); // app 级流式监听只注册一次，按 conversationId 路由
   await chatStore.loadHistory(app.currentConvId);
   await loadSkills();
+  // 拉一次供应商清单(切换器选项据此自动识别已配的 API);codex 授权态供清单判断
+  providersStore.refresh();
+  providersStore.refreshCodex();
   scrollToBottom();
   // 若在别的视图点了工作流包「使用」才切来对话，挂载时补消费一次
   applyInsert(workflowsStore.insertRequest);
@@ -1264,6 +1344,13 @@ async function send() {
     return;
   }
 
+  // 空白页时选的供应商(pending)落到这条新对话, 之后它就记住自己用哪家;随后复位 pending。
+  if (pendingProvider.value !== "auto" && !convProvider.value[convId]) {
+    convProvider.value = { ...convProvider.value, [convId]: pendingProvider.value };
+    pendingProvider.value = "auto";
+  }
+  const sendProviderId = providerForConv(convId);
+
   // 把附件绝对路径拼进 prompt，让 claude 能用 Read 等工具读取
   let prompt = text || "请查看我上传的附件。";
   if (hasAttach) {
@@ -1285,6 +1372,7 @@ async function send() {
       permissionMode: permMode.value,
       skillIds: Array.from(skillsStore.enabledSkills),
       useKb: kbMode.value || undefined,
+      providerId: sendProviderId,
     });
     return;
   }
@@ -1299,6 +1387,7 @@ async function send() {
     useKb: kbMode.value || undefined,
     agentMode: agentMode.value,
     workMode: workMode.value,
+    providerId: sendProviderId,
   });
 }
 
@@ -2011,6 +2100,39 @@ async function deleteCurrentConv() {
       </div>
 
 
+      <!-- 「API / 模型」切换器：每个对话各用各的供应商(选项自动来自左下角 API 中心) -->
+      <div v-if="showProviderPanel" class="mode-panel provider-panel">
+        <div class="skill-panel-head">
+          <span class="skill-panel-title">自动模式</span>
+          <button class="skill-panel-close" @click="showProviderPanel = false">
+            <X :size="14" :stroke-width="2" />
+          </button>
+        </div>
+        <div class="prov-hint">这条对话用哪个 API · 每个对话各记各的、互不串台</div>
+        <div class="mode-list">
+          <button
+            v-for="opt in providerOptions"
+            :key="opt.id"
+            class="mode-row exclusive"
+            :class="{ on: currentProviderId === opt.id }"
+            @click="pickProvider(opt.id)"
+          >
+            <span class="mr-tx">
+              <span class="mr-nm">
+                {{ opt.name }}
+                <span v-if="opt.auto" class="mr-default">默认</span>
+              </span>
+              <span class="mr-ds">{{ opt.sub }}</span>
+            </span>
+            <span class="mr-radio" :class="{ on: currentProviderId === opt.id }"></span>
+          </button>
+        </div>
+        <button class="prov-add" @click="providersStore.openAdd(null)">
+          ＋ 配置 / 添加供应商
+        </button>
+      </div>
+
+
       <!-- 输入卡片 -->
       <div class="input-card" :class="{ 'goal-on': goalMode }">
         <!-- Skill 标签 -->
@@ -2140,6 +2262,28 @@ async function deleteCurrentConv() {
                   谁来回答这条消息
                   <div class="btn-tooltip-sub">
                     默认「智能匹配」自动召集最合适的专家；也可召唤指定专家 / 专家团，或切回单 Agent
+                  </div>
+                </div>
+              </div>
+            </button>
+            <button
+              class="toolbar-btn provider-btn"
+              :class="{ active: showProviderPanel || currentProviderId !== 'auto' }"
+              @click="showProviderPanel = !showProviderPanel"
+            >
+              <Layers :size="14" :stroke-width="1.8" />
+              <span>{{ currentProviderName }}</span>
+              <ChevronDown
+                :size="12"
+                :stroke-width="2"
+                class="prov-caret"
+                :class="{ flip: showProviderPanel }"
+              />
+              <div class="btn-tooltip">
+                <div class="btn-tooltip-inner">
+                  这条对话用哪个 API / 模型
+                  <div class="btn-tooltip-sub">
+                    选项自动来自左下角「API 供应商」里已配的那些；每个对话各记各的、互不串台。Auto = 用当前默认供应商
                   </div>
                 </div>
               </div>
@@ -3549,6 +3693,38 @@ html[data-theme="aurora-dark"] .bm-card:hover {
 .mode-list {
   padding: 6px;
   overflow-y: auto;
+}
+/* API/模型切换器 */
+.prov-caret {
+  color: var(--muted);
+  transition: transform 0.18s ease;
+}
+.prov-caret.flip {
+  transform: rotate(180deg);
+}
+.provider-panel {
+  width: 320px;
+}
+.prov-hint {
+  padding: 8px 14px 2px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.prov-add {
+  margin: 2px 8px 8px;
+  padding: 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.prov-add:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
 }
 .mode-row {
   display: flex;

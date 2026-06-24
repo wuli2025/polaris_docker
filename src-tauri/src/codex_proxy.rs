@@ -332,6 +332,11 @@ fn build_responses_body(req: &Value) -> Result<Value, String> {
         "stream": true,
         // gpt-5.5 是最新 ChatGPT 模型; 推理模型(o1/o3)用 reasoning 字段
         "reasoning": { "effort": "medium" },
+        // 关键: ChatGPT 后端在 `store:false` 下带 `reasoning` 时, **必须**同时声明
+        // `include: ["reasoning.encrypted_content"]`, 否则整条 /responses 请求被 400 拒
+        // (官方 codex CLI client.rs 也是 reasoning⟹include 成对发; 缺它 → 授权成功却每条对话都失败)。
+        // 我们不透传思维链, 收到的 reasoning 增量在 drive_upstream 里被忽略, 只为满足后端契约。
+        "include": ["reasoning.encrypted_content"],
     });
     let obj = body.as_object_mut().unwrap();
     if !tools.is_empty() {
@@ -926,6 +931,9 @@ fn persist_auth(auth: &Auth, id_token: &str) {
     };
     let body = json!({
         "OPENAI_API_KEY": Value::Null,
+        // 见 provider::codex_write_auth_json —— 刷新回写也要带 auth_mode, 否则覆盖掉
+        // 外部 codex CLI 原写入的标记, 事后 codex/社区插件会拒认这份订阅凭证。
+        "auth_mode": "chatgpt",
         "tokens": {
             "id_token": id,
             "access_token": auth.access_token,
@@ -1046,6 +1054,24 @@ mod tests {
             .as_array()
             .map(|a| !a.is_empty())
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn build_responses_body_pairs_reasoning_with_encrypted_include() {
+        // 回归护栏: 只要带 reasoning + store:false, 就必须同时声明
+        // include=["reasoning.encrypted_content"], 否则 ChatGPT 后端 400 拒, 授权后每条对话都失败。
+        let req = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let body = build_responses_body(&req).expect("应翻译成功");
+        assert_eq!(body["store"], false);
+        assert!(body.get("reasoning").is_some(), "reasoning 应在场");
+        let include = body["include"].as_array().expect("include 必须是数组");
+        assert!(
+            include.iter().any(|v| v == "reasoning.encrypted_content"),
+            "store:false + reasoning 时必须带 reasoning.encrypted_content"
+        );
     }
 
     #[test]

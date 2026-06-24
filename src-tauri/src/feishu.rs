@@ -702,6 +702,8 @@ fn handle_bridge_line(app: &AppHandle, cfg: &FeishuConfig, bot_open_id: &str, li
                 agent_mode: None,
                 // 飞书机器人要真操作软件/写文件 → 工作模式(纯 Claude Code)放开全套工具
                 work_mode: Some("work".into()),
+                // 飞书走应用全局当前供应商(Auto 档), 不按对话钉死
+                provider_id: None,
             };
             if let Err(e) = block_on_chat_send(app.clone(), args) {
                 emit_log(app, format!("调起对话失败: {e}"));

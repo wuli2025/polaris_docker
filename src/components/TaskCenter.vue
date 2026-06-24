@@ -47,6 +47,9 @@ interface Row {
 const rows = computed<Row[]>(() => {
   const out: Row[] = [];
   for (const cid of chat.runningConvIds) {
+    // 你正盯着看的这条对话不算「后台」任务——普通对话边聊边生成属于前台,不该弹浮层叨扰。
+    // 只有当你切走了(去别的视图 / 别的对话),它还在生成,才算真正的后台任务显示出来。
+    if (app.view === "chat" && app.currentConvId === cid) continue;
     out.push({
       key: "chat:" + cid,
       label: app.convTitle(cid) || "AI 对话",

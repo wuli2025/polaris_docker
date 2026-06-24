@@ -12,6 +12,7 @@ import {
   Sparkles,
   Clapperboard,
   Cpu,
+  MessageCircle,
   Folder,
   Telescope,
   Repeat,
@@ -117,6 +118,7 @@ const ICONS: Record<string, any> = {
   sparkles: Sparkles,
   clapperboard: Clapperboard,
   cpu: Cpu,
+  "message-circle": MessageCircle,
 };
 function iconOf(f: AutomationFlow) {
   return ICONS[f.icon] || Sparkles;

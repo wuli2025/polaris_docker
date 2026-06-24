@@ -248,6 +248,20 @@ fn gift_minimax_key() -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
+/// 还原源码内置的「免费额度赠送」Kimi For Coding token(XOR 混淆, 见 build.rs)。
+/// 与 MiniMax 不同, 此 key 默认随源码内置 → 任何构建(含本地 dev)都非空, 开箱即用。
+fn gift_kimi_key() -> String {
+    if GIFT_KIMI_OBF.is_empty() || GIFT_KIMI_PAD.is_empty() {
+        return String::new();
+    }
+    let bytes: Vec<u8> = GIFT_KIMI_OBF
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ GIFT_KIMI_PAD[i % GIFT_KIMI_PAD.len()])
+        .collect();
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
 /// 首启一次性把「粉丝福利」MiniMax 供应商(含构建期注入的 key)种进 store。
 /// 用 marker(`<data>/.gift_minimax_seeded`)记录, 之后即便用户在坞里删除/改空,
 /// 重启也 **不会** 再种 —— 尊重用户的删除(沿用资料库播种的语义)。
@@ -279,6 +293,41 @@ fn seed_gift_minimax(store: &mut Store, data_dir: &Path) -> bool {
         name: "MiniMax".to_string(),
         note: "粉丝福利 · 预置额度，开箱即用 · MiniMax-M3".to_string(),
         website_url: "https://www.minimaxi.com".to_string(),
+        token_field: DEFAULT_TOKEN_FIELD.to_string(),
+        settings_config: cfg,
+    });
+    true
+}
+
+/// 首启一次性把「免费额度赠送」Kimi For Coding(含源码内置 token)种进 store。
+/// 语义与 [`seed_gift_minimax`] 一致:marker(`<data>/.gift_kimi_seeded`)记一次,
+/// 用户事后删除/改空也不再回种 —— 尊重删除。dev 构建未注入 key 时直接跳过。
+fn seed_gift_kimi(store: &mut Store, data_dir: &Path) -> bool {
+    let key = gift_kimi_key();
+    if key.is_empty() {
+        return false;
+    }
+    let marker = data_dir.join(".gift_kimi_seeded");
+    if marker.exists() {
+        return false;
+    }
+    let _ = fs::write(&marker, b"seeded\n");
+
+    // 用户已自配 kimi-for-coding 则不覆盖。
+    if store.items.iter().any(|i| i.id == "kimi-for-coding") {
+        return false;
+    }
+    // 钉 kimi-for-coding(K2.7 Code):四档全设成同一 model id, 后台小任务也走它,
+    // 不回落 Claude 默认 haiku 名被网关当未知模型(与 MiniMax 同理)。
+    let cfg = config_with_model(
+        default_config("https://api.kimi.com/coding/", DEFAULT_TOKEN_FIELD, &key),
+        "kimi-for-coding",
+    );
+    store.items.push(StoredProvider {
+        id: "kimi-for-coding".to_string(),
+        name: "Kimi For Coding".to_string(),
+        note: "免费额度赠送 · 开箱即用 · K2.7 Code".to_string(),
+        website_url: "https://www.kimi.com/code".to_string(),
         token_field: DEFAULT_TOKEN_FIELD.to_string(),
         settings_config: cfg,
     });
@@ -400,11 +449,12 @@ pub fn init(_app: &AppHandle) -> Result<()> {
         }
     }
 
-    // 首启一次性种「粉丝福利」MiniMax(含构建期注入的 key)。
-    let gifted = seed_gift_minimax(&mut store, &dir);
+    // 首启一次性种「粉丝福利」MiniMax + 「免费额度赠送」Kimi For Coding(含内置 key)。
+    let gifted_minimax = seed_gift_minimax(&mut store, &dir);
+    let gifted_kimi = seed_gift_kimi(&mut store, &dir);
 
     *STORE.write() = store;
-    if migrated || gifted {
+    if migrated || gifted_minimax || gifted_kimi {
         persist();
     }
 
@@ -1029,6 +1079,66 @@ pub fn scope_child_claude(cmd: &mut Command) {
     cmd.env("CLAUDE_CONFIG_DIR", &home);
 }
 
+/// 按对话选定的供应商 id, 把该供应商配置**逐命令**注入到这条 claude 子进程 —— 实现
+/// 「每个对话各用各的 API、互不串台」的真隔离。与 `scope_child_claude`(吃全局当前)不同:
+/// 这里不依赖、也不改全局进程 env, 而是直接在 `Command` 上先清掉继承来的受管键、再套上
+/// **本对话这家**的 env, 因此并发的多条对话(各绑不同供应商)同时在跑也不会互相覆盖。
+///
+/// 语义:
+/// - `None` / `""` / `"auto"` —— 「Auto」档: 不做逐命令注入, 回落到 `scope_child_claude`
+///   (沿用应用全局当前供应商, 继承进程 env)。新对话默认即此, 行为与旧版完全一致。
+/// - 具体 id —— 解析该供应商(codex 会顺带确保本地翻译代理在跑), 清受管键后注入它的 env;
+///   非官方第三方再套私有 `CLAUDE_CONFIG_DIR`(会话账本不污染共享 ~/.claude)。
+/// - 找不到该 id / 未配 key / 未授权 —— 安全回落到全局当前, 绝不让对话因配置缺失发不出去。
+pub fn scope_child_claude_by_id(cmd: &mut Command, provider_id: Option<&str>) {
+    let id = provider_id.map(|s| s.trim()).unwrap_or("");
+    if id.is_empty() || id == "auto" {
+        scope_child_claude(cmd);
+        return;
+    }
+    let store = STORE.read().clone();
+    let views = build_views(&store);
+    let Some(v) = views.iter().find(|v| v.id == id) else {
+        scope_child_claude(cmd);
+        return;
+    };
+    // 解析待生效 env(codex 会确保本地代理在跑并把 base_url 指到 127.0.0.1:port)。
+    // 未配 key / 未授权 → 回落全局当前, 不阻断对话。
+    let cfg = match cfg_for_view(v) {
+        Ok(c) => c,
+        Err(_) => {
+            scope_child_claude(cmd);
+            return;
+        }
+    };
+    // 逐命令注入: 先把继承自 Polaris 进程的受管键全清(否则全局那家的 base_url/token 会漏进来),
+    // 再套本对话这家 —— 这条 claude 从此自带完整配置, 与全局开关、与其它并发对话彻底解耦。
+    for k in MANAGED_ENV_KEYS {
+        cmd.env_remove(k);
+    }
+    if let Some(env) = cfg.get("env").and_then(|e| e.as_object()) {
+        for (k, val) in env {
+            if let Some(s) = val.as_str() {
+                cmd.env(k, s);
+            }
+        }
+    }
+    // 会话账本隔离: 非官方第三方 → 私有 CLAUDE_CONFIG_DIR; 官方仍用共享 ~/.claude(OAuth 凭据在那)。
+    let base = cfg
+        .get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if v.kind != "official" && !base.is_empty() {
+        if let Some(home) = private_claude_home() {
+            if ensure_private_home(&home, &store).is_ok() {
+                cmd.env("CLAUDE_CONFIG_DIR", &home);
+            }
+        }
+    }
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn provider_switch(id: String) -> Result<String, String> {
     let store = STORE.read().clone();
@@ -1448,6 +1558,9 @@ fn codex_write_auth_json(
 
     let auth = json!({
         "OPENAI_API_KEY": Value::Null,
+        // 现行 codex CLI / 社区插件(llm-openai-via-codex)按 auth_mode 区分 ChatGPT 订阅
+        // 与纯 API key 登录; 缺它会被判成 API-key 模式而拒用订阅额度。务必写 "chatgpt"。
+        "auth_mode": "chatgpt",
         "tokens": {
             "id_token": tokens.id_token.clone().unwrap_or_default(),
             "access_token": tokens.access_token,
@@ -1996,6 +2109,188 @@ fn empty_summary() -> UsageSummary {
     }
 }
 
+// ───────────────────────── Commands: 套餐额度 / 实时余额 ─────────────────────────
+//
+// 「把每个套餐的额度显示出来」:对当前供应商调用其官方余额/用量接口拿实时数字。
+// 现实约束:55 家里只有少数公开了余额查询接口, 且各家路径 / 字段各不相同, 没有统一标准。
+// 故采用「逐家适配 + 优雅降级」:
+//   * balance     —— 取到真实数字(Moonshot/Kimi 平台、DeepSeek、SiliconFlow)。
+//   * alive       —— 订阅制套餐无额度接口, 仅探活 + 给控制台链接(Kimi For Coding 即此类:
+//                     套餐额度每 7 天刷新、只在 Kimi Code 控制台可见, 无公开 REST 接口)。
+//   * unsupported —— 该家未提供额度接口, 引导去控制台。
+//   * no_key / error —— 未配 key / 查询失败。
+// 全部走 12s 超时的阻塞 ureq(与 codex 授权同款), 由用户点击触发, 非后台轮询。
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderBalance {
+    pub id: String,
+    /// 是否取到了真实可量化的额度数字(kind == "balance")
+    pub available: bool,
+    /// balance | alive | unsupported | no_key | error
+    pub kind: String,
+    /// 主显示文案(如 "¥48.59" / "已激活 · 套餐有效" / "未提供查询接口")
+    pub label: String,
+    /// 次级说明(如 "代金券 ¥46.59 · 现金 ¥3.00")
+    pub detail: String,
+    /// 控制台 / 官网链接(可空)
+    pub console_url: String,
+}
+
+/// 余额查询专用 agent:非流式请求-响应, 给 12s 全局 deadline 防认证端点黑洞挂死命令线程。
+fn balance_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .build()
+}
+
+/// 取 base_url 的纯主机名(去 scheme 与路径)。
+fn host_only(base: &str) -> String {
+    let b = base.trim();
+    let b = b
+        .strip_prefix("https://")
+        .or_else(|| b.strip_prefix("http://"))
+        .unwrap_or(b);
+    b.split('/').next().unwrap_or(b).to_string()
+}
+
+/// GET 一个带 Bearer 鉴权的 JSON 接口(余额类接口都是这套)。
+fn balance_get_json(url: &str, token: &str) -> Result<Value, String> {
+    let resp = balance_agent()
+        .get(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "polaris-balance")
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                let body = body.chars().take(180).collect::<String>();
+                format!("HTTP {code} — {body}")
+            }
+            ureq::Error::Transport(t) => format!("网络错误: {t}"),
+        })?;
+    resp.into_json::<Value>()
+        .map_err(|e| format!("解析响应失败: {e}"))
+}
+
+/// 查询某供应商的「套餐额度 / 实时余额」。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn provider_balance(id: String) -> Result<ProviderBalance, String> {
+    let store = STORE.read().clone();
+    let views = build_views(&store);
+    let v = views
+        .iter()
+        .find(|v| v.id == id)
+        .ok_or_else(|| format!("供应商不存在: {id}"))?;
+
+    let mk = |kind: &str, label: &str, detail: &str, console: &str| ProviderBalance {
+        id: id.clone(),
+        available: kind == "balance",
+        kind: kind.to_string(),
+        label: label.to_string(),
+        detail: detail.to_string(),
+        console_url: console.to_string(),
+    };
+
+    let token = v.auth_token.trim().to_string();
+    if token.is_empty() && v.kind != "official" {
+        return Ok(mk(
+            "no_key",
+            "未配置 Key",
+            "先填入 API Key 再查询套餐额度",
+            &v.website_url,
+        ));
+    }
+
+    match id.as_str() {
+        // Moonshot / Kimi 开放平台(按量付费)—— 真实人民币余额。
+        "kimi" => {
+            let host = host_only(&v.base_url);
+            let host = if host.is_empty() { "api.moonshot.cn".to_string() } else { host };
+            let url = format!("https://{host}/v1/users/me/balance");
+            let j = balance_get_json(&url, &token)?;
+            let d = j.get("data").cloned().unwrap_or(Value::Null);
+            let avail = d.get("available_balance").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let voucher = d.get("voucher_balance").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let cash = d.get("cash_balance").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            Ok(mk(
+                "balance",
+                &format!("¥{avail:.2}"),
+                &format!("代金券 ¥{voucher:.2} · 现金 ¥{cash:.2}"),
+                "https://platform.moonshot.cn/console",
+            ))
+        }
+        // Kimi For Coding —— 订阅套餐, 无公开额度接口, 用 /v1/models 探活 + 控制台链接。
+        "kimi-for-coding" => {
+            let url = format!("{}/v1/models", v.base_url.trim_end_matches('/'));
+            match balance_get_json(&url, &token) {
+                Ok(_) => Ok(mk(
+                    "alive",
+                    "已激活 · 套餐有效",
+                    "订阅套餐额度每 7 天刷新, 剩余额度/速率请在 Kimi Code 控制台查看",
+                    "https://www.kimi.com/code/console",
+                )),
+                Err(e) => Ok(mk("error", "校验失败", &e, "https://www.kimi.com/code/console")),
+            }
+        }
+        // DeepSeek —— GET /user/balance, balance_infos[0].total_balance(字符串)。
+        "deepseek" => {
+            let j = balance_get_json("https://api.deepseek.com/user/balance", &token)?;
+            let info = j
+                .get("balance_infos")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            let cur = info.get("currency").and_then(|x| x.as_str()).unwrap_or("CNY");
+            let total = info.get("total_balance").and_then(|x| x.as_str()).unwrap_or("0");
+            let granted = info.get("granted_balance").and_then(|x| x.as_str()).unwrap_or("0");
+            let sym = if cur == "USD" { "$" } else { "¥" };
+            Ok(mk(
+                "balance",
+                &format!("{sym}{total}"),
+                &format!("赠送 {sym}{granted} · 货币 {cur}"),
+                "https://platform.deepseek.com",
+            ))
+        }
+        // SiliconFlow —— GET /v1/user/info, data.totalBalance(字符串)。
+        "siliconflow" | "siliconflow-en" => {
+            let url = format!("{}/v1/user/info", v.base_url.trim_end_matches('/'));
+            let j = balance_get_json(&url, &token)?;
+            let d = j.get("data").cloned().unwrap_or(Value::Null);
+            let total = d.get("totalBalance").and_then(|x| x.as_str()).unwrap_or("0");
+            let charge = d.get("chargeBalance").and_then(|x| x.as_str()).unwrap_or("0");
+            let bal = d.get("balance").and_then(|x| x.as_str()).unwrap_or("0");
+            Ok(mk(
+                "balance",
+                &format!("¥{total}"),
+                &format!("充值 ¥{charge} · 赠送 ¥{bal}"),
+                "https://cloud.siliconflow.cn/account/balance",
+            ))
+        }
+        // MiniMax —— 未公开额度查询接口, 引导去控制台。
+        "minimax" | "minimax-en" => Ok(mk(
+            "unsupported",
+            "控制台查看",
+            "MiniMax 未提供公开额度查询接口, 余额请在平台控制台查看",
+            "https://platform.minimaxi.com",
+        )),
+        // 官方 Claude 订阅 —— 用量按订阅档, 无额度数字接口。
+        "claude-official" => Ok(mk(
+            "unsupported",
+            "订阅制",
+            "Claude 官方订阅按档计费, 用量请见下方 Token 统计或 claude.ai",
+            "https://claude.ai/settings/usage",
+        )),
+        _ => Ok(mk(
+            "unsupported",
+            "未提供查询接口",
+            "该供应商未提供公开额度查询接口",
+            &v.website_url,
+        )),
+    }
+}
+
 // ───────────────────────── 工具函数 ─────────────────────────
 
 fn now_ms() -> u64 {
@@ -2090,5 +2385,65 @@ mod claude_oauth_tests {
             "org%3Acreate_api_key%20user%3Aprofile"
         );
         assert_eq!(claude_url_encode("aZ09-_.~"), "aZ09-_.~");
+    }
+}
+
+#[cfg(test)]
+mod per_conv_scope_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    /// 收集一条 Command 上「显式设置/移除」的 env 覆写: key → Some(值) 表示设了某值,
+    /// key → None 表示被 env_remove(阻止从父进程继承)。inherited(没动过的)不出现在这里。
+    fn cmd_env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// 核心隔离机制: 对话显式选「Claude 官方」时, 即便父进程(全局当前供应商)残留着
+    /// ANTHROPIC_BASE_URL/TOKEN, 也会被本条命令逐键 env_remove 顶掉 —— 这条 claude
+    /// 因此走官方端点, 与全局开关、与其它并发对话彻底解耦。这正是「每对话隔离」的根。
+    #[test]
+    fn forced_official_clears_inherited_global_env() {
+        // 模拟「全局当前 = 某第三方」在父进程 env 里留下的痕迹
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://global-thirdparty.example/anthropic");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "global-token");
+
+        let mut cmd = Command::new("claude");
+        scope_child_claude_by_id(&mut cmd, Some("claude-official"));
+        let ov = cmd_env_overrides(&cmd);
+
+        // 受管键必须被显式移除(值为 None), 而不是放任继承全局那家
+        for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"] {
+            assert_eq!(ov.get(k), Some(&None), "受管键 {k} 应被 env_remove 顶掉继承值");
+        }
+        // 官方档不套私有 CLAUDE_CONFIG_DIR(OAuth 凭据在共享 ~/.claude)
+        assert!(!ov.contains_key("CLAUDE_CONFIG_DIR"), "官方不应改 CLAUDE_CONFIG_DIR");
+    }
+
+    /// Auto 档(None/""/"auto"): 不做逐命令注入。全局当前为官方时, scope_child_claude
+    /// 提前返回 → 命令上零 env 覆写(纯继承父进程), 行为与旧版完全一致。
+    #[test]
+    fn auto_is_passthrough_when_global_official() {
+        {
+            let mut s = STORE.write();
+            s.link_global = false;
+            s.current_id = "claude-official".to_string();
+        }
+        for id in [None, Some(""), Some("auto")] {
+            let mut cmd = Command::new("claude");
+            scope_child_claude_by_id(&mut cmd, id);
+            assert!(
+                cmd_env_overrides(&cmd).is_empty(),
+                "Auto 档({id:?}) 不应在命令上留下任何 env 覆写"
+            );
+        }
     }
 }

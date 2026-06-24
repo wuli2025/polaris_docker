@@ -69,6 +69,7 @@ pub async fn serve() -> anyhow::Result<()> {
     crate::skills::seed_deck_studio_skill();
     crate::skills::seed_web_studio_skill();
     crate::skills::seed_wechat_typesetter_skill();
+    crate::skills::seed_wechat_tasks_skill();
     // 老用户迁移：早期版本首启播种过毛主席资料库的，补装 consult-mao 技能。
     crate::skills::migrate_consult_mao_for_seeded_kb();
     // 飞书网关「开机自动启动」（若用户开了 auto_start 且凭证齐全）。
@@ -696,6 +697,7 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         }
         "provider_delete" => ok(provider::provider_delete(req_str(a, "id")?)?),
         "usage_summary" => ok(provider::usage_summary()?),
+        "provider_balance" => ok(provider::provider_balance(req_str(a, "id")?)?),
         "codex_status" => ok(provider::codex_status()?),
         "codex_start_login" => ok(provider::codex_start_login()?),
         "codex_poll_login" => ok(provider::codex_poll_login(
@@ -791,6 +793,25 @@ fn dispatch_sync(cmd: &str, a: &Value, app: AppHandle) -> Result<Value, String> 
         "wecom_scan_create" => ok(wecom::wecom_scan_create(req_str(a, "source")?)?),
         "media_accounts_status" => ok(accounts::media_accounts_status()),
         "media_account_forget" => ok(accounts::media_account_forget(req_str(a, "platform")?)?),
+
+        // ── 盘管理(NAS 网络盘记忆 + 映射)──
+        "nas_list" => ok(crate::nas::nas_list()),
+        "nas_save" => {
+            let rec = serde_json::from_value(a.get("record").cloned().unwrap_or(Value::Null))
+                .map_err(|e| format!("record 参数无效：{e}"))?;
+            ok(crate::nas::nas_save(rec)?)
+        }
+        "nas_forget" => ok(crate::nas::nas_forget(req_str(a, "id")?)?),
+        "nas_connect" => {
+            let rec = serde_json::from_value(a.get("record").cloned().unwrap_or(Value::Null))
+                .map_err(|e| format!("record 参数无效：{e}"))?;
+            ok(crate::nas::nas_connect(rec)?)
+        }
+        "nas_disconnect" => {
+            let rec = serde_json::from_value(a.get("record").cloned().unwrap_or(Value::Null))
+                .map_err(|e| format!("record 参数无效：{e}"))?;
+            ok(crate::nas::nas_disconnect(rec)?)
+        }
 
         // ── 降级/桌面专属：给惰性 stub，保证前端不报错 ──
         "sandbox_status" => ok(json!({

@@ -177,6 +177,11 @@ pub struct ChatSendArgs {
     /// None 视为 fast —— 不带此字段的旧调用方(如分批长任务)默认走快速预设。
     #[serde(default)]
     pub work_mode: Option<String>,
+    /// 本对话选定的供应商 id(来自左下角「API 供应商」中心, 自动识别已配的那些)。
+    /// None / "" / "auto" = Auto 档(沿用应用全局当前供应商)。具体 id = 本对话钉死这家,
+    /// 逐命令注入其 env 实现「每个对话各用各的 API」真隔离, 与全局开关、其它并发对话解耦。
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -528,7 +533,7 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
     // 默认走宿主机执行（沙箱可选，但默认关闭）；动态编排时放行 Task 子代理；
     // work_full 决定快速模式是否禁用冗余工具(disallowedTools)、是否传按模式的 --model。
     let mut child =
-        spawn_on_host(&final_prompt, perm, &art_dir, args.dynamic_workflow, work_full)?;
+        spawn_on_host(&final_prompt, perm, &art_dir, args.dynamic_workflow, work_full, args.provider_id.as_deref())?;
 
     // prompt 经 stdin 喂给 claude (而非命令行参数): 大 prompt 不会撞 Windows 命令行
     // 长度上限, 也不会因 prompt 以 `-` 开头被当成 flag。spawn 后立刻写 + drop, claude 读到 EOF 就开始处理。
@@ -1084,6 +1089,7 @@ fn spawn_on_host(
     art_dir: &Path,
     with_task: bool,
     work_full: bool,
+    provider_id: Option<&str>,
 ) -> Result<Child, String> {
     let perm_flag = format!("--permission-mode={}", perm);
     // cwd = polaris-app 根 (env!("CARGO_MANIFEST_DIR") 的父级),
@@ -1165,7 +1171,9 @@ fn spawn_on_host(
     crate::doctor::harden_child_env(&mut cmd);
     // 隔离模式跑第三方 → CLAUDE_CONFIG_DIR 指私有目录, 会话账本不进 ~/.claude/projects,
     // cc-switch 等外部监控不再看见 Polaris 自动任务的第三方会话。
-    crate::provider::scope_child_claude(&mut cmd);
+    // provider_id 指定了本对话这家 → 逐命令注入它的 env(真隔离, 与全局开关/其它对话解耦);
+    // None/"auto" → 回落全局当前供应商(Auto 档)。统一走这一个入口。
+    crate::provider::scope_child_claude_by_id(&mut cmd, provider_id);
     no_window(&mut cmd); // 隐藏式: 每次发消息不再弹出黑色终端窗口
 
     // Linux/容器: 让 claude 成为新进程组的组长 (setpgid)。这样 kill_tree 的

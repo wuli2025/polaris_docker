@@ -53,6 +53,10 @@ const HELP: &str = r#"polaris-forge — Polaris Forge 渲染引擎 CLI
   polaris-forge fable search --q=<查询> [--top=12] [--mode=hybrid|grep|vector]
       塌平混检:grep 多核车道 ∥ RAG 向量车道并行 → RRF 融合 → 重排,JSON 命中。
 
+  polaris-forge fable warmup
+      预热本地嵌入/重排模型(BGE-M3 + bge-reranker-v2-m3)→ 下载到 FASTEMBED_CACHE_DIR。
+      仅 local-embed 构建有效;Docker 构建期预烤一次,运行时离线加载、零联网。
+
 约定:成功 → JSON 到 stdout,退出码 0;失败 → {"ok":false,"error":…} 到 stderr,退出码 1。
 "#;
 
@@ -197,6 +201,29 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
                             &mode,
                         )?)
                         .map_err(|e| e.to_string())
+                    }
+                }
+                "warmup" => {
+                    // 预热本地嵌入/重排:触发 fastembed 下载 + 加载 BGE-M3 / bge-reranker-v2-m3
+                    // → 缓存落 FASTEMBED_CACHE_DIR。Docker 构建期跑一次,把模型烤进镜像层。
+                    #[cfg(feature = "local-embed")]
+                    {
+                        app::fable::embed_local::embed(&["warmup".to_string()])
+                            .map_err(|e| format!("嵌入模型预热失败: {e}"))?;
+                        app::fable::embed_local::rerank("warmup", &["warmup".to_string()], 1)
+                            .map_err(|e| format!("重排模型预热失败: {e}"))?;
+                        serde_json::to_value(serde_json::json!({
+                            "ok": true,
+                            "warmed": ["BAAI/bge-m3", "bge-reranker-v2-m3"],
+                            "cache": std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_default(),
+                        }))
+                        .map_err(|e| e.to_string())
+                    }
+                    #[cfg(not(feature = "local-embed"))]
+                    {
+                        Err::<Value, String>(
+                            "本二进制未编 local-embed feature,无法预热本地嵌入模型".to_string(),
+                        )
                     }
                 }
                 other => Err(format!("未知 fable 子命令 {other}(--help 看用法)")),

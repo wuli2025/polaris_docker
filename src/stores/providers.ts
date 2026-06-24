@@ -5,6 +5,7 @@ import {
   type ProviderView,
   type ProviderSaveInput,
   type UsageSummary,
+  type ProviderBalance,
   type CodexStatus,
   type CodexDeviceLogin,
   type CodexProxyInfo,
@@ -16,6 +17,10 @@ export const useProvidersStore = defineStore("providers", () => {
   /** true = 联动系统 CLI(写 ~/.claude/settings.json); false = 隔离, 仅 Polaris 内生效 */
   const linkGlobal = ref(false);
   const usage = ref<UsageSummary | null>(null);
+  /** 各供应商套餐额度 / 实时余额(id → 结果),按需懒查 */
+  const balances = ref<Record<string, ProviderBalance>>({});
+  /** 正在查询额度的供应商 id 集合(驱动行内 spinner) */
+  const balanceBusy = ref<Record<string, boolean>>({});
   const codex = ref<CodexStatus | null>(null);
   const codexProxy = ref<CodexProxyInfo | null>(null);
   const loading = ref(false);
@@ -66,6 +71,41 @@ export const useProvidersStore = defineStore("providers", () => {
       usage.value = await providerApi.usage();
     } catch (e) {
       error.value = String(e);
+    }
+  }
+
+  /** 查询单个供应商的套餐额度 / 实时余额(失败也写回一个 error 结果, 便于 UI 展示) */
+  async function refreshBalance(id: string): Promise<ProviderBalance | null> {
+    if (!id) return null;
+    balanceBusy.value = { ...balanceBusy.value, [id]: true };
+    try {
+      const b = await providerApi.balance(id);
+      balances.value = { ...balances.value, [id]: b };
+      return b;
+    } catch (e) {
+      const fail: ProviderBalance = {
+        id,
+        available: false,
+        kind: "error",
+        label: "查询失败",
+        detail: String(e),
+        consoleUrl: "",
+      };
+      balances.value = { ...balances.value, [id]: fail };
+      return fail;
+    } finally {
+      const { [id]: _drop, ...rest } = balanceBusy.value;
+      balanceBusy.value = rest;
+    }
+  }
+
+  /** 批量查询所有「已配 key」供应商的额度(用量看板的套餐额度区用,串行避免一次性打满) */
+  async function refreshConfiguredBalances() {
+    const targets = providers.value.filter(
+      (p) => p.hasKey && p.kind !== "codex" && p.kind !== "copilot"
+    );
+    for (const p of targets) {
+      await refreshBalance(p.id);
     }
   }
 
@@ -162,6 +202,8 @@ export const useProvidersStore = defineStore("providers", () => {
     currentId,
     linkGlobal,
     usage,
+    balances,
+    balanceBusy,
     codex,
     codexProxy,
     loading,
@@ -177,6 +219,8 @@ export const useProvidersStore = defineStore("providers", () => {
     closeUsage,
     refresh,
     refreshUsage,
+    refreshBalance,
+    refreshConfiguredBalances,
     refreshCodex,
     refreshCodexProxy,
     codexStartLogin,

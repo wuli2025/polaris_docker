@@ -156,6 +156,22 @@ const BROWSER_USE_SKILL_MD: &str = include_str!("templates/skills/browser-use/SK
 const BROWSER_USE_RUNNER: &str =
     include_str!("templates/skills/browser-use/scripts/browser_use_runner.py");
 
+// ───────── 「微信聊天 · 每日待办」多文件技能（本地解密微信→挖待办→写晨报，编译期内嵌，启动落盘）─────────
+// SKILL.md + scripts/wx_daily.py（每日：复用缓存 master key 解密导出→挖「你回过话且最近几天别人
+// 发来未回」的消息→写进 kb_root/memory/briefing 晨报）+ scripts/wx_setup.py（一次性 hook 抓 key）
+// + scripts/wx_config.example.json。脚本纯 stdlib，解密导出 shell 到 wechat-decrypt 的 venv。
+// 和其它多文件技能同套路：编译期内嵌、启动确保落到 ~/Polaris/skills（版本号比对覆盖）。
+const WECHAT_TASKS_ID: &str = "wechat-tasks";
+// 改动 SKILL.md / wx_daily.py / wx_setup.py 后必须 +1，让已安装用户下次启动拿到更新。
+const WECHAT_TASKS_VERSION: &str = "1";
+const WECHAT_TASKS_SKILL_MD: &str = include_str!("templates/skills/wechat-tasks/SKILL.md");
+const WECHAT_TASKS_DAILY_PY: &str =
+    include_str!("templates/skills/wechat-tasks/scripts/wx_daily.py");
+const WECHAT_TASKS_SETUP_PY: &str =
+    include_str!("templates/skills/wechat-tasks/scripts/wx_setup.py");
+const WECHAT_TASKS_CONFIG_EXAMPLE: &str =
+    include_str!("templates/skills/wechat-tasks/scripts/wx_config.example.json");
+
 // ═══════════════════════════════════════════════════════════════
 // 统一目录 Catalog（编译期，只读）
 // ═══════════════════════════════════════════════════════════════
@@ -349,6 +365,15 @@ fn catalog() -> Vec<CatalogSkill> {
             source: "third-party",
             preinstalled: true,
             system_prompt: WECHAT_TS_SKILL_MD,
+        },
+        // ── 微信聊天 · 每日待办（本地解密微信→挖「该回谁」→进晨报；配套每日自动化流程） ──
+        CatalogSkill {
+            id: WECHAT_TASKS_ID,
+            name: "微信聊天 · 每日待办",
+            description: "每天本地解密微信聊天，从「你回过话的私聊 + 你活跃的群里、最近几天别人发来你还没回」的消息里挖出待办，写进晨报卡片，点一下就帮你拟回复。一次性 hook 抓密钥后每天自动复用。全本地、不上传、不发布",
+            source: "official",
+            preinstalled: false,
+            system_prompt: WECHAT_TASKS_SKILL_MD,
         },
         // ── 源自 ClaudeSkills 合集的两个内容创作技能（全链路成稿/出图时调用） ──
         CatalogSkill {
@@ -1322,6 +1347,39 @@ fn write_wechat_typesetter_files(dest: &Path) -> Result<(), String> {
     fs::create_dir_all(&scripts).map_err(|e| e.to_string())?;
     fs::write(dest.join("skill.md"), WECHAT_TS_SKILL_MD).map_err(|e| e.to_string())?;
     fs::write(scripts.join("wechat_yiban.py"), WECHAT_TS_YIBAN_PY).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 启动时确保「微信聊天 · 每日待办」技能在 ~/Polaris/skills 落盘（多文件，含 wx_daily.py / wx_setup.py
+/// 可执行脚本 + wx_config.example.json）。与壹伴排版同策略：目录缺失 / 版本旧就（重）写；已最新则跳过。
+/// 注意：**不覆盖**用户已填好的 wx_config.json（内含 master key 与本机路径），只补样例。
+/// best-effort：失败只让「微信每日待办」暂不可用，不阻断 App 启动。
+pub fn seed_wechat_tasks_skill() {
+    let Some(root) = skills_dir() else {
+        return;
+    };
+    let dest = root.join(WECHAT_TASKS_ID);
+    let ver_file = dest.join(".polaris_version");
+    let stored = fs::read_to_string(&ver_file).unwrap_or_default();
+    let present = dest.join("skill.md").exists();
+    if present && stored.trim() == WECHAT_TASKS_VERSION {
+        return;
+    }
+    if write_wechat_tasks_files(&dest).is_ok() {
+        let _ = fs::write(&ver_file, WECHAT_TASKS_VERSION);
+    }
+}
+
+/// 把内嵌的「微信每日待办」文件写到目标目录。技能正文写成小写 `skill.md`，与扫描约定一致。
+/// wx_config.json（用户机密：master key + 路径）若已存在则保留不动。
+fn write_wechat_tasks_files(dest: &Path) -> Result<(), String> {
+    let scripts = dest.join("scripts");
+    fs::create_dir_all(&scripts).map_err(|e| e.to_string())?;
+    fs::write(dest.join("skill.md"), WECHAT_TASKS_SKILL_MD).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("wx_daily.py"), WECHAT_TASKS_DAILY_PY).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("wx_setup.py"), WECHAT_TASKS_SETUP_PY).map_err(|e| e.to_string())?;
+    fs::write(scripts.join("wx_config.example.json"), WECHAT_TASKS_CONFIG_EXAMPLE)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
