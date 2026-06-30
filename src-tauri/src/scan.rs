@@ -570,9 +570,15 @@ fn proc_mount_roots() -> Vec<String> {
         if mnt == "/" {
             continue; // 容器根 overlay,扫它等于扫整个容器
         }
-        if ["/proc", "/sys", "/dev", "/run", "/etc", "/var/lib/", "/snap", "/boot"]
+        // 系统路径黑名单:按**路径分量边界**匹配(相等或 `<sys>/…` 才算命中),不能用裸 starts_with
+        // ——否则用户把宿主盘 bind 到名字恰好以系统前缀打头的容器路径(如 `/etcdata`、`/run-data`、
+        // `/snapshots`、`/bootcamp`)会被误判成系统目录而整根排除,这些挂载里的文件于是「扫不到」。
+        if ["/proc", "/sys", "/dev", "/run", "/etc", "/var/lib", "/snap", "/boot"]
             .iter()
-            .any(|p| mnt == p.trim_end_matches('/') || mnt.starts_with(p))
+            .any(|p| {
+                let p = p.trim_end_matches('/');
+                mnt == p || mnt.starts_with(format!("{p}/").as_str())
+            })
         {
             continue;
         }

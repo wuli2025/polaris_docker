@@ -10,7 +10,7 @@
 # ═══════════════════════════════════════════════════════════════
 [package]
 name = "polaris-cli"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "polaris-forge — Polaris Forge 渲染引擎 CLI"
 publish = false

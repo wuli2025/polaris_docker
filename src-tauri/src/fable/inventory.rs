@@ -410,6 +410,44 @@ fn parent_rel(rel: &str) -> &str {
     }
 }
 
+/// 自愈核心:把「本轮被跳过 / 反复读失败 / 看门狗放弃的目录」的**父目录**在 `dirs` 缓存里 mtime
+/// 置 0,作废父目录的「免遍历」资格。
+///
+/// 为什么必须这么做:被跳过的目录本轮没产生 `Msg` → 它的 `dirs` 行随后被代际对账(`seen<>gen`)
+/// 清掉;而它父目录的 mtime 多半没变,下次**增量**盘点会对父目录走「免遍历」跳过、且邻接表(由
+/// `dirs` 现存行反推)里已不含这个子目录 → 该子树**永远不会再被 `read_dir` 发现**,哪怕 NAS /
+/// 外置盘 / 权限早已恢复,也只有用户手动点「完整盘点」才找得回(线上「经常有些文件扫不到」的根因)。
+/// 把父目录 mtime 置 0 后,下次增量盘点比对 `cur_mtime != 0 && cached == cur` 必然失败 → 真正
+/// `read_dir` 父目录 → 重新发现并补扫漏掉的子树,直到挂载恢复后自然收敛。父目录此刻 `seen=gen`
+/// (被跳过时 `touch_dir` 过 / 被扫到时 `up_dir` 过),不会被代际对账的 DELETE 误伤。
+///
+/// 返回实际作废的父目录行数(供测试 / 诊断)。`skipped_paths` 为空时零成本返回。
+fn invalidate_skipped_parents(
+    conn: &rusqlite::Connection,
+    root_id: i64,
+    root_path: &Path,
+    skipped_paths: &[String],
+) -> usize {
+    if skipped_paths.is_empty() {
+        return 0;
+    }
+    let Ok(mut up_parent) =
+        conn.prepare("UPDATE dirs SET mtime=0 WHERE root_id=?1 AND relpath=?2")
+    else {
+        return 0;
+    };
+    let mut seen_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut n = 0usize;
+    for p in skipped_paths {
+        let rel = rel_of(Path::new(p), root_path);
+        let parent = parent_rel(&rel).to_string();
+        if seen_parents.insert(parent.clone()) {
+            n += up_parent.execute(rusqlite::params![root_id, parent]).unwrap_or(0);
+        }
+    }
+    n
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanSummary {
     pub root: String,
@@ -905,13 +943,16 @@ pub fn scan_root(
     let files = n_files.load(Ordering::Relaxed);
     let bytes = n_bytes.load(Ordering::Relaxed);
     progress(files, bytes); // 收尾再报一次,确保进度条落到最终值
-    let skipped: u64 = {
+    // 本轮被跳过/反复读失败/看门狗放弃的目录绝对路径(用于①报数 ②下面给它们的父目录作废增量缓存,
+    // 根治「一次读失败就永久漏扫」——见下方自愈逻辑)。
+    let skipped_paths: Vec<String> = {
         let mut v = problematic.lock().unwrap();
         for (d, _mt) in skipped_dirs {
             v.push(d.to_string_lossy().into_owned());
         }
-        v.len() as u64
+        v.clone()
     };
+    let skipped = skipped_paths.len() as u64;
 
     // 护栏:本轮扫到 0 文件 → 几乎一定是「根临时读不到」(NAS 挂载掉线 / 权限抖动 / 路径没挂上),
     // 而非用户真把整个根清空了。此时若照常跑 seen 代际删除,会把该根上一轮的全部记录连同
@@ -982,6 +1023,13 @@ pub fn scan_root(
         // 完整 read_dir 再补回缓存,绝不波及 files(文件的删除另由上面「逐个 stat 确认真消失」把关)。
         conn.execute("DELETE FROM dirs WHERE root_id=?1 AND seen<>?2", rusqlite::params![root_id, gen])
             .map_err(|e| e.to_string())?;
+
+        // 自愈:防「一次读失败就永久漏扫」。被跳过/读失败的目录本轮没产生 Msg → 它的 dirs 行刚被
+        // 上面按 seen<>gen 清掉;而它的**父目录** mtime 多半没变,下次增量盘点会对父目录走「免遍历」
+        // 跳过、且邻接表(由 dirs 现存行反推)里已不含这个子目录 → 该子树**再也不会被 read_dir 发现**,
+        // 哪怕 NAS/挂载早已恢复,也只有手动「完整盘点」才找得回。修法见 [`invalidate_skipped_parents`]。
+        invalidate_skipped_parents(&conn, root_id, root_path.as_path(), &skipped_paths);
+
         conn.execute(
             "UPDATE roots SET scanned_at=?2, files=?3, bytes=?4 WHERE id=?1",
             rusqlite::params![root_id, gen, files as i64, bytes as i64],
@@ -2183,6 +2231,97 @@ mod tests {
             mtime_of(&conn, "B/SUB/s1.txt") > s1_mtime_scan1,
             "完整盘点应补回原地改写文件的新 mtime"
         );
+
+        drop(conn);
+        std::env::remove_var("POLARIS_FABLE_DB");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 端到端(默认 `#[ignore]`,单独手动跑):复现并验证修复「一次读失败就永久漏扫」。
+    /// `cargo test --manifest-path src-tauri/Cargo.toml --lib skipped_subtree_self_heals -- --ignored --exact --nocapture`
+    ///
+    /// 场景:某子目录在一轮盘点里读失败 / 被看门狗放弃(本测试用「删它的 dirs 缓存行」模拟代际对账
+    /// 清掉它后留下的状态),而其父目录 mtime 没变。不修的话,下次增量盘点会跳过父目录、邻接表里又
+    /// 没了这个子目录 → 子树**永久漏扫**(线上「经常有些文件扫不到」的根因)。[`invalidate_skipped_parents`]
+    /// 把父目录 mtime 置 0 令其下次必被重新 `read_dir`,从而补扫回来。本测试先复现漏扫,再验证自愈。
+    #[test]
+    #[ignore]
+    fn skipped_subtree_self_heals() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("polaris_inv_heal_{}", std::process::id()));
+        let root = base.join("root");
+        let db = base.join("fable_test.db");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(root.join("A").join("SUB")).unwrap();
+        let write = |p: &Path, s: &str| {
+            let mut f = std::fs::File::create(p).unwrap();
+            f.write_all(s.as_bytes()).unwrap();
+        };
+        write(&root.join("A").join("a1.txt"), "a1");
+        write(&root.join("A").join("SUB").join("s1.txt"), "s1");
+
+        std::env::set_var("POLARIS_FABLE_DB", &db);
+        let root_s = root.to_string_lossy().to_string();
+        let empty = HashSet::new();
+        let noop = |_f: u64, _b: u64| {};
+
+        // ① 首扫:2 个文件,4 个目录(""/A/A/SUB)。
+        let s1 = scan_root(&root_s, &empty, false, &noop).unwrap();
+        assert_eq!(s1.files, 2, "首扫应有 2 个文件");
+        let conn = open_db().unwrap();
+        let root_id: i64 =
+            conn.query_row("SELECT id FROM roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        let has = |c: &rusqlite::Connection, rel: &str| -> bool {
+            c.query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id=?1 AND relpath=?2",
+                rusqlite::params![root_id, rel],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        let dir_mtime = |c: &rusqlite::Connection, rel: &str| -> i64 {
+            c.query_row(
+                "SELECT mtime FROM dirs WHERE root_id=?1 AND relpath=?2",
+                rusqlite::params![root_id, rel],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(has(&conn, "A/SUB/s1.txt"), "首扫应收录 A/SUB/s1.txt");
+        assert!(dir_mtime(&conn, "A") != 0, "A 目录首扫后应有非零缓存 mtime");
+
+        // ② 模拟「A/SUB 那轮读失败 → 代际对账清掉它的 dirs 行」留下的状态(A 的 mtime 不变,因为 A
+        //    直属项没增删)。同时在 A/SUB 里**新增**文件(A 的 mtime 仍不变,SUB 早已存在)——这正是
+        //    增量盘点的盲区。
+        conn.execute("DELETE FROM dirs WHERE root_id=?1 AND relpath='A/SUB'", [root_id]).unwrap();
+        write(&root.join("A").join("SUB").join("s2-new.txt"), "s2-new");
+
+        // ③ 复现漏扫:不调自愈,直接增量重扫 → A 走「免遍历」跳过、邻接表里没了 A/SUB → 新文件被漏。
+        let _ = scan_root(&root_s, &empty, false, &noop).unwrap();
+        assert!(
+            !has(&conn, "A/SUB/s2-new.txt"),
+            "复现:不自愈时 A/SUB 被永久漏扫,新文件 s2-new.txt 扫不到"
+        );
+
+        // ④ 自愈:把 A/SUB 的父目录(A)缓存 mtime 置 0(= invalidate_skipped_parents 在一轮收尾把它
+        //    列入 skipped 后做的事),令下次增量必重读 A。
+        let healed = invalidate_skipped_parents(
+            &conn,
+            root_id,
+            root.as_path(),
+            &[root.join("A").join("SUB").to_string_lossy().into_owned()],
+        );
+        assert_eq!(healed, 1, "应作废 1 个父目录(A)");
+        assert_eq!(dir_mtime(&conn, "A"), 0, "A 的缓存 mtime 应被置 0");
+
+        // ⑤ 再增量重扫 → A 被真正 read_dir → A/SUB 重新发现 → 漏掉的新文件补回。
+        let _ = scan_root(&root_s, &empty, false, &noop).unwrap();
+        assert!(
+            has(&conn, "A/SUB/s2-new.txt"),
+            "自愈后增量盘点应补扫回此前漏掉的 A/SUB/s2-new.txt"
+        );
+        assert!(has(&conn, "A/SUB/s1.txt"), "原有文件仍在");
 
         drop(conn);
         std::env::remove_var("POLARIS_FABLE_DB");
