@@ -1,0 +1,17 @@
+# ═══════════════════════════════════════════════════════════════
+# polaris-protocol — 命令契约层(分仓规划 v2 第 1 仓的仓内种子)
+# /api/invoke 信封类型 + 参数访问记账(Args):命令读过哪些顶层参数被如实记录,
+# 未被任何代码读取的参数 = 客户端拼错名/契约漂移 —— 默认回响应头曝光,
+# POLARIS_STRICT_ARGS=1 时直接 400 拒绝。治「未知参数静默容忍」欠账(codex 两轮实锤)。
+# 铁律: 本 crate 零业务依赖,双端(壳/引擎)皆可安全引用;未来抽独立仓+TS 双发布。
+# ═══════════════════════════════════════════════════════════════
+[package]
+name = "polaris-protocol"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"

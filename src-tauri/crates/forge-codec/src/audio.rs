@@ -10,15 +10,19 @@ use crate::{ForgeError, Result};
 /// PCM → Opus 编码器
 /// 真实实现 P1.5 落 audiopus::Encoder 链;本期给 stub
 pub struct OpusEncoder {
-    pub sample_rate: u32,  // 48000
-    pub channels: u8,      // 1 or 2
-    pub bitrate_bps: u32,  // 默认 64000
+    pub sample_rate: u32, // 48000
+    pub channels: u8,     // 1 or 2
+    pub bitrate_bps: u32, // 默认 64000
 }
 
 impl OpusEncoder {
     pub fn new(sample_rate: u32, channels: u8, bitrate_bps: u32) -> Result<Self> {
         // P1.5:audiopus::Encoder::create_state() 真实实现
-        Ok(Self { sample_rate, channels, bitrate_bps })
+        Ok(Self {
+            sample_rate,
+            channels,
+            bitrate_bps,
+        })
     }
 
     /// 编码 20ms 一帧 PCM(960 samples per channel @48kHz)

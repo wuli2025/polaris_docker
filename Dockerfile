@@ -49,29 +49,24 @@ RUN mkdir -p /usr/local/cargo/ \
         'git-fetch-with-cli = true' \
         > /usr/local/cargo/config.toml
 
-# 2a) 依赖缓存层：先只拷清单 + crates 源 + 空占位 src，预编译全部第三方依赖。
-#     之后改业务代码不会重编 axum/tokio 等重型依赖 → Windows 更新后 Docker 快速重建。
-COPY src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs ./src-tauri/
-COPY src-tauri/crates ./src-tauri/crates
-RUN mkdir -p src-tauri/src/bin \
-    && echo 'fn main(){}' > src-tauri/src/bin/polaris-server.rs \
-    && echo 'fn main(){}' > src-tauri/src/bin/polaris-forge.rs \
-    && echo '' > src-tauri/src/main.rs \
-    && echo '' > src-tauri/src/lib.rs \
-    && cargo build --profile release-fast \
+# ★ 分仓重构(主仓 v2.0 起)后的构建姿势 —— 别再照抄旧的「stub src/bin 预热依赖」写法:
+#   旧布局:polaris-server/polaris-forge 的 [[bin]] 住主包 src/bin/,故可用「空占位 src +
+#          --bin polaris-server」预编依赖。
+#   新布局:两个 bin 都住 workspace 成员 crates/polaris-cli,且 polaris-cli 依赖
+#          polaris-app{default-features=false, features=["server"]}。此时再 stub 主包
+#          src/lib.rs,polaris-cli 会因为找不到 polaris-app 的符号直接编译失败 ——
+#          占位层不再可行,整包一次编(依赖缓存交给 image.yml 的 GHA cache-from/to)。
+#
+#   -p polaris-cli 一次出双 bin(polaris-server + polaris-forge),server feature 经依赖恒开,
+#   等价于旧的 --no-default-features --features server。
+#   --features collab-net:让 polaris-server 起 iroh host_listen 暴露 NodeId ——
+#     ★ 没有它 NAS 侧连不出 NodeId,桌面「设备联盟」的 P2P 远程盘直连不可用(实测根因)。
+#   --features local-embed:本地 ONNX 嵌入/重排(经 polaris-cli → polaris-app → polaris-fable
+#     转发);配套 crates/polaris-fable 的 ort-load-dynamic + 运行层 ORT_DYLIB_PATH。
+COPY src-tauri ./src-tauri
+RUN cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --no-default-features --features server,local-embed \
-    ; rm -rf src-tauri/src
-
-# 2b) 真实源码层：拷源码 + 资源 + assets(feishu/wecom 的 include_str!)，编出 polaris-server。
-COPY src-tauri/src ./src-tauri/src
-COPY src-tauri/assets ./src-tauri/assets
-COPY src-tauri/resources ./src-tauri/resources
-# 触碰 mtime 确保 cargo 重编 polaris-app crate 本体（而非缓存的空壳）。
-RUN touch src-tauri/src/main.rs src-tauri/src/lib.rs \
-    && cargo build --profile release-fast \
-        --manifest-path src-tauri/Cargo.toml \
-        --bin polaris-server --bin polaris-forge --no-default-features --features server,local-embed \
+        -p polaris-cli --features collab-net,local-embed \
     && cp src-tauri/target/release-fast/polaris-server /usr/local/bin/polaris-server \
     && cp src-tauri/target/release-fast/polaris-forge /usr/local/bin/polaris-forge
 

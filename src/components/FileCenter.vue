@@ -41,6 +41,7 @@ import {
   WifiOff,
   Server,
 } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import {
   files as fc,
   artifacts as artifactsApi,
@@ -54,6 +55,8 @@ import {
 import { useAppStore } from "../stores/app";
 import { useWizardStore } from "../stores/wizard";
 import { useFileTasksStore } from "../stores/fileTasks";
+import { loadRemoteSources, type RemoteSource } from "../features/interconnect/remoteSources";
+import { fsList, fsDownload, joinPath, type FsEntry } from "../features/collab/fsapi";
 // 星图(星河图谱)按需加载:依赖 cytoscape(~562KB),只在点开「星图」时才拉。
 const KnowledgeGraph = defineAsyncComponent(() => import("./KnowledgeGraph.vue"));
 // 核心层 = 整套知识库(llmwiki)本体:点「核心层」tab 直接内嵌完整知识库,体验与独立知识库一致。
@@ -92,8 +95,68 @@ watch(
 );
 
 // ───────────────────────── 状态 ─────────────────────────
-type ViewKind = "gallery" | "clusters" | "list" | "core";
+type ViewKind = "gallery" | "clusters" | "list" | "core" | "remote";
 const view = ref<ViewKind>("gallery");
+
+// ── 远程源(经 iroh 隧道接入的 NAS/主机):像本机一样浏览、下载它的盘 ──
+const remoteSources = ref<RemoteSource[]>(loadRemoteSources());
+const remoteSel = ref<RemoteSource | null>(null);
+const rcwd = ref(""); // 当前相对路径
+const rentries = ref<FsEntry[]>([]);
+const rloading = ref(false);
+const rerr = ref("");
+const rcrumbs = computed(() => rcwd.value.split("/").filter(Boolean));
+function pickRemote(s: RemoteSource) {
+  remoteSources.value = loadRemoteSources();
+  view.value = "remote";
+  openRemote(s, "");
+}
+async function openRemote(s: RemoteSource, rel = "") {
+  remoteSel.value = s;
+  rcwd.value = rel;
+  rerr.value = "";
+  rloading.value = true;
+  try {
+    rentries.value = await fsList(s, rel);
+  } catch (e) {
+    rerr.value = (e as Error).message;
+    rentries.value = [];
+  } finally {
+    rloading.value = false;
+  }
+}
+function enterRemote(e: FsEntry) {
+  if (e.is_dir && remoteSel.value) openRemote(remoteSel.value, joinPath(rcwd.value, e.name));
+}
+function remoteUp() {
+  if (!remoteSel.value) return;
+  const parts = rcrumbs.value.slice(0, -1);
+  openRemote(remoteSel.value, parts.join("/"));
+}
+function remoteCrumbTo(i: number) {
+  if (!remoteSel.value) return;
+  openRemote(remoteSel.value, rcrumbs.value.slice(0, i + 1).join("/"));
+}
+async function downloadRemote(e: FsEntry) {
+  if (!remoteSel.value || e.is_dir) return;
+  try {
+    const blob = await fsDownload(remoteSel.value, joinPath(rcwd.value, e.name));
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = e.name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch (err) {
+    rerr.value = (err as Error).message;
+  }
+}
+function fmtRemoteSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
+}
 
 // ── 核心层(知识体系):个人=知识网/聚类,企业=Schema-Guided 抽出的实体关系三元组 ──
 interface OntoTypeLite { id: string; name: string; hint: string }
@@ -1062,6 +1125,14 @@ const headerStats = computed<{ label: string; value: string; hint?: string }[]>(
 });
 
 onMounted(async () => {
+  remoteSources.value = loadRemoteSources(); // 互联页新接入的远程源同步进来
+  // 互联页设备卡点了「使用盘」→ 带着目标远程源直接落进远程浏览
+  const want = sessionStorage.getItem("polaris.fc.openRemote");
+  if (want) {
+    sessionStorage.removeItem("polaris.fc.openRemote");
+    const rs = remoteSources.value.find((s) => s.id === want);
+    if (rs) pickRemote(rs);
+  }
   await loadOverview();
   await loadGrid(true);
   // 后台补齐文稿自然语言(不阻塞首屏;代码/媒体的按语言归类已即时可用)
@@ -1127,6 +1198,18 @@ onBeforeUnmount(() => {
           <Network :size="15" :stroke-width="1.7" />
           <span class="seg-lab">核心层</span>
         </button>
+        <!-- 远程源:每台经 iroh 隧道接入的 NAS/主机一颗 chip -->
+        <button
+          v-for="rs in remoteSources"
+          :key="rs.id"
+          class="seg-btn core-seg remote-seg"
+          :class="{ on: view === 'remote' && remoteSel?.id === rs.id }"
+          :title="`远程源 · ${rs.name}（127.0.0.1:${rs.port}）`"
+          @click="pickRemote(rs)"
+        >
+          <Server :size="15" :stroke-width="1.7" />
+          <span class="seg-lab">{{ rs.name }}</span>
+        </button>
       </div>
 
       <div v-show="view !== 'core'" class="search">
@@ -1141,7 +1224,7 @@ onBeforeUnmount(() => {
           <X :size="13" :stroke-width="2" />
         </button>
         <button class="sem-btn" :disabled="semBusy || !searchText.trim()" title="语义检索(grep ∥ 向量)" @click="runSemantic">
-          <LoaderCircle v-if="semBusy" :size="14" class="spin" />
+          <OrbitSpinner v-if="semBusy" :size="14" />
           <Radar v-else :size="14" :stroke-width="1.8" />
           <span>语义</span>
         </button>
@@ -1181,7 +1264,7 @@ onBeforeUnmount(() => {
           title="盘点:先扫一眼文件夹结构,勾选要盘点的目录(可选知识库之外的盘符/文件夹),再建库"
           @click="openFolderPicker"
         >
-          <LoaderCircle v-if="scanning || pickerLoading" :size="14" class="spin" />
+          <OrbitSpinner v-if="scanning || pickerLoading" :size="14" />
           <FolderSearch v-else :size="14" :stroke-width="1.8" />
           <span>{{ scanning ? "盘点中" : "盘点" }}</span>
         </button>
@@ -1193,7 +1276,7 @@ onBeforeUnmount(() => {
             : '智能归类:先秒级按结构出星图骨架 → AI 读懂并起名;到设置页配硅基 key(免费)后,还会在后台按内容语义精修一次'"
           @click="doSmartCluster"
         >
-          <LoaderCircle v-if="clustering || llmClustering" :size="14" class="spin" />
+          <OrbitSpinner v-if="clustering || llmClustering" :size="14" />
           <Wand2 v-else :size="14" :stroke-width="1.8" />
           <span>{{ clustering || llmClustering ? "归类中" : "智能归类" }}</span>
         </button>
@@ -1205,7 +1288,7 @@ onBeforeUnmount(() => {
             : '建索引需要嵌入 key:点这里到设置页配硅基 key(免费),全文索引则照常后台建'"
           @click="buildIndex"
         >
-          <LoaderCircle v-if="building" :size="14" class="spin" />
+          <OrbitSpinner v-if="building" :size="14" />
           <Radar v-else :size="14" :stroke-width="1.8" />
           <span>{{ building ? "建索引中" : overview && overview.embeddedFiles > 0 ? "续建索引" : "建索引" }}</span>
         </button>
@@ -1215,7 +1298,7 @@ onBeforeUnmount(() => {
           title="用大模型给乱码/杂乱的文件名起可读的中文标题(只改显示,不改磁盘文件名)"
           @click="doTitlesLlm"
         >
-          <LoaderCircle v-if="llmTitling" :size="14" class="spin" />
+          <OrbitSpinner v-if="llmTitling" :size="14" />
           <Sparkles v-else :size="14" :stroke-width="1.8" />
           <span>{{ llmTitling ? "整理中" : "AI 整理名称" }}</span>
         </button>
@@ -1275,7 +1358,7 @@ onBeforeUnmount(() => {
             :disabled="building"
             @click="buildIndex"
           >
-            <LoaderCircle v-if="building" :size="12" class="spin" />
+            <OrbitSpinner v-if="building" :size="12" />
             <Radar v-else :size="12" :stroke-width="1.8" />
             {{ overview.embeddedFiles > 0 ? "续建索引" : "建索引" }}
           </button>
@@ -1407,13 +1490,48 @@ onBeforeUnmount(() => {
          体验与独立「知识库」完全一致,只是住在文件中心里。空库与否都照常进知识库。 -->
     <WikiBrowse v-if="view === 'core'" class="fc-core-wiki" />
 
+    <!-- 远程源:经 iroh 隧道浏览对端(NAS/主机)的盘 -->
+    <div v-else-if="view === 'remote'" class="fc-remote glass">
+      <div class="rm-bar">
+        <span class="rm-src"><Server :size="14" :stroke-width="1.8" /> {{ remoteSel?.name || "远程源" }}</span>
+        <div class="rm-crumb">
+          <button class="rm-cr" @click="remoteSel && openRemote(remoteSel, '')">根</button>
+          <template v-for="(c, i) in rcrumbs" :key="i">
+            <ChevronRight :size="12" class="rm-sep" />
+            <button class="rm-cr" @click="remoteCrumbTo(i)">{{ c }}</button>
+          </template>
+        </div>
+        <button class="rm-btn" :disabled="!rcwd" title="上一级" @click="remoteUp"><ChevronLeft :size="14" /> 上级</button>
+        <button class="rm-btn" title="刷新" @click="remoteSel && openRemote(remoteSel, rcwd)"><RefreshCw :size="14" /></button>
+      </div>
+
+      <div v-if="rloading" class="rm-state"><OrbitSpinner :size="18" /> 读取远程目录…</div>
+      <div v-else-if="rerr" class="rm-state rm-err"><WifiOff :size="16" /> {{ rerr }}</div>
+      <div v-else-if="!rentries.length" class="rm-state">这个目录是空的。</div>
+      <div v-else class="rm-list">
+        <div
+          v-for="e in rentries"
+          :key="e.name"
+          class="rm-row"
+          :class="{ dir: e.is_dir }"
+          @dblclick="enterRemote(e)"
+        >
+          <span class="rm-ic"><Folder v-if="e.is_dir" :size="16" :stroke-width="1.8" /><Server v-else :size="15" :stroke-width="1.7" /></span>
+          <span class="rm-name" @click="enterRemote(e)">{{ e.name }}</span>
+          <span class="rm-sz">{{ e.is_dir ? "" : fmtRemoteSize(e.size) }}</span>
+          <button v-if="!e.is_dir" class="rm-dl" @click.stop="downloadRemote(e)"><ArrowDownWideNarrow :size="13" /> 下载</button>
+          <button v-else class="rm-dl ghost" @click.stop="enterRemote(e)"><ChevronRight :size="13" /> 进入</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 空库引导 -->
     <div v-else-if="!hasFiles" class="fc-empty glass">
       <div class="empty-orb"><FolderSearch :size="30" :stroke-width="1.3" /></div>
       <div class="empty-title">文件中心还是空的</div>
       <div class="empty-sub">点「盘点」先扫一眼文件夹,勾选要盘点的目录(可选知识库之外的盘符/文件夹),建成可视化文件库;<br />已嵌入文本可再点「智能归类」把相似数据自动放在一起。</div>
       <button class="empty-cta" :disabled="scanning || pickerLoading" @click="openFolderPicker">
-        <LoaderCircle v-if="scanning || pickerLoading" :size="15" class="spin" />
+        <OrbitSpinner v-if="scanning || pickerLoading" :size="15" />
         <FolderSearch v-else :size="15" :stroke-width="1.8" />
         <span>{{ scanning ? "盘点中…" : "立即盘点" }}</span>
       </button>
@@ -1428,7 +1546,7 @@ onBeforeUnmount(() => {
           <span>语义检索:「{{ searchText }}」</span>
           <button class="sem-close" @click="clearSemantic"><X :size="13" :stroke-width="2" /> 收起</button>
         </div>
-        <div v-if="semBusy" class="sem-loading"><LoaderCircle :size="16" class="spin" /> 检索中…</div>
+        <div v-if="semBusy" class="sem-loading"><OrbitSpinner :size="16" /> 检索中…</div>
         <div v-else-if="!semHits.length" class="sem-empty">没有命中。试试更短的关键词,或先在「检索枢纽」构建向量索引。</div>
         <div v-else class="sem-list">
           <div v-for="h in semHits" :key="h.path" class="sem-row" @click="openPath(h.abspath)">
@@ -1492,7 +1610,7 @@ onBeforeUnmount(() => {
         </div>
       </RecycleScroller>
       <div v-show="view === 'gallery'" class="grid-status">
-        <span v-if="loading" class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</span>
+        <span v-if="loading" class="grid-loading"><OrbitSpinner :size="18" /> 加载中…</span>
         <span v-else-if="!cards.length" class="grid-empty">该筛选下没有文件</span>
         <span v-else-if="exhausted" class="grid-done">已显示全部 {{ total.toLocaleString() }} 个</span>
       </div>
@@ -1507,7 +1625,7 @@ onBeforeUnmount(() => {
             每个大类点开能看它下面又分了哪些子类,点节点即可筛出该类的文件。
           </div>
           <button class="empty-cta" :disabled="clustering || llmClustering || !overview?.totalFiles" @click="doSmartCluster">
-            <LoaderCircle v-if="clustering || llmClustering" :size="15" class="spin" />
+            <OrbitSpinner v-if="clustering || llmClustering" :size="15" />
             <Wand2 v-else :size="15" :stroke-width="1.8" /><span>{{ clustering || llmClustering ? "归类中…" : "智能归类" }}</span>
           </button>
         </div>
@@ -1611,7 +1729,7 @@ onBeforeUnmount(() => {
             <span class="lv-c-time">{{ fmtTime(card.mtime) }}</span>
           </div>
         </RecycleScroller>
-        <div v-if="loading" class="grid-status"><span class="grid-loading"><LoaderCircle :size="18" class="spin" /> 加载中…</span></div>
+        <div v-if="loading" class="grid-status"><span class="grid-loading"><OrbitSpinner :size="18" /> 加载中…</span></div>
       </div>
     </div>
 
@@ -1640,7 +1758,7 @@ onBeforeUnmount(() => {
         <div class="detail-gist">
           <div class="gist-head"><Sparkles :size="13" :stroke-width="1.7" /> 内容速览</div>
           <div v-if="detailGist" class="gist-body">{{ detailGist }}</div>
-          <div v-else class="gist-body loading"><LoaderCircle :size="13" class="spin" /> 生成中…</div>
+          <div v-else class="gist-body loading"><OrbitSpinner :size="13" /> 生成中…</div>
         </div>
         <div class="detail-actions">
           <button class="detail-btn primary" @click="openExternal(selected)"><ExternalLink :size="14" :stroke-width="1.8" /> 打开</button>
@@ -1695,7 +1813,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div v-if="pickerLoading" class="picker-loading">
-            <LoaderCircle :size="20" class="spin" /> 正在扫描文件夹结构…
+            <OrbitSpinner :size="20" /> 正在扫描文件夹结构…
           </div>
           <div v-else-if="pickerErr" class="picker-error">{{ pickerErr }}</div>
           <div v-else-if="!scanRoots.length" class="picker-error">没有可盘点的目录。</div>
@@ -1748,7 +1866,7 @@ onBeforeUnmount(() => {
                 class="picker-row sub-loading"
                 :style="{ paddingLeft: 8 + row.level * 20 + 'px' }"
               >
-                <LoaderCircle :size="13" class="spin" /> 加载子文件夹…
+                <OrbitSpinner :size="13" /> 加载子文件夹…
               </div>
               <!-- 空目录占位 -->
               <div
@@ -2497,6 +2615,33 @@ onBeforeUnmount(() => {
   height: auto;
 }
 
+/* ── 远程源浏览(NAS/主机的盘,经 iroh 隧道) ── */
+.fc-remote { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; margin: 12px; padding: 0; overflow: hidden; }
+.rm-bar { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--hairline); flex-wrap: wrap; }
+.rm-src { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13.5px; color: var(--ink); }
+.rm-crumb { display: flex; align-items: center; gap: 3px; flex: 1; min-width: 0; overflow-x: auto; }
+.rm-cr { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 12.5px; padding: 3px 6px; border-radius: 6px; white-space: nowrap; }
+.rm-cr:hover { color: var(--ink); background: var(--selection-bg); }
+.rm-sep { color: var(--dim); flex: none; }
+.rm-btn { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 12px; padding: 5px 9px; border-radius: 8px; }
+.rm-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--ink); }
+.rm-btn:disabled { opacity: .45; cursor: not-allowed; }
+.rm-state { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 40px; color: var(--muted); font-size: 13px; }
+.rm-state.rm-err { color: var(--vermilion); }
+.rm-list { flex: 1; overflow-y: auto; padding: 6px 8px; }
+.rm-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 9px; cursor: default; }
+.rm-row:hover { background: var(--selection-bg); }
+.rm-row.dir { cursor: pointer; }
+.rm-ic { flex: none; width: 24px; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+.rm-row.dir .rm-ic { color: var(--primary); }
+.rm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--text); cursor: pointer; }
+.rm-row.dir .rm-name { font-weight: 600; color: var(--ink); }
+.rm-sz { flex: none; font-family: var(--mono); font-size: 11.5px; color: var(--muted); min-width: 68px; text-align: right; }
+.rm-dl { flex: none; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 11.5px; padding: 4px 9px; border-radius: 7px; }
+.rm-dl:hover { border-color: var(--primary); color: var(--primary); }
+.rm-dl.ghost { color: var(--muted); }
+.remote-seg .seg-lab { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* 语义带 */
 .sem-strip {
   flex: none;
@@ -2654,6 +2799,20 @@ onBeforeUnmount(() => {
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
   box-shadow: 0 2px 8px -2px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.src-badge {
+  position: absolute;
+  left: 9px;
+  top: 9px;
+  font-size: 9.5px;
+  letter-spacing: 0.3px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: color-mix(in srgb, #6fcf97 80%, #000 12%);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 8px -2px color-mix(in srgb, #6fcf97 60%, transparent);
 }
 .play-badge {
   position: absolute;

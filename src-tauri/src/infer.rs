@@ -36,6 +36,13 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+fn status_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
+        .build()
+}
+
 /// 给 `/api/status` 与前端用的端点状态, 含一次轻量连通性探测(GET /health)。
 pub fn status_json() -> Value {
     match endpoint() {
@@ -45,7 +52,7 @@ pub fn status_json() -> Value {
             "note": "未设 POLARIS_INFER_ENDPOINT；嵌入/重排/ASR 走本机 CPU 兜底(较慢)。"
         }),
         Some(ep) => {
-            let reachable = agent()
+            let reachable = status_agent()
                 .get(&format!("{ep}/health"))
                 .call()
                 .map(|r| r.status() < 500)
@@ -104,7 +111,11 @@ pub fn embed(texts: &[String]) -> Result<Vec<Vec<f32>>, InferError> {
         .iter()
         .map(|row| {
             row.as_array()
-                .map(|r| r.iter().filter_map(|n| n.as_f64().map(|f| f as f32)).collect())
+                .map(|r| {
+                    r.iter()
+                        .filter_map(|n| n.as_f64().map(|f| f as f32))
+                        .collect()
+                })
                 .unwrap_or_default()
         })
         .collect())
@@ -121,7 +132,10 @@ pub fn rerank(query: &str, documents: &[String]) -> Result<Vec<f32>, InferError>
         .get("scores")
         .and_then(|x| x.as_array())
         .ok_or_else(|| InferError::Http("响应缺 scores 字段".into()))?;
-    Ok(scores.iter().filter_map(|n| n.as_f64().map(|f| f as f32)).collect())
+    Ok(scores
+        .iter()
+        .filter_map(|n| n.as_f64().map(|f| f as f32))
+        .collect())
 }
 
 /// 语音转写(ASR): 服务端可达的音/视频文件路径 → 文本。供视频/音频入库的转写链路调用。

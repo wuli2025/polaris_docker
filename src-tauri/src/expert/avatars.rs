@@ -65,7 +65,12 @@ mod tests {
 
     #[test]
     fn slots_deterministic_and_in_range() {
-        for id in ["chief-strategist", "python-pro", "team-creative-content", ""] {
+        for id in [
+            "chief-strategist",
+            "python-pro",
+            "team-creative-content",
+            "",
+        ] {
             let s = slot_for(id);
             assert!(s < 9, "slot 越界: {s}");
             assert_eq!(s, slot_for(id), "同 id 应稳定散列到同槽位");

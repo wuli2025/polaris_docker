@@ -1,13 +1,13 @@
 /* ===== Polaris 墨蓝水墨主题 (v6 token, 沿用 PRD) ===== */
 :root {
-  --bg: #fafaf7;
-  --bg-soft: #f5f4ef;
+  --bg: #fafaf9;
+  --bg-soft: #f4f4f2;
   --panel: #ffffff;
-  --panel-hover: #fbfaf6;
+  --panel-hover: #fafaf8;
 
-  --border: #e2e0d8;
-  --border-soft: #ecebe5;
-  --border-strong: #d0cec5;
+  --border: #e3e2de;
+  --border-soft: #edecea;
+  --border-strong: #d2d1cc;
 
   --text: #1a1a1c;
   --text-2: #44444a;
@@ -51,16 +51,17 @@
   /* ===== v7 琉璃质感（仿 Codex/Kimi 收敛稿）=====
      主区暖白、侧栏略深一档的暖米（Codex 形态：靠色差分区，无分割线）；
      琉璃流光描边用于产物 chip 等边缘点缀（暖金调，若有似无） */
-  /* 仿 Codex 浅色：主区近白面板，侧栏/框面暖米色 + 中部微光渐变（用户指定保留） */
-  --bg-chat: #fcfbf7;
-  --bg-side: #f3f2eb;
-  --bg-side-mid: #f7f6ef;
+  /* 低视觉污染稿(2026-07 用户指定): 左右两侧退到近中性灰白、纯平无渐变,
+     与主区只差一档明度靠色差分区; 暖黄味压到几乎不可察, 页面只剩内容有颜色 */
+  --bg-chat: #fdfdfb;
+  --bg-side: #f2f2ef;
+  --bg-side-mid: #f2f2ef;
   --liuli-edge: linear-gradient(
     135deg,
-    rgba(255, 255, 255, 0.9),
-    rgba(167, 140, 79, 0.14) 50%,
-    rgba(196, 186, 164, 0.22) 80%,
-    rgba(255, 255, 255, 0.75)
+    rgba(255, 255, 255, 0.85),
+    rgba(150, 148, 140, 0.1) 50%,
+    rgba(170, 168, 160, 0.14) 80%,
+    rgba(255, 255, 255, 0.7)
   );
 
   --serif: "Source Han Serif SC", "Noto Serif SC", STSong, "SimSun", serif;
@@ -97,6 +98,29 @@ body,
 button {
   font-family: inherit;
   cursor: pointer;
+}
+
+/* ===== 质感反馈层：全局按压回缩(WorkBuddy 式「沉重」手感) =====
+   按下瞬间微缩、松手弹回 —— 每次点击都有物理反馈。
+   用 :where() 把特异性压到最低: 依赖 transform 定位的按钮(组件样式
+   在后加载、同特异性)自身 transform 仍然生效, 不会被按压位移打乱。 */
+:root {
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.45, 0.64, 1);
+}
+:where(button) {
+  transition: transform 0.22s var(--ease-spring);
+}
+:where(button:not(:disabled)):active {
+  transform: scale(0.96);
+  transition-duration: 0.05s;
+}
+@media (prefers-reduced-motion: reduce) {
+  :where(button),
+  :where(button:not(:disabled)):active {
+    transition: none;
+    transform: none;
+  }
 }
 
 input,
@@ -165,16 +189,16 @@ a:hover {
 
   --hairline: rgba(255, 255, 255, 0.07);
 
-  /* Codex 形态：主区略暗、框面/侧栏略亮，侧栏中部微光走 --bg-side-mid */
+  /* Codex 形态：主区略暗、框面/侧栏略亮; 低视觉污染稿 —— 两侧纯平, 描边去金调 */
   --bg-chat: #181818;
   --bg-side: #1f1f1f;
-  --bg-side-mid: #242423;
+  --bg-side-mid: #1f1f1f;
   --liuli-edge: linear-gradient(
     135deg,
-    rgba(255, 255, 255, 0.22),
-    rgba(212, 176, 106, 0.12) 50%,
-    rgba(255, 255, 255, 0.1) 80%,
-    rgba(255, 255, 255, 0.16)
+    rgba(255, 255, 255, 0.18),
+    rgba(255, 255, 255, 0.07) 50%,
+    rgba(255, 255, 255, 0.09) 80%,
+    rgba(255, 255, 255, 0.14)
   );
 }
 
@@ -408,6 +432,11 @@ html[data-theme="aurora-dark"] .aurora span {
   .aurora span {
     animation: none;
   }
+}
+/* 低配机(useLowSpec 判定,挂在 <html data-lowspec>)：停掉极光漂移的持续合成，
+   把 GPU 时间片让给正事；静态光斑仍在，观感不塌。 */
+html[data-lowspec] .aurora span {
+  animation: none;
 }
 
 /* 全局滚动条 (细) */

@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 // ───────────────────────── 调参 ─────────────────────────
 const HEARTBEAT_MS = 30_000; // 心跳间隔
 const HEALTH_HARD_MS = 90_000; // 掉线超此值 → 主动退出让监工重起
-const PARENT_POLL_MS = 5_000; // ppid 轮询间隔（父亡兜底）
+const PARENT_POLL_MS = 2_000; // ppid 轮询间隔（父亡兜底，2s 足够敏感又不会吵）
 const LOG_RETENTION_DAYS = 14; // 日志保留天数
 
 const appId = process.env.FEISHU_APP_ID || "";
@@ -150,9 +150,14 @@ process.stdin.on("error", (e) => {
   shutdown("parent_stdin_error");
 });
 // 兜底：Windows 上父进程被强杀后子进程 ppid 会变（被 reparent/失效），轮询自检。
+// 一旦发现 ppid 漂移（典型场景：App 崩溃 / 被任务管理器杀 / 退出钩子没跑成），立即退出，
+// 杜绝孤儿空转烧 CPU + 重复占飞书长连接可能导致的重复回消息。
 const bornPpid = process.ppid;
 setInterval(() => {
-  if (process.ppid !== bornPpid) shutdown("parent_ppid_changed");
+  if (process.ppid !== bornPpid) {
+    logEvent("info", "parent_ppid_changed", { from: String(bornPpid), to: String(process.ppid) });
+    shutdown("parent_ppid_changed");
+  }
 }, PARENT_POLL_MS);
 // 信号：被显式终止时也走优雅退出，留日志。
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {

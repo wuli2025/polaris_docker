@@ -54,7 +54,10 @@ fn dockerfile_path() -> Result<PathBuf> {
 ///
 /// 同时是 `#[tauri::command]` 与普通 `pub fn`：板块① `chat` 在发送前会直接
 /// 调 `polaris_sandbox::sandbox_status()` 做容器预检，故保留可直接调用。
-#[tauri::command]
+///
+/// `command(async)`：docker CLI(version/info/inspect/ps 连环探测)是阻塞调用，同步命令
+/// 默认跑主线程会冻 UI；标 async 让 tauri 调度到独立线程，fn 本体保持同步、直调不受影响。
+#[tauri::command(async)]
 pub fn sandbox_status() -> SandboxStatus {
     let mut notes = Vec::new();
 
@@ -102,8 +105,7 @@ pub fn sandbox_status() -> SandboxStatus {
         notes.push("Docker CLI 未检测到。请先安装 Docker Desktop (Windows)。".into());
     } else if !docker_running {
         notes.push(
-            "Docker daemon 未运行。请启动 Docker Desktop, 然后回到本页点击 \"刷新状态\"。"
-                .into(),
+            "Docker daemon 未运行。请启动 Docker Desktop, 然后回到本页点击 \"刷新状态\"。".into(),
         );
     } else if !image_built {
         notes.push(format!(
@@ -129,7 +131,8 @@ pub fn sandbox_status() -> SandboxStatus {
 
 // ───────────────────────── Build / Start / Stop ──────────
 
-#[tauri::command]
+/// `command(async)`：docker build 约需 1-3 分钟,绝不能同步钉在主线程(见 sandbox_status 注)。
+#[tauri::command(async)]
 pub fn sandbox_build_image() -> Result<String, String> {
     let df = dockerfile_path().map_err(|e| e.to_string())?;
     if !df.exists() {
@@ -170,7 +173,8 @@ pub fn sandbox_build_image() -> Result<String, String> {
 /// 需要 KB 根路径来挂载 `/kb`。该路径不再 `use crate::kb` 直取，而是从 Tauri
 /// 托管状态里取出 host 注入的 [`polaris_core::KbLocator`] 实现 (依赖反转)。
 /// 仅作为命令被前端调用，故可安全接收注入的 `AppHandle`。
-#[tauri::command]
+/// `command(async)`：docker ps/start/run 阻塞调用不进主线程(见 sandbox_status 注)。
+#[tauri::command(async)]
 pub fn sandbox_start(app: tauri::AppHandle) -> Result<String, String> {
     // 如果已存在(无论 running)先尝试 start
     let exists = Command::new("docker")
@@ -250,7 +254,8 @@ pub fn sandbox_start(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
+/// `command(async)`：docker stop -t 5 + rm 可阻塞 5s+,同款不进主线程(见 sandbox_status 注)。
+#[tauri::command(async)]
 pub fn sandbox_stop() -> Result<String, String> {
     let stop = Command::new("docker")
         .args(["stop", "-t", "5", CONTAINER_NAME])
@@ -267,7 +272,8 @@ pub fn sandbox_stop() -> Result<String, String> {
     ))
 }
 
-#[tauri::command]
+/// `command(async)`：docker exec 跑任意容器内命令,时长不可控,不进主线程(见 sandbox_status 注)。
+#[tauri::command(async)]
 pub fn sandbox_exec(cmd: String) -> Result<String, String> {
     let parts = shell_split(&cmd);
     if parts.is_empty() {

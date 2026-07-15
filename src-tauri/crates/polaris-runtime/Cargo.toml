@@ -1,0 +1,24 @@
+# polaris-runtime — 横切基建 crate(分仓规划 v2 · 目录→crate 强制边界的第一块)
+# 路径解析 / 子进程池与超时看门 / HTTP 客户端的唯一入口。
+# 铁律: 本 crate 是全体系最底层, **不得依赖 tauri、不得依赖任何业务板块**;
+#       编译器可见性从此物理保证「任何人可以用 runtime,runtime 不认识任何人」。
+[package]
+name = "polaris-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# 版本与主 crate 对齐(同 workspace 共享编译产物,零增量)
+directories = "5"
+once_cell = "1"
+parking_lot = "0.12"
+ureq = { version = "2", features = ["json"] }
+# host shim(双壳事件广播 AppHandle 替身, host.rs): serde 序列化 payload + tokio broadcast。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(unix)'.dependencies]
+# run_with_timeout 的 killpg(超时带走整棵子孙进程树)
+libc = "0.2"

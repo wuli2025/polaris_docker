@@ -32,6 +32,8 @@ v5 两个根治：
             → 切片 png × N + manifest.json。纯本地确定性，不碰后台。
   publish-image 长图链路下半场：开编辑器 →（可选）真文字导语 → 切片按序**粘贴**进正文
             （图片粘贴是编辑器原生欢迎的操作，零清洗零字数问题）→ 等每张真落位 → 填标题 → 存草稿。
+  cards     小红书图卡链路：自包含图卡 HTML（每卡 <section class="card">，3:4 竖版）→
+            逐卡元素截图 @2x → PNG × N + manifest.json。纯本地确定性，PNG 直接发小红书。
 
 用法：
   python wechat_yiban.py --mode render  --body-file body.html --theme 墨韵 --out 预览.html
@@ -1305,6 +1307,55 @@ def run_snapshot(body_html, theme, out_dir, base_name, raw_file=None, no_slice=F
             pw.stop()
 
 
+def run_cards(html_file, out_dir, base_name, selector, card_width):
+    """小红书图卡链路：自包含图卡 HTML → 逐卡元素截图（@2x 高清 PNG × N）+ manifest.json。
+    输入是**带完整样式**的单文件 HTML（图卡样式由上游自己写，不套公众号主题），
+    每张卡是一个匹配 --card-selector 的元素（约定 <section class="card">，3:4 竖版）。
+    纯本地确定性，不碰任何后台；产出的 PNG 直接拖进小红书创作页或喂给 post-to-xhs。"""
+    os.makedirs(out_dir, exist_ok=True)
+    browser = launch(headless=True, humanize=False)
+    try:
+        # 视口宽给足卡宽（卡通常 1080css），@2x 导出手机端不糊
+        page = browser.new_page(viewport={"width": max(card_width, 720), "height": 1200},
+                                device_scale_factor=SNAP_SCALE)
+        page.goto("file:///" + os.path.abspath(html_file).replace(os.sep, "/"))
+        page.wait_for_timeout(900)  # 等字体/图片
+        loc = page.locator(selector)
+        n = loc.count()
+        if n == 0:
+            print(json.dumps({
+                "ok": False, "mode": "cards", "reason":
+                    "没找到任何卡片元素（选择器：" + selector + "）。约定每张卡写成 "
+                    "<section class=\"card\">…</section>，或用 --card-selector 指定实际选择器。",
+            }, ensure_ascii=False))
+            sys.exit(2)
+        cards = []
+        for i in range(n):
+            el = loc.nth(i)
+            try:
+                el.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
+            sp_ = os.path.join(out_dir, "%s-%02d.png" % (base_name, i + 1))
+            el.screenshot(path=sp_)
+            cards.append(os.path.abspath(sp_))
+            print("[图卡] %d/%d 已截：%s" % (i + 1, n, sp_), flush=True)
+        manifest = {"cards": cards, "html": os.path.abspath(html_file),
+                    "selector": selector, "scale": SNAP_SCALE}
+        with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        print(json.dumps({"ok": True, "mode": "cards", "count": n, **manifest},
+                         ensure_ascii=False))
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        pw = getattr(browser, "_pw", None)
+        if pw:
+            pw.stop()
+
+
 # 粘贴图片进编辑器：File→DataTransfer→合成 paste。和用户截图后 Ctrl+V 完全同路，
 # 编辑器自己负责上传素材库+插入正文——这是它原生欢迎的操作，不会被清洗。
 JS_PASTE_IMAGE = r"""
@@ -1752,7 +1803,7 @@ def _publish_failed(ctx, body_html, theme, save_fallback, reason):
 def main():
     ap = argparse.ArgumentParser(description="Polaris 壹伴排版引擎 v8（公众号·两段解耦 + 面板 + 长图链路）")
     ap.add_argument("--mode", choices=["render", "publish", "restyle", "panel",
-                                       "snapshot", "publish-image"], default="publish")
+                                       "snapshot", "publish-image", "cards"], default="publish")
     ap.add_argument("--body-file", default="", help="干净语义正文 HTML（render/publish/snapshot 必填）")
     ap.add_argument("--theme", default="墨韵", help="风格预设：墨韵/极简/科技蓝/杂志/清新绿/活力橙/米纸/黛青")
     ap.add_argument("--title", default="", help="文章标题（publish/publish-image 填进后台；snapshot 用作切片文件名）")
@@ -1766,6 +1817,10 @@ def main():
                     help="publish 只跑第一段（纯文字入草稿），样式稍后用 restyle/panel 套")
     ap.add_argument("--no-slice", action="store_true",
                     help="snapshot 一张到底：不切片，整页截成单张长图（默认切片以保手机端清晰）")
+    ap.add_argument("--card-selector", default="section.card, .xhs-card",
+                    help="cards 模式的卡片元素选择器（约定 <section class=\"card\">）")
+    ap.add_argument("--card-width", type=int, default=1080,
+                    help="cards 模式渲染视口宽（默认 1080，对应小红书 3:4 竖版卡宽）")
     ap.add_argument("--timeout", type=int, default=300, help="等登录+编辑器的秒数（默认 300）")
     args = ap.parse_args()
 
@@ -1777,6 +1832,16 @@ def main():
         return
     if args.mode == "publish-image":
         run_publish_image(args.slices_dir, args.title, args.intro, args.timeout)
+        return
+    if args.mode == "cards":
+        if not args.body_file:
+            print(json.dumps({"ok": False, "reason": "--body-file 必填（自包含图卡 HTML）"},
+                             ensure_ascii=False))
+            sys.exit(2)
+        out_dir = args.out_dir or os.path.join(
+            os.path.dirname(os.path.abspath(args.body_file)), "图卡")
+        run_cards(args.body_file, out_dir, args.title or "小红书图卡",
+                  args.card_selector, args.card_width)
         return
 
     if not args.body_file:

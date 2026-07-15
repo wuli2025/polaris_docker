@@ -16,6 +16,7 @@ import {
   Sparkles,
   Waypoints,
 } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import {
   kb,
   scan,
@@ -544,7 +545,7 @@ function sendTableCmd() {
         class="upload-row"
         :class="u.status"
       >
-        <LoaderCircle v-if="u.status === 'loading'" :size="15" class="spin" />
+        <OrbitSpinner v-if="u.status === 'loading'" :size="15" />
         <CheckCircle2 v-else-if="u.status === 'ok'" :size="15" />
         <XCircle v-else :size="15" />
         <span class="up-name" :title="u.name">{{ u.name }}</span>
@@ -705,11 +706,9 @@ function sendTableCmd() {
               :disabled="packBusy === p.id"
               @click="installPack(p)"
             >
-              <LoaderCircle
+              <OrbitSpinner
                 v-if="packBusy === p.id"
                 :size="14"
-                :stroke-width="1.8"
-                class="spin"
               />
               <Download v-else :size="14" :stroke-width="1.8" />
               <span>{{ packBusy === p.id ? "正在装入…" : "下载到我的资料库" }}</span>
@@ -833,11 +832,9 @@ function sendTableCmd() {
           原始资料只读不改。耗时分钟级。
         </div>
         <button class="primary-btn" :disabled="compiling" @click="doCompile">
-          <LoaderCircle
+          <OrbitSpinner
             v-if="compiling"
             :size="14"
-            :stroke-width="1.8"
-            class="spin"
           />
           <span>{{ buildLabel }}</span>
         </button>
@@ -946,11 +943,9 @@ function sendTableCmd() {
             :disabled="converting"
             @click="doConvertBatch"
           >
-            <LoaderCircle
+            <OrbitSpinner
               v-if="converting"
               :size="14"
-              :stroke-width="1.8"
-              class="spin"
             />
             <span>{{ converting ? "转换中…" : "批量转换" }}</span>
           </button>

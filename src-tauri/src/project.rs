@@ -14,6 +14,8 @@
 //! 一切进程都在宿主机本地跑(localhost), 内嵌 webview 的 CSP 为 null, 故 iframe 可直接加载
 //! `http://localhost:<port>`。
 
+#[cfg(not(feature = "desktop"))]
+use crate::host::AppHandle;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -25,21 +27,27 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
-#[cfg(not(feature = "desktop"))]
-use crate::host::AppHandle;
 use walkdir::WalkDir;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 给从 GUI 进程拉起的子进程加 `CREATE_NO_WINDOW`, 别每起一个服务就闪一个黑控制台。
+/// unix(mac/Linux): 额外把子进程放进 **新进程组** (自己当组长), 这样 `kill_tree` 的
+/// `kill -TERM -<pid>` 能带走 npm→node/vite 整棵子孙树; 否则 child 继承 Polaris 自身
+/// 的 pgid, 负号 kill 找不到该组 → 退化成只杀外层 shell, dev server 变孤儿占端口/CPU。
 fn no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = cmd;
     }
@@ -116,11 +124,18 @@ pub struct ProjectInfo {
 // ───────────────────────── 运行态注册表 ─────────────────────────
 
 struct RunningProject {
+    /// 启动代次:每次 project_run 单调递增。占位的清理/转正只认自己代次,防 ABA——
+    /// A 启动中被 stop 摘走占位、B 立即重启插入新占位后,A 完成时不比对代次就会
+    /// 认领/误删 B 的占位(A 的服务成孤儿或 B 被误报停止)。
+    gen: u64,
     /// 各服务子进程 (持有以便 kill; 我们不 wait)。
     children: Vec<Child>,
     /// 各服务子进程 PID (Windows 下 taskkill 整树用)。
     pids: Vec<u32>,
 }
+
+/// 见 [`RunningProject::gen`]。
+static PROJ_NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// root(正斜杠绝对路径) → 运行态。同一项目同一时刻只跑一份。
 static RUNNING: Lazy<Mutex<HashMap<String, RunningProject>>> =
@@ -188,7 +203,10 @@ fn project_name(root: &Path, m: &Manifest) -> String {
 fn port_from_url(url: &str) -> Option<u16> {
     let after = url.split("://").nth(1).unwrap_or(url);
     let hostport = after.split('/').next().unwrap_or(after);
-    hostport.rsplit(':').next().and_then(|s| s.parse::<u16>().ok())
+    hostport
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
 }
 
 // ───────────────────────── 命令: 列项目 ─────────────────────────
@@ -203,11 +221,7 @@ pub fn project_list(conversation_id: Option<String>) -> Vec<ProjectInfo> {
     }
     let running = RUNNING.lock();
     // 限深度遍历, 找清单文件
-    for w in WalkDir::new(&out_dir)
-        .max_depth(5)
-        .into_iter()
-        .flatten()
-    {
+    for w in WalkDir::new(&out_dir).max_depth(5).into_iter().flatten() {
         if !w.file_type().is_file() || w.file_name() != MANIFEST_NAME {
             continue;
         }
@@ -249,19 +263,6 @@ pub fn project_status(root: String) -> bool {
 /// 立即返回, 真正的装/起在后台线程跑, 进度走 `project:log` / `project:ready` / `project:exit` 事件。
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn project_run(app: AppHandle, root: String) -> Result<(), String> {
-    if RUNNING.lock().contains_key(&root) {
-        // 已在跑: 直接回报就绪, 前端据此加载 iframe。
-        if let Ok(m) = read_manifest(Path::new(&root)) {
-            let _ = app.emit(
-                "project:ready",
-                ProjectReadyEvent {
-                    root: root.clone(),
-                    open: m.open,
-                },
-            );
-        }
-        return Ok(());
-    }
     let root_path = PathBuf::from(&root);
     if !root_path.join(MANIFEST_NAME).exists() {
         return Err("找不到项目清单 polaris.project.json".into());
@@ -276,10 +277,62 @@ pub fn project_run(app: AppHandle, root: String) -> Result<(), String> {
         return Err("项目清单里没有声明任何可启动服务 (services)".into());
     }
 
+    // 防重: 「检查 + 占位」在同一把锁里原子完成。旧写法只在这里 contains_key 检查,
+    // 而真正的 RUNNING 插入要等 pipeline 里 npm install(可数分钟)跑完才发生, 窗口期
+    // 第二次 project_run 会双起整套服务, 且 HashMap::insert 覆盖第一套的 Vec<Child>
+    // (std Child drop 并不 kill)→ 孤儿 dev server 永占端口。
+    let my_gen = PROJ_NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut g = RUNNING.lock();
+        // 先把状态取成纯值再分支, 避免 get/insert 借用冲突。
+        let is_placeholder = g.get(&root).map(|r| r.children.is_empty() && r.pids.is_empty());
+        match is_placeholder {
+            // 占位(children/pids 皆空)= 正在装依赖/起服务 → 拒绝二次启动
+            Some(true) => {
+                return Err("项目正在启动中(装依赖/起服务), 请稍候".into());
+            }
+            // 真在跑: 直接回报就绪, 前端据此加载 iframe。
+            Some(false) => {
+                drop(g);
+                let _ = app.emit(
+                    "project:ready",
+                    ProjectReadyEvent {
+                        root: root.clone(),
+                        open: m.open,
+                    },
+                );
+                return Ok(());
+            }
+            None => {
+                g.insert(
+                    root.clone(),
+                    RunningProject {
+                        gen: my_gen,
+                        children: Vec::new(),
+                        pids: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+
     std::thread::spawn(move || {
-        run_pipeline(&app, &root, &root_path, m);
+        run_pipeline(&app, &root, &root_path, m, my_gen);
     });
     Ok(())
+}
+
+/// 启动失败/被取消时清掉 project_run 预插的「启动中占位」(children/pids 皆空才是占位;
+/// 真运行态不在此清, 由 project_stop 负责)。只清**自己代次**的占位:自己那个可能已被
+/// stop 摘走、槽位又被更晚的 project_run 占上(ABA),误删会让后来者被无辜报停。
+fn clear_starting_placeholder(root: &str, my_gen: u64) {
+    let mut g = RUNNING.lock();
+    if g.get(root)
+        .map(|r| r.gen == my_gen && r.children.is_empty() && r.pids.is_empty())
+        .unwrap_or(false)
+    {
+        g.remove(root);
+    }
 }
 
 /// 校验 root 落在受信任的产物目录内(KB conversations 或 ~/Polaris/data/artifacts)。
@@ -305,13 +358,14 @@ fn root_is_trusted(root: &Path) -> bool {
 }
 
 /// 后台线程: 串行装依赖 → 起各服务 → 就绪探测 → emit ready。失败处处 emit exit。
-fn run_pipeline(app: &AppHandle, root: &str, root_path: &Path, m: Manifest) {
+fn run_pipeline(app: &AppHandle, root: &str, root_path: &Path, m: Manifest, my_gen: u64) {
     log(app, root, "info", "▶ 准备启动项目…");
 
     // 1. 项目根的一次性 setup 命令 (await)。
     for cmd in &m.setup {
         log(app, root, "info", format!("$ {}", cmd));
         if !run_blocking(app, root, root_path, cmd) {
+            clear_starting_placeholder(root, my_gen);
             emit_exit(app, root, false, Some(format!("准备命令失败: {}", cmd)));
             return;
         }
@@ -324,13 +378,24 @@ fn run_pipeline(app: &AppHandle, root: &str, root_path: &Path, m: Manifest) {
         if let Some(install) = &s.install {
             let needs = !svc_dir.join("node_modules").exists();
             if needs {
-                log(app, root, "info", format!("[{}] 装依赖: $ {}", label, install));
+                log(
+                    app,
+                    root,
+                    "info",
+                    format!("[{}] 装依赖: $ {}", label, install),
+                );
                 if !run_blocking(app, root, &svc_dir, install) {
+                    clear_starting_placeholder(root, my_gen);
                     emit_exit(app, root, false, Some(format!("[{}] 装依赖失败", label)));
                     return;
                 }
             } else {
-                log(app, root, "info", format!("[{}] 依赖已就绪, 跳过安装", label));
+                log(
+                    app,
+                    root,
+                    "info",
+                    format!("[{}] 依赖已就绪, 跳过安装", label),
+                );
             }
         }
     }
@@ -348,10 +413,22 @@ fn run_pipeline(app: &AppHandle, root: &str, root_path: &Path, m: Manifest) {
                 pids.push(pid);
                 // 流式转发该服务 stdout/stderr → project:log
                 if let Some(out) = child.stdout.take() {
-                    pump(app.clone(), root.to_string(), format!("{}", label), out, "stdout");
+                    pump(
+                        app.clone(),
+                        root.to_string(),
+                        format!("{}", label),
+                        out,
+                        "stdout",
+                    );
                 }
                 if let Some(err) = child.stderr.take() {
-                    pump(app.clone(), root.to_string(), format!("{}", label), err, "stderr");
+                    pump(
+                        app.clone(),
+                        root.to_string(),
+                        format!("{}", label),
+                        err,
+                        "stderr",
+                    );
                 }
                 children.push(child);
             }
@@ -363,20 +440,44 @@ fn run_pipeline(app: &AppHandle, root: &str, root_path: &Path, m: Manifest) {
                     let _ = c.kill();
                     let _ = c.wait();
                 }
-                emit_exit(app, root, false, Some(format!("[{}] 启动失败: {}", label, e)));
+                clear_starting_placeholder(root, my_gen);
+                emit_exit(
+                    app,
+                    root,
+                    false,
+                    Some(format!("[{}] 启动失败: {}", label, e)),
+                );
                 return;
             }
         }
     }
 
-    // 注册运行态 (供 stop / status / 防重复启动)。
-    RUNNING.lock().insert(
-        root.to_string(),
-        RunningProject {
-            children,
-            pids: pids.clone(),
-        },
-    );
+    // 注册运行态 (供 stop / status): **自己代次**的占位还在才转正。
+    // 占位已消失 = 用户在装依赖/启动窗口期间点了停止;代次不符 = 自己被 stop 后槽位
+    // 已被更晚的 project_run 占走(ABA)—— 两种情况都视为已取消, 收掉刚起的服务,
+    // 绝不认领/覆盖别人的槽位(覆盖会 drop 对方的 Vec<Child>, 服务成孤儿)。
+    let cancelled = {
+        let mut g = RUNNING.lock();
+        match g.get_mut(root) {
+            Some(slot) if slot.gen == my_gen => {
+                slot.children = std::mem::take(&mut children);
+                slot.pids = pids.clone();
+                false
+            }
+            _ => true,
+        }
+    };
+    if cancelled {
+        for pid in &pids {
+            kill_tree(*pid);
+        }
+        for mut c in children.drain(..) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        emit_exit(app, root, true, Some("项目在启动期间被停止".into()));
+        return;
+    }
 
     // 4. 就绪探测: 优先用 open URL 的端口, 否则用第一个声明了 port 的服务。
     let probe_port = m
@@ -402,8 +503,14 @@ fn run_pipeline(app: &AppHandle, root: &str, root_path: &Path, m: Manifest) {
         std::thread::sleep(Duration::from_secs(3));
     }
 
-    // 项目可能在探测期间被用户停掉了; 没停才报就绪。
-    if RUNNING.lock().contains_key(root) {
+    // 项目可能在探测期间被用户停掉了; 自己代次仍在注册表里才报就绪
+    // (只 contains_key 会把「已被停 + 别人重启占位」误认成自己还活着)。
+    if RUNNING
+        .lock()
+        .get(root)
+        .map(|r| r.gen == my_gen)
+        .unwrap_or(false)
+    {
         let _ = app.emit(
             "project:ready",
             ProjectReadyEvent {
@@ -446,16 +553,33 @@ fn run_blocking(app: &AppHandle, root: &str, cwd: &Path, cmdline: &str) -> bool 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            log(app, root, "stderr", format!("无法执行: {} ({})", cmdline, e));
+            log(
+                app,
+                root,
+                "stderr",
+                format!("无法执行: {} ({})", cmdline, e),
+            );
             return false;
         }
     };
     let mut handles = Vec::new();
     if let Some(out) = child.stdout.take() {
-        handles.push(pump(app.clone(), root.to_string(), String::new(), out, "stdout"));
+        handles.push(pump(
+            app.clone(),
+            root.to_string(),
+            String::new(),
+            out,
+            "stdout",
+        ));
     }
     if let Some(err) = child.stderr.take() {
-        handles.push(pump(app.clone(), root.to_string(), String::new(), err, "stderr"));
+        handles.push(pump(
+            app.clone(),
+            root.to_string(),
+            String::new(),
+            err,
+            "stderr",
+        ));
     }
     let status = child.wait();
     for h in handles {
@@ -555,11 +679,25 @@ fn kill_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        // 杀进程组 (shell -c 起的子孙); 失败再退化为 kill 单进程。
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{}", pid)])
+        // 杀进程组 (shell -c 起的子孙)。注意 output() 只有 spawn 失败才 Err;
+        // killpg 因「pid 非组长/组不存在」失败时退出码非 0 但仍是 Ok, 必须看 status
+        // 才能退化为单杀, 否则非组长 child 的子孙全部漏杀成孤儿 (旧 or_else 写法是死代码)。
+        let group_ok = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", pid)])
             .output()
-            .or_else(|_| Command::new("kill").arg(pid.to_string()).output());
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !group_ok {
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+        }
+        // TERM 宽限后补 KILL: node/vite 一类可能忽略/来不及处理 TERM。进程已退则 kill 无害。
+        std::thread::sleep(Duration::from_millis(300));
+        let target = if group_ok {
+            format!("-{}", pid)
+        } else {
+            pid.to_string()
+        };
+        let _ = Command::new("kill").args(["-KILL", "--", &target]).output();
     }
 }
 

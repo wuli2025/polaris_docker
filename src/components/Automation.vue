@@ -24,6 +24,7 @@ import {
   Power,
   ChevronDown,
 } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import { useAutomationStore, type AutomationFlow } from "../stores/automation";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
@@ -271,7 +272,7 @@ function stopFlow(f: AutomationFlow) {
             </span>
             <span class="c-name" :title="f.name">{{ f.name }}</span>
             <span v-if="running(f)" class="run-tag">
-              <LoaderCircle :size="12" :stroke-width="2" class="spin" /> 运行中
+              <OrbitSpinner :size="12" /> 运行中
             </span>
           </div>
           <p class="c-desc">{{ f.description || "（无描述）" }}</p>

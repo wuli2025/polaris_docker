@@ -8,6 +8,7 @@ import {
   type EnvReport,
   type EnvStreamEvent,
   type ToolStatus,
+  type UvCacheInfo,
 } from "../tauri";
 import McpConfigModal from "./McpConfigModal.vue";
 
@@ -27,7 +28,7 @@ const report = ref<EnvReport | null>(null);
 
 // 安装 / 修复 / 更新 的进行态
 const busyKind = ref<
-  "" | "claude" | "claude-npm" | "claude-update" | "node" | "pwsh" | "path"
+  "" | "claude" | "claude-npm" | "claude-update" | "node" | "pwsh" | "uv" | "path"
 >("");
 const installReqId = ref<string | null>(null);
 const logs = ref<string[]>([]);
@@ -37,6 +38,10 @@ let unlisten: (() => void) | null = null;
 // Claude Code 更新检测
 const updateInfo = ref<ClaudeUpdateInfo | null>(null);
 const checkingUpdate = ref(false);
+
+// uv 缓存信息 (装了 uv 才查; 用于展示占用 + 一键清理)
+const uvCache = ref<UvCacheInfo | null>(null);
+const cleaningCache = ref(false);
 
 const busy = computed(() => busyKind.value !== "");
 
@@ -88,7 +93,20 @@ onMounted(async () => {
 
   unlisten = await listen<EnvStreamEvent>("env:stream", onStream);
 
-  const r = await runCheck();
+  // env_check 一旦 reject,不能把启动门永远钉死在「正在检测…」(全屏转圈无出口):
+  // gate 模式失败即放行进主界面;面板模式落到 panel 并给出错误横幅,可点「重新检测」。
+  let r: EnvReport;
+  try {
+    r = await runCheck();
+  } catch (e) {
+    banner.value = {
+      kind: "err",
+      text: `环境检测失败：${String(e)}。可稍后在侧栏「环境」页重新检测。`,
+    };
+    if (props.gate) emit("done");
+    else phase.value = "panel";
+    return;
+  }
   if (r.ready) localStorage.setItem(READY_FLAG, "1");
   // claude 在但缺 shell → 自动补装 PowerShell 7 (进入流式日志), 不再放任用户进去后对话报错
   if (maybeAutoInstallShell(r)) return;
@@ -101,14 +119,13 @@ onBeforeUnmount(() => {
 
 // 进入面板 / 跳过页且 Claude Code 已安装时, 自动静默检测一次更新
 watch(phase, (p) => {
-  if (
-    (p === "panel" || p === "ready-skip") &&
-    isTauri &&
-    report.value?.claude.found &&
-    !updateInfo.value &&
-    !checkingUpdate.value
-  ) {
-    checkClaudeUpdate();
+  if ((p === "panel" || p === "ready-skip") && isTauri) {
+    if (report.value?.claude.found && !updateInfo.value && !checkingUpdate.value) {
+      checkClaudeUpdate();
+    }
+    if (report.value?.uv.found && !uvCache.value) {
+      loadUvCache();
+    }
   }
 });
 
@@ -132,6 +149,8 @@ async function finishInstall(ok: boolean, message: string) {
   // 装好 / 更新完后重新检测版本, 让「更新」按钮翻成「已是最新」
   updateInfo.value = null;
   if (r.claude.found) checkClaudeUpdate();
+  // 刚装完 uv → 刷新缓存信息卡
+  if (justFinished === "uv") loadUvCache();
 
   // 链式①: 刚装完 Node.js 且本意是装 Claude → npm 就绪后自动继续装 Claude (一次点击装齐)
   if (justFinished === "node" && chainClaudeAfterNode) {
@@ -206,6 +225,50 @@ async function installPwsh() {
   }
 }
 
+async function installUv() {
+  if (busyKind.value) return; // 防双发
+  banner.value = null;
+  logs.value = [];
+  busyKind.value = "uv";
+  try {
+    installReqId.value = await envDoctor.installUv();
+    logs.value.push(
+      "$ 下载 uv release (gh-proxy 加速) → 解压到 ~/.local/bin → 写国内镜像配置"
+    );
+  } catch (e) {
+    busyKind.value = "";
+    banner.value = { kind: "err", text: String(e) };
+  }
+}
+
+// uv 缓存占用 (静默查; 仅在 uv 已装时有意义)
+async function loadUvCache() {
+  if (!isTauri || !report.value?.uv.found) {
+    uvCache.value = null;
+    return;
+  }
+  try {
+    uvCache.value = await envDoctor.uvCacheInfo();
+  } catch {
+    uvCache.value = null;
+  }
+}
+
+async function cleanUvCache() {
+  if (cleaningCache.value || busy.value) return;
+  cleaningCache.value = true;
+  banner.value = null;
+  try {
+    const msg = await envDoctor.uvCacheClean();
+    banner.value = { kind: "ok", text: msg };
+    await loadUvCache();
+  } catch (e) {
+    banner.value = { kind: "err", text: String(e) };
+  } finally {
+    cleaningCache.value = false;
+  }
+}
+
 // 检测 Claude Code 是否有新版本 (静默, 不打扰; 仅在已安装时有意义)
 async function checkClaudeUpdate() {
   if (checkingUpdate.value || busy.value) return;
@@ -259,8 +322,13 @@ async function cancelInstall() {
 async function recheck() {
   banner.value = null;
   phase.value = "checking";
-  const r = await runCheck();
-  if (r.ready) localStorage.setItem(READY_FLAG, "1");
+  try {
+    const r = await runCheck();
+    if (r.ready) localStorage.setItem(READY_FLAG, "1");
+  } catch (e) {
+    // 复检失败同样不能卡死在 checking:回到面板报错,按钮可再试
+    banner.value = { kind: "err", text: `环境检测失败：${String(e)}，请重试。` };
+  }
   phase.value = "panel";
 }
 
@@ -270,10 +338,16 @@ function enter() {
 
 // 工具状态 → 状态点级别
 function level(t: ToolStatus): "ok" | "warn" | "bad" {
+  // Python 由 uv 按需托管: 装了 uv(或本机已有真 Python)即视作就绪, 否则提示装 uv
+  if (t.key === "python") return report.value?.uv.found || t.found ? "ok" : "warn";
   if (t.found) return "ok";
   return t.required ? "bad" : "warn";
 }
 function statusText(t: ToolStatus): string {
+  if (t.key === "python") {
+    if (t.found) return "可用";
+    return report.value?.uv.found ? "由 uv 托管" : "建议装 uv 托管";
+  }
   if (t.found) return t.onPath ? "已就绪" : "已安装 (不在 PATH)";
   return t.required ? "未安装 · 必需" : "未安装 · 建议";
 }
@@ -284,7 +358,8 @@ const isWin = computed(() => osName.value === "windows");
 
 const tools = computed<ToolStatus[]>(() => {
   if (!report.value) return [];
-  const all = [report.value.claude, report.value.pwsh, report.value.node, report.value.npm];
+  const r = report.value;
+  const all = [r.claude, r.pwsh, r.node, r.npm, r.uv, r.python];
   // PowerShell 7 仅 Windows 上是 Claude 的可用 shell; mac/Linux 自带 sh/zsh, 不展示该行。
   return isWin.value ? all : all.filter((t) => t.key !== "pwsh");
 });
@@ -397,6 +472,16 @@ const npmReady = computed(() => !!report.value?.npm.found);
                   {{ busyKind === "pwsh" ? "安装中…" : "安装" }}
                 </button>
               </template>
+              <template v-else-if="t.key === 'uv' && !t.found">
+                <button
+                  class="btn"
+                  :disabled="busy"
+                  title="装 uv 后, Claude 写的 Python 脚本一律 uv run（自动管解释器+依赖），不再依赖系统 Python"
+                  @click="installUv"
+                >
+                  {{ busyKind === "uv" ? "安装中…" : "安装" }}
+                </button>
+              </template>
             </div>
           </li>
         </ul>
@@ -420,6 +505,22 @@ const npmReady = computed(() => !!report.value?.npm.found);
           </div>
           <button class="btn primary" :disabled="busy" @click="fixPath">
             {{ busyKind === "path" ? "修复中…" : "修复 PATH" }}
+          </button>
+        </div>
+
+        <!-- uv 缓存治理: 装了 uv 才显示。uv 缓存放任会涨到数 GB, 给一键清理 -->
+        <div v-if="report?.uv.found && uvCache?.available" class="uv-cache">
+          <div class="uc-text">
+            <strong>uv 缓存</strong>占用 <span class="uc-size">{{ uvCache.human }}</span>
+            <span v-if="uvCache.dir" class="uc-dir" :title="uvCache.dir">{{ uvCache.dir }}</span>
+          </div>
+          <button
+            class="btn"
+            :disabled="busy || cleaningCache || uvCache.bytes === 0"
+            title="uv cache clean —— 清空已下载的 Python 解释器与依赖缓存"
+            @click="cleanUvCache"
+          >
+            {{ cleaningCache ? "清理中…" : "清理缓存" }}
           </button>
         </div>
 
@@ -649,6 +750,30 @@ const npmReady = computed(() => !!report.value?.npm.found);
   padding: 0 4px;
   border-radius: 2px;
   font-family: var(--mono);
+}
+
+.uv-cache {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 10px 14px;
+  border-radius: 4px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+}
+.uc-text { flex: 1; font-size: 12px; line-height: 1.6; color: var(--text-2); min-width: 0; }
+.uc-text strong { color: var(--ink); font-weight: 600; }
+.uc-size { color: var(--ink); font-family: var(--mono); }
+.uc-dir {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .logwrap {

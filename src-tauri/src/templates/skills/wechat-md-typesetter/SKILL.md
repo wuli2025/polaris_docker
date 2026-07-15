@@ -90,7 +90,18 @@ description: 壹伴式排版 + 两段直送公众号草稿。和「壹伴」插�
    超时跑它——中途杀进程虽有先存的草稿兜底，但已贴的图会缺。
    注意：长图正文文字不可复制/不被搜索收录——所以 `--intro` 别省。
 
-6. **可视化排版面板**（壹伴插件形态，用户要"自己看着改/挑模板/AI 改风格"时用这个）：
+6. **小红书图卡截图**（小红书链路的「截图发送」引擎——上游产出**自包含带样式**的图卡 HTML，
+   每张卡一个 `<section class="card">`，固定 3:4 竖版（宽 1080px、高 1440px），逐卡自动截成高清 PNG）：
+   ```bash
+   python ~/Polaris/skills/wechat-md-typesetter/scripts/wechat_yiban.py \
+     --mode cards --body-file "<图卡.html 绝对路径>" --title "<笔记标题>" \
+     --out-dir "<输出目录，缺省=图卡 HTML 旁的 图卡/>"
+   ```
+   注意与公众号链路相反：**图卡 HTML 的样式由你自己写**（不套主题、不走 STYLIZE），配色统一、
+   字大留白多、每卡一个要点；封面 1 张 + 内容卡 N 张（总数 3~9）。产出 PNG 直接拖进小红书
+   创作页，或喂给 `post-to-xhs` 只填不发。卡片选择器可用 `--card-selector` 覆盖。
+
+7. **可视化排版面板**（壹伴插件形态，用户要"自己看着改/挑模板/AI 改风格"时用这个）：
    ```bash
    python ~/Polaris/skills/wechat-md-typesetter/scripts/wechat_yiban.py --mode panel
    ```

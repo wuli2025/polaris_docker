@@ -1,0 +1,52 @@
+# ═══════════════════════════════════════════════════════════════
+# polaris-kernel — 核心内核 crate(分仓规划 v2 第 2 仓的仓内形态)
+# chat 对话管线 / provider 供应商坞 / doctor 环境医生 / skills 技能框架 /
+# integrations 网关集成 / conv 项目·对话存储 / claude_md 主上下文。
+# 边界铁律: 只准向下依赖 polaris-runtime(横切基建);对检索(kb/fable)与专家团
+#   (expert)的一切需要走 chat::bridges 的 trait 注入(壳侧 wiring 拼装)——
+#   kernel 不认识任何引擎板块,编译器物理保证。
+# 双壳: 默认(无特性)= server 形态(host shim 事件);desktop 特性开 tauri + sandbox。
+# ═══════════════════════════════════════════════════════════════
+[package]
+name = "polaris-kernel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+polaris-runtime = { path = "../polaris-runtime" }
+# 版本与主 crate 逐条对齐(同 workspace 共享编译产物,零增量)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+once_cell = "1"
+parking_lot = "0.12"
+directories = "5"
+walkdir = "2"
+regex = "1"
+base64 = "0.22"
+ureq = { version = "2", features = ["json"] }
+# Claude 订阅 OAuth(PKCE)+ Codex 设备码流程(provider/)
+sha2 = "0.10"
+getrandom = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+zip = "8.6.0"
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "sync", "net", "io-util", "signal"] }
+# 文件转换 convert.rs(chat 附件 + kb/fable 入库共用, 收在内核, 上层引擎向下取用)
+calamine = "0.35.0"
+pdf-extract = "0.10.0"
+# integrations/nas.rs: GBK 文件名解码
+encoding_rs = "0.8"
+# 飞书建应用二维码(integrations/feishu)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+tauri = { version = "2.1", features = [], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_WindowsProgramming", "Win32_NetworkManagement_WNet", "Win32_System_SystemInformation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+desktop = ["dep:tauri"]

@@ -36,6 +36,9 @@ import {
 import { useFileDrop } from "../composables/useFileDrop";
 import { toast } from "../composables/useToast";
 
+// KeepAlive 的 include 按组件 name 匹配 → 显式命名:切走再回来选题/配置不丢
+defineOptions({ name: "MediaOps" });
+
 const app = useAppStore();
 const chat = useChatStore();
 
@@ -84,19 +87,20 @@ const RESEARCH: SkillCard[] = [
   { id: "__kb", label: "知识库补料", hint: "用你 KB 里的事实/数据补充", icon: "📚", isSkill: false },
 ];
 
-// 排版 / 产出技能（多选，按平台切换）
-// 长图模式(__longimg)与「壹伴排版 + CloakBrowser 直传」互斥：长图是端到端替代链路,
-// 默认推荐只勾长图，想切回 HTML 注入模式用户自己加回另外两张。
+// 排版 / 产出（公众号交付：两个「功能键」二选一——要么出文件自己传，要么帮你截图上传）。
+// __htmlfile 与 __longimg 互斥（同为「最终怎么交付」的两条路），下面 toggleOutput 里强制单选。
 const WX_OUTPUT: SkillCard[] = [
-  { id: "__longimg", label: "长图模式", hint: "默认·正文渲染成长图上传：零清洗零字数问题，所见即所得", icon: "🖼", isSkill: false, wx: true },
-  { id: "wechat-md-typesetter", label: "壹伴排版优化", hint: "套主题压内联样式，进微信不乱版（与长图互斥）", icon: "🖋", isSkill: true, wx: true },
-  { id: "cloak-browser", label: "CloakBrowser 直传", hint: "直注公众号编辑器存草稿，不格式错（与长图互斥）", icon: "🌐", isSkill: true, wx: true },
+  { id: "__htmlfile", label: "排版 HTML 文件", hint: "生成排版好的 HTML 文件给你——浏览器打开全选复制粘进后台，或直接上传，最稳", icon: "📄", isSkill: false, wx: true },
+  { id: "__longimg", label: "截图上传", hint: "默认·正文渲成一整张长图，帮你自动贴进草稿箱：零清洗零字数问题，所见即所得", icon: "🖼", isSkill: false, wx: true },
   { id: "image-gen", label: "AI 配图", hint: "自动配封面/插图，失败有兜底", icon: "🎨", isSkill: true },
   { id: "__deai", label: "去 AI 痕", hint: "把机翻腔改成人话", icon: "🪶", isSkill: false },
 ];
+// 小红书交付同样是两个「功能键」二选一（对齐公众号）：图卡自动截成 PNG 直接发 / 出排版 HTML 自己截或复制。
 const XHS_OUTPUT: SkillCard[] = [
-  { id: "gz-notion-infographic", label: "图卡渲染", hint: "把文案排成小红书方形图卡", icon: "🖼", isSkill: true, wx: true },
-  { id: "cloak-browser", label: "CloakBrowser 待发包", hint: "浏览器自动登录，导出待发/半自动发布", icon: "🌐", isSkill: true, wx: true },
+  { id: "__cardimg", label: "图卡截图", hint: "默认·排成 3:4 竖版图卡并逐卡自动截成高清 PNG，直接发小红书；文案另存可复制", icon: "🖼", isSkill: false, wx: true },
+  { id: "__htmlfile", label: "排版 HTML 文件", hint: "生成排版好的图卡 HTML 给你——浏览器打开自己截图或复制文案，想微调时用这个", icon: "📄", isSkill: false, wx: true },
+  { id: "cloak-browser", label: "自动填进创作页", hint: "把图卡 PNG + 文案自动填进小红书创作页存草稿，只填不发", icon: "🌐", isSkill: true },
+  { id: "gz-notion-infographic", label: "手绘信息图风", hint: "Notion 手绘风信息图组图（带研究，更精致但更慢）", icon: "✏️", isSkill: true },
   { id: "image-gen", label: "AI 配图", hint: "自动配封面/插图，失败有兜底", icon: "🎨", isSkill: true },
   { id: "__deai", label: "去 AI 痕", hint: "把机翻腔改成人话", icon: "🪶", isSkill: false },
 ];
@@ -111,9 +115,17 @@ function toggleResearch(id: string) {
   next.has(id) ? next.delete(id) : next.add(id);
   selResearch.value = next;
 }
+// 两个交付「功能键」二选一：选中一个就把另一个让出来（同为最终交付路径，不能同时跑）。
+// 公众号=__htmlfile/__longimg；小红书=__htmlfile/__cardimg。
+const DELIVERY_EXCLUSIVE = ["__htmlfile", "__longimg", "__cardimg"];
 function toggleOutput(id: string) {
   const next = new Set(selOutput.value);
-  next.has(id) ? next.delete(id) : next.add(id);
+  if (next.has(id)) {
+    next.delete(id);
+  } else {
+    if (DELIVERY_EXCLUSIVE.includes(id)) DELIVERY_EXCLUSIVE.forEach((d) => next.delete(d));
+    next.add(id);
+  }
   selOutput.value = next;
 }
 function toggleCustom(id: string) {
@@ -152,7 +164,7 @@ function pickPlatform(p: Platform) {
   selResearch.value = new Set(["hot-topic-radar", "deep-research"]);
   selOutput.value = p === "wechat"
     ? new Set(["__longimg"])
-    : new Set(["gz-notion-infographic", "cloak-browser"]);
+    : new Set(["__cardimg"]);
 }
 function pickWrite(id: string) {
   selectedWrite.value = id;
@@ -166,7 +178,7 @@ function applyRecommended() {
   selResearch.value = new Set(["hot-topic-radar", "deep-research"]);
   selOutput.value = platform.value === "wechat"
     ? new Set(["__longimg"])
-    : new Set(["gz-notion-infographic", "cloak-browser"]);
+    : new Set(["__cardimg"]);
   selCustom.value = new Set();
 }
 
@@ -184,8 +196,9 @@ const finalSkillIds = computed(() => {
   ids.add(platform.value === "wechat" ? "wechat-pipeline" : "xiaohongshu-pipeline");
   selResearch.value.forEach((r) => { if (!r.startsWith("__")) ids.add(r); });
   selOutput.value.forEach((o) => { if (!o.startsWith("__")) ids.add(o); });
-  // 长图模式靠壹伴脚本的 snapshot/publish-image 跑,隐式带上该技能
-  if (selOutput.value.has("__longimg")) ids.add("wechat-md-typesetter");
+  // 交付功能键都靠壹伴脚本(公众号:截图=snapshot/publish-image,出文件=render;小红书:图卡=cards),隐式带上该技能
+  if (selOutput.value.has("__longimg") || selOutput.value.has("__htmlfile") || selOutput.value.has("__cardimg"))
+    ids.add("wechat-md-typesetter");
   if (customWriteSkillId.value) ids.add(customWriteSkillId.value);
   selCustom.value.forEach((c) => ids.add(c));
   return Array.from(ids);
@@ -456,31 +469,60 @@ function planPrompt(): string {
       "【去 AI 痕 · 已选定，按此执行】成稿后做一遍口语化润色：消除机翻腔 / 八股腔，长短句交错，读起来像人写的。"
     );
   }
-  // 排版 + 投递（仅公众号，且勾了对应技能时显式编排，确保"出文件→直送草稿"链路）
+  // 排版 + 投递（仅公众号）：两个交付「功能键」二选一——出 HTML 文件自己传 / 帮你截图上传。
   if (platform.value === "wechat") {
+    const wantHtmlFile = selOutput.value.has("__htmlfile");
     const wantLongImg = selOutput.value.has("__longimg");
-    const wantTypeset = selOutput.value.has("wechat-md-typesetter");
-    const wantCloak = selOutput.value.has("cloak-browser");
-    if (wantLongImg) {
-      // 长图模式优先级最高：渲染权在自己手里,编辑器只当图床,零清洗零字数问题
+    // 两条路共用的正文铁律：干净语义正文 + 绝不写开头摘要 + 排版舒展、有「配图感」
+    const BODY_RULES = [
+      "- 成稿后只产出**干净的语义正文 HTML**（h2/h3/p/strong/blockquote/hr/ul 等，**零内联样式**），存成 .html 文件报绝对路径——样式交给壹伴脚本套，别写进正文。",
+      "- **正文开头绝对不要写「摘要 / 导语 / 前言 / 内容提要」这类段落或灰底框**（用户明确不要）——直接从第一个小标题或正文第一段开始。",
+      "- 排版要**舒展、有呼吸感**：每个小标题（h2）前面加一个贴切的 emoji 当小图标增强视觉点；关键数据、金句、结论用 `<blockquote>` 做成「卡片」；段落之间用 `<hr>` 适度分隔。模型无法生成真实照片，就用 emoji + 卡片 + 分隔线营造「配图感」，别让长图变成一堵字墙。",
+    ];
+    if (wantHtmlFile) {
       lines.push(
         "",
-        "【长图模式 · 已在面板选定，写进规划并按此执行，不用再问我】",
-        "- 成稿后只产出**干净的语义正文 HTML**（h2/h3/p/strong/blockquote/hr/ul 等，零内联样式），存成 .html 文件报绝对路径。",
-        "- 跑「壹伴排版优化」技能的 `wechat_yiban.py --mode snapshot --body-file <正文.html> --theme <主题> --title <标题>`：按约定主题（墨韵/极简/科技蓝/杂志/清新绿/活力橙/米纸/黛青）渲成长图并在段落空隙切片，把成品 HTML 和切片图路径都报给我先眼检。",
-        "- 我确认后跑 `wechat_yiban.py --mode publish-image --slices-dir <切片目录> --title <标题> --intro <一两句真文字导语>`：开头插导语（利于摘要/搜一搜），切片按序粘贴进正文（编辑器原生欢迎图片，零清洗），保存为草稿（绝不自动发布），窗口留着让我核对后自己点发布。"
+        "【排版 HTML 文件 · 已在面板选定，按此执行，不用再问我】",
+        ...BODY_RULES,
+        "- 跑「壹伴排版优化」技能的 `wechat_yiban.py --mode render --body-file <正文.html> --theme <主题> --out <成品.html>`：按约定主题（墨韵/极简/科技蓝/杂志/清新绿/活力橙/米纸/黛青）套样式，渲成排版好的成品 HTML。",
+        "- 把成品 `.html` 的绝对路径报给我，并告诉我：用浏览器打开 → 全选复制 → 粘进公众号后台编辑器即可（或把这个 HTML 文件直接上传）。绝不自动发布。"
       );
-    } else if (wantTypeset || wantCloak) {
-      lines.push("", "【排版 / 投递 · 已在面板选定，写进规划并按此执行，不用再问我】");
-      if (wantTypeset)
-        lines.push(
-          "- 壹伴式分工：成稿后只产出**干净的语义正文 HTML**（h2/h3/p/strong/blockquote/hr/ul 等，**零内联样式**），存成 .html 文件报绝对路径——样式不要写进正文，交给壹伴脚本套。",
-          "- 用「壹伴排版优化」技能的 `wechat_yiban.py --mode render` 按约定风格（墨韵/极简/科技蓝/杂志）渲出预览成品 HTML 给我先眼检，报绝对路径。"
-        );
-      if (wantCloak)
-        lines.push(
-          "- 然后 `wechat_yiban.py --mode publish`：用 CloakBrowser 打开公众号后台编辑器，**只注入语义正文**，在编辑器 DOM 上按约定风格一键套样式（标题色块/引用卡/分割线/列表转段落全内联），正文图走素材库上传，填标题，保存为草稿（绝不自动发布），窗口留着让我核对后自己点发布。"
-        );
+    } else if (wantLongImg) {
+      // 截图上传：渲染权在自己手里,编辑器只当图床,零清洗零字数问题
+      lines.push(
+        "",
+        "【截图上传（长图） · 已在面板选定，按此执行，不用再问我】",
+        ...BODY_RULES,
+        "- 跑「壹伴排版优化」技能的 `wechat_yiban.py --mode snapshot --body-file <正文.html> --theme <主题> --title <标题> --no-slice`：**必须带 `--no-slice` 截成一整张完整长图**（不要切成多段），底色铺满无白边。把成品 HTML 和长图 png 路径都报给我先眼检。",
+        "- 我确认后跑 `wechat_yiban.py --mode publish-image --slices-dir <切片目录> --title <标题> --intro <一两句真文字导语>`：开头插真文字导语（利于摘要/搜一搜，但不渲进图里），长图按序粘贴进正文（编辑器原生欢迎图片，零清洗），保存为草稿（绝不自动发布），窗口留着让我核对后自己点发布。"
+      );
+    }
+  } else {
+    // 小红书交付：两个功能键二选一——图卡自动截成 PNG 直接发 / 出排版 HTML 自己截。
+    const wantCardImg = selOutput.value.has("__cardimg");
+    const wantHtmlFile = selOutput.value.has("__htmlfile");
+    // 两条路共用的图卡铁律
+    const CARD_RULES = [
+      "- 成稿后把图卡做成**一个自包含的单文件 HTML**（样式全内联/内嵌 `<style>`，本地双击能直接看）：每张卡一个 `<section class=\"card\">`，**固定 3:4 竖版（宽 1080px × 高 1440px）**；封面 1 张（大标题 + 钩子，字要大）+ 内容卡每张只讲一个要点，总数 3~9 张；配色统一、字大留白多，禁止一张卡塞成字墙。",
+      "- 文案（标题 ≤20 字含 1-2 个 emoji + 正文 300-600 字 + 8-12 个话题标签）同时存一份 `.md`，并**在回复里直接给出完整可复制的文案块**——我要能一键复制粘进小红书。",
+    ];
+    if (wantCardImg) {
+      lines.push(
+        "",
+        "【图卡截图 · 已在面板选定，按此执行，不用再问我】",
+        ...CARD_RULES,
+        "- 跑 `python ~/Polaris/skills/wechat-md-typesetter/scripts/wechat_yiban.py --mode cards --body-file <图卡.html> --title <笔记标题>`：逐卡自动截成高清 PNG（@2x），把图卡 HTML 和每张 PNG 的绝对路径都报给我——PNG 直接拖进小红书创作页就能发。",
+        selOutput.value.has("cloak-browser")
+          ? "- 我确认图卡后，用「post-to-xhs」把 PNG + 文案填进小红书创作页存草稿：**只填不发**，发布键留给我。"
+          : "- 不用自动投递：把 PNG 和文案给我，我自己发。"
+      );
+    } else if (wantHtmlFile) {
+      lines.push(
+        "",
+        "【排版 HTML 文件 · 已在面板选定，按此执行，不用再问我】",
+        ...CARD_RULES,
+        "- 把图卡 HTML 的绝对路径报给我，并告诉我：浏览器打开后每张卡截图（或直接用系统截图工具框选）即可发小红书；想让你代截时再说一声（cards 模式随时可跑）。"
+      );
     }
   }
   return lines.join("\n");
@@ -762,7 +804,7 @@ onMounted(async () => {
               >
                 <BookMarked :size="22" :stroke-width="1.6" />
                 <div class="mo-plat-name">小红书</div>
-                <div class="mo-plat-desc">钩子文案 + 图卡 → 待发包</div>
+                <div class="mo-plat-desc">钩子文案 + 3:4 图卡 → 自动截图 / 待发包</div>
                 <Check v-if="platform === 'xhs'" :size="15" class="mo-plat-check" />
               </button>
             </div>
@@ -773,7 +815,7 @@ onMounted(async () => {
             <div class="mo-reco-ico"><Sparkles :size="17" /></div>
             <div class="mo-reco-txt">
               <div class="mo-reco-t">第一次用？一键套推荐配置</div>
-              <div class="mo-reco-d">深度评论体 + 选题雷达 + 深度搜索 + 壹伴排版 + CloakBrowser 直传，够发一篇了。</div>
+              <div class="mo-reco-d">文风 + 选题雷达 + 深度搜索 + 默认交付（公众号=截图上传草稿箱 / 小红书=图卡自动截图），够发一篇了。</div>
             </div>
             <button class="mo-reco-btn" @click="applyRecommended"><Check :size="13" /> 一键推荐</button>
           </div>

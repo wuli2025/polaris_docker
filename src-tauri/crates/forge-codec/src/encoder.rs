@@ -16,8 +16,8 @@ pub struct EncodeConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub bitrate_bps: u32,        // openh264 推荐 1.5-2x 目标(同码率质量差 libx264 medium 2-3dB)
-    pub keyframe_interval: u32,  // 默认 60 帧(2s@30fps)
+    pub bitrate_bps: u32, // openh264 推荐 1.5-2x 目标(同码率质量差 libx264 medium 2-3dB)
+    pub keyframe_interval: u32, // 默认 60 帧(2s@30fps)
 }
 
 impl Default for EncodeConfig {
@@ -37,7 +37,13 @@ impl Default for EncodeConfig {
 ///  - FfmpegEncoder 逃生口(本期给 stub,实现见 ffmpeg_fallback.rs)
 #[async_trait::async_trait]
 pub trait VideoEncoder: Send {
-    async fn encode_rgba(&mut self, rgba: &[u8], width: u32, height: u32, keyframe: bool) -> Result<Vec<u8>>;
+    async fn encode_rgba(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        keyframe: bool,
+    ) -> Result<Vec<u8>>;
     async fn finish(self: Box<Self>) -> Result<Vec<u8>>;
 }
 
@@ -45,7 +51,7 @@ pub trait VideoEncoder: Send {
 ///  本版给 stub:直接返 NeedFallback,让链路优先走 ffmpeg 兜底验证
 pub struct H264Encoder {
     pub cfg: EncodeConfig,
-    pub nals: Vec<u8>,  // 占位,真实实现时连续 NAL 流
+    pub nals: Vec<u8>, // 占位,真实实现时连续 NAL 流
 }
 
 impl H264Encoder {
@@ -60,10 +66,20 @@ impl H264Encoder {
 
 #[async_trait::async_trait]
 impl VideoEncoder for H264Encoder {
-    async fn encode_rgba(&mut self, _rgba: &[u8], _w: u32, _h: u32, _keyframe: bool) -> Result<Vec<u8>> {
-        Err(ForgeError::NeedFallback { reason: "H264Encoder stub".into() })
+    async fn encode_rgba(
+        &mut self,
+        _rgba: &[u8],
+        _w: u32,
+        _h: u32,
+        _keyframe: bool,
+    ) -> Result<Vec<u8>> {
+        Err(ForgeError::NeedFallback {
+            reason: "H264Encoder stub".into(),
+        })
     }
     async fn finish(self: Box<Self>) -> Result<Vec<u8>> {
-        Err(ForgeError::NeedFallback { reason: "H264Encoder stub".into() })
+        Err(ForgeError::NeedFallback {
+            reason: "H264Encoder stub".into(),
+        })
     }
 }

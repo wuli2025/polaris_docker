@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════════════════════
+# polaris-fable — 检索/KB 引擎 crate(分仓规划 v2 第 3 仓的仓内形态)
+# fable(盘点/索引/混检/文件中心/回声层/感官坞/归集扫描) + kb(妈妈库/关键词检索/图谱)。
+# 边界铁律: 只准向下依赖 polaris-kernel(conv 转写/skills 装载/convert 转换)与
+#   polaris-runtime;同层引擎(forge/collab)与上层(wiki)一概不认识 —— 编译器物理保证。
+# 双壳: 默认(无特性)= server 形态;desktop 特性开 tauri;local-embed 开本地 ONNX 嵌入。
+# ═══════════════════════════════════════════════════════════════
+[package]
+name = "polaris-fable"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+polaris-kernel = { path = "../polaris-kernel" }
+polaris-runtime = { path = "../polaris-runtime" }
+# 版本与主 crate 逐条对齐(同 workspace 共享编译产物,零增量)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+once_cell = "1"
+parking_lot = "0.12"
+regex = "1"
+directories = "5"
+walkdir = "2"
+ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+encoding_rs = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "sync", "net", "io-util", "signal"] }
+tauri = { version = "2.1", features = [], optional = true }
+# 本地开源嵌入/重排(local-embed):选型理由与坑见主 crate 历史注释。
+# ★ DOCKER 分叉:此处用 ort-load-dynamic,主仓用 ort-download-binaries-rustls-tls。
+#   容器侧由 Dockerfile 装 onnxruntime .so 并设 ORT_DYLIB_PATH → 运行时才 dlopen,
+#   缺库也不影响启动(降级走云嵌入);download-binaries 会在构建期拉二进制,与镜像分层冲突。
+#   同步主仓时必须保住这一行。
+fastembed = { version = "5", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_WindowsProgramming", "Win32_NetworkManagement_WNet", "Win32_System_SystemInformation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+desktop = ["dep:tauri"]
+# fable/mod.rs 的 server 专属路径(双壳分叉),由壳仓 server 特性转发。
+server = []
+local-embed = ["dep:fastembed"]

@@ -20,14 +20,18 @@ import {
   Archive,
   Clapperboard,
   Megaphone,
-  Presentation,
-  Globe,
   Users,
+  UsersRound,
+  ChevronRight,
   Sparkles,
+  Handshake,
+  Radio,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import { useAppStore } from "../stores/app";
 import { useChatStore } from "../stores/chat";
+import { useCollabStore } from "../features/collab/stores/collab";
+import type { CollabProject } from "../features/collab/api";
 import ProviderDock from "./ProviderDock.vue";
 import {
   persona as personaApi,
@@ -39,6 +43,7 @@ import { toast } from "../composables/useToast";
 
 const app = useAppStore();
 const chat = useChatStore();
+const collab = useCollabStore();
 
 type NavItem = { key: typeof app.view; label: string; icon: any };
 // 常驻主项（仿豆包：顶层精简）。统一用 lucide 线性图标，去掉杂乱的 Unicode 字符，求一致的高级线条感。
@@ -55,12 +60,18 @@ const primaryNav: NavItem[] = [
   { key: "skill_center", label: "技能中心", icon: Puzzle },
   // 「专家团」中心（原「人格」升级）：点开看全部专家 + 业务团 + 按知识库智能推荐
   { key: "claude_md", label: "专家团", icon: Users },
+  // 多人协作:任务卡看板 + 领取/提交/验收闭环(团队共用协作主机)—— 只管项目/任务
+  { key: "collab", label: "协作", icon: Handshake },
+  // 互联 · 设备联盟:设备看板 + 主机连接码 + 账号根口令 —— 与协作彻底分开,只管设备与连接
+  { key: "interconnect", label: "互联", icon: Radio },
 ];
 // 收纳进「更多」的次要项（更新 / 飞书 / 环境 / MCP / 设置）
 const moreNav: NavItem[] = [
   { key: "media_ops", label: "自媒体运营", icon: Megaphone },
-  { key: "deck", label: "PPT 演示", icon: Presentation },
-  { key: "web_studio", label: "网站生成", icon: Globe },
+  // 「PPT 演示」「网站生成」入口已隐藏：改由对话直接触发（说「做个 PPT / 做个网站」
+  // 即自动激活 polaris-deck-studio / polaris-web-studio 技能，见 skills.rs
+  // auto_skills_for_intent）。视图与路由（App.vue deck / web_studio）保留，
+  // 未来要加回入口时恢复这两行即可。
   { key: "video_course", label: "生成课件类视频", icon: Clapperboard },
   { key: "update", label: "更新", icon: CloudDownload },
   { key: "feishu", label: "聊天机器人", icon: MessageCircle },
@@ -79,7 +90,23 @@ const showNewProject = ref(false);
 
 onMounted(() => {
   app.refreshProjects();
+  // 团队项目分区数据(幂等:validated 闸在 store 内;未登录静默无感)
+  void collab.init();
 });
+
+// ─────────── 团队项目分区(GitHub repo 列表式) ───────────
+const teamProjects = computed<CollabProject[]>(() =>
+  collab.authed ? collab.projects.filter((p) => !p.archived) : []
+);
+const expandedTeam = ref<Record<number, boolean>>({});
+function openTeamProject(p: CollabProject) {
+  void collab.selectProject(p.id);
+  app.setView("collab_project");
+}
+/** 团队项目绑定的本地项目(对话工作区);未绑定返回 undefined */
+function boundOf(p: CollabProject) {
+  return app.projectByCollabId(p.id);
+}
 
 async function submitNewProject() {
   const n = newProjectName.value.trim();
@@ -256,7 +283,15 @@ const sortedProjects = computed(() => {
     }
     return r;
   };
-  return [...app.projects].sort(
+  // 已绑定到「团队项目」且该团队项目当前可见的本地项目,不在「我的项目」重复显示
+  // (对话由团队分区展开直达);未登录/团队项目不可见时回落到这里,对话不失联。
+  const visible = app.projects.filter(
+    (p) =>
+      p.collabProjectId == null ||
+      !collab.authed ||
+      !collab.projects.some((cp) => cp.id === p.collabProjectId)
+  );
+  return [...visible].sort(
     (a, b) => recency(b.id, b.createdAt) - recency(a.id, a.createdAt)
   );
 });
@@ -369,6 +404,54 @@ const sortedProjects = computed(() => {
         />
         <button class="primary-mini" @click="submitNewProject">建</button>
       </div>
+
+      <!-- 团队项目分区(GitHub repo 列表式:徽章计数,点名字进项目主页,展开看讨论) -->
+      <template v-if="teamProjects.length">
+        <div class="team-sec-head">团队项目</div>
+        <div v-for="tp in teamProjects" :key="'tp' + tp.id" class="proj-block">
+          <div
+            class="proj team"
+            :class="{ active: app.view === 'collab_project' && collab.currentProjectId === tp.id }"
+            @click="openTeamProject(tp)"
+          >
+            <button
+              class="tp-caret"
+              :class="{ open: expandedTeam[tp.id] }"
+              title="展开讨论"
+              @click.stop="expandedTeam[tp.id] = !expandedTeam[tp.id]"
+            >
+              <ChevronRight :size="12" :stroke-width="2" />
+            </button>
+            <UsersRound class="folder" :size="15" :stroke-width="1.7" />
+            <span class="name">{{ tp.name }}</span>
+            <span
+              v-if="(tp.open_count ?? 0) + (tp.review_count ?? 0) > 0"
+              class="tp-badge"
+              :title="`进行中 ${tp.open_count ?? 0} · 待验收 ${tp.review_count ?? 0}`"
+            >
+              {{ (tp.open_count ?? 0) + (tp.review_count ?? 0) }}
+            </span>
+          </div>
+          <template v-if="expandedTeam[tp.id]">
+            <template v-if="boundOf(tp)">
+              <div
+                v-for="c in sortedConvs(boundOf(tp)!.id)"
+                :key="c.id"
+                class="conv"
+                :class="{ active: app.currentConvId === c.id, pinned: app.isPinned(c.id) }"
+                @click="app.selectConversation(c)"
+              >
+                <span class="cv-name" :title="c.title">{{ c.title || "未命名对话" }}</span>
+              </div>
+              <div v-if="!sortedConvs(boundOf(tp)!.id).length" class="tp-empty">
+                还没有讨论 · 点项目名进主页开一个
+              </div>
+            </template>
+            <div v-else class="tp-empty">点项目名进主页,「开新讨论」即自动关联</div>
+          </template>
+        </div>
+        <div class="team-sec-head">我的项目</div>
+      </template>
 
       <div v-for="proj in sortedProjects" :key="proj.id" class="proj-block">
         <div
@@ -551,15 +634,8 @@ const sortedProjects = computed(() => {
 
 <style scoped>
 .sb {
-  /* 仿 Codex：比主区略深一档的暖米，无分割线靠色差分区；中部透一点点更亮的暖光 */
-  background: linear-gradient(
-    180deg,
-    var(--bg-side) 0%,
-    var(--bg-side) 32%,
-    var(--bg-side-mid) 50%,
-    var(--bg-side) 68%,
-    var(--bg-side) 100%
-  );
+  /* 低视觉污染稿：比主区略深一档的中性灰白, 纯平无渐变, 无分割线靠色差分区 */
+  background: var(--bg-side);
   border-right: none;
   display: flex;
   flex-direction: column;
@@ -699,6 +775,47 @@ const sortedProjects = computed(() => {
   font-size: 11px;
   letter-spacing: 1.5px;
   color: var(--dim);
+}
+/* 团队项目分区(GitHub repo 列表式) */
+.team-sec-head {
+  font-family: var(--serif);
+  font-size: 10.5px;
+  letter-spacing: 1.5px;
+  color: var(--dim);
+  padding: 8px 10px 2px;
+}
+.tp-caret {
+  border: none;
+  background: none;
+  cursor: pointer;
+  display: inline-flex;
+  color: var(--muted);
+  padding: 2px;
+  margin: -2px -4px -2px -6px;
+  transition: transform 0.15s;
+}
+.tp-caret.open {
+  transform: rotate(90deg);
+}
+.tp-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 16px;
+  text-align: center;
+  padding: 1px 5px;
+  border-radius: 999px;
+  color: #b8860b;
+  background: color-mix(in srgb, #b8860b 14%, transparent);
+}
+.proj.team .name {
+  flex: 0 1 auto;
+}
+.tp-empty {
+  font-size: 11px;
+  color: var(--dim);
+  font-style: italic;
+  padding: 4px 10px 6px 30px;
 }
 .ic-btn {
   width: 18px;

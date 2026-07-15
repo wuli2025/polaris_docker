@@ -30,6 +30,7 @@ import {
   Network,
   ShieldCheck,
 } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import {
   files as fc,
   artifacts as artifactsApi,
@@ -642,7 +643,7 @@ onBeforeUnmount(() => {
           <!-- 企业:选行业框(中文) -->
           <div v-if="wiz.profile === 'enterprise'" class="schema-box">
             <div class="schema-head"><Network :size="14" :stroke-width="1.7" /> <b>选一个行业框</b><span class="schema-fine">框里只用给定的实体/关系类型,模型「做选择题」→ 不乱编</span></div>
-            <div v-if="schemasLoading" class="wiz-loading"><LoaderCircle :size="16" class="spin" /> 加载行业框…</div>
+            <div v-if="schemasLoading" class="wiz-loading"><OrbitSpinner :size="16" /> 加载行业框…</div>
             <div v-else class="schema-grid">
               <button
                 v-for="sc in schemaList"
@@ -679,7 +680,7 @@ onBeforeUnmount(() => {
             已<b>默认全选</b>你电脑上所有可访问的盘 / 目录(系统、缓存目录会自动跳过)。
             想缩小范围就取消勾选,或在下方填关键词排除。
           </p>
-          <div v-if="loadingRoots" class="wiz-loading"><LoaderCircle :size="18" class="spin" /> 正在列出可盘点的盘…</div>
+          <div v-if="loadingRoots" class="wiz-loading"><OrbitSpinner :size="18" /> 正在列出可盘点的盘…</div>
           <div v-else-if="rootsErr" class="wiz-err">{{ rootsErr }}</div>
           <template v-else>
             <div class="root-tools">
@@ -706,7 +707,7 @@ onBeforeUnmount(() => {
                   </span>
                   <span class="root-size">{{ fmtBytes(sizeCache.get(r.path)!.bytes) }}</span>
                 </template>
-                <span v-else class="root-calc"><LoaderCircle :size="11" class="spin" /> 计算体积…</span>
+                <span v-else class="root-calc"><OrbitSpinner :size="11" /> 计算体积…</span>
               </button>
             </div>
             <p class="wiz-fine">
@@ -847,14 +848,14 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <div v-if="suggesting" class="suggest-busy">
-            <LoaderCircle :size="12" class="spin" /> AI 正在读你的资料、为你量身想建议…(先点上面任意一条也行)
+            <OrbitSpinner :size="12" /> AI 正在读你的资料、为你量身想建议…(先点上面任意一条也行)
           </div>
           <button v-else class="suggest-redo" @click="loadSuggestions">
             <Sparkles :size="12" :stroke-width="1.8" /> 让 AI 再想几条
           </button>
           <div class="finish-row">
             <button class="mini" :disabled="!profilePath" @click="openProfile"><FileText :size="12" :stroke-width="1.8" /> 打开桌面画像</button>
-            <span v-if="finishing" class="fine-busy"><LoaderCircle :size="12" class="spin" /> 生成画像中…</span>
+            <span v-if="finishing" class="fine-busy"><OrbitSpinner :size="12" /> 生成画像中…</span>
             <span v-else-if="profilePath" class="fine-ok"><Check :size="12" :stroke-width="2.4" /> 画像已存桌面</span>
           </div>
           <div class="wiz-foot end">

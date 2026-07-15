@@ -6,17 +6,17 @@
 //!
 //! 入口: expert_list() / expert_route() / expert_match_auto() / expert_apply()
 
-mod expert_groups;
 mod avatars;
 mod expert_docs;
+mod expert_groups;
 mod teams;
 
 pub use teams::ExpertTeam;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use chrono::Utc;
 
 /// 专家能力卡 — 一张「能力候选池」卡片，不含任何执行顺序/依赖关系。
 #[derive(Serialize, Clone, Debug)]
@@ -125,15 +125,40 @@ pub struct RouteRequest {
 /// 列表 / 智能路由 / 专家团。源 ec() 定义暂留 expert_groups.rs，后续可物理删除（功能已等同删除）。
 const RETIRED: &[&str] = &[
     // —— cut（删除）——
-    "nlp-engineer", "rl-engineer", "technical-writer-pro", "graphql-architect",
-    "event-sourcing-architect", "platform-engineer-devops", "csharp-pro", "blockchain-developer",
-    "context-manager", "delivery-manager", "scrum-master", "scientific-researcher", "osint-analyst",
+    "nlp-engineer",
+    "rl-engineer",
+    "technical-writer-pro",
+    "graphql-architect",
+    "event-sourcing-architect",
+    "platform-engineer-devops",
+    "csharp-pro",
+    "blockchain-developer",
+    "context-manager",
+    "delivery-manager",
+    "scrum-master",
+    "scientific-researcher",
+    "osint-analyst",
     // —— merge（并入他人后下线被合并的一方）——
-    "llm-architect", "mlops-engineer", "flutter-expert", "brand-storyteller", "payment-integration",
-    "microservices-architect", "mermaid-expert", "multi-agent-coordinator", "knowledge-synthesizer",
-    "ops-engineer", "business-analyst", "qa-expert", "tech-debt-strategist", "research-analyst",
-    "penetration-tester", "appsec-coder", "license-counsel", "deployment-engineer",
-    "data-contract-engineer", "strategy-planner",
+    "llm-architect",
+    "mlops-engineer",
+    "flutter-expert",
+    "brand-storyteller",
+    "payment-integration",
+    "microservices-architect",
+    "mermaid-expert",
+    "multi-agent-coordinator",
+    "knowledge-synthesizer",
+    "ops-engineer",
+    "business-analyst",
+    "qa-expert",
+    "tech-debt-strategist",
+    "research-analyst",
+    "penetration-tester",
+    "appsec-coder",
+    "license-counsel",
+    "deployment-engineer",
+    "data-contract-engineer",
+    "strategy-planner",
 ];
 
 static EXPERTS: once_cell::sync::Lazy<Vec<ExpertCard>> = once_cell::sync::Lazy::new(|| {
@@ -163,7 +188,9 @@ pub fn detect_multi_expert_task(task: &str) -> bool {
     let t = task.to_lowercase();
 
     // 并行关键词
-    let parallel_kw = ["并行", "同时", "分别", "各自", "拆成", "分工", "团队", "组队", "多人", "多步"];
+    let parallel_kw = [
+        "并行", "同时", "分别", "各自", "拆成", "分工", "团队", "组队", "多人", "多步",
+    ];
     for kw in &parallel_kw {
         if t.contains(*kw) {
             return true;
@@ -176,24 +203,31 @@ pub fn detect_multi_expert_task(task: &str) -> bool {
         .filter(|l| !l.trim().is_empty())
         .collect();
     // 统计看起来像子任务项的行(以 bullet/数字/顿号开头)
-    let bullet_count = lines.iter().filter(|l| {
-        let l = l.trim();
-        l.starts_with('-') || l.starts_with('*') || l.starts_with('·')
-            || l.starts_with('●') || l.starts_with('○')
-            || (l.len() > 1 && l.chars().next().unwrap().is_numeric())
-            || l.starts_with('1') || l.starts_with('2') || l.starts_with('3')
-            || l.starts_with('①') || l.starts_with('②') || l.starts_with('③')
-    }).count();
+    let bullet_count = lines
+        .iter()
+        .filter(|l| {
+            let l = l.trim();
+            l.starts_with('-')
+                || l.starts_with('*')
+                || l.starts_with('·')
+                || l.starts_with('●')
+                || l.starts_with('○')
+                || (l.len() > 1 && l.chars().next().unwrap().is_numeric())
+                || l.starts_with('1')
+                || l.starts_with('2')
+                || l.starts_with('3')
+                || l.starts_with('①')
+                || l.starts_with('②')
+                || l.starts_with('③')
+        })
+        .count();
 
     bullet_count >= 3 || lines.len() >= 3
 }
 
 /// 召集专家团
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn expert_team_spawn(
-    project_id: String,
-    task_description: String,
-) -> Vec<ExpertMatch> {
+pub fn expert_team_spawn(project_id: String, task_description: String) -> Vec<ExpertMatch> {
     let matches = expert_route(RouteRequest {
         query: task_description.clone(),
         limit: Some(5),
@@ -317,7 +351,11 @@ pub fn expert_route(req: RouteRequest) -> Vec<ExpertMatch> {
         .map(|(rank, (id, score))| {
             let expert = experts.iter().find(|e| e.id == id).unwrap();
             let hit_signals = find_hit_signals(expert, &query_lower);
-            let similarity = if max > 0.0 { (score / max).min(1.0) } else { 0.0 };
+            let similarity = if max > 0.0 {
+                (score / max).min(1.0)
+            } else {
+                0.0
+            };
             ExpertMatch {
                 expert: expert.clone(),
                 hit_signals,
@@ -366,11 +404,7 @@ pub fn expert_avatar_slots() -> Vec<String> {
 /// 与 persona_apply 走同一条写 CLAUDE.md 链路；区别是 expert_apply 读模板文件，
 /// persona_apply 用编译期内嵌的 preset body。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn expert_apply(
-    project_id: String,
-    expert_id: String,
-    overwrite: bool,
-) -> Result<(), String> {
+pub fn expert_apply(project_id: String, expert_id: String, overwrite: bool) -> Result<(), String> {
     // 查找专家
     let expert = all_experts_ref()
         .iter()
@@ -397,9 +431,7 @@ pub fn expert_apply(
     let path = project_claude_md_path(&project_id).ok_or("无法确定项目路径")?;
     if !overwrite && path.exists() {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if !existing.trim().is_empty()
-            && !existing.contains(crate::claude_md::PLACEHOLDER_MARKER)
-        {
+        if !existing.trim().is_empty() && !existing.contains(crate::claude_md::PLACEHOLDER_MARKER) {
             return Err("该项目已有人格内容，确认覆盖请重试。".into());
         }
     }
@@ -465,7 +497,11 @@ fn keyword_match_score(query: &str, experts: &[ExpertCard]) -> HashMap<String, f
 }
 
 /// RRF (RecipRank Fusion) — 两路分数融合
-fn rrf_fuse(signal_scores: &HashMap<String, f32>, keyword_scores: &HashMap<String, f32>, k: f32) -> HashMap<String, f32> {
+fn rrf_fuse(
+    signal_scores: &HashMap<String, f32>,
+    keyword_scores: &HashMap<String, f32>,
+    k: f32,
+) -> HashMap<String, f32> {
     let mut combined: HashMap<String, f32> = HashMap::new();
 
     // 信号路排名
@@ -650,7 +686,11 @@ pub fn expert_route_debug(query: String) -> Vec<ExpertDebugRow> {
                 name: e.name.clone(),
                 group: e.group.clone(),
                 hit_signals: find_hit_signals(e, &q),
-                similarity: if max > 0.0 { (score / max).min(1.0) } else { 0.0 },
+                similarity: if max > 0.0 {
+                    (score / max).min(1.0)
+                } else {
+                    0.0
+                },
                 // 排名前 3 且有命中即视为「会被召集」（绝对分阈值对 RRF 不成立）
                 would_select: rank < 3 && score > 0.0,
             }
@@ -673,10 +713,16 @@ pub fn route_block(query: &str) -> Option<String> {
     let primary = &hit[0].expert;
     let mut s = String::new();
     s.push_str(
-        "【智能匹配·专家团】本轮自动匹配到主理专家。请**严格以下述专家的标准、品味与方法**作答 —— \
-         这是该专家完整的工作准则,优先级高于泛泛的通用风格(若与默认风格冲突,以专家准则为准):\n\n",
+        "【智能匹配·专家团】本轮自动匹配到主理专家。以下述专家的标准与品味作答。\
+         优先级:用户的明确要求 > 专家准则 > 通用风格 —— 用户要求与专家铁律冲突时,\
+         一律按用户的来(至多一句话点明代价,不说教、不拒绝)。始终用用户提问的语言回答。\n\
+         动手前先按领域直觉扫一遍本题最可能出错/最刁钻处(隐藏陷阱、边界、易漏项),\
+         再对照下述铁律清单——别让清单挤掉探索,清单是下限不是上限。\n\n",
     );
-    s.push_str(&format!("# 主理专家:{}（{}）\n\n", primary.name, primary.role));
+    s.push_str(&format!(
+        "# 主理专家:{}（{}）\n\n",
+        primary.name, primary.role
+    ));
     // ★关键:注入该专家**完整提示词正文**(来自 templates/experts/<group>/<id>.md,可本地编辑),
     //   而不是过去那一行"命中/补维度"标签 —— 否则改了提示词也驱动不了模型。
     if let Some(body) = expert_docs::build_expert_doc(
@@ -704,10 +750,55 @@ pub fn route_block(query: &str) -> Option<String> {
             ));
         }
     }
+    s.push_str("\n纪律:任务简单就主理专家一人直接干到好,确需分工且并行有收益时才召备选。");
+    Some(s)
+}
+
+/// 多专家召集注入块（expert-team 模式）：给每位主选专家注入**完整工作准则正文**，
+/// 备选只给一行。此前这里只注入「名字+分工标签」——最需要专家标准的多人场景反而
+/// 拿不到任何准则，现在与 route_block 的单专家路径对齐。
+pub fn team_block(matches: &[ExpertMatch]) -> Option<String> {
+    if matches.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
     s.push_str(
-        "\n纪律:以主理专家的标准为准、备选为辅;任务简单就主理专家一人直接干到好,\
-         确需分工且并行有收益时才召备选(一次≤4~5 人,紧耦合则串行)。",
+        "【专家团召集】本轮召集以下专家协同。各自严守自己的准则,分工不重叠。\
+         优先级:用户的明确要求 > 专家准则 > 通用风格 —— 冲突时一律按用户的来\
+         (至多一句话点明代价)。始终用用户提问的语言回答。\
+         动手前各自先按领域直觉扫一遍本题最可能出错/最刁钻处,再对照自己的铁律清单——\
+         别让清单挤掉探索,清单是下限不是上限。\n\n",
     );
+    for m in matches.iter().filter(|m| m.is_primary) {
+        let e = &m.expert;
+        s.push_str(&format!("# 专家:{}（{}）\n\n", e.name, e.role));
+        if let Some(body) = expert_docs::build_expert_doc(
+            &e.claude_md_ref,
+            &e.name,
+            &e.role,
+            &e.description,
+            &e.keywords,
+            &e.capabilities,
+            &e.trigger_signals,
+            &e.complements,
+            &e.exclusive_with,
+            e.cost_tier,
+        ) {
+            s.push_str(&body);
+            s.push_str("\n\n");
+        }
+    }
+    let backups: Vec<_> = matches.iter().filter(|m| !m.is_primary).collect();
+    if !backups.is_empty() {
+        s.push_str("## 可借力的备选专家\n");
+        for m in &backups {
+            s.push_str(&format!(
+                "- **{}**（{}）— 补「{}」\n",
+                m.expert.name, m.expert.role, m.complements
+            ));
+        }
+    }
+    s.push_str("\n纪律:独立子任务才并行,紧耦合退回串行;由第一位专家统一收口交付。");
     Some(s)
 }
 
@@ -743,10 +834,7 @@ fn kb_corpus(scope: Option<String>) -> (String, usize, Vec<String>) {
         }
         // 取每段路径分量（尤其顶层目录名 = 领域），喂进语料
         for seg in p.split(|c| c == '/' || c == '\\') {
-            let seg = seg
-                .trim_end_matches(".md")
-                .trim_end_matches(".txt")
-                .trim();
+            let seg = seg.trim_end_matches(".md").trim_end_matches(".txt").trim();
             if seg.is_empty() || seg == "raw" || seg == "wiki" {
                 continue;
             }
@@ -775,7 +863,11 @@ pub fn expert_recommend_from_kb(scope: Option<String>) -> KbRecommendation {
     let rrf = rrf_fuse(&signal, &keyword, 60.0);
     let mut ranked: Vec<(&String, &f32)> = rrf.iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Less));
-    let top_ids: Vec<String> = ranked.iter().take(10).map(|(id, _)| (*id).clone()).collect();
+    let top_ids: Vec<String> = ranked
+        .iter()
+        .take(10)
+        .map(|(id, _)| (*id).clone())
+        .collect();
     let top_experts: Vec<ExpertCard> = top_ids
         .iter()
         .take(3)
@@ -787,7 +879,9 @@ pub fn expert_recommend_from_kb(scope: Option<String>) -> KbRecommendation {
     let mut best: Option<(ExpertTeam, i32)> = None;
     for team in teams {
         let mut score = 0i32;
-        let roster: Vec<&String> = std::iter::once(&team.lead_id).chain(team.member_ids.iter()).collect();
+        let roster: Vec<&String> = std::iter::once(&team.lead_id)
+            .chain(team.member_ids.iter())
+            .collect();
         for r in &roster {
             if top_ids.iter().any(|t| &t == r) {
                 score += 2;
@@ -827,7 +921,13 @@ pub fn expert_recommend_from_kb(scope: Option<String>) -> KbRecommendation {
                 team.name,
                 names.join("、"),
             );
-            KbRecommendation { team: Some(team), reason, top_experts, matched_topics, corpus_size }
+            KbRecommendation {
+                team: Some(team),
+                reason,
+                top_experts,
+                matched_topics,
+                corpus_size,
+            }
         }
         _ => KbRecommendation {
             team: None,
@@ -891,7 +991,9 @@ mod tests {
         let count = all_experts().len();
         assert!(count >= 60, "专家数量应 >= 60，实际 {}", count);
         assert!(
-            !all_experts().iter().any(|e| RETIRED.contains(&e.id.as_str())),
+            !all_experts()
+                .iter()
+                .any(|e| RETIRED.contains(&e.id.as_str())),
             "已裁撤专家不应出现在花名册"
         );
     }
@@ -905,7 +1007,11 @@ mod tests {
         });
         assert!(!results.is_empty(), "路由应返回结果");
         for r in &results {
-            assert!(!r.expert.trigger_signals.is_empty(), "{} 缺 trigger_signals", r.expert.id);
+            assert!(
+                !r.expert.trigger_signals.is_empty(),
+                "{} 缺 trigger_signals",
+                r.expert.id
+            );
         }
     }
 
@@ -943,10 +1049,16 @@ mod tests {
             group_filter: None,
         });
         assert!(!results.is_empty());
-        assert!((results[0].similarity - 1.0).abs() < 1e-6, "首位相似度应归一化为 1.0");
+        assert!(
+            (results[0].similarity - 1.0).abs() < 1e-6,
+            "首位相似度应归一化为 1.0"
+        );
         assert!(results[0].is_primary, "首位应为主选");
         for r in &results {
-            assert!(r.similarity >= 0.0 && r.similarity <= 1.0, "相似度应在 0..1");
+            assert!(
+                r.similarity >= 0.0 && r.similarity <= 1.0,
+                "相似度应在 0..1"
+            );
         }
     }
 
@@ -955,14 +1067,20 @@ mod tests {
     fn route_debug_has_selectable() {
         let rows = expert_route_debug("做一个带支付的前端落地页".into());
         assert!(!rows.is_empty(), "应有命中行");
-        assert!(rows.iter().any(|r| r.would_select), "应至少一行 would_select");
+        assert!(
+            rows.iter().any(|r| r.would_select),
+            "应至少一行 would_select"
+        );
         assert!(rows[0].similarity <= 1.0);
     }
 
     /// route_block：明确领域查询应注入；纯闲聊不应注入。
     #[test]
     fn route_block_fires_on_domain_not_chitchat() {
-        assert!(route_block("帮我写个 python 异步爬虫").is_some(), "领域查询应注入专家块");
+        assert!(
+            route_block("帮我写个 python 异步爬虫").is_some(),
+            "领域查询应注入专家块"
+        );
         assert!(route_block("嗯嗯好的谢谢你").is_none(), "闲聊不应注入");
     }
 
@@ -973,10 +1091,10 @@ mod tests {
     fn route_block_injects_full_expert_prompt() {
         let block = route_block("你帮我写一个这个的ppt").expect("ppt 应命中专家");
         assert!(block.contains("视觉设计"), "应路由到视觉设计专家");
+        let head: String = block.chars().take(200).collect();
         assert!(
-            block.contains("演示美学") || block.contains("大字少字"),
-            "应注入 visual-designer.md 的实质提示词(证明吃的是文件全文而非标签),实际开头:\n{}",
-            &block[..block.len().min(400)]
+            block.contains("项目符号墙") || block.contains("发布会 slide"),
+            "应注入 visual-designer.md 的实质提示词(证明吃的是文件全文而非标签),实际开头:\n{head}"
         );
     }
 }

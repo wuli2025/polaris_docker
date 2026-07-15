@@ -54,17 +54,97 @@ fn presets() -> Vec<PersonaPreset> {
     };
     vec![
         // ── 单专家（一段人设皮肤）──
-        mk("stock-expert", "股票助手", "📈", "A 股深度分析 / 公告监控 / 行情查询，数据驱动客观分析。", "raw/股票", STOCK, "single"),
-        mk("content-writer", "内容创作", "✍️", "公众号/自媒体写手：选题、撰写、5 种风格、排版钩子。", "raw/创作", WRITER, "single"),
-        mk("lesson-planner", "备课出卷", "📚", "K12 教案/试卷/答案解析，难度分布可控，输出 docx/xlsx。", "raw/教学", LESSON, "single"),
-        mk("content-summarizer", "内容总结", "📋", "网页/文档/会议纪要的结构化摘要：一句话→要点→详细→行动项。", "", SUMMARY, "single"),
-        mk("health-interpreter", "医疗健康解读", "🏥", "体检报告/化验单通俗解读，分级标注，附免责声明。", "raw/健康", HEALTH, "single"),
-        mk("pet-care", "萌宠管家", "🐾", "猫狗行为/健康/营养，温暖亲切，安全禁忌优先。", "raw/萌宠", PET, "single"),
-        mk("mao", "毛主席", "☭", "毛选式客观分析：矛盾分析、实事求是、同志称呼、引用克制。", "raw/毛主席", MAO, "single"),
+        mk(
+            "stock-expert",
+            "股票助手",
+            "📈",
+            "A 股深度分析 / 公告监控 / 行情查询，数据驱动客观分析。",
+            "raw/股票",
+            STOCK,
+            "single",
+        ),
+        mk(
+            "content-writer",
+            "内容创作",
+            "✍️",
+            "公众号/自媒体写手：选题、撰写、5 种风格、排版钩子。",
+            "raw/创作",
+            WRITER,
+            "single",
+        ),
+        mk(
+            "lesson-planner",
+            "备课出卷",
+            "📚",
+            "K12 教案/试卷/答案解析，难度分布可控，输出 docx/xlsx。",
+            "raw/教学",
+            LESSON,
+            "single",
+        ),
+        mk(
+            "content-summarizer",
+            "内容总结",
+            "📋",
+            "网页/文档/会议纪要的结构化摘要：一句话→要点→详细→行动项。",
+            "",
+            SUMMARY,
+            "single",
+        ),
+        mk(
+            "health-interpreter",
+            "医疗健康解读",
+            "🏥",
+            "体检报告/化验单通俗解读，分级标注，附免责声明。",
+            "raw/健康",
+            HEALTH,
+            "single",
+        ),
+        mk(
+            "pet-care",
+            "萌宠管家",
+            "🐾",
+            "猫狗行为/健康/营养，温暖亲切，安全禁忌优先。",
+            "raw/萌宠",
+            PET,
+            "single",
+        ),
+        mk(
+            "mao",
+            "毛主席",
+            "☭",
+            "毛选式客观分析：矛盾分析、实事求是、同志称呼、引用克制。",
+            "raw/毛主席",
+            MAO,
+            "single",
+        ),
         // ── 专家团（战略师领衔·按需组阵·四模式默认单 agent）──
-        mk("team-general", "全能专家团", "🧭", "战略师领衔，读目标后按情况临时组阵；默认单 agent，值得才升级到多专家/多 agent 编排。", "", TEAM_GENERAL, "team"),
-        mk("team-creative", "创作专家团", "🎨", "PPT/网页/自媒体/视频成品：UI 设计师×叙事官×落地工程师，要美、动人、能交付。", "raw/创作", TEAM_CREATIVE, "team"),
-        mk("team-research", "研究专家团", "🔬", "调研/尽调/选型：多源检索×对抗校验×单一合成者收口，结论带来源可追溯。", "", TEAM_RESEARCH, "team"),
+        mk(
+            "team-general",
+            "全能专家团",
+            "🧭",
+            "战略师领衔，读目标后按情况临时组阵；默认单 agent，值得才升级到多专家/多 agent 编排。",
+            "",
+            TEAM_GENERAL,
+            "team",
+        ),
+        mk(
+            "team-creative",
+            "创作专家团",
+            "🎨",
+            "PPT/网页/自媒体/视频成品：UI 设计师×叙事官×落地工程师，要美、动人、能交付。",
+            "raw/创作",
+            TEAM_CREATIVE,
+            "team",
+        ),
+        mk(
+            "team-research",
+            "研究专家团",
+            "🔬",
+            "调研/尽调/选型：多源检索×对抗校验×单一合成者收口，结论带来源可追溯。",
+            "",
+            TEAM_RESEARCH,
+            "team",
+        ),
     ]
 }
 
@@ -107,9 +187,7 @@ pub fn persona_apply(
     let path = project_claude_md_path(&project_id).ok_or("无法确定项目路径")?;
     if !overwrite && path.exists() {
         let existing = fs::read_to_string(&path).unwrap_or_default();
-        if !existing.trim().is_empty()
-            && !existing.contains(crate::claude_md::PLACEHOLDER_MARKER)
-        {
+        if !existing.trim().is_empty() && !existing.contains(crate::claude_md::PLACEHOLDER_MARKER) {
             return Err("该项目已有人格内容，确认覆盖请重试。".into());
         }
     }

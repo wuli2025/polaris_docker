@@ -5,82 +5,53 @@
 > `.docker-owned` 管的是「**Docker 有、主仓没有**」的分叉（保护它别被覆盖）。
 > 本文件管的是反方向：「**主仓有、Docker 还没追上**」的落后债——这些**不能**在普通同步里
 > 顺手并，因为它们牵一发动全身，必须开一个**单独的、跑完整 `cargo build` 验证过**的 catch-up pass。
-> 在那之前，`.docker-owned` 把相关文件标成 OWNED，让守卫脚本拦住盲覆盖。
 
-更新于：2026-06-12（v1.0.5 同步时盘点；同日并入寓言计划三件套,见 D0）
-
----
-
-## D0. 寓言计划三件套已并入（2026-06-12,主仓尚未 commit 的前瞻同步）✅
-
-**内容**：`sense.rs`(感官 API 坞) + `echo.rs`(回声层做梦) + `fable/`(检索枢纽:盘点 L1a /
-向量索引 / grep∥RAG 塌平混检) + 前端 `SenseApi.vue` 整页 + `Settings.vue`/`App.vue`/`app.ts`
-增量 + `conv.rs`/`kb.rs`/`claude_md.rs` 增量(均为主仓正向增量,非 OWNED,整拷) + `docker/sense-models.sh`。
-手并的 OWNED 文件：`Cargo.toml`(+chrono+rusqlite bundled)、`lib.rs`(+3 个 `pub mod`)、
-`server.rs`(+opt_bool/opt_f64/opt_u8 助手 + sense/echo/fable dispatch + init 三行)、
-`src/bin/polaris-forge.rs`(+`fable` 子命令组,容器内 agent 的全盘检索工具)。
-**验证**：`cargo check --lib/--bins --no-default-features --features server` 绿 + `vue-tsc` 绿(Windows)。
-**注意**：主仓该批改动同步时尚未 commit——主仓 commit 后做常规同步,这批共享文件 hash 应当
-已一致(对得上就跳过)。镜像未重建;下次 CI 因 rusqlite(bundled) 编 C 会略变慢属正常。
+更新于：2026-07-15（v2.1.0 catch-up）
 
 ---
 
-## D1. polaris-forge CLI 进 Docker 镜像 ✅ 已完成（2026-06-12，commit 见下）
+## 当前状态：落后债 = 0 ✅
 
-**结论**：已落地并 Windows 真机验证（`cargo build --bin polaris-forge --features server` 绿、
-`preflight` 出 JSON、`spec-pptx` 端到端出合法可编辑 .pptx 并 validate 通过）。做法**未照搬主仓的
-独立 polaris-cli crate**（会和 _pdocker 主包 `[[bin]] polaris-server` 撞名、还要动 docker 分叉的
-server 入口），改成**主包加 `src/bin/polaris-forge.rs` + `[[bin]]`**（docker 不跑 tauri bundler，
-主包加 bin 安全）。补齐了 `forge_pptx_native.rs`（spec→OOXML）、`forge::spec_to_pptx_sync`、
-`forge_pptx.rs` 的 `TmpGuard`+10 个符号放宽 `pub(crate)`。Dockerfile 出双 bin，DOCKER.md 补文档。
+2026-07-15 的 v2.1.0 catch-up 把积压的 **3 个版本 / 663 文件 / ~10 万行**一次还清，
+docker 仓的共享源码现已与主仓 v2.1.0 **同构**。旧的 D0 / D1 条目全部作废（见文末「历史」）。
 
-<details><summary>原始诊断（保留备查）</summary>
-
-**当初现状**：主仓把渲染引擎封了一个独立 crate `crates/polaris-cli`，出 `polaris-forge` 二进制
-（子命令 preflight / pptx / spec-pptx / video / tts / validate），让容器内 agent 命令行出片。
-群晖那份工作副本的 Dockerfile/DOCKER.md 已经在用它。
-
-**Docker (_pdocker) 还没追上**：
-- 没有 `crates/polaris-cli` crate；`polaris-server` 仍是**主包 `[[bin]]`**（住 `src-tauri/src/bin/polaris-server.rs`）。
-- lib 里缺 `forge_pptx_native.rs`（spec→原生可编辑 OOXML，「slim 也能出传统 PPT」靠它）。
-- Dockerfile stage 2 还是 `cargo build --bin polaris-server`，没出 `polaris-forge`。
-
-**为什么不在普通同步里顺手做**：这是结构迁移——加 crate + 改 workspace `members`/`[[bin]]` +
-补 `forge_pptx_native.rs` + 主 lib 的 `server` feature 要能在 _pdocker 这棵**已 drift 的树**上编过 +
-Dockerfile 改 `-p polaris-cli` 出双 bin。任一处对不齐，镜像就挂在 build 阶段。
-**必须开专门 pass、跑完整 `cargo build -p polaris-cli --no-default-features --features server` 验证后再推。**
-
-**追的时候怎么做**（备忘）：
-1. 拷主仓 `crates/polaris-cli/`（薄 crate：Cargo.toml + src/main.rs + src/bin/polaris-server.rs）。
-2. 拷主仓 `src-tauri/src/forge_pptx_native.rs`，并按主仓 `lib.rs` 补 `pub mod forge_pptx_native;`。
-   ⚠️ `lib.rs`/`chat.rs` 是 C2 drift 文件，得连带 catch-up，别只动一行。
-3. `src-tauri/Cargo.toml`：`members` 已含 `crates/*`，确认 polaris-cli 被收；主包那两个
-   `[[bin]]`（polaris-server / polaris-app）按主仓策略处理（Docker 不跑 tauri bundler，
-   主包留 `[[bin]] polaris-server` 本身不炸，但要避免和 polaris-cli 重名冲突——二选一）。
-4. Dockerfile stage 2a 改 `--lib`，stage 2b 改 `cargo build -p polaris-cli` 并 `cp` 两个 bin。
-5. DOCKER.md 补 `polaris-forge` 用法（群晖那份可直接抄文案）。
-6. **跑完整镜像 build（slim+full）验证后**再 push。
-
-（实际落地时走了更省事的「主包加 bin」路线，见上方 ✅ 小结；本备忘的 polaris-cli crate 路线未采用。）
-
-</details>
-
-## D2. chat.rs 提示词装配落后
-
-主仓 `chat.rs` 有 `longtask_convention` / 创作模式（CREATIVE_SKILL_IDS）/ `script_convention` 等
-always-on 注入；_pdocker 的 `chat.rs` 是老版装配（kb_first→skill→reply_style→output→project→batch），
-**没有**这些。属 reinforcement-only（少了不崩，只是行为不如桌面端克制/稳健）。
-追的时候要连 lib.rs 的相关导出一起核对（C2 已标 OWNED）。
-
-## D3. deck / 模板版本
-
-主仓 `DECK_VERSION` 已到 5、版式扩到 9 版式；_pdocker 的 deck 模板停在更早版本。
-属渐进增强，单独追时连 `slidesSpec.ts`/`deckThemes.ts`/`runtime.js` 一起对齐。
+今后按常规节奏同步即可，别再攒这种规模的债。**攒债的代价不是线性的**：这次真正的工作量
+不在那 663 个文件（绝大多数无脑取新版即可），而在于「**判断哪些是真分叉**」——
+而判断成本随落后的版本数增长。
 
 ---
 
-## 同步纪律一句话
+## v2.1.0 catch-up 做了什么（2026-07-15）
 
-- **从主仓拿新功能**：`pwsh scripts/sync-guard.ps1 -Apply` —— SAFE 文件自动并，OWNED 留手并。
-- **加了新的 Docker-only 分叉**：登记进 `.docker-owned`，跑 `-Audit` 体检。
-- **追 D1–D3 这种落后债**：单开 pass，跑完整 `cargo build` / 镜像 build 验证，**别混进日常同步**。
+**背景**：docker 仓 VERSION 停在 1.7.1，主仓已到 2.1.0，期间主仓做了**分仓重构**
+（src-tauri/src/ 下大批模块迁入 crates/，4 crate → 11 crate）。
+
+**结论先行**：真正带 docker 语义的共享源码只有 **4 个半文件**，其余全是「落后漂移」，
+直接取主仓新版即可。判定方法 = **blob 哈希比对**（见 .docker-owned 顶部教训 ①）。
+
+| 做的事 | 说明 |
+| --- | --- |
+| 整树对齐 | `src-tauri/src`、`src-tauri/crates`、`src` 全换成主仓 v2.1.0（先删后拷，消除搬家后的陈旧文件） |
+| **架构对齐** | docker 原先把 `polaris-server`/`polaris-forge` 的 `[[bin]]` 放在主包 `src/bin/`（旧 D1 的决定）；现改为**采用主仓的 `crates/polaris-cli`**。`src-tauri/src/bin/` 已删除 |
+| Dockerfile 构建段重写 | 旧的「stub `src/bin/*.rs` 预热依赖」层在新布局下**不再可行**（stub 主包 lib.rs → polaris-cli 找不到 polaris-app 的符号必炸）。改为整包一次编 `-p polaris-cli`，依赖缓存交给 image.yml 的 GHA cache |
+| **+collab-net** | 镜像新增 `--features collab-net`。**这是 NAS 侧连不出 NodeId 的实测根因**——没有它，桌面「设备联盟」的 P2P 远程盘直连不可用 |
+| local-embed 转发 | `crates/polaris-cli/Cargo.toml` 加 `local-embed = ["polaris-app/local-embed"]`（主仓没有），使一条 `-p polaris-cli --features collab-net,local-embed` 即出双 bin |
+| ort feature 保住 | `crates/polaris-fable/Cargo.toml` 的 fastembed 仍用 `ort-load-dynamic`（主仓换成了 download-binaries，与本镜像的 ORT_DYLIB_PATH 分层冲突） |
+| `/api/version` 补齐 | **它一直是个幽灵路由**：DOCKER.md / DEPLOY-SYNOLOGY.md / Dockerfile 注释 / 前端 useUpdater 全都引用它，但 server.rs 里从来没有过这个路由 → 前端那句「修显示 v—」的逻辑其实一直在吃 404。本轮真正实现（读 `/app/VERSION`） |
+| 容器自更新重落 | `useUpdater.ts`(+106) / `UpdatePanel.vue`(+177) 三方合并到主仓 v2.1.0 上（基点 `archive/docker-pre-cleanup-2026-06-11`）。**注意**：主仓新增了冷启动退避重试，docker 那版没有——是**合流**不是叠加 |
+| 6 个未提交修复落库 | 见 commit `36e8111`。它们当时只躺在工作区，**再晚一步就被这次整树覆盖抹掉了** |
+
+**已验证**：`cargo check -p polaris-cli --features collab-net,local-embed` 绿；`npm run build`
+（含 vue-tsc）绿。
+**未验证**：镜像真机构建、NAS 端到端自更新与 `/api/version` 实际返回——靠 image.yml + 真机点验。
+
+---
+
+## 历史（已作废，保留备查）
+
+- **D0. 寓言计划三件套并入**（2026-06-12）—— 早已随后续同步全部上游化，作废。
+- **D1. polaris-forge CLI 进镜像**（2026-06-12）—— 当时的决定是「不照搬主仓的独立
+  polaris-cli crate，改成主包加 `src/bin/polaris-forge.rs`」，理由是会与 docker 分叉的
+  `[[bin]] polaris-server` 撞名。**该决定已于 2026-07-15 反转**：主仓分仓重构后
+  `crates/polaris-cli` 成为唯一正解，docker 侧的主包 bin 已删除，两仓结构归一。
+  这条债能被反转掉，正是因为分叉的根源（docker 自己的 server 入口）已经上游化。

@@ -10,7 +10,7 @@
 # ═══════════════════════════════════════════════════════════════
 [package]
 name = "polaris-cli"
-version = "1.7.1"
+version = "2.1.0"
 edition = "2021"
 description = "polaris-forge — Polaris Forge 渲染引擎 CLI"
 publish = false
@@ -24,6 +24,15 @@ path = "src/main.rs"
 [[bin]]
 name = "polaris-server"
 path = "src/bin/polaris-server.rs"
+
+# collab-net(iroh 打洞直连)透传:polaris-server 镜像加 `--features collab-net` 即让
+# 服务端起 iroh host_listen 暴露 NodeId,桌面/手机可 P2P 连入。polaris-forge 不带,零额外编译。
+[features]
+collab-net = ["polaris-app/collab-net"]
+# ★ DOCKER 分叉:主仓 polaris-cli 没有这条转发(桌面不从 CLI 走本地嵌入)。
+#   镜像用 `-p polaris-cli --features local-embed` 一条命令出双 bin,故需在此透传到主 lib。
+#   配套:crates/polaris-fable 的 fastembed 用 ort-load-dynamic + Dockerfile 的 ORT_DYLIB_PATH。
+local-embed = ["polaris-app/local-embed"]
 
 [dependencies]
 # 复用主 lib 的全部引擎(forge 五件套 + convert)。server feature 是 Docker 侧

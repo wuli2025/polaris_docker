@@ -20,6 +20,16 @@ interface VoiceConfig {
   antipollute: string;
   pinyin_threshold: number;
   overlay_pos: string;
+  polish_api_base: string;
+  polish_api_key: string;
+  polish_model: string;
+}
+interface PolishResult {
+  raw: string;
+  text: string;
+  model: string;
+  ms: number;
+  key_source: string;
 }
 interface VoiceLexicon {
   hotwords: string[];
@@ -107,6 +117,27 @@ async function runProbe() {
     probeBusy.value = false;
   }
 }
+
+// ── AI 整形（仿 Typeless）测一下 ──
+const polishIn = ref("嗯……那个我们呢就是说先把这个北极星的方案确定下来然后然后再排期不对是先排期");
+const polishRes = ref<PolishResult | null>(null);
+const polishErr = ref("");
+const polishBusy = ref(false);
+async function runPolish() {
+  if (polishBusy.value) return;
+  polishBusy.value = true;
+  polishRes.value = null;
+  polishErr.value = "";
+  try {
+    polishRes.value = await invoke<PolishResult>("voice_polish", { text: polishIn.value });
+  } catch (e) {
+    polishErr.value = String(e);
+  } finally {
+    polishBusy.value = false;
+  }
+}
+const keySourceLabel = (s: string) =>
+  s === "config" ? "你填的 Key" : s === "borrowed" ? "借用坞里 MiniMax" : "无 Key";
 
 // ── 启用实时语音输入（按住热键说话 → 注入焦点应用）──
 const listenOn = ref(false);
@@ -260,8 +291,8 @@ async function runLearn() {
           <span v-if="listenErr" class="err-line" style="margin: 0">{{ listenErr }}</span>
         </div>
         <div class="tierhint">
-          Windows / macOS 桌面版已内置本地语音识别;首次使用前请在「设置 → 感官 API」
-          下载「SenseVoice-Small」感官包(约 230&nbsp;MB)。Docker / Web 版暂不支持本地听写。
+          Windows 桌面版已内置本地语音识别;首次使用前请在「设置 → 感官 API」
+          下载「SenseVoice-Small」感官包(约 230&nbsp;MB)。macOS 即将支持;Docker / Web 版暂不支持本地听写。
         </div>
       </section>
 
@@ -315,8 +346,78 @@ async function runLearn() {
               :checked="cfg.polish"
               @change="setCfg({ polish: ($event.target as HTMLInputElement).checked })"
             />
-            说完 AI 润色（去语气词·补标点，默认关最快）
+            说完 AI 整形（仿 Typeless·去语气词/顺句/自动列表，走下方 API，默认关最快）
           </label>
+        </div>
+      </section>
+
+      <!-- AI 整形（仿 Typeless）接入 -->
+      <section class="block">
+        <div class="b-head">
+          <h2>AI 整形 · 接入便宜 API</h2>
+          <span class="b-desc">
+            开启上方「说完 AI 整形」后，松手/停录会把识别终稿发给这里配的 LLM，去语气词·去重复·补标点·顺句·自动列表——把「你说的话」变成「你想写的字」。走 OpenAI 兼容协议，几乎任何便宜 API 都能接。
+          </span>
+        </div>
+        <div class="row">
+          <label class="fl fill">
+            接口 Base
+            <input
+              class="in"
+              :value="cfg.polish_api_base"
+              placeholder="https://api.minimaxi.com/v1"
+              @change="setCfg({ polishApiBase: ($event.target as HTMLInputElement).value })"
+            />
+          </label>
+        </div>
+        <div class="row">
+          <label class="fl fill">
+            API Key
+            <input
+              class="in"
+              type="password"
+              :value="cfg.polish_api_key"
+              placeholder="留空则自动借用「供应商坞」里的 MiniMax key（含粉丝福利额度）"
+              @change="setCfg({ polishApiKey: ($event.target as HTMLInputElement).value })"
+            />
+          </label>
+        </div>
+        <div class="row">
+          <label class="fl fill">
+            模型
+            <input
+              class="in"
+              :value="cfg.polish_model"
+              placeholder="MiniMax-M2.7-highspeed"
+              @change="setCfg({ polishModel: ($event.target as HTMLInputElement).value })"
+            />
+          </label>
+        </div>
+        <div class="tierhint">
+          <b>优先推荐 MiniMax-M2.7-highspeed</b>：便宜、低延迟，整形这种短任务足够。国内用
+          <code>https://api.minimaxi.com/v1</code>，海外用 <code>https://api.minimax.io/v1</code>。
+          Key 留空即用内置的粉丝福利额度开箱即试；也可换成 DeepSeek / Kimi / 通义等任何 OpenAI 兼容便宜 API。
+        </div>
+        <textarea
+          v-model="polishIn"
+          class="ta"
+          rows="2"
+          placeholder="贴一段带语气词的口水话，看整形效果…"
+        ></textarea>
+        <div class="row">
+          <button class="btn primary sm" :disabled="polishBusy" @click="runPolish">
+            {{ polishBusy ? "整形中…" : "测一下整形" }}
+          </button>
+          <span v-if="polishRes" class="dim sm">
+            {{ polishRes.model }} · {{ polishRes.ms }}ms · {{ keySourceLabel(polishRes.key_source) }}
+          </span>
+          <span v-if="polishErr" class="err-line" style="margin: 0">{{ polishErr }}</span>
+        </div>
+        <div v-if="polishRes" class="probe-out">
+          <div class="dim sm">整形前（识别终稿）</div>
+          <div class="po-text">{{ polishRes.raw }}</div>
+          <div class="dim sm" style="margin-top: 8px">整形后</div>
+          <div class="po-text">{{ polishRes.text }}</div>
         </div>
       </section>
 
@@ -573,6 +674,14 @@ async function runLearn() {
   gap: 6px;
   font-size: 12.5px;
   color: var(--text-2);
+}
+.fl.fill {
+  display: flex;
+  width: 100%;
+}
+.fl.fill .in {
+  flex: 1;
+  min-width: 0;
 }
 .sw {
   display: inline-flex;

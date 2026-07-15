@@ -9,6 +9,9 @@ import {
   type CodexStatus,
   type CodexDeviceLogin,
   type CodexProxyInfo,
+  type ClaudeAuthStatus,
+  type ClaudeLoginStart,
+  type LoginPollResult,
 } from "../tauri";
 
 export const useProvidersStore = defineStore("providers", () => {
@@ -23,6 +26,7 @@ export const useProvidersStore = defineStore("providers", () => {
   const balanceBusy = ref<Record<string, boolean>>({});
   const codex = ref<CodexStatus | null>(null);
   const codexProxy = ref<CodexProxyInfo | null>(null);
+  const claudeAuth = ref<ClaudeAuthStatus | null>(null);
   const loading = ref(false);
   const switching = ref<string | null>(null);
   const error = ref<string | null>(null);
@@ -146,6 +150,63 @@ export const useProvidersStore = defineStore("providers", () => {
     return r.status;
   }
 
+  /** ②' auto 模式:轮询回环一键授权进度;ok 时顺带刷新 codex 状态 */
+  async function codexLoginPoll(): Promise<LoginPollResult> {
+    const r = await providerApi.codexLoginPoll();
+    if (r.status === "ok") await refreshCodex();
+    return r;
+  }
+
+  /** 取消进行中的 codex 回环授权(释放 1455 端口);尽力而为 */
+  function codexLoginCancel() {
+    providerApi.codexLoginCancel().catch(() => {});
+  }
+
+  async function refreshClaudeAuth() {
+    try {
+      claudeAuth.value = await providerApi.claudeAuthStatus();
+    } catch (e) {
+      error.value = String(e);
+    }
+  }
+
+  /** ① 发起 Claude 官方订阅 OAuth:后端开浏览器。桌面端默认回环一键授权(mode=auto),
+   *  forceManual=true 强制手工回贴(回环失灵时的兜底入口) */
+  async function claudeStartLogin(
+    forceManual = false
+  ): Promise<ClaudeLoginStart | null> {
+    error.value = null;
+    try {
+      return await providerApi.claudeStartLogin(forceManual);
+    } catch (e) {
+      error.value = String(e);
+      return null;
+    }
+  }
+
+  /** ②' auto 模式:轮询回环一键授权进度;ok 时顺带刷新登录态 */
+  async function claudeLoginPoll(): Promise<LoginPollResult> {
+    const r = await providerApi.claudeLoginPoll();
+    if (r.status === "ok") await refreshClaudeAuth();
+    return r;
+  }
+
+  /** 取消进行中的 Claude 回环授权(释放 54545 端口);尽力而为 */
+  function claudeLoginCancel() {
+    providerApi.claudeLoginCancel().catch(() => {});
+  }
+
+  /** ② 回贴授权码换 token 落盘;成功后刷新登录态。抛错交调用方处理 */
+  async function claudeFinishLogin(
+    pasted: string,
+    verifier: string,
+    state: string
+  ): Promise<boolean> {
+    const st = await providerApi.claudeFinishLogin(pasted, verifier, state);
+    claudeAuth.value = st;
+    return st.loggedIn;
+  }
+
   /** 切换「联动系统 CLI / 隔离」模式;开联动会把当前供应商写入全局 settings.json,
    *  关联动会把全局清回官方(终端 CLI 立刻恢复干净)、Polaris 内选择不变 */
   async function setLinkMode(link: boolean): Promise<boolean> {
@@ -206,6 +267,7 @@ export const useProvidersStore = defineStore("providers", () => {
     balanceBusy,
     codex,
     codexProxy,
+    claudeAuth,
     loading,
     switching,
     error,
@@ -223,8 +285,15 @@ export const useProvidersStore = defineStore("providers", () => {
     refreshConfiguredBalances,
     refreshCodex,
     refreshCodexProxy,
+    refreshClaudeAuth,
     codexStartLogin,
     codexPollLogin,
+    codexLoginPoll,
+    codexLoginCancel,
+    claudeStartLogin,
+    claudeFinishLogin,
+    claudeLoginPoll,
+    claudeLoginCancel,
     setLinkMode,
     switchTo,
     save,

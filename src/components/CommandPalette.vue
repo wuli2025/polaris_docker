@@ -7,8 +7,6 @@ import {
   Sparkles,
   Settings as SettingsIcon,
   Clapperboard,
-  Presentation,
-  Globe,
   Megaphone,
   Workflow,
   Stethoscope,
@@ -36,8 +34,7 @@ const VIEWS: { key: ViewKey; label: string; icon: any }[] = [
   { key: "graph", label: "知识图谱", icon: Sparkles },
   { key: "skill_center", label: "技能中心", icon: Sparkles },
   { key: "automation", label: "自动化", icon: Workflow },
-  { key: "deck", label: "演示工坊 (PPT)", icon: Presentation },
-  { key: "web_studio", label: "网站生成", icon: Globe },
+  // 演示工坊 / 网站生成入口已隐藏:对话里说「做个 PPT / 做个网站」即自动触发同款引擎
   { key: "video_course", label: "课件视频", icon: Clapperboard },
   { key: "media_ops", label: "自媒体运营", icon: Megaphone },
   { key: "env_doctor", label: "环境检测", icon: Stethoscope },

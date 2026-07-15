@@ -52,7 +52,10 @@ fn wechat_profile() -> PathBuf {
 fn xhs_profile_candidates() -> Vec<PathBuf> {
     let lad = local_app_data();
     vec![
-        lad.join("Google").join("Chrome").join("XiaohongshuProfiles").join("default"),
+        lad.join("Google")
+            .join("Chrome")
+            .join("XiaohongshuProfiles")
+            .join("default"),
         lad.join("Google").join("Chrome").join("XiaohongshuProfile"),
     ]
 }
@@ -136,7 +139,8 @@ pub fn media_accounts_status() -> Vec<AccountStatus> {
 
 /// 解绑某平台：删除其 profile 目录，强制下次重新扫码登录。
 /// 安全：只允许删本模块固定推导出的已知路径，杜绝任意路径删除。
-#[cfg_attr(feature = "desktop", tauri::command)]
+/// (async)：remove_dir_all 数百 MB 的 Chrome profile 要跑好几秒，同步命令会钉死主线程。
+#[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn media_account_forget(platform: String) -> Result<String, String> {
     let targets: Vec<PathBuf> = match platform.as_str() {
         "wechat" => vec![wechat_profile()],
@@ -146,8 +150,7 @@ pub fn media_account_forget(platform: String) -> Result<String, String> {
     let mut removed = 0usize;
     for dir in targets {
         if dir.exists() {
-            fs::remove_dir_all(&dir)
-                .map_err(|e| format!("删除 {} 失败：{e}", dir.display()))?;
+            fs::remove_dir_all(&dir).map_err(|e| format!("删除 {} 失败：{e}", dir.display()))?;
             removed += 1;
         }
     }

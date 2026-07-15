@@ -21,7 +21,12 @@ pub fn ffmpeg_available() -> bool {
 }
 
 /// 兜底:把 PNG 帧序列 + 音轨合成 mp4(原 forge_video 路径)
-pub fn run_ffmpeg_fallback(frames_dir: &Path, audio: Option<&Path>, out_mp4: &Path, fps: u32) -> Result<()> {
+pub fn run_ffmpeg_fallback(
+    frames_dir: &Path,
+    audio: Option<&Path>,
+    out_mp4: &Path,
+    fps: u32,
+) -> Result<()> {
     if !ffmpeg_available() {
         return Err(ForgeError::NeedFallback {
             reason: "ffmpeg 不在 PATH,无法 fallback;Docker 镜像应有 /usr/bin/ffmpeg".into(),
@@ -29,15 +34,21 @@ pub fn run_ffmpeg_fallback(frames_dir: &Path, audio: Option<&Path>, out_mp4: &Pa
     }
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
-        .arg("-framerate").arg(fps.to_string())
-        .arg("-i").arg(frames_dir.join("f%05d.png"));
+        .arg("-framerate")
+        .arg(fps.to_string())
+        .arg("-i")
+        .arg(frames_dir.join("f%05d.png"));
     if let Some(a) = audio {
         cmd.arg("-i").arg(a);
     }
-    cmd.arg("-c:v").arg("libx264")
-        .arg("-pix_fmt").arg("yuv420p")
-        .arg("-preset").arg("veryfast")
-        .arg("-crf").arg("23");
+    cmd.arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-crf")
+        .arg("23");
     if audio.is_some() {
         cmd.arg("-c:a").arg("aac").arg("-b:a").arg("128k");
     }
@@ -49,9 +60,14 @@ pub fn run_ffmpeg_fallback(frames_dir: &Path, audio: Option<&Path>, out_mp4: &Pa
     if !out.status.success() {
         return Err(ForgeError::Codec {
             encoder: "ffmpeg_fallback".into(),
-            reason: format!("ffmpeg exit {}: {}",
+            reason: format!(
+                "ffmpeg exit {}: {}",
                 out.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&out.stderr).chars().take(400).collect::<String>()),
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(400)
+                    .collect::<String>()
+            ),
         });
     }
     Ok(())

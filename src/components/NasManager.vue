@@ -21,6 +21,7 @@ import {
   Check,
   Info,
 } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import { nas, type NasView, type NasRecord } from "../tauri";
 
 const emit = defineEmits<{ (e: "close"): void }>();
@@ -195,7 +196,7 @@ onMounted(refresh);
         </div>
         <div class="nas-head-actions">
           <button class="ghost-btn" :disabled="loading" title="刷新" @click="refresh">
-            <LoaderCircle v-if="loading" :size="15" class="spin" />
+            <OrbitSpinner v-if="loading" :size="15" />
             <RefreshCw v-else :size="15" :stroke-width="1.8" />
           </button>
           <button class="ghost-btn" title="关闭" @click="emit('close')">
@@ -285,7 +286,7 @@ onMounted(refresh);
                   title="映射成网络盘"
                   @click="connect(n)"
                 >
-                  <LoaderCircle v-if="busyId === n.id" :size="14" class="spin" />
+                  <OrbitSpinner v-if="busyId === n.id" :size="14" />
                   <Link2 v-else :size="14" :stroke-width="1.9" /> 连接
                 </button>
                 <button
@@ -295,7 +296,7 @@ onMounted(refresh);
                   title="取消映射"
                   @click="disconnect(n)"
                 >
-                  <LoaderCircle v-if="busyId === n.id" :size="14" class="spin" />
+                  <OrbitSpinner v-if="busyId === n.id" :size="14" />
                   <Unlink v-else :size="14" :stroke-width="1.9" /> 断开
                 </button>
                 <button class="act icon" title="编辑" @click="openEdit(n)"><Pencil :size="14" :stroke-width="1.8" /></button>
@@ -329,11 +330,11 @@ onMounted(refresh);
                   :disabled="busyId === n.id"
                   @click="connect(n)"
                 >
-                  <LoaderCircle v-if="busyId === n.id" :size="14" class="spin" />
+                  <OrbitSpinner v-if="busyId === n.id" :size="14" />
                   <Link2 v-else :size="14" :stroke-width="1.9" /> 连接
                 </button>
                 <button v-else class="act" :disabled="busyId === n.id" @click="disconnect(n)">
-                  <LoaderCircle v-if="busyId === n.id" :size="14" class="spin" />
+                  <OrbitSpinner v-if="busyId === n.id" :size="14" />
                   <Unlink v-else :size="14" :stroke-width="1.9" /> 断开
                 </button>
                 <button class="act icon" title="完善并记住" @click="openEdit(n)"><Pencil :size="14" :stroke-width="1.8" /></button>

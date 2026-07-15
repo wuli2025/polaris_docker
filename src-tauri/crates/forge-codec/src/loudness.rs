@@ -13,18 +13,23 @@ use crate::{ForgeError, Result};
 /// 响度分析器 + gain 缩放
 /// P1.5 落 ebur128::EbuR128 真实调用;本期给 stub
 pub struct LoudnessAnalyzer {
-    pub target_lufs: f64,    // 默认 -23(ITU-R BS.1770-4 流媒体)
-    pub true_peak_db: f64,   // 默认 -1 dBTP 防爆音
+    pub target_lufs: f64,  // 默认 -23(ITU-R BS.1770-4 流媒体)
+    pub true_peak_db: f64, // 默认 -1 dBTP 防爆音
 }
 
 impl Default for LoudnessAnalyzer {
     fn default() -> Self {
-        Self { target_lufs: -23.0, true_peak_db: -1.0 }
+        Self {
+            target_lufs: -23.0,
+            true_peak_db: -1.0,
+        }
     }
 }
 
 impl LoudnessAnalyzer {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// 分析 PCM 整段(samples interleave,channels=1|2,rate=48000)
     /// 返 integrated LUFS(标量)

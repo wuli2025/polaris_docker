@@ -22,7 +22,6 @@ import {
   FolderOpen,
   ExternalLink,
   Paperclip,
-  LoaderCircle,
   Target,
   Ellipsis,
   PencilLine,
@@ -46,8 +45,10 @@ import {
   RefreshCw,
   Zap,
   Code2,
+  Eraser,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import {
   chat,
   convApi,
@@ -80,6 +81,7 @@ import { useProvidersStore } from "../stores/providers";
 import { useWorkflowsStore } from "../stores/workflows";
 import { useLongTaskStore, detectLongTask } from "../stores/longtask";
 import { useFileDrop } from "../composables/useFileDrop";
+import { isLowSpec } from "../composables/useLowSpec";
 
 function fileName(path: string): string {
   return path.replace(/\/+$/, "").split("/").pop() || path;
@@ -128,6 +130,32 @@ function openArtifact(path: string) {
   artifactsStore.open(path);
 }
 
+/** 豆包式「参考文件」: 本回合 Read 过的文件, 去重、剔除本回合产物与被截断的摘要,
+ *  收在回答最前面供点开预览(走 openArtifact 同一条右侧抽屉链路) */
+function refFiles(t: Turn): string[] {
+  const arts = new Set(t.artifacts);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const tl of t.tools) {
+    if (tl.name !== "Read") continue;
+    for (const d of tl.details) {
+      const p = d.trim().replace(/\\/g, "/");
+      // 摘要被截断(尾随 …)或不像路径的跳过, 宁缺勿错
+      if (!p || p.endsWith("…") || !p.includes("/")) continue;
+      if (seen.has(p) || arts.has(p)) continue;
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out.slice(0, 8);
+}
+
+// 产物文件夹卡片的折叠态(按回合 key, 默认展开; 只在会话内存活, 不持久化)
+const filesCollapsed = ref<Record<number, boolean>>({});
+function toggleFiles(k: number) {
+  filesCollapsed.value = { ...filesCollapsed.value, [k]: !filesCollapsed.value[k] };
+}
+
 const input = ref("");
 // 每个对话各自的未发送草稿:切走/切回都保留本对话的草稿,且绝不把 A 的半句话
 // 带进 B(全局单 ref 会串台、还可能误发到别的对话)。键用 convId,新对话(null)用 ""。
@@ -146,9 +174,24 @@ const isMaoProject = computed(() => currentProjectName.value === "毛主席");
 // 已完成回合按原文命中缓存(流式期间不再全量重算);shiki/KaTeX 异步增强,
 // 完成后 mdVersion 变化触发重读缓存。流式中的活跃回合传 enhance=false 省 CPU。
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+// 系统提示词约定长回答第一行写 `TL;DR: 一句话结论`(见后端 reply_style_directive),
+// 这里把它从正文里摘出来渲染成置顶速览卡, 正文从第二段起正常走 markdown 管线。
+const TLDR_RE = /^\s*(?:>\s*)?(?:\*\*)?\s*TL;?\s?DR\s*(?:\*\*)?\s*[::]\s*(.+?)\s*$/i;
 function renderMd(text: string, enhance = true): string {
   void mdVersion.value; // 注册响应式依赖:增强完成后刷新
   const clean = (text || "").replace(ANSI_RE, "");
+  const nl = clean.indexOf("\n");
+  const firstLine = nl >= 0 ? clean.slice(0, nl) : clean;
+  const m = firstLine.match(TLDR_RE);
+  if (m) {
+    const rest = nl >= 0 ? clean.slice(nl + 1).replace(/^\s*\n/, "") : "";
+    return (
+      `<div class="tldr"><span class="tldr-tag">TL;DR</span><div class="tldr-body">` +
+      renderMarkdown(m[1], { enhance }) +
+      `</div></div>` +
+      (rest ? renderMarkdown(rest, { enhance }) : "")
+    );
+  }
   return renderMarkdown(clean, { enhance });
 }
 
@@ -192,10 +235,12 @@ interface Turn {
   at?: number;
 }
 const ERR_RE = /^\[(错误|发送失败|result error)/;
-const renderTurns = computed<Turn[]>(() => {
+/** 把一段气泡切片构建成回合模型(原 renderTurns 主体原样提炼,key 从 startKey 递增)。
+ *  切片须在回合边界上:要么从头开始,要么以一条 user 气泡开头(user 恒开新回合)。 */
+function buildTurnsSlice(list: Bubble[], startKey: number): Turn[] {
   const out: Turn[] = [];
   let cur: Turn | undefined;
-  let k = 0;
+  let k = startKey;
   // 当前回合已收录产物的去重集:产物只往「当前回合」追加,故单个随回合重置的 Set 即可。
   // 把原先 `artifacts.includes(a)` 的 O(N) 线性查改成 O(1) 命中,整轮去重从 O(N²) 降到 O(N) ——
   // 长对话 + 多产物时不再越聊越顿。
@@ -216,7 +261,7 @@ const renderTurns = computed<Turn[]>(() => {
     curArtSet = new Set<string>();
     return turn;
   };
-  for (const b of bubbles.value) {
+  for (const b of list) {
     if (b.role === "user") {
       startTurn(b);
       continue;
@@ -255,13 +300,65 @@ const renderTurns = computed<Turn[]>(() => {
     }
   }
   return out;
+}
+// ── 已定稿回合缓存:流式 delta 帧(每 ~40ms)只有末回合在长,之前全量重建全部回合
+// 纯属浪费(长对话时逐帧字符串拼接 + 对象分配)。切分点 = 最后一条 user 气泡(user 恒
+// 开新回合,故其之前的气泡构成的回合已定稿)。前缀按「逐气泡引用 + 产物数」签名比对
+// (O(n) 引用比较,远便宜于重建),命中则复用上次前缀回合;任何结构变化 —— 切换对话 /
+// 重发 / 删除 / loadHistory 重载(整个数组换新对象)—— 签名必不匹配 → 整体重建,
+// 保守失效,绝不渲染错乱。产物数纳入签名是防「artifact 事件就地 push 进前缀气泡」的
+// 边角(本回合尚无 assistant 正文时后端产物会挂到上一回合的 assistant 气泡上)。
+interface TurnsPrefixCache {
+  sig: { b: Bubble; artLen: number }[];
+  turns: Turn[];
+}
+let turnsPrefixCache: TurnsPrefixCache | null = null;
+const renderTurns = computed<Turn[]>(() => {
+  const list = bubbles.value;
+  // 末回合起点 = 最后一条 user 气泡;没有 user 气泡则整段都算活跃回合
+  let split = 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].role === "user") {
+      split = i;
+      break;
+    }
+  }
+  let prefixTurns: Turn[];
+  const c = turnsPrefixCache;
+  let hit = c !== null && c.sig.length === split;
+  if (hit && c) {
+    for (let i = 0; i < split; i++) {
+      const s = c.sig[i];
+      // 引用比较即可:前缀气泡唯一的就地变更是 artifacts push(见上),用产物数兜住
+      if (s.b !== list[i] || s.artLen !== (list[i].artifacts?.length ?? 0)) {
+        hit = false;
+        break;
+      }
+    }
+  }
+  if (hit && c) {
+    prefixTurns = c.turns;
+  } else {
+    prefixTurns = buildTurnsSlice(list.slice(0, split), 0);
+    turnsPrefixCache = {
+      sig: list
+        .slice(0, split)
+        .map((b) => ({ b, artLen: b.artifacts?.length ?? 0 })),
+      turns: prefixTurns,
+    };
+  }
+  // 活跃末回合每帧重建(它在流式变化中);key 顺延保证与整段构建时完全一致
+  const tailTurns = buildTurnsSlice(list.slice(split), prefixTurns.length);
+  return prefixTurns.length ? prefixTurns.concat(tailTurns) : tailTurns;
 });
 function isPending(t: Turn): boolean {
   return sending.value && t === renderTurns.value[renderTurns.value.length - 1];
 }
 
 // ── 历史折叠:长对话只渲染最近 N 回合,顶部「加载更早」逐段放开 ──
-const FOLD_STEP = 30;
+// 低配机起步只渲染 15 回合(单回合含大量工具/产物时 DOM 也重),弱机滚动更顺;
+// 「加载更早」仍按同一步长逐段放开,不影响回看完整历史。
+const FOLD_STEP = isLowSpec ? 15 : 30;
 const visibleLimit = ref(FOLD_STEP);
 const hiddenCount = computed(() =>
   Math.max(0, renderTurns.value.length - visibleLimit.value)
@@ -440,6 +537,22 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
+// ── 首帧非关键加载推迟 ──
+// ChatPanel 挂载时多个 onMounted 并发打出与首屏渲染无关的 IPC(晨报/技能清单/供应商/
+// codex 状态),与首屏聊天区渲染抢主线程和后端。统一包进空闲回调:浏览器空闲(或到点
+// 兜底)再执行;组件已卸载则放弃,防止延迟回调在卸载后注册监听器/改状态。
+let disposed = false;
+function runWhenIdle(fn: () => void) {
+  const run = () => {
+    if (!disposed) fn();
+  };
+  if (typeof (window as any).requestIdleCallback === "function") {
+    (window as any).requestIdleCallback(run, { timeout: 600 });
+  } else {
+    setTimeout(run, 600);
+  }
+}
+
 onMounted(async () => {
   window.addEventListener("keydown", onGlobalKeydown);
   // 从「专家团」页点「召唤」后会切回本视图(ChatPanel 重新挂载)→ 在此消费召唤意图。
@@ -474,8 +587,10 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  disposed = true; // 让尚未执行的空闲回调作废
   window.removeEventListener("keydown", onGlobalKeydown);
   for (const u of voiceUnlisteners) u();
+  stopAgentsPoll(); // 切走视图即停表,别把退避轮询定时器泄漏到卸载后
   if (webRec) {
     webRec.cancel();
     webRec = null;
@@ -638,28 +753,35 @@ watch(
   { immediate: true },
 );
 
-onMounted(async () => {
-  await loadBriefings();
-  // 每次打开软件:只要有今日建议,就在屏幕正中自动弹出一次(本次启动仅弹一次,
-  // 关掉后不再骚扰;底部胶囊随时可手动重开)。sessionStorage 随进程重启而清空,
-  // 所以「下次打开软件」会再弹。
-  if (briefings.value.length && !sessionStorage.getItem("polaris.brief.shown")) {
-    briefOpen.value = true;
-    sessionStorage.setItem("polaris.brief.shown", "1");
-  }
-  // 做梦/晨报生成完 → 刷新建议,并主动弹出让用户第一时间看到新内容。
-  // 桌面走 Tauri 事件、Docker/Web 走 WS,两条路径的 listen 包装都直接回传 payload 本体
-  // (见 tauri.ts),所以读 p.kind;旧代码读 p.payload.kind 多包一层、永远取不到。
-  // 捕获 unlisten 并纳入 voiceUnlisteners(onBeforeUnmount 统一回收):此前未解绑,
-  // KeepAlive 反复挂载会逐月累积上千个 echo:dream 监听器及其闭包 → 内存爬升。
-  voiceUnlisteners.push(
-    await listen("echo:dream", async (p: any) => {
-      if ((p?.kind ?? p?.payload?.kind) === "done") {
-        await loadBriefings();
-        if (briefings.value.length) briefOpen.value = true;
+onMounted(() => {
+  // 晨报拉取 + 做梦监听都不影响首屏聊天区渲染 → 推迟到空闲帧,别与首帧 IPC 抢资源。
+  // 弹窗因此最多晚 ~600ms,可接受。
+  runWhenIdle(() => {
+    void (async () => {
+      await loadBriefings();
+      if (disposed) return; // await 期间可能已卸载
+      // 每次打开软件:只要有今日建议,就在屏幕正中自动弹出一次(本次启动仅弹一次,
+      // 关掉后不再骚扰;底部胶囊随时可手动重开)。sessionStorage 随进程重启而清空,
+      // 所以「下次打开软件」会再弹。
+      if (briefings.value.length && !sessionStorage.getItem("polaris.brief.shown")) {
+        briefOpen.value = true;
+        sessionStorage.setItem("polaris.brief.shown", "1");
       }
-    })
-  );
+      // 做梦/晨报生成完 → 刷新建议,并主动弹出让用户第一时间看到新内容。
+      // 桌面走 Tauri 事件、Docker/Web 走 WS,两条路径的 listen 包装都直接回传 payload 本体
+      // (见 tauri.ts),所以读 p.kind;旧代码读 p.payload.kind 多包一层、永远取不到。
+      // 捕获 unlisten 并纳入 voiceUnlisteners(onBeforeUnmount 统一回收):此前未解绑,
+      // KeepAlive 反复挂载会逐月累积上千个 echo:dream 监听器及其闭包 → 内存爬升。
+      const un = await listen("echo:dream", async (p: any) => {
+        if ((p?.kind ?? p?.payload?.kind) === "done") {
+          await loadBriefings();
+          if (briefings.value.length) briefOpen.value = true;
+        }
+      });
+      if (disposed) un(); // 卸载后才注册完成:立刻解绑,别泄漏
+      else voiceUnlisteners.push(un);
+    })();
+  });
 });
 
 // ─────────── 分批长任务（Batch Build）模式开关 ───────────
@@ -872,8 +994,15 @@ function consumePendingSummon() {
 }
 
 // ─────────── 专家团实时状态轮询 ──────────
+// 自适应退避:状态有变化 → 回到 2s 快节奏(用户正盯着看进度);连续稳定 → 逐步拉长
+// 到 15s(空转就别每 3s 打一次后端);窗口失焦 → 直接慢到上限(用户没在看)。
+// 旧版固定 3s setInterval,活跃时对后端是恒定压力、且失焦仍照打。
 const teamAgentsStatus = ref<ExpertAgentStatus[]>([]);
-let agentsPollInterval: ReturnType<typeof setInterval> | null = null;
+const AGENTS_POLL_MIN = 2000;
+const AGENTS_POLL_MAX = 15000;
+let agentsPollTimer: ReturnType<typeof setTimeout> | null = null;
+let agentsPollDelay = AGENTS_POLL_MIN;
+let agentsPolling = false;
 
 async function pollAgentsStatus() {
   const pid = app.currentProjectId;
@@ -885,16 +1014,39 @@ async function pollAgentsStatus() {
   }
 }
 
+function scheduleAgentsPoll() {
+  if (!agentsPolling) return;
+  agentsPollTimer = setTimeout(async () => {
+    if (!agentsPolling) return;
+    const before = JSON.stringify(teamAgentsStatus.value);
+    await pollAgentsStatus();
+    const after = JSON.stringify(teamAgentsStatus.value);
+    const hidden =
+      typeof document !== "undefined" && document.visibilityState === "hidden";
+    if (before !== after) {
+      agentsPollDelay = AGENTS_POLL_MIN; // 有进展→回快节奏
+    } else if (hidden) {
+      agentsPollDelay = AGENTS_POLL_MAX; // 用户没在看→直接慢到底
+    } else {
+      agentsPollDelay = Math.min(Math.round(agentsPollDelay * 1.6), AGENTS_POLL_MAX);
+    }
+    scheduleAgentsPoll();
+  }, agentsPollDelay);
+}
+
 function startAgentsPoll() {
-  if (agentsPollInterval) return;
-  pollAgentsStatus();
-  agentsPollInterval = setInterval(pollAgentsStatus, 3000);
+  if (agentsPolling) return;
+  agentsPolling = true;
+  agentsPollDelay = AGENTS_POLL_MIN;
+  void pollAgentsStatus(); // 立即拉一次,别等第一个间隔
+  scheduleAgentsPoll();
 }
 
 function stopAgentsPoll() {
-  if (agentsPollInterval) {
-    clearInterval(agentsPollInterval);
-    agentsPollInterval = null;
+  agentsPolling = false;
+  if (agentsPollTimer) {
+    clearTimeout(agentsPollTimer);
+    agentsPollTimer = null;
   }
 }
 
@@ -1300,13 +1452,16 @@ watch(tailSig, () => {
 onMounted(async () => {
   await chatStore.init(); // app 级流式监听只注册一次，按 conversationId 路由
   await chatStore.loadHistory(app.currentConvId);
-  await loadSkills();
-  // 拉一次供应商清单(切换器选项据此自动识别已配的 API);codex 授权态供清单判断
-  providersStore.refresh();
-  providersStore.refreshCodex();
   scrollToBottom();
   // 若在别的视图点了工作流包「使用」才切来对话，挂载时补消费一次
   applyInsert(workflowsStore.insertRequest);
+  // 技能清单 / 供应商清单 / codex 授权态都只服务于点开面板后的展示,
+  // 不影响首屏聊天区渲染 → 推迟到空闲帧再打 IPC
+  runWhenIdle(() => {
+    void loadSkills();
+    providersStore.refresh();
+    providersStore.refreshCodex();
+  });
 });
 
 async function ensureConversation(): Promise<string | null> {
@@ -1395,6 +1550,28 @@ async function cancel() {
   // 先停掉分批编排循环（否则它会在本轮 done 后又发下一批），再取消在飞的子进程
   if (app.currentConvId) longTaskStore.stop(app.currentConvId);
   await chatStore.cancel(app.currentConvId);
+}
+
+// ── 清空上下文（右下角橡皮擦）：消息清零避免上下文过长;旧内容后台自动沉淀入记忆库 ──
+const clearingCtx = ref(false);
+async function clearContext() {
+  const cid = app.currentConvId;
+  if (!cid || clearingCtx.value) return;
+  if (
+    !confirm(
+      "清空本对话的全部历史上下文？\n\n有价值的内容（反馈、偏好、决策）会自动沉淀进记忆库，生成的文件不受影响。"
+    )
+  )
+    return;
+  clearingCtx.value = true;
+  try {
+    await chatStore.clearContext(cid);
+    toast.success("上下文已清空，旧对话正在后台沉淀入记忆库");
+  } catch (e: any) {
+    toast.error(`清空失败：${humanizeError(e)}`);
+  } finally {
+    clearingCtx.value = false;
+  }
 }
 
 function pickPerm(m: PermissionMode) {
@@ -1845,6 +2022,21 @@ async function deleteCurrentConv() {
             <div v-for="(d, x) in tl.details" :key="x" class="td-line">{{ d }}</div>
           </div>
 
+          <!-- 参考文件：豆包式小胶囊, 收在回答最前面, 点开右侧预览 -->
+          <div v-if="t.text && refFiles(t).length" class="ref-files">
+            <span class="ref-label">参考 {{ refFiles(t).length }} 个文件</span>
+            <button
+              v-for="p in refFiles(t)"
+              :key="p"
+              class="ref-pill"
+              :title="p"
+              @click="openArtifact(p)"
+            >
+              <component :is="artifactIcon(p)" :size="12" :stroke-width="1.7" />
+              <span class="ref-name">{{ fileName(p) }}</span>
+            </button>
+          </div>
+
           <!-- 正文：markdown 渲染(流式中的活跃回合跳过异步高亮排队) -->
           <div v-if="t.text" class="md" v-html="renderMd(t.text, !isPending(t))"></div>
 
@@ -1858,26 +2050,40 @@ async function deleteCurrentConv() {
             {{ e }}
           </div>
 
-          <!-- 生成的文件：统一收在回答末尾 -->
+          <!-- 生成的文件：文件夹卡片统一收在回答末尾, 点文件行在右侧抽屉预览 -->
           <div v-if="t.artifacts.length" class="files">
-            <div class="files-head">生成的文件 · {{ t.artifacts.length }}</div>
-            <div class="files-list">
-              <button
-                v-for="a in t.artifacts"
-                :key="a"
-                class="artifact-chip"
-                :class="{ active: artifactsStore.current?.path === a }"
-                :title="a"
-                @click="openArtifact(a)"
-              >
-                <component
-                  :is="artifactIcon(a)"
-                  :size="15"
-                  :stroke-width="1.7"
+            <div class="folder-card">
+              <button class="folder-head" @click="toggleFiles(t.key)">
+                <FolderOpen :size="15" :stroke-width="1.7" class="folder-ico" />
+                <span class="folder-title">本轮产物</span>
+                <span class="folder-count">{{ t.artifacts.length }}</span>
+                <ChevronDown
+                  :size="14"
+                  :stroke-width="2"
+                  class="folder-chev"
+                  :class="{ closed: filesCollapsed[t.key] }"
                 />
-                <span class="af-name">{{ fileName(a) }}</span>
-                <ExternalLink :size="12" :stroke-width="1.8" class="af-open" />
               </button>
+              <div v-if="!filesCollapsed[t.key]" class="folder-body">
+                <button
+                  v-for="a in t.artifacts"
+                  :key="a"
+                  class="file-row"
+                  :class="{ active: artifactsStore.current?.path === a }"
+                  :title="a"
+                  @click="openArtifact(a)"
+                >
+                  <component
+                    :is="artifactIcon(a)"
+                    :size="15"
+                    :stroke-width="1.7"
+                    class="fr-ico"
+                  />
+                  <span class="fr-name">{{ fileName(a) }}</span>
+                  <span v-if="fileExt(a)" class="fr-ext">{{ fileExt(a) }}</span>
+                  <ExternalLink :size="12" :stroke-width="1.8" class="fr-open" />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -2172,7 +2378,7 @@ async function deleteCurrentConv() {
             class="attach-chip pending"
             :title="p.name"
           >
-            <LoaderCircle :size="14" :stroke-width="2" class="spin" />
+            <OrbitSpinner :size="14" />
             <span class="ac-name">{{ p.name }}</span>
           </div>
         </div>
@@ -2290,6 +2496,15 @@ async function deleteCurrentConv() {
             </button>
           </div>
           <div class="toolbar-right">
+            <button
+              v-if="bubbles.length && !sending"
+              class="clear-ctx-btn"
+              :disabled="clearingCtx"
+              title="清空上下文：清空本对话历史避免上下文过长；有价值内容自动沉淀进记忆库，文件不受影响"
+              @click="clearContext"
+            >
+              <Eraser :size="15" :stroke-width="1.9" />
+            </button>
             <button
               class="mic-btn"
               :class="{ live: dictating, busy: voiceBusy }"
@@ -2807,6 +3022,14 @@ async function deleteCurrentConv() {
 .turn {
   max-width: 880px;
   margin: 0 auto 22px;
+  animation: card-rise 0.32s var(--ease-out) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn,
+  .folder-card,
+  .ref-files {
+    animation: none;
+  }
 }
 
 /* ── 历史骨架 / 加载失败 / 折叠 ── */
@@ -3030,22 +3253,37 @@ async function deleteCurrentConv() {
   border-radius: 50%;
   background: var(--primary);
   opacity: 0.5;
-  animation: typing-bounce 1.2s ease-in-out infinite;
+  /* 游戏式弹跳: 顶点带 squash & stretch(压扁-拉伸)与光晕, 比匀速正弦更有"落地反弹"的实感 */
+  animation: typing-bounce 1.1s cubic-bezier(0.36, 0, 0.64, 1) infinite;
 }
 .typing span:nth-child(2) {
-  animation-delay: 0.18s;
+  animation-delay: 0.15s;
 }
 .typing span:nth-child(3) {
-  animation-delay: 0.36s;
+  animation-delay: 0.3s;
 }
 @keyframes typing-bounce {
-  0%, 80%, 100% {
-    transform: translateY(0);
-    opacity: 0.4;
+  0%,
+  70%,
+  100% {
+    transform: translateY(0) scale(1, 0.92);
+    opacity: 0.35;
+    box-shadow: 0 0 0 rgba(0, 0, 0, 0);
   }
-  40% {
-    transform: translateY(-4px);
+  35% {
+    transform: translateY(-5px) scale(0.92, 1.1);
     opacity: 1;
+    box-shadow: 0 2px 6px var(--primary-soft), 0 0 6px var(--primary-soft);
+  }
+  55% {
+    transform: translateY(0) scale(1.15, 0.8);
+    opacity: 0.7;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .typing span {
+    animation: none;
+    opacity: 0.6;
   }
 }
 
@@ -3066,23 +3304,6 @@ async function deleteCurrentConv() {
   margin-top: 12px;
   padding-top: 11px;
   border-top: 1px dashed var(--border);
-}
-.files-head {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  letter-spacing: 0.5px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-.files-head :deep(svg) {
-  color: var(--gold);
-}
-.files-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
 }
 
 /* 回答下方操作行（复制） —— 平时淡出，悬停回答时浮现 */
@@ -3106,12 +3327,15 @@ async function deleteCurrentConv() {
   color: var(--muted);
   font-size: 11.5px;
   border-radius: 7px;
-  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  transition: border-color 0.15s, color 0.15s, background 0.15s,
+    transform 0.22s var(--ease-spring), box-shadow 0.22s var(--ease-out);
 }
 .ta-btn:hover {
   border-color: var(--border);
   color: var(--text);
   background: var(--bg-soft);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
 }
 .ta-time {
   align-self: center;
@@ -3251,59 +3475,205 @@ async function deleteCurrentConv() {
 }
 
 /* 成品文件 chips —— 回答末尾的可点击文件 */
-.artifact-chip {
-  position: relative;
-  display: inline-flex;
+/* ── 产物文件夹卡片(Kimi 式)：头部可折叠, 文件按行排列, 点行右侧预览 ── */
+.folder-card {
+  max-width: 420px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), var(--shadow-sm);
+  overflow: hidden;
+  animation: card-rise 0.35s var(--ease-out) both;
+  transition: box-shadow 0.25s var(--ease-out), border-color 0.25s;
+}
+.folder-card:hover {
+  border-color: var(--border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), var(--shadow);
+}
+@keyframes card-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.folder-head {
+  display: flex;
   align-items: center;
   gap: 7px;
-  max-width: 320px;
-  padding: 6px 10px;
-  background: var(--panel);
-  border: 1px solid transparent;
-  border-radius: 8px;
+  width: 100%;
+  padding: 8px 11px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  text-align: left;
+}
+.folder-head:hover {
+  background: var(--bg-soft);
+}
+.folder-ico {
   color: var(--primary);
+  flex-shrink: 0;
+}
+.folder-title {
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.folder-count {
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 10.5px;
+  line-height: 16px;
+}
+.folder-chev {
+  margin-left: auto;
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+.folder-chev.closed {
+  transform: rotate(-90deg);
+}
+.folder-body {
+  border-top: 1px solid var(--border-soft);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
   font-size: 12.5px;
   cursor: pointer;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), var(--shadow-sm);
-  transition: border-color 0.15s, background 0.15s;
+  text-align: left;
+  transition: background 0.12s, color 0.12s,
+    transform 0.22s var(--ease-spring);
 }
-/* 琉璃流光描边：mask 镂空只留 1px 边缘（hover/active 时让位给实色反馈） */
-.artifact-chip::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: 8px;
-  padding: 1px;
-  background: var(--liuli-edge);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  pointer-events: none;
-}
-.artifact-chip:hover {
-  border-color: var(--primary);
+.file-row:hover,
+.file-row.active {
   background: var(--primary-soft);
+  color: var(--primary);
+  transform: translateX(2px);
 }
-.artifact-chip.active {
-  border-color: var(--primary);
-  background: var(--primary-soft);
+.file-row .fr-ico {
+  color: var(--primary);
+  flex-shrink: 0;
 }
-.artifact-chip:hover::before,
-.artifact-chip.active::before {
-  display: none;
-}
-.artifact-chip .af-name {
+.file-row .fr-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 500;
+  min-width: 0;
 }
-.artifact-chip .af-open {
-  opacity: 0.5;
+.file-row .fr-ext {
   flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
 }
-.artifact-chip:hover .af-open {
-  opacity: 0.9;
+.file-row .fr-open {
+  margin-left: auto;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.file-row:hover .fr-open,
+.file-row.active .fr-open {
+  opacity: 0.8;
+}
+
+/* ── TL;DR 速览行：回答开头一句话结论(renderMd 从正文摘出)。
+   刻意低调(豆包式): 只是加粗一行 + 细虚线分隔, 不做彩色卡片。 ── */
+.md :deep(.tldr) {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 0 0 10px;
+  border-bottom: 1px dashed var(--border-soft);
+}
+.md :deep(.tldr .tldr-tag) {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  line-height: 15px;
+  color: var(--muted);
+}
+.md :deep(.tldr .tldr-body) {
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+.md :deep(.tldr .tldr-body p) {
+  margin: 0;
+  display: inline;
+}
+
+/* ── 参考文件胶囊：回答最前面一行小 pill, 点开右侧预览 ── */
+.ref-files {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 9px;
+  animation: card-rise 0.3s var(--ease-out) both;
+}
+.ref-label {
+  font-size: 10.5px;
+  color: var(--dim);
+  letter-spacing: 0.3px;
+  margin-right: 2px;
+}
+.ref-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 200px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s,
+    transform 0.22s var(--ease-spring), box-shadow 0.22s var(--ease-out);
+}
+.ref-pill:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+.ref-pill .ref-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ─────────── 输入区域 ─────────── */
@@ -4258,7 +4628,7 @@ html[data-theme="dark"] .input-card.goal-on {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07),
     0 0 0 1px var(--primary-soft), 0 8px 32px rgba(0, 0, 0, 0.45);
 }
-html[data-theme="dark"] .artifact-chip {
+html[data-theme="dark"] .folder-card {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), var(--shadow-sm);
 }
 /* 深色下 --ink 变浅色：发送键/工具提示的反色文字需跟着翻转 */
@@ -4292,9 +4662,17 @@ html[data-theme="dark"] .btn-tooltip-inner {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  transition: background 0.18s, transform 0.22s var(--ease-spring),
+    box-shadow 0.22s var(--ease-out);
 }
 .send-btn:hover {
   background: var(--primary);
+  transform: scale(1.06);
+  box-shadow: var(--shadow);
+}
+.send-btn:not(:disabled):active {
+  transform: scale(0.9);
+  transition-duration: 0.05s;
 }
 .send-btn:disabled {
   background: var(--border);
@@ -4302,6 +4680,30 @@ html[data-theme="dark"] .btn-tooltip-inner {
 }
 .send-btn.stop {
   background: var(--vermilion);
+}
+
+/* 清空上下文（麦克风左侧的橡皮擦）：外观与 mic-btn 同族 */
+.clear-ctx-btn {
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  color: var(--text-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.clear-ctx-btn:hover:not(:disabled) {
+  color: var(--vermilion);
+  border-color: var(--vermilion);
+  background: var(--vermilion-soft, rgba(220, 80, 50, 0.08));
+}
+.clear-ctx-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ─────────── 语音听写麦克风（发送键左侧 · 仿豆包/Codex）─────────── */
@@ -4558,13 +4960,5 @@ html[data-theme="dark"] .btn-tooltip-inner {
 .ac-remove:hover {
   background: var(--border);
   color: var(--text);
-}
-.spin {
-  animation: spin 0.9s linear infinite;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 </style>

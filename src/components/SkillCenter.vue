@@ -16,6 +16,12 @@ import {
   Ghost,
   FolderOpen,
   X,
+  Bug,
+  FlaskConical,
+  Calculator,
+  Receipt,
+  Palette,
+  ClipboardList,
 } from "@lucide/vue";
 import SearchGlass from "./icons/SearchGlass.vue";
 import { skills as skillsApi, isTauri, type Skill } from "../tauri";
@@ -81,6 +87,32 @@ const currentSkills = computed(() => {
   );
 });
 
+// 市场按人群/用途分组展示；「我的技能」保持平铺（title 为空 = 不渲染组头）
+const CATEGORY_ORDER = [
+  "开发编程",
+  "测试质检",
+  "财务会计",
+  "设计美工",
+  "办公文档",
+  "自媒体运营",
+  "音视频",
+  "自动化与浏览器",
+  "通用",
+];
+const currentGroups = computed(() => {
+  const list = currentSkills.value;
+  if (activeTab.value !== "market") return [{ title: "", skills: list }];
+  const by = new Map<string, Skill[]>();
+  for (const s of list) {
+    const c = s.category || "通用";
+    if (!by.has(c)) by.set(c, []);
+    by.get(c)!.push(s);
+  }
+  const ordered = CATEGORY_ORDER.filter((c) => by.has(c));
+  const rest = [...by.keys()].filter((c) => !CATEGORY_ORDER.includes(c));
+  return [...ordered, ...rest].map((c) => ({ title: c, skills: by.get(c)! }));
+});
+
 function iconForSkill(skill: Skill) {
   const map: Record<string, any> = {
     "deep-research": Globe,
@@ -92,6 +124,19 @@ function iconForSkill(skill: Skill) {
     "web-search": SearchGlass,
     "image-gen": ImageIcon,
     "cloak-browser": Ghost,
+    "systematic-debugging": Bug,
+    "bug-report-repro": Bug,
+    "writing-plans": ClipboardList,
+    "verification-before-completion": ClipboardList,
+    "mcp-builder": Wrench,
+    "webapp-testing": FlaskConical,
+    "e2e-test-pipeline": FlaskConical,
+    "financial-model": Calculator,
+    "bookkeeping-recon": Calculator,
+    "invoice-audit": Receipt,
+    "canvas-design": Palette,
+    "brand-guidelines": Palette,
+    "algorithmic-art": Sparkles,
   };
   return map[skill.id] ?? Sparkles;
 }
@@ -262,9 +307,18 @@ async function submitCreate() {
       </div>
     </div>
 
-    <!-- Skill Grid -->
-    <div v-if="!loading" class="sc-grid">
-      <div v-for="skill in currentSkills" :key="skill.id" class="sc-card">
+    <!-- Skill Grid（市场按分组，我的技能平铺） -->
+    <div
+      v-for="group in loading ? [] : currentGroups"
+      :key="group.title || 'all'"
+      class="sc-group"
+    >
+      <div v-if="group.title" class="sc-group-head">
+        <span class="sc-group-title">{{ group.title }}</span>
+        <span class="sc-group-count">{{ group.skills.length }}</span>
+      </div>
+      <div class="sc-grid">
+      <div v-for="skill in group.skills" :key="skill.id" class="sc-card">
         <div class="sc-card-head">
           <div class="sc-card-icon">
             <component :is="iconForSkill(skill)" :size="22" :stroke-width="1.6" />
@@ -307,6 +361,7 @@ async function submitCreate() {
             </label>
           </template>
         </div>
+      </div>
       </div>
     </div>
 
@@ -582,6 +637,34 @@ async function submitCreate() {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
+}
+.sc-group + .sc-group {
+  margin-top: 26px;
+}
+.sc-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.sc-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary, var(--text));
+  letter-spacing: 0.02em;
+}
+.sc-group-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  border-radius: 9px;
+  font-size: 10.5px;
+  font-weight: 600;
 }
 .sc-card {
   background: var(--panel);

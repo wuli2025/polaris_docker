@@ -14,9 +14,29 @@
 #   提醒清单漏了哪些。over-list 是安全的（顶多多审一遍），under-list 才危险（静默丢改动）。
 #
 # 语法：每行一个路径或 glob（相对仓库根，用 /）。# 开头是注释，空行忽略。
+#
+# ─────────────────────────────────────────────────────────────────
+# 2026-07-15 v2.1.0 catch-up 重写。上一版（v1.7.1 时期）已严重失真，教训记这里：
+#
+# ① **清单为空 ≠ 没有分叉**。旧流程「git diff <上次sync点>..HEAD 列 docker 单独改的文件」
+#    对这份仓返回空，因为分叉是在 sync 提交里一并并入的。真正可靠的判分叉法 =
+#    **blob 哈希比对**：docker 侧文件的 blob 若与主仓某个历史 commit 的同路径 blob
+#    逐字节相同 → 零分叉（只是落后），可直接取主仓新版；找不到匹配才是真分叉。
+#
+# ② 旧清单把一批**早已上游化**的东西仍列为 OWNED，导致同步时白白手并、还挡住主仓修复：
+#    server.rs 的 /api/version+自更新、tauri.ts 的 HTTP 适配层、artifacts.ts 的 web 分支、
+#    RightDrawer.vue 的 isTauri 三元 —— 主仓 v2.1.0 都已自带。已从清单删除。
+#
+# ③ 反过来，旧清单**漏了** crates/polaris-fable 与 crates/polaris-cli 两处真分叉
+#    （ort feature / local-embed 转发）——那时它们还不存在（分仓重构后才有）。
+#
+# ④ 判定分叉时**看内容不看清单**；清单只是提醒该停下来手并的路标。
 # ════════════════════════════════════════════════════════════════
 
 # ── A. 纯 Docker 基础设施（永远不该从主仓来，主仓压根没有）────────────────
+#   注:主仓 v2.0 起自带了一份 Dockerfile(未实测构建),与本仓这份**不是同一个东西**,
+#   永远不要用它覆盖本文件。本仓这份带 chromium/ffmpeg/CJK 字体子集/onnxruntime/
+#   entrypoint/xvfb,是真正在发的镜像。
 Dockerfile
 .gitattributes
 .gitignore
@@ -33,56 +53,45 @@ VERSION
 .github/workflows/image.yml
 docker/**
 
-# ── B. Docker 分发壳：安装 / 更新 / 文档 / 网页外壳（与桌面版不同源）────────
+# ── B. Docker 分发壳：安装 / 更新 / 文档（与桌面版不同源）──────────────────
 install.sh
 install.ps1
 update.sh
 update.ps1
 README.md
-index.html
-package.json
-package-lock.json
-tsconfig.json
-tsconfig.node.json
-vite.config.ts
+#   scripts/:docker 运维脚本(docker-monitor / pull-ghcr-to-nas / sync-guard)是本仓独有;
+#   主仓的 check-boundaries.mjs 等按需单拷,别整目录覆盖。
 scripts/**
 
-# ── C. 分叉过的共享【后端】源码——藏着 Docker-only 逻辑，最容易被误覆盖 ──────
-#   server.rs：axum 服务端本体 + 口令鉴权 + /api/version + 容器自更新(do_docker_update)
-#              + serve_file 的 ?token=/?download= 兜底。主仓那份没有服务端骨架。
+# ── C. 分叉过的共享【后端】源码 ────────────────────────────────────────
+#   src-tauri/src/server.rs：**只分叉 /api/version 一个路由 + version_info handler**。
+#     其余(axum 骨架、口令鉴权、health/ready/status、serve_file)主仓 v2.1.0 已全部自带,
+#     同步时取主仓新版 + 把这一处补回即可,不必整文件手并。
 src-tauri/src/server.rs
-#   polaris-server bin 入口：_pdocker 住主包 src/bin（主仓已迁 crates/polaris-cli，架构不同）。
-src-tauri/src/bin/polaris-server.rs
-#   Cargo 清单：workspace members / [[bin]] 与主仓分叉（主仓多一个 polaris-cli crate）。
-src-tauri/Cargo.toml
-#   Cargo.lock：主仓 .gitignore 了它，Docker 可复现构建必须留一份。
-src-tauri/Cargo.lock
-#   tauri.conf.json：bundler / 标识配置按 Docker 调过。
-src-tauri/tauri.conf.json
+#   crates/polaris-fable/Cargo.toml：fastembed 用 **ort-load-dynamic**(主仓是
+#     ort-download-binaries-rustls-tls)。配套 Dockerfile 装 libonnxruntime.so + ORT_DYLIB_PATH,
+#     运行时才 dlopen → 缺库不影响启动(降级走云嵌入)。
+src-tauri/crates/polaris-fable/Cargo.toml
+#   crates/polaris-cli/Cargo.toml：多一条 `local-embed = ["polaris-app/local-embed"]` 转发,
+#     让镜像用 `-p polaris-cli --features collab-net,local-embed` 一条命令出双 bin。
+src-tauri/crates/polaris-cli/Cargo.toml
 
-# ── C2. drift-divergent 后端：Docker 落后主仓，**盲覆盖会炸构建**（见 DRIFT.md）──────
-#   这些不是「Docker 有主仓没有」，而是「Docker 比主仓旧」：主仓的对应文件引用了
-#   Docker 侧还没有的符号（如 forge_pptx_native、longtask/creative/script_convention），
-#   单独整覆盖任一文件 → 编译期找不到符号。catch-up 必须整簇一起做并跑完整 cargo 构建，
-#   所以平时同步一律当 OWNED 跳过，留到专门的、构建验证过的 catch-up pass。
-src-tauri/src/lib.rs
-src-tauri/src/chat.rs
-src-tauri/src/provider.rs
-src-tauri/src/forge.rs
-src-tauri/src/forge_pptx.rs
-src-tauri/src/forge_capture.rs
-src-tauri/src/forge_video.rs
-src-tauri/src/forge_tts.rs
-src-tauri/src/forge_fx_safe.rs
-
-# ── D. 分叉过的共享【前端】源码——Docker/Web 适配层 + 容器自更新 UI ──────────
-#   tauri.ts：整个「Docker/Web 后端适配层」(HTTP /api/invoke + WS /ws + 口令 + backendFileUrl)，
-#             主仓那份是纯 Tauri IPC。**整文件覆盖必炸**。
+# ── D. 分叉过的共享【前端】源码 ────────────────────────────────────────
+#   src/tauri.ts：**只分叉 1 行** —— authHeaders() 要 export(主仓是私有)。
+#     容器侧 useUpdater.ts 的裸 fetch 必须自带 Bearer,否则设了 POLARIS_AUTH_TOKEN 时 401。
+#     漏了这个 export → vite build 直接报 "authHeaders is not exported"。
 src/tauri.ts
-#   RightDrawer.vue：预览抽屉，含 isTauri 分支的 web 预览/下载按钮（已并入主仓 958ac49）。
-src/components/RightDrawer.vue
-#   artifacts.ts：openExternal/revealInFolder 的 web 分支（backendFileUrl + triggerDownload）。
-src/stores/artifacts.ts
-#   UpdatePanel.vue + useUpdater.ts：容器自更新面板（替身容器模式触发 /api 更新）。
-src/components/UpdatePanel.vue
+#   useUpdater.ts / UpdatePanel.vue：整套容器自更新(isDockerMode 分流 + /api/version +
+#     /api/invoke docker_status|docker_update + docker-panel UI)。主仓零对应逻辑,
+#     必须逐 hunk 保住。三方合并可用主仓 archive/docker-pre-cleanup-2026-06-11 作基点。
 src/composables/useUpdater.ts
+src/components/UpdatePanel.vue
+
+# ── 已退役（曾经 OWNED，现主仓已上游化，同步时直接取主仓新版）──────────────
+#   src-tauri/src/bin/polaris-server.rs —— 分仓重构后 bin 迁至 crates/polaris-cli,本仓已删。
+#   src-tauri/src/lib.rs / chat.rs / provider.rs / forge*.rs（旧 C2 drift 簇）
+#     —— 已随 v2.1.0 catch-up 整簇对齐,不再是分叉。
+#   src-tauri/Cargo.toml / Cargo.lock / tauri.conf.json —— 已与主仓一致(11-crate workspace)。
+#   src/stores/artifacts.ts / src/components/RightDrawer.vue —— web 分支主仓已自带。
+#   package.json / package-lock.json / index.html / vite.config.ts / tsconfig*.json
+#     —— 实测与主仓仅差版本号,取主仓新版即可。

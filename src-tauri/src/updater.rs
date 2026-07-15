@@ -165,6 +165,21 @@ pub fn resolve_check(current: &str, found: Option<(String, String)>) -> UpdaterS
     }
 }
 
+/// 纯函数：检查失败时的落点。**关键**：磁盘上若还留着「可装版本」(≠当前)，宁可退回
+/// `Available`，也绝不用 `Error` 把它盖掉——这样冷启动网络没就绪 / 离线时，中央弹窗
+/// （只在「有更新」时浮出）照样能弹，而不是「开机那一下网络抖一下就再也不提示、得手动去更新页才看到」。
+/// 只有连落盘标记都没有(或已等于当前=已装上)时，才如实报 `Error`。
+pub fn resolve_check_error(
+    current: &str,
+    persisted: Option<(String, String)>,
+    message: String,
+) -> UpdaterState {
+    match persisted {
+        Some((version, notes)) if version != current => UpdaterState::Available { version, notes },
+        _ => UpdaterState::Error { message },
+    }
+}
+
 // ───────────────────────── 核心动作 ─────────────────────────
 
 async fn run_check(app: &AppHandle) -> UpdaterState {
@@ -173,7 +188,14 @@ async fn run_check(app: &AppHandle) -> UpdaterState {
 
     let updater = match app.updater() {
         Ok(u) => u,
-        Err(e) => return transition(app, UpdaterState::Error { message: format!("更新器不可用: {e}") }),
+        Err(e) => {
+            return transition(
+                app,
+                UpdaterState::Error {
+                    message: format!("更新器不可用: {e}"),
+                },
+            )
+        }
     };
 
     match updater.check().await {
@@ -188,8 +210,16 @@ async fn run_check(app: &AppHandle) -> UpdaterState {
             }
             transition(app, mapped)
         }
-        // 检查失败不清落盘标记（之前发现的「可装版本」仍有效，离线时照样能续提示）。
-        Err(e) => transition(app, UpdaterState::Error { message: format!("检查更新失败: {e}") }),
+        // 检查失败不清落盘标记（之前发现的「可装版本」仍有效，离线时照样能续提示）；
+        // 且若磁盘上仍有可装版本(≠当前) → 退回 Available 而非 Error，保证中央弹窗照常浮出。
+        Err(e) => {
+            let path = { UPDATER.lock().persist_path.clone() };
+            let persisted = load_persisted(&path).map(|p| (p.version, p.notes));
+            transition(
+                app,
+                resolve_check_error(&current, persisted, format!("检查更新失败: {e}")),
+            )
+        }
     }
 }
 
@@ -212,7 +242,9 @@ fn mirror_candidates(url: &str) -> Vec<String> {
     let mut out = vec![format!("https://gh-proxy.com/{bare}")];
     // Cloudflare 排第二：首个源一「卡死」(停滞看门狗 ~30s 触发)就直接切到最可靠的自托管源，而非再耗在第二个 github 镜像上。
     if !filename.is_empty() {
-        out.push(format!("https://polaris-2us.pages.dev/downloads/{filename}"));
+        out.push(format!(
+            "https://polaris-2us.pages.dev/downloads/{filename}"
+        ));
     }
     out.push(format!("https://ghfast.top/{bare}"));
     out.push(bare); // 直连 github，最后兜底
@@ -227,7 +259,13 @@ async fn run_apply(app: &AppHandle, version: &str) -> Result<(), String> {
         .map_err(|e| format!("校验更新失败: {e}"))?
         .ok_or_else(|| "更新已不可用".to_string())?;
 
-    transition(app, UpdaterState::Downloading { version: version.to_string(), percent: 0 });
+    transition(
+        app,
+        UpdaterState::Downloading {
+            version: version.to_string(),
+            percent: 0,
+        },
+    );
 
     // ════════ 防「更新卡死」两道独立闸门 ════════
     // 单道闸门会漏：纯总超时会误杀「慢但在动」的下载；纯停滞检测扛不住「一直慢吞吞吐数据但永不完」。
@@ -254,7 +292,13 @@ async fn run_apply(app: &AppHandle, version: &str) -> Result<(), String> {
         }
 
         // 每个候选源都重置进度 + 重建闭包（on_finish 是 FnOnce，on_chunk 内含可变累计状态）。
-        transition(app, UpdaterState::Downloading { version: version.to_string(), percent: 0 });
+        transition(
+            app,
+            UpdaterState::Downloading {
+                version: version.to_string(),
+                percent: 0,
+            },
+        );
         // 看门狗与 on_chunk 共享的「已下载字节」计数（停滞判定的唯一依据）。
         let progress = Arc::new(AtomicU64::new(0));
         let progress_chunk = progress.clone();
@@ -262,7 +306,8 @@ async fn run_apply(app: &AppHandle, version: &str) -> Result<(), String> {
         let version_chunk = version.to_string();
         let mut last_pct: i64 = -1;
         let on_chunk = move |chunk_len: usize, content_len: Option<u64>| {
-            let downloaded = progress_chunk.fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
+            let downloaded =
+                progress_chunk.fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
             let pct = match content_len {
                 Some(total) if total > 0 => ((downloaded.min(total) * 100) / total) as i64,
                 _ => 0,
@@ -271,7 +316,10 @@ async fn run_apply(app: &AppHandle, version: &str) -> Result<(), String> {
                 last_pct = pct;
                 transition(
                     &app_chunk,
-                    UpdaterState::Downloading { version: version_chunk.clone(), percent: pct as u8 },
+                    UpdaterState::Downloading {
+                        version: version_chunk.clone(),
+                        percent: pct as u8,
+                    },
                 );
             }
         };
@@ -320,21 +368,41 @@ async fn run_apply(app: &AppHandle, version: &str) -> Result<(), String> {
         Some(b) => b,
         None => {
             let msg = format!("下载失败（已试 {} 个源）：{last_err}", candidates.len());
-            transition(app, UpdaterState::Error { message: msg.clone() });
+            transition(
+                app,
+                UpdaterState::Error {
+                    message: msg.clone(),
+                },
+            );
             return Err(msg);
         }
     };
 
     // 下载完成、开始安装 → Installing。
-    transition(app, UpdaterState::Installing { version: version.to_string() });
+    transition(
+        app,
+        UpdaterState::Installing {
+            version: version.to_string(),
+        },
+    );
     update.install(bytes).map_err(|e| {
         let msg = format!("安装失败: {e}");
-        transition(app, UpdaterState::Error { message: msg.clone() });
+        transition(
+            app,
+            UpdaterState::Error {
+                message: msg.clone(),
+            },
+        );
         msg
     })?;
 
     clear_persisted();
-    transition(app, UpdaterState::Ready { version: version.to_string() });
+    transition(
+        app,
+        UpdaterState::Ready {
+            version: version.to_string(),
+        },
+    );
     // 安装完成 → 自重启到新版本（即「关掉、过一会再开就是新版」）。restart() 不返回。
     app.restart();
 }
@@ -356,7 +424,10 @@ pub async fn updater_check(app: AppHandle) -> Result<UpdaterState, String> {
             return Ok(g.state.clone());
         }
         if g.in_flight
-            || matches!(g.state, UpdaterState::Downloading { .. } | UpdaterState::Installing { .. })
+            || matches!(
+                g.state,
+                UpdaterState::Downloading { .. } | UpdaterState::Installing { .. }
+            )
         {
             return Ok(g.state.clone());
         }
@@ -400,13 +471,56 @@ mod tests {
         let s = resolve_check("0.2.17", Some(("0.2.18".into(), "新特性".into())));
         assert_eq!(
             s,
-            UpdaterState::Available { version: "0.2.18".into(), notes: "新特性".into() }
+            UpdaterState::Available {
+                version: "0.2.18".into(),
+                notes: "新特性".into()
+            }
         );
     }
 
     #[test]
     fn check_resolves_up_to_date_when_no_update() {
         assert_eq!(resolve_check("0.2.17", None), UpdaterState::UpToDate);
+    }
+
+    #[test]
+    fn check_error_falls_back_to_persisted_available() {
+        // 网络复检失败，但磁盘上还留着「可装版本」(≠当前) → 退回 Available，弹窗照常弹。
+        let s = resolve_check_error(
+            "0.2.17",
+            Some(("0.2.18".into(), "新特性".into())),
+            "检查更新失败: 网络超时".into(),
+        );
+        assert_eq!(
+            s,
+            UpdaterState::Available {
+                version: "0.2.18".into(),
+                notes: "新特性".into()
+            }
+        );
+    }
+
+    #[test]
+    fn check_error_reports_error_when_no_persisted() {
+        // 没有落盘标记 → 如实报错（panel 引导手动检查）。
+        let s = resolve_check_error("0.2.17", None, "检查更新失败: 网络超时".into());
+        assert_eq!(
+            s,
+            UpdaterState::Error {
+                message: "检查更新失败: 网络超时".into()
+            }
+        );
+    }
+
+    #[test]
+    fn check_error_reports_error_when_persisted_already_current() {
+        // 落盘版本已等于当前(说明已装上) → 不该再当「有更新」，如实报错。
+        let s = resolve_check_error(
+            "0.2.18",
+            Some(("0.2.18".into(), String::new())),
+            "检查更新失败: 网络超时".into(),
+        );
+        assert!(matches!(s, UpdaterState::Error { .. }));
     }
 
     #[test]
@@ -447,7 +561,10 @@ mod tests {
         );
         assert_eq!(c.len(), 4);
         // Cloudflare 兜底（第二位）按文件名，不带版本路径前缀。
-        assert_eq!(c[1], "https://polaris-2us.pages.dev/downloads/Polaris.app.tar.gz");
+        assert_eq!(
+            c[1],
+            "https://polaris-2us.pages.dev/downloads/Polaris.app.tar.gz"
+        );
         assert_eq!(
             c[3],
             "https://github.com/wuli2025/polaris_coworker/releases/download/v0.2.18/Polaris.app.tar.gz"
@@ -460,7 +577,10 @@ mod tests {
     fn mirror_candidates_passthrough_non_github() {
         // 非 github 源（如将来自托管 Cloudflare）直连、不套镜像。
         let c = mirror_candidates("https://polaris-2us.pages.dev/v0.2.18/setup.exe");
-        assert_eq!(c, vec!["https://polaris-2us.pages.dev/v0.2.18/setup.exe".to_string()]);
+        assert_eq!(
+            c,
+            vec!["https://polaris-2us.pages.dev/v0.2.18/setup.exe".to_string()]
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //!
 //! 本版给 trait + 骨架;P1.5 落流式增量写。
 
-use crate::{Result, FxFrame};
+use crate::{FxFrame, Result};
 
 /// mp4 muxer trait
 ///  - Mp4Muxer 真实实现(自写 BMFF,P1.5 落)
@@ -33,16 +33,25 @@ impl SimpleMp4Muxer {
 }
 
 impl Mp4Muxer for SimpleMp4Muxer {
-    fn begin(&mut self, _w: u32, _h: u32, _fps: u32) -> Result<()> { unreachable!() }
-    fn push_video_nal(&mut self, _nal: &[u8], _pts_sec: f64) -> Result<()> { unreachable!() }
-    fn push_audio(&mut self, _samples: &[i16], _sr: u32, _ch: u8) -> Result<()> { unreachable!() }
-    fn finish(self: Box<Self>, _out: &str) -> Result<()> { unreachable!() }
+    fn begin(&mut self, _w: u32, _h: u32, _fps: u32) -> Result<()> {
+        unreachable!()
+    }
+    fn push_video_nal(&mut self, _nal: &[u8], _pts_sec: f64) -> Result<()> {
+        unreachable!()
+    }
+    fn push_audio(&mut self, _samples: &[i16], _sr: u32, _ch: u8) -> Result<()> {
+        unreachable!()
+    }
+    fn finish(self: Box<Self>, _out: &str) -> Result<()> {
+        unreachable!()
+    }
 }
 
 /// 把 FxFrame(RGBA 帧) + H.264Encoder 接到 Mp4Muxer 的三段流水线
 /// 真实实现在 P1.5 落,本期给连接顺序
 pub fn fx_to_mp4_pipeline(_frames: Vec<FxFrame>, _out_mp4: &str) -> Result<()> {
     Err(crate::ForgeError::NeedFallback {
-        reason: "fx_to_mp4_pipeline P1.5 待实;forge_video::render_deck_fx_video 仍走 ffmpeg CLI".into(),
+        reason: "fx_to_mp4_pipeline P1.5 待实;forge_video::render_deck_fx_video 仍走 ffmpeg CLI"
+            .into(),
     })
 }

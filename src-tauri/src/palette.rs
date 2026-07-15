@@ -100,7 +100,11 @@ fn hsl_to_rgb(c: Hsl) -> Rgb {
         let v = l * 255.0;
         return Rgb { r: v, g: v, b: v };
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hue = |mut t: f64| -> f64 {
         if t < 0.0 {
@@ -233,19 +237,40 @@ pub struct Palette {
 
 fn build_dark(seed: Hsl) -> Palette {
     let h = seed.h;
-    let bg = Hsl { h, s: 0.16, l: 0.065 };
+    let bg = Hsl {
+        h,
+        s: 0.16,
+        l: 0.065,
+    };
     let bg_rgb = hsl_to_rgb(bg);
     // accent:在深底上要亮而不刺眼,且保证对底对比度达标
-    let accent = accent_fit(with_sl(seed, clamp01(seed.s.max(0.58).min(0.88)), 0.62), bg_rgb, 3.5, true);
+    let accent = accent_fit(
+        with_sl(seed, clamp01(seed.s.max(0.58).min(0.88)), 0.62),
+        bg_rgb,
+        3.5,
+        true,
+    );
     let accent2 = accent_fit(with_l(rot(accent, 28.0), 0.66), bg_rgb, 3.0, true);
     let accent3 = accent_fit(with_sl(rot(accent, 174.0), 0.62, 0.64), bg_rgb, 3.0, true);
 
     let bg_soft = with_l(bg, 0.045);
-    let surface = Hsl { h, s: 0.16, l: 0.115 };
+    let surface = Hsl {
+        h,
+        s: 0.16,
+        l: 0.115,
+    };
     let surface2 = with_l(surface, 0.155);
-    let border = Hsl { h, s: 0.16, l: 0.255 };
+    let border = Hsl {
+        h,
+        s: 0.16,
+        l: 0.255,
+    };
     let border_strong = with_l(border, 0.36);
-    let glow = Hsl { h, s: 0.32, l: 0.17 };
+    let glow = Hsl {
+        h,
+        s: 0.32,
+        l: 0.17,
+    };
 
     let t1 = text_for(bg_rgb, h, 0.12, 0.94, 7.5, true);
     let t2 = text_for(bg_rgb, h, 0.14, 0.72, 4.6, true);
@@ -276,19 +301,40 @@ fn build_dark(seed: Hsl) -> Palette {
 
 fn build_light(seed: Hsl) -> Palette {
     let h = seed.h;
-    let bg = Hsl { h, s: 0.10, l: 0.985 };
+    let bg = Hsl {
+        h,
+        s: 0.10,
+        l: 0.985,
+    };
     let bg_rgb = hsl_to_rgb(bg);
     // accent:在白底上要够深才压得住,且保证对底对比度达标(绿/黄等高亮色相自动压暗)
-    let accent = accent_fit(with_sl(seed, clamp01(seed.s.max(0.62)), 0.48), bg_rgb, 3.2, false);
+    let accent = accent_fit(
+        with_sl(seed, clamp01(seed.s.max(0.62)), 0.48),
+        bg_rgb,
+        3.2,
+        false,
+    );
     let accent2 = accent_fit(with_l(rot(accent, 28.0), 0.52), bg_rgb, 3.0, false);
     let accent3 = accent_fit(with_sl(rot(accent, 174.0), 0.6, 0.46), bg_rgb, 3.0, false);
 
     let bg_soft = with_l(bg, 0.955);
-    let surface = Hsl { h, s: 0.10, l: 0.995 };
+    let surface = Hsl {
+        h,
+        s: 0.10,
+        l: 0.995,
+    };
     let surface2 = with_l(surface, 0.945);
-    let border = Hsl { h, s: 0.22, l: 0.88 };
+    let border = Hsl {
+        h,
+        s: 0.22,
+        l: 0.88,
+    };
     let border_strong = with_l(border, 0.74);
-    let glow = Hsl { h, s: 0.45, l: 0.93 };
+    let glow = Hsl {
+        h,
+        s: 0.45,
+        l: 0.93,
+    };
 
     let t1 = text_for(bg_rgb, h, 0.30, 0.14, 11.0, false);
     let t2 = text_for(bg_rgb, h, 0.22, 0.36, 5.0, false);
@@ -365,9 +411,21 @@ fn palette_css_vars(p: &Palette) -> String {
         "--bg:{};--bg-soft:{};--surface:{};--surface-2:{};--border:{};--border-strong:{};\
 --text-1:{};--text-2:{};--text-3:{};--accent:{};--accent-2:{};--accent-3:{};\
 --grad:linear-gradient(135deg,{},{});--glow:{};",
-        p.bg, p.bg_soft, p.surface, p.surface2, p.border, p.border_strong,
-        p.text1, p.text2, p.text3, p.accent, p.accent2, p.accent3,
-        p.grad_from, p.grad_to, p.glow
+        p.bg,
+        p.bg_soft,
+        p.surface,
+        p.surface2,
+        p.border,
+        p.border_strong,
+        p.text1,
+        p.text2,
+        p.text3,
+        p.accent,
+        p.accent2,
+        p.accent3,
+        p.grad_from,
+        p.grad_to,
+        p.glow
     )
 }
 
@@ -417,10 +475,7 @@ pub fn generate(seed: Option<&str>, mood: Option<&str>) -> Result<ThemeResult, S
 /// 色彩调配:给种子色(#hex)或主题情绪,出一整套协调主题(深浅两版 + CSS/PPT 适配)。
 /// 全 app 各产出(deck / 网页 / PPT / 信息图 / 视频)共用此能力现调配色。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn palette_generate(
-    seed: Option<String>,
-    mood: Option<String>,
-) -> Result<ThemeResult, String> {
+pub fn palette_generate(seed: Option<String>, mood: Option<String>) -> Result<ThemeResult, String> {
     generate(seed.as_deref(), mood.as_deref())
 }
 
@@ -436,7 +491,9 @@ mod tests {
     fn hex_roundtrip_and_hsl() {
         let c = p("#4F8CFF");
         let back = parse_hex(&to_hex(c)).unwrap();
-        assert!((c.r - back.r).abs() < 1.0 && (c.g - back.g).abs() < 1.0 && (c.b - back.b).abs() < 1.0);
+        assert!(
+            (c.r - back.r).abs() < 1.0 && (c.g - back.g).abs() < 1.0 && (c.b - back.b).abs() < 1.0
+        );
         // hsl 往返
         let h = rgb_to_hsl(c);
         let r2 = hsl_to_rgb(h);
@@ -454,15 +511,35 @@ mod tests {
     #[test]
     fn generated_theme_meets_contrast() {
         // 多个种子色:三级文字对各自 bg 的对比度都要达标(不翻车的核心保证)。
-        for seed in ["#4F8CFF", "#E0445A", "#2FAE66", "#C9A227", "#8B5CF6", "#0EA5A5"] {
+        for seed in [
+            "#4F8CFF", "#E0445A", "#2FAE66", "#C9A227", "#8B5CF6", "#0EA5A5",
+        ] {
             let r = generate(Some(seed), None).unwrap();
             for pal in [&r.light, &r.dark] {
                 let bg = p(&pal.bg);
-                assert!(contrast(p(&pal.text1), bg) >= 7.0, "{seed} {} text1 对比不足: {}", pal.mode, contrast(p(&pal.text1), bg));
-                assert!(contrast(p(&pal.text2), bg) >= 4.5, "{seed} {} text2 对比不足", pal.mode);
-                assert!(contrast(p(&pal.text3), bg) >= 3.0, "{seed} {} text3 对比不足", pal.mode);
+                assert!(
+                    contrast(p(&pal.text1), bg) >= 7.0,
+                    "{seed} {} text1 对比不足: {}",
+                    pal.mode,
+                    contrast(p(&pal.text1), bg)
+                );
+                assert!(
+                    contrast(p(&pal.text2), bg) >= 4.5,
+                    "{seed} {} text2 对比不足",
+                    pal.mode
+                );
+                assert!(
+                    contrast(p(&pal.text3), bg) >= 3.0,
+                    "{seed} {} text3 对比不足",
+                    pal.mode
+                );
                 // 强调色对背景也要看得见(≥3,大色块/标题级)
-                assert!(contrast(p(&pal.accent), bg) >= 3.0, "{seed} {} accent 对比不足: {}", pal.mode, contrast(p(&pal.accent), bg));
+                assert!(
+                    contrast(p(&pal.accent), bg) >= 3.0,
+                    "{seed} {} accent 对比不足: {}",
+                    pal.mode,
+                    contrast(p(&pal.accent), bg)
+                );
             }
         }
     }
@@ -475,15 +552,28 @@ mod tests {
         let a2 = rgb_to_hsl(p(&r.dark.accent2)).h;
         let a3 = rgb_to_hsl(p(&r.dark.accent3)).h;
         let dh = |x: f64, y: f64| ((x - y + 540.0).rem_euclid(360.0) - 180.0).abs();
-        assert!(dh(a, a2) > 12.0 && dh(a, a2) < 45.0, "accent2 不是同类色: {}", dh(a, a2));
+        assert!(
+            dh(a, a2) > 12.0 && dh(a, a2) < 45.0,
+            "accent2 不是同类色: {}",
+            dh(a, a2)
+        );
         assert!(dh(a, a3) > 150.0, "accent3 不是互补色: {}", dh(a, a3));
     }
 
     #[test]
     fn mood_maps_to_seed() {
-        assert_eq!(generate(None, Some("做个科技感的发布会")).unwrap().seed, "#3B6CFF");
-        assert_eq!(generate(None, Some("自然环保主题")).unwrap().seed, "#2FAE66");
-        assert_eq!(generate(None, Some("高级奢华尊贵")).unwrap().seed, "#C9A227");
+        assert_eq!(
+            generate(None, Some("做个科技感的发布会")).unwrap().seed,
+            "#3B6CFF"
+        );
+        assert_eq!(
+            generate(None, Some("自然环保主题")).unwrap().seed,
+            "#2FAE66"
+        );
+        assert_eq!(
+            generate(None, Some("高级奢华尊贵")).unwrap().seed,
+            "#C9A227"
+        );
     }
 
     /// 打印若干种子生成的 PPT 主题字典 + 光晕色,供真机渲染 demo 用。

@@ -1,15 +1,14 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
-// Tauri requires a fixed port; PRD/memory dictates 1420.
-// 临时避让 1420(被本机另一 vite 进程占着);改成 1421 + strictPort:false,
-// 等对端释放再改回。devUrl 同步指向 1421。
+// Tauri devUrl 固定指向 1421。端口被占用时必须直接报错；若让 Vite 自动漂到 1422，
+// Tauri 仍会打开 1421，可能连上旧服务或空白页，形成很难排查的假启动。
 export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
   server: {
     port: 1421,
-    strictPort: false,
+    strictPort: true,
     host: "0.0.0.0",
     watch: {
       ignored: ["**/src-tauri/**"],

@@ -79,7 +79,9 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 }
 
 fn flag_u32(args: &[String], name: &str, default: u32) -> u32 {
-    flag(args, name).and_then(|v| v.parse().ok()).unwrap_or(default)
+    flag(args, name)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn has(args: &[String], name: &str) -> bool {
@@ -93,10 +95,8 @@ fn req(args: &[String], name: &str) -> Result<String, String> {
 fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
     match cmd {
         "preflight" => Ok(app::forge::forge_preflight()),
-        "spec-pptx" => {
-            app::forge::spec_to_pptx_sync(req(args, "spec")?, req(args, "out")?)
-        }
-        "pptx" => app::forge_pptx::render_deck_to_pptx(
+        "spec-pptx" => app::forge::spec_to_pptx_sync(req(args, "spec")?, req(args, "out")?),
+        "pptx" => app::forge::pptx::render_deck_to_pptx(
             &req(args, "deck")?,
             &req(args, "out")?,
             flag_u32(args, "width", 1920),
@@ -104,7 +104,7 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
             !has(args, "no-text"),
             flag(args, "slides").and_then(|v| v.parse().ok()),
         ),
-        "shot" => app::forge_pptx::screenshot(
+        "shot" => app::forge::pptx::screenshot(
             &req(args, "url")?,
             &req(args, "out")?,
             flag_u32(args, "width", 1280),
@@ -115,18 +115,22 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
             let out = req(args, "out")?;
             let images: Vec<String> = args
                 .iter()
-                .filter(|a| !a.starts_with("--") && Some(a.as_str()) != flag(args, "out").as_deref())
+                .filter(|a| {
+                    !a.starts_with("--") && Some(a.as_str()) != flag(args, "out").as_deref()
+                })
                 .cloned()
                 .collect();
             if images.is_empty() {
                 return Err("pack 需要至少一张图片路径".into());
             }
-            app::forge_pptx::build_pptx(&images, &out)
+            app::forge::pptx::build_pptx(&images, &out)
         }
-        "video" => app::forge_video::render_deck_to_video(
+        "video" => app::forge::video::render_deck_to_video(
             &req(args, "deck")?,
             &req(args, "out")?,
-            flag(args, "sps").and_then(|v| v.parse().ok()).unwrap_or(3.0),
+            flag(args, "sps")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3.0),
             flag_u32(args, "fps", 30),
             flag_u32(args, "width", 1920),
             flag_u32(args, "height", 1080),
@@ -136,14 +140,14 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
             flag(args, "transition").and_then(|v| v.parse().ok()),
             has(args, "motion"),
         ),
-        "tts" => app::forge_tts::synth(
+        "tts" => app::forge::tts::synth(
             &req(args, "text")?,
             &req(args, "out")?,
             flag(args, "voice").as_deref(),
             flag(args, "lang-boost").as_deref(),
         ),
         "validate" => {
-            let v = app::forge_pptx::validate_pptx(&req(args, "pptx")?)?;
+            let v = app::forge::pptx::validate_pptx(&req(args, "pptx")?)?;
             serde_json::to_value(&v).map_err(|e| e.to_string())
         }
         // 寓言计划 · 检索枢纽:agent 的全盘检索 shell 工具(grep ∥ RAG 混检)
@@ -158,13 +162,18 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
                     let root = req(rest, "root")?;
                     let exclude = std::collections::HashSet::new();
                     // CLI 一次性盘点 → 默认完整(每目录都 read_dir;顺带建立目录缓存供桌面端后续增量)。
-                    let incremental = flag(rest, "incremental").is_some();
+                    // 布尔开关必须用 has():flag() 的「--name value」形式会把尾参/相邻 flag
+                    // 解析成 None,导致 --incremental 静默失效退回全量。
+                    let incremental = has(rest, "incremental");
                     let summary = app::fable::inventory::scan_root(
                         &root,
                         &exclude,
                         !incremental,
                         &|files, bytes| {
-                            eprintln!("[fable] 已盘点 {files} 个文件 / {:.1} GB", bytes as f64 / 1e9);
+                            eprintln!(
+                                "[fable] 已盘点 {files} 个文件 / {:.1} GB",
+                                bytes as f64 / 1e9
+                            );
                         },
                     )?;
                     serde_json::to_value(summary).map_err(|e| e.to_string())
@@ -241,7 +250,10 @@ fn main() {
     let rest = &argv[1..];
     match run(&cmd, rest) {
         Ok(v) => {
-            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string()));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+            );
         }
         Err(e) => {
             eprintln!("{}", json!({ "ok": false, "command": cmd, "error": e }));

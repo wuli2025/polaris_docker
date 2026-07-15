@@ -4,12 +4,12 @@
 # 跨板块只依赖 polaris-core 契约，可 `cargo test -p <板块>` 独立测试。
 # ═══════════════════════════════════════════════════════════════
 [workspace]
-members = ["crates/*", "crates/forge-codec"]
+members = ["crates/*"]
 resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "1.7.1"
+version = "2.1.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -46,6 +46,8 @@ anyhow = "1"
 # tokio 本就随 tauri 编进来了，这里只是显式开 time/macros 两个 feature；与 Codex 那条
 # 「无 tokio 的 ureq 同步流」互不影响。
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "sync", "net", "io-util", "signal"] }
+# 设备联盟遥测:本机 CPU/内存/磁盘 真实采样(跨平台)。见 sysstat.rs。
+sysinfo = "0.32"
 walkdir = "2"
 once_cell = "1"
 # 把 src/templates/experts/ 整目录编进二进制：每个专家一份可编辑 .md 提示词，
@@ -60,17 +62,31 @@ libc = { version = "0.2", features = [] }
 
 # 板块 crate (架构重构 Phase 0–1)
 polaris-core = { path = "crates/polaris-core" }
+# 命令契约层(分仓规划 v2 第 1 仓种子):invoke 信封 + 参数访问记账(未知参数曝光/严格模式)。
+polaris-protocol = { path = "crates/polaris-protocol" }
+# Forge 渲染引擎(分仓规划 v2 Phase 1):PPT/截图/视频/TTS/Figma 桥。
+# desktop 特性经下方 [features] 转发;server/CLI 形态用默认(无 tauri)。
+polaris-forge = { path = "crates/polaris-forge" }
+# 核心内核(分仓规划 v2 Phase 1):chat/provider/doctor/skills/integrations/conv/claude_md。
+polaris-kernel = { path = "crates/polaris-kernel" }
+# 检索/KB 引擎(分仓规划 v2 Phase 1):fable 盘点/索引/混检/文件中心 + kb 妈妈库。
+polaris-fable = { path = "crates/polaris-fable" }
+# llmwiki 知识网构建(分仓规划 v2 第 6 仓):唯一获批的 3→2 依赖(骑在 fable 之上)。
+polaris-wiki = { path = "crates/polaris-wiki" }
+# 多人协作引擎(分仓规划 v2 第 5 仓):壳件 apihub/hosting 留本仓 src/。
+polaris-collab = { path = "crates/polaris-collab" }
+# 横切基建(路径/子进程池/超时看门/HTTP):最底层 crate,不依赖 tauri 与任何业务板块。
+# 主 crate 经 `pub use polaris_runtime as runtime;` 别名,业务代码仍写 crate::runtime::…
+polaris-runtime = { path = "crates/polaris-runtime" }
 # sandbox 含 #[tauri::command]，依赖 tauri → 仅桌面构建编译；
 # Docker 内「Docker-in-Docker」沙箱本期降级（dispatch 层给 stub）。
 polaris-sandbox = { path = "crates/polaris-sandbox", optional = true }
-# Forge codec 板块:openh264-rs + 自写 BMFF muxer + ebur128 + cosmic-text + symphonia + audiopus
+# Forge codec 板块:openh264-rs(source feature 从源码编译,编译开销大)+ 自写 BMFF muxer
 # 替 ffmpeg CLI;二进制增量 3.3-5MB;详 workspace/research-notes/task-b.md
-polaris-forge-codec = { path = "crates/forge-codec" }
-# 文件转换 (板块② 上传/入库) — 纯 Rust，无需 pdfium.dll 等原生绑定
-# clean-room 自写转换逻辑，仅这些底层解析库为第三方
-zip = "8.6.0"          # docx/pptx/xlsx 本质是 zip+xml，解压取 XML
-calamine = "0.35.0"    # xlsx/xls/ods 表格 → markdown
-pdf-extract = "0.10.0" # pdf 文本抽取（纯 Rust，panic 由 convert::guard 兜住）
+# ⚠ 当前主 crate 源码零引用它(原生编码是 P1.5 stub),却被无条件编译 = 纯死编译开销
+# (openh264 source 构建很重)。改为 optional,仅 native-codec 特性下才拉,默认不编。
+polaris-forge-codec = { path = "crates/forge-codec", optional = true }
+# 文件转换 convert.rs(zip/calamine/pdf-extract)已随内核迁入 crates/polaris-kernel。
 # Codex(ChatGPT) OAuth Device Code 流程 —— 同步阻塞 HTTP 客户端 (rustls, 无 tokio)。
 # 只用于授权三步: 取设备码 / 轮询 / code 换 token。比 cc-switch 的 reqwest+tokio 轻得多。
 ureq = { version = "2", features = ["json"] }
@@ -82,18 +98,19 @@ getrandom = "0.2"
 # 专家头像:base64 编码 PNG → data URL，供前端 <img src=""> 直接使用。
 # 纯 Rust 实现，三平台同构，无系统依赖。
 base64 = "0.22"
-# 「聊天机器人」板块「扫码创建机器人」: 把飞书开放平台建应用 URL 编码成二维码 (SVG)。
-# default-features=false → 不拉重型 image crate, 只保留纯 Rust 的 svg 渲染。
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# 多人协作(collab):账号密码哈希。argon2id PHC 串,纯 Rust,三平台同构。
+argon2 = "0.5"
+# 多人协作:账号镜像加密(云端双存,零知识——云端只见密文,解密钥=host.key 派生,永不出主机)。
+chacha20poly1305 = "0.10"
+# iroh / tokio-tungstenite 已随 collab 板块迁入 crates/polaris-collab(collab-net 特性)。
+# qrcode 已随 integrations 板块迁入 crates/polaris-kernel。
 # 回声层「每日做梦」调度需要本地时区的钟点(std 拿不到 local hour)。
 # clock-only:不拉 wasm/serde 等默认特性,增量极小。
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 语音输入 · 防污染秒达档(voice.rs §7):个人词表拼音对齐纠同音错。
 # 纯 Rust 内嵌音节表,零系统依赖;只用 ToPinyin 取无调音节做编辑距离匹配。
 pinyin = "0.10"
-# 文件中心 · 非 UTF-8 文件名修复(fable/inventory.rs):Linux/Docker 上 GBK 中文名
-# 用 to_string_lossy 会变成乱码 �;用它把 GBK 字节解回中文,IO 时再编码回字节命中磁盘。
-encoding_rs = "0.8"
+# encoding_rs 已随 fable(inventory)与 integrations(nas)迁入各自 crate。
 # 语音识别核(voice-asr feature):sherpa-onnx 的 Rust 绑定,本地跑 SenseVoice。
 # download-binaries = 构建时下载预编译 sherpa-onnx 库(免 cmake 从源码编译,本机最稳)。
 # optional + 专属 feature → 默认 build 不拉它,保护现有绿色编译;桌面/Docker 发版显式开。
@@ -108,23 +125,17 @@ enigo = { version = "0.3", optional = true }   # 把终稿「敲」进当前焦�
 # 与硅基流动**同源** → 向量同空间、兼容既有索引,无需重嵌全库;绕开 API 限速与网络延迟(治覆盖率+查询延迟)。
 # optional + 专属 feature → 默认 build 不拉(保护编译+体积);Docker 发版显式开 `--features local-embed`。
 # 经 ort 拉 onnxruntime,**勿与 voice-asr(sherpa 自带 onnxruntime)同时开**,避免两份运行时冲突。
-# load-dynamic:onnxruntime 运行时 dlopen(ORT_DYLIB_PATH 指向 .so),缺库不影响启动(只本地嵌入才报错),
-# 比 link 模式安全得多;hf-hub-rustls-tls 避免 Docker 拉 openssl。
-fastembed = { version = "5", optional = true, default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
+# **ort-download-binaries**(非 load-dynamic):构建期由 ort 拉「与 ort-sys 2.0.0-rc.12 严格匹配的
+# onnxruntime 1.24.2」并链接进二进制 —— 自包含、版本必对。改用它的根因(2026-06-26 实测):
+# load-dynamic 会在运行时 dlopen 系统里**任意**一个 onnxruntime.dll(本机 C:\WINDOWS\system32 就有
+# 一个旧版),ABI 不匹配 → 推理首次前向 0-CPU 卡死。download-binaries 一劳永逸消掉这类「抓错 DLL」。
+# rustls 变体避免 Docker 拉 openssl;hf-hub-rustls-tls 同理。
+# (fastembed 已随 fable 板块迁入 crates/polaris-fable, 特性经上方 local-embed 转发)
 # 寓言计划 · 检索枢纽(fable/):盘点/chunk/向量统一落 SQLite(PRD v5 P0「SQLite 落盘」)。
 # bundled = 静态编译 sqlite3,三平台(Win/mac/Docker musl 之外的 gnu)零系统依赖。
 rusqlite = { version = "0.32", features = ["bundled"] }
-# 文件中心 · 缩略图/首帧:纯 Rust 解码+缩放(jpg/png/gif/webp/bmp),三壳同构无系统依赖。
-# default-features=false 只取需要的编解码器,避免拉 rayon 等重型默认特性。
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
-# ── Forge 工业级化阶段 1:chromiumoxide 持久 CDP 替「每帧起 chromium CLI 进程」 ──
-#   提速 6-10×(单页 350-900ms → 50-120ms);双选型 chromiumoxide 主路 + headless_chrome 兜底
-#   pin minor 版本:0.9.x API 仍在动(issue 标 "Regression from 0.8 to 0.9")
-#   chromiumoxide Linux 需 libdbus-1-dev(Dockerfile 阶段2 装);mac/Win 自带
-#   feature:默认 + 截图 + serde_json(chromiumoxide 自动拉)
-chromiumoxide = { version = "=0.9.1", default-features = false }
-# headless_chrome 二选型,作 fallback tier2
-headless_chrome = { version = "1.0", default-features = false, optional = true }
+# image(缩略图/首帧解码)已随 fable 板块迁入 crates/polaris-fable(forge 各自带)。
+# chromiumoxide / headless_chrome 已随 forge 板块迁入 crates/polaris-forge(仅它在用)。
 # 图像字节级处理(forge_pptx 流式写无需 image crate,本条仅 codec 板块用,留 polaris-forge-codec)
 # image = { version = "0.25", default-features = false, optional = true }
 # audio 解码(symphonia) + 编码(audiopus)+ 响度(ebur128)+ 字幕(cosmic-text)
@@ -132,7 +143,7 @@ headless_chrome = { version = "1.0", default-features = false, optional = true }
 
 # 原生标题栏染色（titlebar.rs）：Win11 DwmSetWindowAttribute 让标题栏随主题与框面同色
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_WindowsProgramming", "Win32_NetworkManagement_WNet"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_WindowsProgramming", "Win32_NetworkManagement_WNet", "Win32_System_SystemInformation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
 
 [features]
 default = ["desktop"]
@@ -145,12 +156,21 @@ desktop = [
     "dep:tauri-plugin-updater",
     "dep:tauri-plugin-process",
     "dep:polaris-sandbox",
-    "dep:headless_chrome",   # forge_capture fallback tier2(可选)
+    "polaris-kernel/desktop", # 内核的桌面形态(tauri 事件 + 沙箱档位)
+    "polaris-forge/desktop", # forge 引擎的桌面形态(tauri 事件 + headless_chrome 兜底)
+    "polaris-fable/desktop", # 检索引擎的桌面形态(tauri 事件/async_runtime)
+    "polaris-wiki/desktop",  # llmwiki 构建管线的桌面形态
+    "polaris-collab/desktop", # 协作引擎的桌面命令
     "custom-protocol",
+    "collab-host",           # 桌面一键当主机:内嵌协作 axum 路由
+    "collab-net",            # iroh 打洞直连:桌面当 iroh 主机(host_listen),手机 P2P 连
 ]
 custom-protocol = ["tauri?/custom-protocol"]
 # Docker/Web 构建：axum HTTP/WS 外壳，复用全部 Rust 引擎，不含 Tauri。
-server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util"]
+# collab-host 提供共用的协作路由(collab/http.rs)与全部 axum 依赖。
+server = ["collab-host", "polaris-fable/server"]
+# 协作路由双壳共用(collab crate 的 http.rs)+ 壳件 apihub/hosting 所需 HTTP 依赖。
+collab-host = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util", "polaris-collab/collab-host"]
 # 语音识别运行时:本地 SenseVoice(sherpa-onnx),**桌面 / Docker server 皆可**。
 # 只拉 sherpa-rs,不含麦克风/热键/注入 → Docker server 可开它跑「浏览器上传音频→服务端识别」。
 # 默认不开(保护 build + 镜像体积),实测/发版显式开 `--features voice-asr`。
@@ -162,7 +182,13 @@ voice-live = ["voice-asr", "dep:cpal", "dep:rdev", "dep:enigo"]
 # 本地开源嵌入/重排(fastembed/ONNX):本地 BGE-M3 + bge-reranker-v2-m3,无 API 限速、查询不走网络。
 # 默认不开(保护 build + 镜像体积);Docker 发版显式开 `--features local-embed`。
 # 运行时 POLARIS_LOCAL_EMBED=1 才真正启用本地路径(否则仍走云 API)。勿与 voice-asr 同开(双 onnxruntime)。
-local-embed = ["dep:fastembed"]
+# fastembed 依赖已随 fable 板块迁入 crates/polaris-fable,此处只做特性转发。
+local-embed = ["polaris-fable/local-embed"]
+# 多人协作组网隧道:iroh 打洞直连 + relay 兜底(依赖已随 collab 板块迁入 crate)。
+collab-net = ["polaris-collab/collab-net"]
+# 原生编解码(openh264 source 从源码编译,重):P1.5 真实现视频原生编码时才开。
+# 默认关——当前主 crate 零引用 forge-codec,开着只是白白拖长编译 + 撑大缓存。
+native-codec = ["dep:polaris-forge-codec"]
 
 # server 二进制：浏览器前端 + REST/WS 后端（替代 Tauri 外壳）。
 # 构建：cargo build --release --bin polaris-server --no-default-features --features server
@@ -172,14 +198,29 @@ local-embed = ["dep:fastembed"]
 # #[cfg(feature="server")] 门控,desktop 默认特性下 main 函数不存在),会
 # 报 does not exist。把整块 [[bin]] 注释掉 → bundler 完全看不到它,直接
 # 出包。Docker 真服务端等 v1.0.2 走 workspace 拆分再补(本版无 docker 镜像)。
+# 【临时启用·仅本机回归测试用】带 required-features 保护:desktop 默认构建不编它;
+# 发版/打桌面包前必须改回注释,否则 tauri bundler 会按 [[bin]] 列表 copy 它而报错。
 # [[bin]]
 # name = "polaris-server"
 # path = "src/bin/polaris-server.rs"
+# required-features = ["server"]
 
 # 桌面二进制保持默认（main.rs）。
 [[bin]]
 name = "polaris-app"
 path = "src/main.rs"
+
+# ═══════════════════════════════════════════════════════════════
+# Dev/check 体积优化 — target/ 曾达 ~120GB(debug deps 58G + incremental 51G)
+# ═══════════════════════════════════════════════════════════════
+# 第三方依赖的调试信息几乎从不用到(断点基本落在自家 crate),却占 debug 构建的大头。
+# 关掉「所有依赖」的 debuginfo,自家 crate 仍保留(下方 [profile.dev] 默认 debug=true),
+# 增量/全量 target 体积可降一大截,且不影响自己代码的断点/回溯。
+[profile.dev.package."*"]
+debug = false
+# 同理作用于 test/bench 用的 dev 变体。
+[profile.test.package."*"]
+debug = false
 
 # ═══════════════════════════════════════════════════════════════
 # Release 体积优化 — 工业级减负配置

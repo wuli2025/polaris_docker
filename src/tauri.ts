@@ -40,15 +40,19 @@ function authToken(): string | null {
   }
 }
 
+// ★ DOCKER 分叉:主仓这里是私有 function。容器侧 useUpdater.ts 的裸 fetch
+//   (/api/version、/api/invoke)必须自带 Bearer,设了 POLARIS_AUTH_TOKEN 时不带必 401。
+//   同步主仓时必须保住这个 export,否则 useUpdater.ts 编译不过。
 export function authHeaders(): Record<string, string> {
   const t = authToken();
   return t ? { authorization: `Bearer ${t}` } : {};
 }
 
 /**
- * 后端受限文件 URL（/api/file）。window.open/<a download> 等导航请求带不了
- * Authorization 头，故 token 走 query（与 /ws 同理）。download=true 让后端加
- * Content-Disposition: attachment 强制下载。
+ * 受 token 保护的后端文件 URL（Docker/Web 用）。
+ * - 默认内联：HTML 在新标签渲染、图片直接显示。
+ * - download:true → 后端加 Content-Disposition: attachment，强制下载。
+ * window.open / <a download> 等导航请求带不了 Authorization 头，token 故走 query（与 /ws 同理）。
  */
 export function backendFileUrl(
   path: string,
@@ -61,8 +65,15 @@ export function backendFileUrl(
   return `/api/file?${qs.toString()}`;
 }
 
+/** stub 判定不终身缓存：页面加载瞬间后端恰在重启时，一次探测失败曾把整个应用
+ *  永久钉死在「浏览器预览」假数据模式（invoke 全走 stub、listen 全空），只能刷新自救。
+ *  超过 TTL 后允许重探，后端恢复即自动切回 http。 */
+const STUB_RETRY_MS = 8000;
+let stubProbedAt = 0;
+
 async function ensureBackend(): Promise<void> {
-  if (backendMode) return;
+  if (backendMode === "http") return;
+  if (backendMode === "stub" && Date.now() - stubProbedAt < STUB_RETRY_MS) return;
   if (!probePromise) {
     probePromise = (async () => {
       try {
@@ -71,20 +82,144 @@ async function ensureBackend(): Promise<void> {
       } catch {
         backendMode = "stub";
       }
+      if (backendMode !== "http") stubProbedAt = Date.now();
+      // 进入 http（首次探测 null→http，或后端重启后 stub→http）：把此前已登记但尚未连接的
+      // 监听接上 WS——否则 invoke 恢复了、事件却永久哑（气泡不出、转圈不停）。走到这里
+      // backendMode 只可能从非 http 翻上来（函数开头 http 已早退），故无需再比对旧值。
+      else if (wsListeners.size > 0) ensureWs();
+      probePromise = null;
     })();
   }
   await probePromise;
+  // 服务端设了 POLARIS_AUTH_TOKEN 而本浏览器口令缺失/错误时，在这里就弹口令框，
+  // 而不是让页面各处功能各自 401 报错（此前唯一入口是 URL ?token=，没人教就全线报错）。
+  // 注：probePromise 里改写了 backendMode，TS 的窄化跨 await 看不见这次赋值，故显式放宽。
+  const mode = backendMode as BackendMode | null;
+  if (mode === "http" && (await tokenRejected())) await requireToken();
+}
+
+// ── 访问口令引导：探测 401 → 弹输入框 → 校验通过才落盘 ──
+
+/** 用当前口令探一次 /api/invoke：仅 401 视为「需要输入/口令错」，网络错误等不算。 */
+async function tokenRejected(): Promise<boolean> {
+  try {
+    const r = await fetch("/api/invoke", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ cmd: "__auth_probe", args: {} }),
+    });
+    return r.status === 401;
+  } catch {
+    return false;
+  }
+}
+
+let tokenGate: Promise<void> | null = null;
+/** 用户点「稍后」之后的冷静期：期间不再自动弹框，避免连环 401 把弹窗顶回来。 */
+let tokenPromptDismissedAt = 0;
+const TOKEN_PROMPT_COOLDOWN_MS = 15000;
+
+/** 单飞口令引导：并发 401 只弹一个框；输错循环重试；「稍后」放行（后续请求照常 401 报错）。 */
+function requireToken(): Promise<void> {
+  if (tokenGate) return tokenGate;
+  if (Date.now() - tokenPromptDismissedAt < TOKEN_PROMPT_COOLDOWN_MS)
+    return Promise.resolve();
+  tokenGate = (async () => {
+    try {
+      let errMsg: string | undefined;
+      for (;;) {
+        const t = await askTokenOnce(errMsg);
+        if (t === null) {
+          tokenPromptDismissedAt = Date.now();
+          return;
+        }
+        localStorage.setItem("POLARIS_AUTH_TOKEN", t);
+        if (!(await tokenRejected())) {
+          // 口令生效：WS 若正带着旧口令（或没带）连接，掐掉让它带新口令自动重连。
+          try {
+            ws?.close();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        errMsg = "口令不对，再试一次";
+      }
+    } finally {
+      tokenGate = null;
+    }
+  })();
+  return tokenGate;
+}
+
+/** 弹一次口令输入框（自绘 DOM，不依赖 Vue，双主题下都可读）。resolve(null)=用户点「稍后」。 */
+function askTokenOnce(errMsg?: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.style.cssText =
+      "position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;" +
+      "background:rgba(15,17,23,.55);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)";
+    const card = document.createElement("div");
+    card.style.cssText =
+      "width:min(340px,86vw);padding:26px 24px;border-radius:18px;background:rgba(28,30,38,.94);" +
+      "border:1px solid rgba(255,255,255,.1);box-shadow:0 24px 64px rgba(0,0,0,.4);" +
+      "font:14px/1.6 system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#f5f6f8";
+    card.innerHTML =
+      '<div style="font-size:17px;font-weight:600;margin-bottom:6px">输入访问口令</div>' +
+      '<div style="opacity:.65;margin-bottom:14px">这台北极星设置了访问口令（POLARIS_AUTH_TOKEN）。输入一次，本浏览器会记住。</div>' +
+      (errMsg
+        ? '<div style="color:#ff8f8f;margin-bottom:10px">' + errMsg + "</div>"
+        : "") +
+      '<input type="password" placeholder="访问口令" autocomplete="current-password" ' +
+      'style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;' +
+      "border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:inherit;" +
+      'outline:none;font-size:14px" />' +
+      '<div style="display:flex;gap:10px;margin-top:16px">' +
+      '<button data-act="ok" style="flex:1;padding:10px 0;border:none;border-radius:10px;' +
+      'background:#4c7dff;color:#fff;font-size:14px;font-weight:600;cursor:pointer">进入</button>' +
+      '<button data-act="later" style="padding:10px 14px;border:1px solid rgba(255,255,255,.15);' +
+      'border-radius:10px;background:transparent;color:inherit;opacity:.7;cursor:pointer">稍后</button>' +
+      "</div>";
+    wrap.appendChild(card);
+    const input = card.querySelector("input")!;
+    const done = (v: string | null) => {
+      wrap.remove();
+      resolve(v);
+    };
+    card.querySelector('[data-act="ok"]')!.addEventListener("click", () => {
+      const v = input.value.trim();
+      if (v) done(v);
+      else input.focus();
+    });
+    card
+      .querySelector('[data-act="later"]')!
+      .addEventListener("click", () => done(null));
+    input.addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key === "Enter") {
+        const v = input.value.trim();
+        if (v) done(v);
+      }
+    });
+    document.body.appendChild(wrap);
+    input.focus();
+  });
 }
 
 async function httpInvoke<T>(
   cmd: string,
-  args?: Record<string, unknown>
+  args?: Record<string, unknown>,
+  retriedAuth = false
 ): Promise<T> {
   const res = await fetch("/api/invoke", {
     method: "POST",
     headers: { "content-type": "application/json", ...authHeaders() },
     body: JSON.stringify({ cmd, args: args ?? {} }),
   });
+  // 口令没输/输错：引导输入后原样重试一次（requireToken 单飞，并发 401 只弹一个框）。
+  if (res.status === 401 && !retriedAuth) {
+    await requireToken();
+    return httpInvoke<T>(cmd, args, true);
+  }
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try {
@@ -123,6 +258,11 @@ export async function uploadToBackend(
 let ws: WebSocket | null = null;
 const wsListeners = new Map<string, Set<(p: unknown) => void>>();
 let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// 指数退避:1s 起,每次失败翻倍 + 少量抖动,封顶 30s;连上即复位。
+// 避免后端宕机/重启时每 1.5s 硬敲(语义对齐 mobile/src/lib/net.ts)。
+const WS_BACKOFF_MIN = 1000;
+const WS_BACKOFF_MAX = 30000;
+let wsBackoff = WS_BACKOFF_MIN;
 
 /** WS 连接状态变化（仅 Docker/Web 模式有意义）：true=已连上, false=断开重连中 */
 const wsStatusCbs = new Set<(connected: boolean) => void>();
@@ -144,7 +284,10 @@ function ensureWs(): void {
       t ? `?token=${encodeURIComponent(t)}` : ""
     }`;
     ws = new WebSocket(url);
-    ws.onopen = () => dispatchWsStatus(true);
+    ws.onopen = () => {
+      wsBackoff = WS_BACKOFF_MIN;
+      dispatchWsStatus(true);
+    };
     ws.onmessage = (e) => {
       try {
         const { topic, payload } = JSON.parse(e.data);
@@ -159,7 +302,11 @@ function ensureWs(): void {
       dispatchWsStatus(false);
       if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
       // 仍有监听者才自动重连（避免空连接刷日志）。
-      if (wsListeners.size > 0) wsReconnectTimer = setTimeout(ensureWs, 1500);
+      if (wsListeners.size > 0) {
+        const jitter = Math.floor(Math.random() * 300);
+        wsReconnectTimer = setTimeout(ensureWs, wsBackoff + jitter);
+        wsBackoff = Math.min(wsBackoff * 2, WS_BACKOFF_MAX);
+      }
     };
     ws.onerror = () => {
       try {
@@ -187,14 +334,16 @@ export async function listen<T>(
 ): Promise<UnlistenFn> {
   if (isTauri) return rawListen<T>(event, (e) => cb(e.payload));
   await ensureBackend();
-  if (backendMode !== "http") return () => {};
-  ensureWs();
+  // 始终登记监听(即便此刻 stub=后端重启中):不再返回 noop 空函数。连接只在 http 模式建立，
+  // stub→http 翻转时由 ensureBackend 补调 ensureWs()——保证「invoke 恢复」与「事件恢复」同步，
+  // 且纯前端预览(永无后端)不会空转重连刷日志。
   let set = wsListeners.get(event);
   if (!set) {
     set = new Set();
     wsListeners.set(event, set);
   }
   set.add(cb as (p: unknown) => void);
+  if (backendMode === "http") ensureWs();
   return () => {
     set!.delete(cb as (p: unknown) => void);
     if (set!.size === 0) wsListeners.delete(event);
@@ -610,6 +759,8 @@ export interface FileCard {
   mtime: number;
   clusterId: number;
   thumbable: boolean;
+  /** 来源徽标:下载 / 微信 / QQ / 企业微信 / ""(普通文件,不显示) */
+  source: string;
 }
 export interface FileGridPage {
   items: FileCard[];
@@ -743,6 +894,10 @@ export const files = {
   /** 检索枢纽混合检索(grep ∥ 向量 RRF) */
   search: (query: string, topK = 24, mode: "hybrid" | "grep" | "vector" = "hybrid") =>
     invoke<FableSearchResult>("fable_search", { query, topK, mode }),
+  /** AI 辅助检索(深度档):claude 把查询多路扩写 → 各变体并行召回 → 多查询融合,提升模糊/关键词
+   *  查询的召回与精度(实测 nDCG +13.6%)。起 headless claude 数秒级,只在用户主动深度搜索时调。 */
+  searchAi: (query: string, topK = 24, scope?: string) =>
+    invoke<FableSearchResult>("fable_search_ai", { query, topK, scope }),
   /** 取消当前盘点/索引任务(协作式:循环轮询 CANCEL,几百毫秒内优雅停;索引可再点继续续建) */
   fableCancel: () => invoke<void>("fable_cancel"),
 };
@@ -884,6 +1039,18 @@ export async function openUrl(url: string): Promise<void> {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Figma 往返桥 — 去程 html.to.design 插件, 回程 REST 拉回转 HTML
+// ──────────────────────────────────────────────────────────────
+export const figmaApi = {
+  /** 拉取文件节点树 + 图片填充(已内嵌 data URI)。file 可以是完整 URL 或裸 key */
+  pull: (file: string, token: string) =>
+    invoke<{ doc: any; images: Record<string, string> }>("figma_pull", { file, token }),
+  /** 批量把矢量节点导出为 SVG data URI（id → dataUri） */
+  exportSvgs: (file: string, ids: string[], token: string) =>
+    invoke<Record<string, string>>("figma_export_svgs", { file, ids, token }),
+};
+
+// ──────────────────────────────────────────────────────────────
 // Artifacts module — 对话生成的成品文件，右侧抽屉预览
 // ──────────────────────────────────────────────────────────────
 export type ArtifactKind =
@@ -934,6 +1101,12 @@ export const artifacts = {
   /** 跨所有对话检索历史产物文件（文件名 + 正文） */
   search: (query: string) =>
     invoke<ArtifactSearchHit[]>("artifact_search", { query }),
+  /** deck.html → .pptx 重新导出（自研 forge 管线逐页截图 + 纯 Rust OOXML，覆盖写出） */
+  deckToPptx: (deck: string, out: string) =>
+    invoke<unknown>("forge_deck_to_pptx", { deck, out }),
+  /** polaris.slides.json(spec) → 原生可编辑 .pptx（路线 B 传统PPT，零浏览器）。spec 传文件路径或 JSON 字符串 */
+  specToPptx: (spec: string, out: string) =>
+    invoke<{ ok: boolean; slides: number; warnings: string[] }>("forge_spec_to_pptx", { spec, out }),
 };
 
 /** 跨对话产物搜索命中 */
@@ -988,6 +1161,8 @@ export interface Skill {
   installed?: boolean;
   /** 是否可删除（物理存在于用户目录，可卸载） */
   removable?: boolean;
+  /** 市场分组（按人群/用途），如「开发编程」「财务会计」 */
+  category?: string;
 }
 
 export const skills = {
@@ -1048,6 +1223,10 @@ export interface Project {
   personaId?: string | null;
   /** 该人格绑定的专属知识库 scope（KB 根下相对子目录，null/空=全局） */
   kbScope?: string | null;
+  /** 绑定的协作项目 id(团队项目↔本地对话工作区之桥;null=普通本地项目) */
+  collabProjectId?: number | null;
+  /** 绑定时的协作主机 base(空=未绑) */
+  collabHost?: string;
 }
 
 export interface Conversation {
@@ -1074,6 +1253,8 @@ type RawProject = {
   archived: boolean;
   persona_id?: string | null;
   kb_scope?: string | null;
+  collab_project_id?: number | null;
+  collab_host?: string;
 };
 type RawConv = {
   id: string;
@@ -1097,6 +1278,8 @@ const p = (r: RawProject): Project => ({
   archived: r.archived,
   personaId: r.persona_id ?? null,
   kbScope: r.kb_scope ?? null,
+  collabProjectId: r.collab_project_id ?? null,
+  collabHost: r.collab_host ?? "",
 });
 const c = (r: RawConv): Conversation => ({
   id: r.id,
@@ -1117,6 +1300,19 @@ export const convApi = {
   listProjects: async () => (await invoke<RawProject[]>("conv_list_projects")).map(p),
   createProject: async (name: string) =>
     p(await invoke<RawProject>("conv_create_project", { name })),
+  /** 本地项目 ↔ 协作项目绑定(团队项目主页「开新讨论」时自动调) */
+  bindProjectCollab: async (
+    projectId: string,
+    collabProjectId: number,
+    collabHost: string
+  ) =>
+    p(
+      await invoke<RawProject>("conv_project_bind_collab", {
+        projectId,
+        collabProjectId,
+        collabHost,
+      })
+    ),
   archiveProject: (projectId: string) =>
     invoke<void>("conv_archive_project", { projectId }),
   openProjectDir: (projectId: string) =>
@@ -1133,6 +1329,10 @@ export const convApi = {
   /** 回声层:把单条对话立刻沉淀为记忆(后台跑,进度走 echo:dream 事件) */
   distillConversation: (convId: string) =>
     invoke<void>("echo_distill_conversation", { convId }),
+  /** 清空上下文:清空该对话全部消息(对话保留);旧内容后台自动按做梦规则沉淀入记忆库。
+   *  返回清掉的消息数。正在沉淀时后端会拒绝(不清空),报错文案可直接展示。 */
+  clearContext: (convId: string) =>
+    invoke<number>("echo_clear_context", { convId }),
   renameConversation: (conversationId: string, title: string) =>
     invoke<void>("conv_rename_conversation", { conversationId, title }),
   getMessages: async (conversationId: string) =>
@@ -1376,6 +1576,8 @@ export interface CodexStatus {
   authPath: string;
 }
 export interface CodexDeviceLogin {
+  /** auto = 回环一键授权(轮询 codexLoginPoll); device = 设备码流程(轮询 codexPollLogin) */
+  mode: "auto" | "device";
   deviceCode: string;
   userCode: string;
   verificationUri: string;
@@ -1385,10 +1587,26 @@ export interface CodexDeviceLogin {
 export interface CodexPollResult {
   status: "pending" | "ok";
 }
+/** 回环一键授权轮询结果 (claude/codex 共用) */
+export interface LoginPollResult {
+  status: "idle" | "pending" | "ok" | "failed";
+  message: string;
+}
 export interface CodexProxyInfo {
   running: boolean;
   port: number;
   lastError: string;
+}
+export interface ClaudeAuthStatus {
+  loggedIn: boolean;
+  credPath: string;
+}
+export interface ClaudeLoginStart {
+  /** auto = 回环一键授权(轮询 claudeLoginPoll); manual = 手工回贴授权码 */
+  mode: "auto" | "manual";
+  authorizeUrl: string;
+  verifier: string;
+  state: string;
 }
 
 export const provider = {
@@ -1406,14 +1624,26 @@ export const provider = {
   codexStartLogin: () => invoke<CodexDeviceLogin>("codex_start_login"),
   codexPollLogin: (deviceCode: string, userCode: string) =>
     invoke<CodexPollResult>("codex_poll_login", { deviceCode, userCode }),
+  /** 回环一键授权(auto 模式)的进度轮询 / 取消 */
+  codexLoginPoll: () => invoke<LoginPollResult>("codex_login_poll"),
+  codexLoginCancel: () => invoke<void>("codex_login_cancel"),
   codexProxyInfo: () => invoke<CodexProxyInfo>("codex_proxy_info"),
+  // Claude 官方订阅 OAuth(PKCE):桌面端 start 默认回环一键授权(浏览器点 Authorize 即完成),
+  // forceManual/端口被占时回落手工回贴 —— finish 回贴授权码换 token
+  claudeAuthStatus: () => invoke<ClaudeAuthStatus>("claude_oauth_status"),
+  claudeStartLogin: (forceManual = false) =>
+    invoke<ClaudeLoginStart>("claude_start_login", { forceManual }),
+  claudeFinishLogin: (pasted: string, verifier: string, state: string) =>
+    invoke<ClaudeAuthStatus>("claude_finish_login", { pasted, verifier, state }),
+  claudeLoginPoll: () => invoke<LoginPollResult>("claude_login_poll"),
+  claudeLoginCancel: () => invoke<void>("claude_login_cancel"),
 };
 
 // ──────────────────────────────────────────────────────────────
 // 环境医生 module — 新用户「环境监测 + 配置安装」(claude / pwsh / PATH)
 // ──────────────────────────────────────────────────────────────
 export interface ToolStatus {
-  key: "claude" | "pwsh" | "node" | "npm";
+  key: "claude" | "pwsh" | "node" | "npm" | "uv" | "python";
   name: string;
   found: boolean;
   version: string | null;
@@ -1428,6 +1658,10 @@ export interface EnvReport {
   pwsh: ToolStatus;
   node: ToolStatus;
   npm: ToolStatus;
+  /** uv —— Python 脚本运行时的统一托管者 (脚本执行公约依赖它) */
+  uv: ToolStatus;
+  /** 系统 Python —— 仅信息展示 (脚本由 uv 按需托管, found=false 多半是只剩 Store 占位符) */
+  python: ToolStatus;
   claudeDir: string | null;
   claudeDirOnUserPath: boolean;
   /** 是否有 claude 可用的 shell (真身 PowerShell 7 / Git Bash)；false ⇒ 对话会报缺 shell */
@@ -1456,6 +1690,13 @@ export interface ClaudeUpdateInfo {
   checked: boolean;
   message: string;
 }
+/** uv 缓存占用信息 */
+export interface UvCacheInfo {
+  available: boolean;
+  dir: string | null;
+  bytes: number;
+  human: string;
+}
 
 export const envDoctor = {
   check: () => invoke<EnvReport>("env_check"),
@@ -1466,6 +1707,12 @@ export const envDoctor = {
   /** 安装 Node.js LTS (winget) —— npm 安装方式的前置依赖 */
   installNode: () => invoke<string>("env_install_node"),
   installPwsh: () => invoke<string>("env_install_pwsh"),
+  /** 安装 uv —— Python 脚本运行时托管者 (装到 ~/.local/bin, 流式日志同安装) */
+  installUv: () => invoke<string>("env_install_uv"),
+  /** uv 缓存占用 (展示 + 决定是否提示清理) */
+  uvCacheInfo: () => invoke<UvCacheInfo>("env_uv_cache_info"),
+  /** 清理 uv 缓存 (`uv cache clean`) */
+  uvCacheClean: () => invoke<string>("env_uv_cache_clean"),
   /** 检测 Claude Code 是否有新版本 (当前版本 vs npmmirror latest) */
   checkClaudeUpdate: () => invoke<ClaudeUpdateInfo>("env_claude_update_check"),
   /** 更新 Claude Code 到最新版 (走国内 npmmirror)，流式日志同安装 */
@@ -1723,13 +1970,16 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       return undefined;
     case "persona_list":
       return [
-        { id: "stock-expert", name: "股票助手", icon: "📈", description: "A 股深度分析 / 公告监控 / 行情查询。", kbScope: "raw/股票", body: "(browser stub)" },
-        { id: "content-writer", name: "内容创作", icon: "✍️", description: "公众号/自媒体写手：选题、撰写、5 种风格。", kbScope: "raw/创作", body: "(browser stub)" },
-        { id: "lesson-planner", name: "备课出卷", icon: "📚", description: "K12 教案/试卷/答案解析。", kbScope: "raw/教学", body: "(browser stub)" },
-        { id: "content-summarizer", name: "内容总结", icon: "📋", description: "网页/文档/会议纪要结构化摘要。", kbScope: "", body: "(browser stub)" },
-        { id: "health-interpreter", name: "医疗健康解读", icon: "🏥", description: "体检报告/化验单通俗解读。", kbScope: "raw/健康", body: "(browser stub)" },
-        { id: "pet-care", name: "萌宠管家", icon: "🐾", description: "猫狗行为/健康/营养。", kbScope: "raw/萌宠", body: "(browser stub)" },
-        { id: "mao", name: "毛主席", icon: "☭", description: "毛选式客观分析。", kbScope: "raw/毛主席", body: "(browser stub)" },
+        { id: "stock-expert", name: "股票助手", icon: "📈", description: "A 股深度分析 / 公告监控 / 行情查询。", kbScope: "raw/股票", body: "(browser stub)", kind: "single" },
+        { id: "content-writer", name: "内容创作", icon: "✍️", description: "公众号/自媒体写手：选题、撰写、5 种风格。", kbScope: "raw/创作", body: "(browser stub)", kind: "single" },
+        { id: "lesson-planner", name: "备课出卷", icon: "📚", description: "K12 教案/试卷/答案解析。", kbScope: "raw/教学", body: "(browser stub)", kind: "single" },
+        { id: "content-summarizer", name: "内容总结", icon: "📋", description: "网页/文档/会议纪要结构化摘要。", kbScope: "", body: "(browser stub)", kind: "single" },
+        { id: "health-interpreter", name: "医疗健康解读", icon: "🏥", description: "体检报告/化验单通俗解读。", kbScope: "raw/健康", body: "(browser stub)", kind: "single" },
+        { id: "pet-care", name: "萌宠管家", icon: "🐾", description: "猫狗行为/健康/营养。", kbScope: "raw/萌宠", body: "(browser stub)", kind: "single" },
+        { id: "mao", name: "毛主席", icon: "☭", description: "毛选式客观分析。", kbScope: "raw/毛主席", body: "(browser stub)", kind: "single" },
+        { id: "team-general", name: "全能专家团", icon: "🧭", description: "战略师领衔，按情况临时组阵；默认单 agent。", kbScope: "", body: "(browser stub)", kind: "team" },
+        { id: "team-creative", name: "创作专家团", icon: "🎨", description: "成品要美、动人、能交付。", kbScope: "raw/创作", body: "(browser stub)", kind: "team" },
+        { id: "team-research", name: "研究专家团", icon: "🔬", description: "多源检索×对抗校验×收口。", kbScope: "", body: "(browser stub)", kind: "team" },
       ];
     case "provider_list": {
       const mk = (id: string, name: string, baseUrl: string, category: string, color: string, kind: string, hasKey: boolean, authToken = "") => ({
@@ -1764,6 +2014,7 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       return { installed: false, loggedIn: false, authPath: "(browser-only)" };
     case "codex_start_login":
       return {
+        mode: "device",
         deviceCode: "stub-device",
         userCode: "WXYZ-1234",
         verificationUri: "https://auth.openai.com/codex/device",
@@ -1772,6 +2023,23 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       };
     case "codex_poll_login":
       return { status: "ok" };
+    case "codex_login_poll":
+    case "claude_login_poll":
+      return { status: "idle", message: "" };
+    case "codex_login_cancel":
+    case "claude_login_cancel":
+      return undefined;
+    case "claude_oauth_status":
+      return { loggedIn: false, credPath: "(browser-only)" };
+    case "claude_start_login":
+      return {
+        mode: "manual",
+        authorizeUrl: "https://claude.ai/oauth/authorize?code=true",
+        verifier: "stub-verifier",
+        state: "stub-state",
+      };
+    case "claude_finish_login":
+      return { loggedIn: true, credPath: "(browser stub) ~/.claude/.credentials.json" };
     case "codex_proxy_info":
       return { running: false, port: 0, lastError: "" };
     case "env_check": {
@@ -1791,12 +2059,18 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         pwsh: tool("pwsh", "PowerShell 7", false),
         node: tool("node", "Node.js", true),
         npm: tool("npm", "npm", true),
+        uv: tool("uv", "uv", false),
+        python: tool("python", "Python", false),
         claudeDir: null,
         claudeDirOnUserPath: true,
         shellReady: false,
         ready: false,
       };
     }
+    case "env_uv_cache_info":
+      return { available: false, dir: null, bytes: 0, human: "0 B" };
+    case "env_uv_cache_clean":
+      return "浏览器预览模式无法清理 uv 缓存。";
     case "env_fix_path":
       return {
         ok: false,
@@ -1807,6 +2081,7 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
     case "env_install_claude":
     case "env_install_node":
     case "env_install_pwsh":
+    case "env_install_uv":
     case "env_update_claude":
       return "env-stub-req";
     case "env_claude_update_check":

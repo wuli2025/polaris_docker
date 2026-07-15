@@ -15,6 +15,7 @@ import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+// ★ DOCKER 分叉起点:以下整套「容器自更新」在主仓不存在,同步主仓时必须整体保住。
 import { isTauri, authHeaders } from "../tauri";
 
 // 后端 updater.rs 的 UpdaterState（serde tag = "status"）。
@@ -29,7 +30,7 @@ type UpdaterState =
   | { status: "installing"; version: string }
   | { status: "error"; message: string };
 
-// /api/version 响应（容器模式独享;桌面模式 fallback 用 getVersion()）。
+// ★ DOCKER 分叉:/api/version 响应（容器模式独享;桌面模式 fallback 用 getVersion()）。
 interface VersionInfo {
   version: string;
   flavor: "docker" | "desktop";
@@ -61,7 +62,7 @@ const state = ref<UpdaterState>({ status: "idle" });
 export const currentVersion = ref<string>(""); // 当前已安装版本（前端取）
 export const lastCheckedAt = ref<number | null>(null); // 上次检查时间戳(ms)
 export const dialogDismissed = ref(false); // 中央对话框「以后再说」—— 纯前端态
-// 容器模式额外位:
+// ★ DOCKER 分叉:容器模式额外位
 export const isDockerMode = ref<boolean>(!isTauri); // 容器/浏览器预览 = true;桌面 Tauri = false
 export const dockerUpdaterEnabled = ref<boolean>(false); // POLARIS_DOCKER_SOCKET=1 && socket 已挂
 export const dockerStatus = ref<DockerStatus | null>(null); // 最近一次 docker_status 响应
@@ -95,9 +96,13 @@ export const checkFailed = computed(() => state.value.status === "error");
 let subscribed = false;
 let autoChecked = false;
 
+// ★ DOCKER 分叉:容器里没有 Tauri IPC,版本号只能从后端 /api/version 读。
 async function fetchDockerVersion(): Promise<VersionInfo | null> {
   try {
-    const r = await fetch("/api/version", { cache: "no-store" });
+    const r = await fetch("/api/version", {
+      cache: "no-store",
+      headers: { ...authHeaders() },
+    });
     if (!r.ok) return null;
     return (await r.json()) as VersionInfo;
   } catch {
@@ -107,19 +112,19 @@ async function fetchDockerVersion(): Promise<VersionInfo | null> {
 
 async function ensureCurrentVersion(): Promise<void> {
   if (currentVersion.value) return;
+  // ★ DOCKER 分叉:容器模式走 /api/version（否则页面显示 v—）
   if (isDockerMode.value) {
-    // 容器模式：去 /api/version 拉真实版本（之前页面显示 v— 的根因）
     const info = await fetchDockerVersion();
     if (info) {
       currentVersion.value = info.version;
       dockerUpdaterEnabled.value = !!info.updater_enabled && !!info.socket_present;
     }
-  } else {
-    try {
-      currentVersion.value = await getVersion();
-    } catch {
-      /* 浏览器预览态拿不到，忽略 */
-    }
+    return;
+  }
+  try {
+    currentVersion.value = await getVersion();
+  } catch {
+    /* 非 Tauri 运行时（纯浏览器预览）拿不到，忽略 */
   }
 }
 
@@ -139,17 +144,35 @@ async function ensureSubscribed(): Promise<void> {
   }
 }
 
-/** 启动时调用一次：订阅 + 触发一次后端检查（失败由状态机记为 error，不弹中央对话框）。 */
+/**
+ * 启动时调用一次：订阅 + 触发后端检查，发现新版即由 UpdateBanner 自动弹出。
+ *
+ * **冷启动重试**：开机那一刻网络常还没就绪 → 首次检查直接失败(error)，中央弹窗就不弹了，
+ * 用户只能手动去「更新」页才看到。这里改成「渐进退避重试」——只要还没拿到确定结论
+ * （发现新版 / 已最新），就隔几秒再试，直到网络恢复，保证「点开 app 就会弹」。
+ */
 export async function checkForUpdate(): Promise<void> {
   if (autoChecked) return;
   autoChecked = true;
   await ensureCurrentVersion();
+  // ★ DOCKER 分叉:容器里没有桌面 updater 状态机(updater_check 是 Tauri IPC,必失败)。
+  //   不早返回的话下面的退避循环会白等 5+4+12+30s 重试四次。容器更新走 dockerCheck()。
+  if (isDockerMode.value) return;
   await ensureSubscribed();
-  try {
-    await invoke("updater_check");
-    lastCheckedAt.value = Date.now();
-  } catch (e) {
-    console.warn("[updater] auto check failed:", e);
+  // 首查错峰推迟 5s（避开首帧 IPC 突发——启动检查更新不抢开屏后的第一波命令），
+  // 随后 4s/12s/30s 退避重试（覆盖冷启动到网络就绪的常见窗口）。
+  const delays = [5000, 4000, 12000, 30000];
+  for (const wait of delays) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    try {
+      const st = await invoke<UpdaterState>("updater_check");
+      lastCheckedAt.value = Date.now();
+      // 已有确定结论(available=有更新会触发弹窗 / up-to-date=已最新)即收手；
+      // 仅「检查失败」才继续退避重试。downloading/installing 也视为已在推进、收手。
+      if (st.status !== "error") return;
+    } catch (e) {
+      console.warn("[updater] auto check failed, will retry:", e);
+    }
   }
 }
 
@@ -177,7 +200,7 @@ export async function applyUpdate(): Promise<void> {
   }
 }
 
-// ── Docker 版独有动作 ───────────────────────────────────────────
+// ── ★ DOCKER 分叉:容器版独有动作(主仓无此段,同步时整体保住)───────────────
 
 /** 容器模式：「检查更新」按钮——调 /api/invoke docker_status,返回 updater_enabled + socket_present。 */
 export async function dockerCheck(): Promise<void> {

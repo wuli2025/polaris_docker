@@ -1,7 +1,19 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from "vue";
+import { onMounted, onBeforeUnmount, ref, watch } from "vue";
 
 const emit = defineEmits<{ (e: "done"): void }>();
+// 父级（App）在应用外壳挂载就绪后把它置 true → 开屏「就绪即放行」，
+// 不再无条件硬等固定时长。仍尊重下面的最短展示时间，避免一闪而过。
+const props = defineProps<{ ready?: boolean }>();
+
+// 开屏本是纯装饰门（真正的重活——扫盘/建库/PATH 预热——早已在后台线程，不被它挡）。
+// 旧版写死 3200ms 硬等，是所有机器都能感知的「开机卡顿」。改为：
+//   · 最短 MIN_MS 防止入场动画一闪而过（也给诗句一个照面）；
+//   · 一旦父级 ready 且过了最短时间即放行；
+//   · CAP_MS 作上限兜底（ready 信号万一没来也不会卡）。
+const MIN_MS = 900;
+const CAP_MS = 1800;
+const mountedAt = Date.now();
 
 // 三层星点：远(暗小) / 中 / 近(亮大)，box-shadow 铺满视口，营造星河纵深
 function genStars(count: number, maxOpacity: number): string {
@@ -21,7 +33,8 @@ const farStars = ref(genStars(140, 0.55));
 const midStars = ref(genStars(70, 0.8));
 const nearStars = ref(genStars(28, 1));
 
-let timer: number | undefined;
+let capTimer: number | undefined;
+let minTimer: number | undefined;
 let finished = false;
 
 function finish() {
@@ -30,18 +43,34 @@ function finish() {
   emit("done");
 }
 
+/** 就绪且已过最短展示时间才放行；否则等最短时间到点再判一次。 */
+function maybeFinish() {
+  if (finished) return;
+  const elapsed = Date.now() - mountedAt;
+  if (props.ready && elapsed >= MIN_MS) finish();
+}
+
 function onKey() {
   finish();
 }
 
+// 父级 ready 翻转时尝试放行（通常最短时间一到就走）。
+watch(
+  () => props.ready,
+  () => maybeFinish()
+);
+
 onMounted(() => {
-  // 留足时间走完渐入动画 + 停顿，再交给父级淡出
-  timer = window.setTimeout(finish, 3200);
+  // 最短时间到点后再判一次（此刻 ready 多半已 true → 立即走）。
+  minTimer = window.setTimeout(maybeFinish, MIN_MS);
+  // 上限兜底：ready 信号异常缺失也不至于卡在开屏。
+  capTimer = window.setTimeout(finish, CAP_MS);
   window.addEventListener("keydown", onKey);
 });
 
 onBeforeUnmount(() => {
-  if (timer) window.clearTimeout(timer);
+  if (capTimer) window.clearTimeout(capTimer);
+  if (minTimer) window.clearTimeout(minTimer);
   window.removeEventListener("keydown", onKey);
 });
 </script>
@@ -252,13 +281,13 @@ onBeforeUnmount(() => {
 .line.l1 {
   font-size: 21px;
   line-height: 2;
-  animation: verseIn 1.4s cubic-bezier(0.2, 0.7, 0.2, 1) 0.7s forwards;
+  animation: verseIn 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) 0.28s forwards;
 }
 .line.l2 {
   font-size: 18px;
   color: #c8d4e6;
   margin-top: 6px;
-  animation: verseIn 1.4s cubic-bezier(0.2, 0.7, 0.2, 1) 1.25s forwards;
+  animation: verseIn 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) 0.5s forwards;
 }
 @keyframes verseIn {
   from { opacity: 0; transform: translateY(10px); }
@@ -274,7 +303,7 @@ onBeforeUnmount(() => {
   text-indent: 0.5em;
   color: rgba(168, 188, 218, 0.7);
   opacity: 0;
-  animation: verseIn 1.4s ease 1.9s forwards;
+  animation: verseIn 0.7s ease 0.72s forwards;
 }
 .hint {
   position: absolute;
@@ -284,6 +313,6 @@ onBeforeUnmount(() => {
   text-indent: 0.25em;
   color: rgba(140, 160, 190, 0.4);
   opacity: 0;
-  animation: verseIn 1.2s ease 2.6s forwards;
+  animation: verseIn 0.6s ease 0.95s forwards;
 }
 </style>

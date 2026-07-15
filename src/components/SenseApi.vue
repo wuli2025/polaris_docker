@@ -152,6 +152,7 @@ async function refresh() {
     loadErr.value = String(e);
   }
   loadClusterModel();
+  loadLocalEmbed();
 }
 
 // ── AI 归类模型(可选,独立于对话供应商;不配=用主对话 API)──
@@ -252,17 +253,59 @@ async function cancelFable() {
   }
 }
 
-async function runSearch() {
+async function runSearch(ai = false) {
   const q = searchQ.value.trim();
   if (!q || searchBusy.value) return;
   searchBusy.value = true;
   fableErr.value = "";
   try {
-    searchRes.value = await invoke<FableSearchResult>("fable_search", { query: q });
+    searchRes.value = ai
+      ? await invoke<FableSearchResult>("fable_search_ai", { query: q })
+      : await invoke<FableSearchResult>("fable_search", { query: q });
   } catch (e) {
     fableErr.value = String(e);
   } finally {
     searchBusy.value = false;
+  }
+}
+
+// ── 本地嵌入引擎(提速:绕开云 API 限速,治「35/秒、61.9 万要 6-28h」)──
+interface LocalEmbedStatus {
+  compiled: boolean;
+  ready: boolean;
+  enabled: boolean;
+  dir: string;
+}
+const localEmbed = ref<LocalEmbedStatus | null>(null);
+const leMsg = ref("");
+const leBusy = ref(false);
+async function loadLocalEmbed() {
+  try {
+    localEmbed.value = await invoke<LocalEmbedStatus>("fable_local_embed_status");
+  } catch {
+    /* 浏览器/降级模式忽略 */
+  }
+}
+async function downloadLocalEmbed() {
+  if (leBusy.value) return;
+  leBusy.value = true;
+  leMsg.value = "正在准备下载…";
+  try {
+    await invoke("fable_local_embed_download");
+  } catch (e: any) {
+    leMsg.value = `下载失败:${e?.message ?? e}`;
+    leBusy.value = false;
+  }
+}
+async function toggleLocalEmbed(on: boolean) {
+  try {
+    localEmbed.value = await invoke<LocalEmbedStatus>("fable_local_embed_set_enabled", { on });
+    leMsg.value = on
+      ? "已启用本地嵌入:之后的检索/建索引走本地,不再受云限速"
+      : "已切回云 API 嵌入";
+  } catch (e: any) {
+    leMsg.value = `${e?.message ?? e}`;
+    void loadLocalEmbed();
   }
 }
 
@@ -301,6 +344,20 @@ onMounted(async () => {
   watch(
     () => [tasks.doneTick.inventory, tasks.doneTick.index],
     () => void refresh(),
+  );
+  unlisteners.push(
+    await listen<{ kind: string; message?: string }>("fable:localembed", (p) => {
+      if (p.kind === "phase") {
+        leMsg.value = p.message ?? "下载中…";
+      } else if (p.kind === "done") {
+        leMsg.value = p.message ?? "本地模型已就位";
+        leBusy.value = false;
+        void loadLocalEmbed();
+      } else if (p.kind === "error") {
+        leMsg.value = `下载失败:${p.message ?? ""}`;
+        leBusy.value = false;
+      }
+    })
   );
   unlisteners.push(
     await listen<{ kind: string; text?: string; episodes?: number }>("echo:dream", (p) => {
@@ -573,6 +630,56 @@ function statusDot(p: SenseProviderView): string {
       </div>
     </section>
 
+    <!-- 本地嵌入引擎(提速:绕开云 API 限速) -->
+    <section v-if="localEmbed" class="group">
+      <div class="g-head">
+        <h2>嵌入 · 本地引擎(提速)</h2>
+        <span class="g-desc">下载本地 BGE-M3 后,建索引/检索不走云、不受限速 —— 治「35/秒、几十万份要十几小时」</span>
+      </div>
+      <div class="echo-card">
+        <!-- 本构建未编入引擎(如带语音的 Windows 桌面版):如实说明 + 指路 -->
+        <template v-if="!localEmbed.compiled">
+          <div class="le-row">
+            <span class="badge local">本地</span>
+            <span class="muted-txt">
+              此版本未内置本地嵌入引擎(桌面语音引擎与它互斥)。本地提速请用
+              <b>Docker / NAS 版</b>(那里这颗按钮即下即用),或用 <code>--features local-embed</code> 构建的桌面版。
+            </span>
+          </div>
+        </template>
+        <!-- 已编入:下载 / 启用 -->
+        <template v-else>
+          <div class="le-row">
+            <span class="le-stat">
+              引擎:<b class="ok-txt">已内置</b>
+              · 模型:<b :class="localEmbed.ready ? 'ok-txt' : 'muted-txt'">{{ localEmbed.ready ? "已就位" : "未下载(约 1.2GB)" }}</b>
+              · 状态:<b :class="localEmbed.enabled ? 'ok-txt' : 'muted-txt'">{{ localEmbed.enabled ? "已启用(走本地)" : "未启用(走云)" }}</b>
+            </span>
+          </div>
+          <div class="le-row" style="margin-top: 10px">
+            <button
+              v-if="!localEmbed.ready"
+              class="btn sm primary"
+              :disabled="leBusy"
+              @click="downloadLocalEmbed"
+            >
+              {{ leBusy ? "下载中…" : "下载本地引擎" }}
+            </button>
+            <label v-if="localEmbed.ready" class="sw">
+              <input
+                type="checkbox"
+                :checked="localEmbed.enabled"
+                @change="toggleLocalEmbed(($event.target as HTMLInputElement).checked)"
+              />
+              启用本地嵌入(重启仍生效)
+            </label>
+            <span class="muted-txt" v-if="localEmbed.dir" :title="localEmbed.dir">模型目录:{{ localEmbed.dir }}</span>
+          </div>
+        </template>
+        <div v-if="leMsg" class="dream-line" style="margin-top: 8px">{{ leMsg }}</div>
+      </div>
+    </section>
+
     <!-- 检索枢纽 · 神经层 -->
     <section v-if="fable" class="group">
       <div class="g-head">
@@ -620,16 +727,25 @@ function statusDot(p: SenseProviderView): string {
             v-model="searchQ"
             class="fable-in"
             placeholder="测一下混合检索(grep ∥ 向量并行)…"
-            @keydown.enter="runSearch"
+            @keydown.enter="runSearch()"
           />
-          <button class="btn sm" :disabled="searchBusy || !searchQ.trim()" @click="runSearch">
+          <button class="btn sm" :disabled="searchBusy || !searchQ.trim()" @click="runSearch()">
             {{ searchBusy ? "检索中…" : "检索" }}
+          </button>
+          <button
+            class="btn sm"
+            :disabled="searchBusy || !searchQ.trim()"
+            title="AI 深度检索:让 AI 把查询多路扩写后并行召回再融合,提升模糊/关键词查询的召回与精度(数秒级)"
+            @click="runSearch(true)"
+          >
+            {{ searchBusy ? "…" : "✨ AI 深度" }}
           </button>
         </div>
         <div v-if="searchRes" class="fable-results">
           <div class="muted-txt" style="margin-bottom: 6px">
             {{ searchRes.ms }}ms · grep {{ searchRes.grep_hits }} 命中 · 向量 {{ searchRes.vector_hits }} 命中
             <template v-if="searchRes.reranked"> · 已重排</template>
+            <template v-if="searchRes.mode && searchRes.mode.startsWith('ai')"> · {{ searchRes.mode }}</template>
             <template v-if="searchRes.grep_truncated"> · grep 预算截断</template>
           </div>
           <div v-for="(h, i) in searchRes.hits" :key="i" class="fable-hit">
@@ -1100,6 +1216,23 @@ function statusDot(p: SenseProviderView): string {
 .btn.primary {
   border-color: var(--primary);
   color: var(--primary);
+}
+
+/* 本地嵌入引擎卡 */
+.le-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.le-stat {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.le-stat b {
+  margin: 0 2px;
 }
 
 /* 回声层 */

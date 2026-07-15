@@ -52,8 +52,8 @@ pub trait FxFrameSink: Send {
     async fn finish(self: Box<Self>) -> Result<Vec<u8>>;
 }
 
-pub mod encoder;
-pub mod muxer;
 pub mod audio;
-pub mod loudness;
+pub mod encoder;
 pub mod ffmpeg_fallback;
+pub mod loudness;
+pub mod muxer;

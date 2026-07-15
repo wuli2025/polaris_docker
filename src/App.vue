@@ -11,7 +11,6 @@ import {
 import Sidebar from "./components/Sidebar.vue";
 import ViewLoader from "./components/ViewLoader.vue";
 import RightDrawer from "./components/RightDrawer.vue";
-import ChatPanel from "./components/ChatPanel.vue";
 import SplashScreen from "./components/SplashScreen.vue";
 import Onboarding from "./components/Onboarding.vue";
 import EnvDoctor from "./components/EnvDoctor.vue"; // 既是视图也是启动 env 网关，留静态
@@ -25,10 +24,16 @@ import { useHotkeys } from "./composables/useHotkeys";
 import { installMarkdownDelegation } from "./lib/markdown";
 import { openUrl, onWsStatus, isTauri, files as fc } from "./tauri";
 import { toast } from "./composables/useToast";
+import { isLowSpec } from "./composables/useLowSpec";
 // ── 重 / 非首屏视图：懒加载，切到对应视图时才拉各自 chunk ──
 // 把 cytoscape(图谱) + 4 套工坊 + 各面板/弹层(合计上万行)从启动主包挪走 → 开窗快、首屏不卡。
 // KnowledgeGraph / SandboxStatus / 四工坊都有 defineOptions({name})，懒加载后 KeepAlive 仍按 name 缓存；
 // 其首次挂载本就被 ViewLoader 加载条盖住，chunk 拉取(本地 ms 级)一并被遮。
+// ChatPanel 也懒加载:它是最大的单体组件树(~142KB),静态导入会整棵进启动主包、
+// 首帧就要解析。异步化后主包先画出外壳,ChatPanel chunk 在 SplashScreen 的
+// 最短展示窗(MIN_MS=900ms,本地 chunk 拉取 ms 级)内加载完成,不会露出白屏帧。
+// 流式事件监听在 chatStore(app 级)注册,不依赖 ChatPanel 挂载时序。
+const ChatPanel = defineAsyncComponent(() => import("./components/ChatPanel.vue"));
 const KnowledgeGraph = defineAsyncComponent(() => import("./components/KnowledgeGraph.vue"));
 const SandboxStatus = defineAsyncComponent(() => import("./features/sandbox/components/SandboxStatus.vue"));
 const WikiBrowse = defineAsyncComponent(() => import("./components/WikiBrowse.vue"));
@@ -50,6 +55,9 @@ const VideoCourseStudio = defineAsyncComponent(() => import("./components/VideoC
 const MediaOps = defineAsyncComponent(() => import("./components/MediaOps.vue"));
 const DeckStudio = defineAsyncComponent(() => import("./components/DeckStudio.vue"));
 const WebStudio = defineAsyncComponent(() => import("./components/WebStudio.vue"));
+const CollabView = defineAsyncComponent(() => import("./features/collab/CollabView.vue"));
+const ProjectHome = defineAsyncComponent(() => import("./features/collab/ProjectHome.vue"));
+const InterconnectView = defineAsyncComponent(() => import("./features/interconnect/InterconnectView.vue"));
 // 「让 AI 更懂你」向导常驻 App 级:首次打开才拉 chunk,之后保持挂载 → 扫描/归类跑着时
 // 用户可转后台、切视图、最小化窗口都不丢进度(组件不卸载,事件监听与状态都还在)。
 const OnboardingWizard = defineAsyncComponent(() => import("./components/OnboardingWizard.vue"));
@@ -62,6 +70,7 @@ import { useWorkflowsStore } from "./stores/workflows";
 import { useAutomationStore } from "./stores/automation";
 import { useWizardStore } from "./stores/wizard";
 import { useFileTasksStore } from "./stores/fileTasks";
+import { useProjectsStore } from "./stores/projects";
 
 const app = useAppStore();
 const artifacts = useArtifactsStore();
@@ -71,6 +80,7 @@ const workflows = useWorkflowsStore();
 const automation = useAutomationStore();
 const wiz = useWizardStore();
 const tasks = useFileTasksStore();
+const projectsStore = useProjectsStore();
 // 首次打开向导后就保持挂载(不再卸载),让后台扫描/归类跨视图、跨最小化持续推进。
 const wizMounted = ref(false);
 watch(
@@ -154,6 +164,11 @@ let unWsStatus: (() => void) | null = null;
 // trimMemory 只回收陈旧、非发送中的对话,纯回收无副作用。
 let trimTimer: number | undefined;
 onMounted(() => {
+  // 低配机(内存小/核少/已开减少动效)标记:CSS 据 [data-lowspec] 停掉极光漂移等
+  // 装饰动画,把 GPU/CPU 留给正事。navigator 探测,零后端往返。
+  if (isLowSpec) document.documentElement.setAttribute("data-lowspec", "1");
+  // 开屏就绪信号:外壳已挂载、首帧可交互 → 允许开屏在最短展示时间后即淡出。
+  splashReady.value = true;
   chatStore.init();
   // 文件中心长任务(盘点/建索引/智能归类/AI 整理名称)的全局事件监听:App 级注册一次,
   // 脱离任何视图生命周期 → 在文件中心点了任务后切走/关掉该视图,进度照常推进、回来即见,
@@ -250,6 +265,10 @@ const phase = ref<"splash" | "onboarding" | "env" | "ready">("splash");
 // 老用户(已 onboarded)走 splash→env→ready,routeFcWizard 始终 false,不打扰、不改落地视图。
 const routeFcWizard = ref(false);
 
+// 开屏「就绪即放行」信号：外壳挂载完成即置 true（真正的重活都在后台线程，
+// 首帧已可交互）→ 开屏只在防闪的最短展示时间后即淡出，不再硬等固定时长。
+const splashReady = ref(false);
+
 function onSplashDone() {
   const done = localStorage.getItem(ONBOARDED_KEY);
   phase.value = done ? "env" : "onboarding";
@@ -270,10 +289,19 @@ function onEnvDone() {
   checkForUpdate();
 }
 
-// 预览成品文件时把右侧抽屉拓宽；展开模式更宽，让观看更好看
+// 预览成品文件时把右侧抽屉拓宽；展开模式更宽，让观看更好看。
+// 用户在收缩条上拖过的宽度（drawerWidths）优先于自适应默认档位。
 const drawerTrack = computed(() => {
+  const w = app.drawerWidths;
   if (artifacts.current) {
-    return artifacts.expanded ? "min(1040px, 72vw)" : "clamp(400px, 36vw, 560px)";
+    if (artifacts.expanded) {
+      return w.expand ? `min(${w.expand}px, 92vw)` : "min(1040px, 72vw)";
+    }
+    return w.preview ? `min(${w.preview}px, 80vw)` : "clamp(400px, 36vw, 560px)";
+  }
+  // 运行中的项目预览（内嵌应用）同样需要宽面板，别挤在 300px 里
+  if (projectsStore.activeRoot) {
+    return w.preview ? `min(${w.preview}px, 80vw)` : "clamp(400px, 36vw, 560px)";
   }
   return `${app.drawerWidth}px`;
 });
@@ -314,7 +342,7 @@ function startSbDrag(e: MouseEvent) {
 </script>
 
 <template>
-  <div class="shell" :class="{ 'sb-drag': sbDragging }" :style="{ gridTemplateColumns: layoutCols }">
+  <div class="shell" :class="{ 'sb-drag': sbDragging || app.drawerResizing }" :style="{ gridTemplateColumns: layoutCols }">
     <!-- 极光琉璃画框主题：虚幻极光 + 颗粒背景层（fixed，居于全部内容之下，
          内容面板不透明遮住中央 → 极光只在画框带透出；浅/深两版共用） -->
     <template v-if="app.theme === 'aurora-light' || app.theme === 'aurora-dark'">
@@ -367,6 +395,9 @@ function startSbDrag(e: MouseEvent) {
         <MediaOps v-else-if="mountedView === 'media_ops'" />
         <DeckStudio v-else-if="mountedView === 'deck'" />
         <WebStudio v-else-if="mountedView === 'web_studio'" />
+        <CollabView v-else-if="mountedView === 'collab'" />
+        <InterconnectView v-else-if="mountedView === 'interconnect'" />
+        <ProjectHome v-else-if="mountedView === 'collab_project'" />
       </KeepAlive>
       </FaultBoundary>
 
@@ -412,7 +443,7 @@ function startSbDrag(e: MouseEvent) {
 
     <!-- 启动流程覆盖层：splash → onboarding -->
     <Transition name="splash-fade">
-      <SplashScreen v-if="phase === 'splash'" @done="onSplashDone" />
+      <SplashScreen v-if="phase === 'splash'" :ready="splashReady" @done="onSplashDone" />
     </Transition>
     <Transition name="onboard-fade">
       <Onboarding v-if="phase === 'onboarding'" @done="onOnboardingDone" />

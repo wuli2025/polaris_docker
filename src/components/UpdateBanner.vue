@@ -2,6 +2,7 @@
 // 豆包式「发现新版本」中央轻薄对话框：启动自动检测到新版后浮现，
 // 点「立即更新」后台下载安装并自动重启；「以后再说」仅关本弹窗（板块仍可更新）。
 import { Sparkles, X, LoaderCircle } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import {
   updateVersion,
   updateNotes,
@@ -47,11 +48,9 @@ import {
           </div>
 
           <button class="upd-go" :disabled="updating" @click="applyUpdate">
-            <LoaderCircle
+            <OrbitSpinner
               v-if="updating"
               :size="15"
-              :stroke-width="2"
-              class="spin"
             />
             <span>{{ updating ? `更新中 ${updateProgress}%` : "立即更新" }}</span>
           </button>

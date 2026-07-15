@@ -16,6 +16,7 @@
  */
 import { computed, ref, watch } from "vue";
 import { LoaderCircle, ChevronDown, Activity, Sparkles, X } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import { useFileTasksStore } from "../stores/fileTasks";
 import { useKbStore } from "../stores/kb";
 import { useChatStore } from "../stores/chat";
@@ -157,7 +158,7 @@ function stop(r: Row) {
       </div>
       <!-- 收起态:只显示一行最紧凑的胶囊(数量 + 第一个任务名) -->
       <div v-show="!expanded" class="tc-mini" @click="expanded = true">
-        <LoaderCircle :size="13" class="tc-spin" />
+        <OrbitSpinner :size="13" />
         <span>{{ rows[0]?.label }}{{ count > 1 ? ` 等 ${count} 项` : "" }}</span>
       </div>
     </div>

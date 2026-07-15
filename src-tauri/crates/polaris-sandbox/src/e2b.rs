@@ -83,7 +83,9 @@ pub fn cube_config_set(config: CubeConfig) -> Result<CubeConfig, String> {
 }
 
 /// 探测 CubeSandbox(E2B) 端点是否可达（curl，超时 6s）。
-#[tauri::command]
+/// `command(async)`：curl 最长阻塞 6s，同步命令默认跑主线程会冻 UI；标 async 让 tauri
+/// 调度到独立线程，fn 本体保持同步签名零改动。
+#[tauri::command(async)]
 pub fn cube_status() -> CubeStatus {
     let cfg = load_config();
     let configured = !cfg.endpoint.trim().is_empty();
@@ -107,23 +109,46 @@ pub fn cube_status() -> CubeStatus {
         "-w".into(),
         "%{http_code}".into(),
     ];
+    // 鉴权头**不进命令行参数**——命令行对本机进程列表全员可见,等于把 key 广播出去。
+    // 改写进临时文件走 curl 的 `-H @file`(7.55+ 支持,Win10 内置 curl 满足),用完即删。
+    let mut hdr_tmp: Option<PathBuf> = None;
     if !cfg.api_key.trim().is_empty() {
-        args.push("-H".into());
-        args.push(format!("X-API-Key: {}", cfg.api_key.trim()));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("polaris_cube_hdr_{}_{ts}", std::process::id()));
+        // 写失败就不带鉴权头裸探连通性(本探测本就不强求 2xx),绝不回退拼进命令行。
+        if std::fs::write(&p, format!("X-API-Key: {}\n", cfg.api_key.trim())).is_ok() {
+            args.push("-H".into());
+            args.push(format!("@{}", p.to_string_lossy()));
+            hdr_tmp = Some(p);
+        }
     }
     args.push(cfg.endpoint.trim().to_string());
 
     let out = Command::new("curl").args(&args).output();
+    // 无论探测成败,临时头文件用完即删,不留 key 落盘残迹。
+    if let Some(p) = hdr_tmp.take() {
+        let _ = std::fs::remove_file(p);
+    }
     let (reachable, note) = match out {
         Ok(o) => {
             let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if o.status.success() && code != "000" && !code.is_empty() {
                 (true, format!("端点可达 (HTTP {}).", code))
             } else {
-                (false, "端点无响应 (curl 未拿到状态码)。检查 URL / 网络 / CubeSandbox 是否在运行。".into())
+                (
+                    false,
+                    "端点无响应 (curl 未拿到状态码)。检查 URL / 网络 / CubeSandbox 是否在运行。"
+                        .into(),
+                )
             }
         }
-        Err(e) => (false, format!("curl 调用失败: {}。Windows 10+ 自带 curl。", e)),
+        Err(e) => (
+            false,
+            format!("curl 调用失败: {}。Windows 10+ 自带 curl。", e),
+        ),
     };
 
     CubeStatus {

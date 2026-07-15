@@ -39,9 +39,10 @@ description: 微信公众号「全链路运营」技能。从选题→成稿→�
    - 把正文写成**纯语义标签、零内联样式**的 HTML 片段：`<h2>/<h3>/<p>/<strong>/<blockquote>/<hr>/<ul>/<li>/<img>`。
    - **不要**写 `style=`/`class=`/`<style>`/外链 CSS——这些会被壹伴引擎接管或被公众号清洗。
    - 图片处用 `<img src="本地绝对路径">` 占位（公众号图片需到后台素材库重传）。
-3. **壹伴排版 + 投递草稿**（若用户选了壹伴排版优化 / CloakBrowser）：调「壹伴排版优化」技能——
-   - 先预览：`python ~/Polaris/skills/wechat-md-typesetter/scripts/wechat_yiban.py --mode render --body-file "<正文.html>" --theme <约定风格> --out "<预览.html>"`，把成品 HTML 路径给用户眼检。
-   - 再直送草稿：`… --mode publish --body-file "<正文.html>" --theme <约定风格> --title "<推荐标题>"`——脚本打开公众号后台、**只注入语义正文**、在编辑器 DOM 上按约定风格套样式、填标题、保存为草稿。
+3. **排版 + 交付**（按用户在面板选的交付功能键走，没选就默认长图）：调「壹伴排版优化」技能——
+   - **截图上传（长图，默认）**：`python ~/Polaris/skills/wechat-md-typesetter/scripts/wechat_yiban.py --mode snapshot --body-file "<正文.html>" --theme <约定风格> --title "<标题>" --no-slice` 截成一整张长图给用户眼检；确认后 `… --mode publish-image --slices-dir "<切片目录>" --title "<标题>" --intro "<真文字导语>"` 贴图进草稿（零清洗零字数问题，跑它须 ≥600s 超时）。
+   - **排版 HTML 文件**：`… --mode render --body-file "<正文.html>" --theme <约定风格> --out "<预览.html>"`，把成品 HTML 路径报给用户：浏览器打开 → 全选复制 → 粘进公众号后台编辑器即可（或直接上传该文件）。
+   - （老路，仅用户点名时用）HTML 注入直送草稿：`… --mode publish --body-file "<正文.html>" --theme <约定风格> --title "<标题>"`。
    - **只保存为草稿，绝不自动发布**；封面与正文图片提示用户到后台重传。定位失败就回传现象 + 脚本存的兜底 HTML 路径，提示用户在已开的窗口里手动完成。
 
 ## 收尾

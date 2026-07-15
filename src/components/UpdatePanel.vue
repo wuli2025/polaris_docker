@@ -13,6 +13,7 @@ import {
   Rocket,
   Container,
 } from "@lucide/vue";
+import OrbitSpinner from "./icons/OrbitSpinner.vue";
 import {
   currentVersion,
   updateVersion,
@@ -95,11 +96,10 @@ async function onApply() {
             : ''"
           @click="onCheck"
         >
-          <LoaderCircle
+          <!-- 主仓 v2.1.0 换用 OrbitSpinner;容器模式下 dockerApplying 也要转圈 -->
+          <OrbitSpinner
             v-if="checking || dockerApplying"
             :size="15"
-            :stroke-width="2"
-            class="spin"
           />
           <RefreshCw v-else :size="15" :stroke-width="2" />
           <span>{{ checking ? "检查中…" : "检查更新" }}</span>
@@ -129,11 +129,9 @@ async function onApply() {
           </div>
 
           <button class="go-btn" :disabled="updating" @click="applyUpdate">
-            <LoaderCircle
+            <OrbitSpinner
               v-if="updating"
               :size="15"
-              :stroke-width="2"
-              class="spin"
             />
             <Rocket v-else :size="15" :stroke-width="1.9" />
             <span>{{ updating ? `更新中 ${updateProgress}%` : "立即更新" }}</span>

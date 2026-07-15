@@ -9,6 +9,9 @@ import {
 } from "../tauri";
 import { useChatStore } from "./chat";
 
+/** 右抽屉的三种宽度形态：默认抽屉 / 成品预览 / 放大编辑 */
+export type DrawerWidthMode = "default" | "preview" | "expand";
+
 export type ViewKey =
   | "chat"
   | "wiki"
@@ -28,7 +31,10 @@ export type ViewKey =
   | "video_course"
   | "media_ops"
   | "deck"
-  | "web_studio";
+  | "web_studio"
+  | "collab"
+  | "interconnect"
+  | "collab_project";
 
 export const useAppStore = defineStore("app", () => {
   const view = ref<ViewKey>("chat");
@@ -179,8 +185,62 @@ export const useAppStore = defineStore("app", () => {
   const sidebarWidth = computed(() =>
     sidebarCollapsed.value ? 48 : sidebarUserWidth.value
   );
+  // ── 右抽屉宽度可拖拽调节（WorkBuddy 式收缩框）──
+  // 三种形态各记各的宽：默认抽屉 / 成品预览 / 放大编辑。拖一次就记住，
+  // 下次进入同一形态直接复原；没拖过(null)则走 App.vue 里的自适应默认档位。
+  const DRAWER_W_KEYS: Record<DrawerWidthMode, string> = {
+    default: "polaris.drawerWidth.default.v1",
+    preview: "polaris.drawerWidth.preview.v1",
+    expand: "polaris.drawerWidth.expand.v1",
+  };
+  const DRAWER_LIMITS: Record<DrawerWidthMode, { min: number; max: () => number }> = {
+    default: { min: 240, max: () => Math.max(320, Math.round(window.innerWidth * 0.5)) },
+    preview: { min: 320, max: () => Math.max(420, Math.round(window.innerWidth * 0.8)) },
+    expand: { min: 520, max: () => Math.max(640, Math.round(window.innerWidth * 0.92)) },
+  };
+  function loadDrawerW(mode: DrawerWidthMode): number | null {
+    try {
+      const n = parseInt(localStorage.getItem(DRAWER_W_KEYS[mode]) || "");
+      return Number.isFinite(n) && n >= 200 ? n : null;
+    } catch {
+      return null;
+    }
+  }
+  const drawerWidths = ref<Record<DrawerWidthMode, number | null>>({
+    default: loadDrawerW("default"),
+    preview: loadDrawerW("preview"),
+    expand: loadDrawerW("expand"),
+  });
+  // 拖拽中：App.vue 据此关掉 grid 列宽过渡，避免跟手延迟
+  const drawerResizing = ref(false);
+  function clampDrawerW(mode: DrawerWidthMode, w: number): number {
+    const L = DRAWER_LIMITS[mode];
+    return Math.min(L.max(), Math.max(L.min, Math.round(w)));
+  }
+  // persist=false：拖拽中每帧只更新内存值；松手时再 persist=true 落一次盘（同侧栏）
+  function setDrawerWidth(mode: DrawerWidthMode, w: number, persist = true) {
+    const v = clampDrawerW(mode, w);
+    drawerWidths.value = { ...drawerWidths.value, [mode]: v };
+    if (!persist) return;
+    try {
+      localStorage.setItem(DRAWER_W_KEYS[mode], String(v));
+    } catch {
+      /* storage 不可用 */
+    }
+  }
+  /** 双击分隔条：恢复该形态的自适应默认宽 */
+  function resetDrawerWidth(mode: DrawerWidthMode) {
+    drawerWidths.value = { ...drawerWidths.value, [mode]: null };
+    try {
+      localStorage.removeItem(DRAWER_W_KEYS[mode]);
+    } catch {
+      /* storage 不可用 */
+    }
+  }
   // 收起后右抽屉完全消失（0 宽，不留小框/导轨）；需要时点对话顶栏的抽屉按钮或生成产物自动展开
-  const drawerWidth = computed(() => (drawerCollapsed.value ? 0 : 300));
+  const drawerWidth = computed(() =>
+    drawerCollapsed.value ? 0 : drawerWidths.value.default ?? 300
+  );
 
   // MCP 配置弹窗（全局状态，Sidebar 与 App 共用）
   const showMcpModal = ref(false);
@@ -199,8 +259,30 @@ export const useAppStore = defineStore("app", () => {
       currentProjectId.value = projects.value[0].id;
       expandedProjects.value.add(currentProjectId.value);
     }
-    // 全量加载各项目对话：侧栏「项目按最近对话活跃排序」与行尾相对时间都依赖各项目的对话时间
-    await Promise.all(projects.value.map((p) => refreshConversations(p.id)));
+    // 首屏只「等」当前项目的对话到位即可让侧栏渲染;其余项目的对话在后台并发补齐。
+    // 侧栏项目排序虽依赖各项目对话的活跃时间,但那些时间戳「后到」无妨——先把界面画
+    // 出来(不被项目数 × 一次 invoke 的串扇出阻塞首帧),批次到齐后一次性响应重排。
+    // 旧版 `await Promise.all(所有项目)` 在项目多时会把首屏卡成 O(项目数)。
+    const cur = currentProjectId.value;
+    if (cur) await refreshConversations(cur);
+    const rest = projects.value.filter((p) => p.id !== cur).map((p) => p.id);
+    if (rest.length) void loadConversationsBatch(rest);
+  }
+
+  /** 后台批量拉多个项目的对话,全部到齐后做「一次」响应更新(避免 N 次 spread 抖动)。 */
+  async function loadConversationsBatch(projectIds: string[]) {
+    const results = await Promise.all(
+      projectIds.map(async (id): Promise<[string, Conversation[]] | null> => {
+        try {
+          return [id, await convApi.listConversations(id)];
+        } catch {
+          return null; // 单个项目失败不连累其余;侧栏该项目暂空,下次刷新再补
+        }
+      })
+    );
+    const next = { ...conversationsByProject.value };
+    for (const r of results) if (r) next[r[0]] = r[1];
+    conversationsByProject.value = next;
   }
 
   async function refreshConversations(projectId: string) {
@@ -236,6 +318,27 @@ export const useAppStore = defineStore("app", () => {
     currentProjectId.value = p.id;
     conversationsByProject.value = { ...conversationsByProject.value, [p.id]: [] };
     return p;
+  }
+
+  /** 本地项目 ↔ 协作项目绑定(团队项目主页/侧栏联动之桥) */
+  async function bindProjectToCollab(
+    projectId: string,
+    collabProjectId: number,
+    collabHost: string
+  ) {
+    const p = await convApi.bindProjectCollab(projectId, collabProjectId, collabHost);
+    const i = projects.value.findIndex((x) => x.id === p.id);
+    if (i >= 0) {
+      const next = [...projects.value];
+      next[i] = p;
+      projects.value = next;
+    }
+    return p;
+  }
+
+  /** 按协作项目 id 反查绑定的本地项目(无则 undefined) */
+  function projectByCollabId(collabId: number) {
+    return projects.value.find((p) => p.collabProjectId === collabId);
   }
 
   // 归档项目 = 从活动列表移除(后端只置 archived 标记, 对话/消息保留, 不做硬删除)
@@ -356,6 +459,10 @@ export const useAppStore = defineStore("app", () => {
     sidebarWidth,
     setSidebarWidth,
     drawerWidth,
+    drawerWidths,
+    drawerResizing,
+    setDrawerWidth,
+    resetDrawerWidth,
     showMcpModal,
     theme,
     setTheme,
@@ -381,6 +488,8 @@ export const useAppStore = defineStore("app", () => {
     refreshConversations,
     toggleProject,
     createProject,
+    bindProjectToCollab,
+    projectByCollabId,
     archiveProject,
     openProjectDir,
     createConversation,

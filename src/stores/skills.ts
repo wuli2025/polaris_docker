@@ -5,8 +5,9 @@ const STORAGE_KEY = "polaris:enabled-skills";
 // 存"已种入过的默认 id 列表"（旧版本可能存的是字符串 "1"）
 const SEED_KEY = "polaris:default-skills-seeded";
 // 软件自带、默认开启的技能：深度搜索 + 官方 Skill 创建向导 + CloakBrowser 默认浏览器
+// + browser-use 浏览器智能体（底层走 CloakBrowser）
 // （每个 id 只种一次；用户关掉后不会被重新打开）
-const DEFAULT_ON = ["deep-research", "skill-creator", "cloak-browser"];
+const DEFAULT_ON = ["deep-research", "skill-creator", "cloak-browser", "browser-use"];
 
 export const useSkillsStore = defineStore("skills", () => {
   const enabledSkills = ref<Set<string>>(new Set());

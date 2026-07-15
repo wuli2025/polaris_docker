@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount, defineAsyncComponent } from "vue";
 import { marked } from "marked";
 import { sanitizeHtml } from "../lib/sanitize";
 import {
@@ -31,7 +31,9 @@ import {
   Boxes,
   Terminal,
 } from "@lucide/vue";
-import ArtifactEditor from "./ArtifactEditor.vue";
+// 懒加载(与 App.vue 的四个 Studio 同模式): 编辑器 149KB+figmaPull/deckThemes 只在
+// 用户真正进入编辑态(artifacts.editing)时才拉取, 不再吸进首屏 chunk。
+const ArtifactEditor = defineAsyncComponent(() => import("./ArtifactEditor.vue"));
 import { useAppStore } from "../stores/app";
 import { useArtifactsStore } from "../stores/artifacts";
 import { useWorkflowsStore, type WorkflowPack } from "../stores/workflows";
@@ -168,11 +170,119 @@ function fmtTime(unixSec: number): string {
     : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
 }
 
-// 仅 HTML / SVG 成品可进编辑器（网页 PPT / 网页）
+// HTML / SVG（网页 PPT / 网页）走可视化编辑器；Markdown / 纯文本走文档编辑（源码+实时预览）
 const canEdit = computed(() => {
   const k = artifacts.payload?.kind;
-  return k === "html" || k === "svg";
+  return k === "html" || k === "svg" || k === "markdown" || k === "text";
 });
+const editTitle = computed(() => {
+  const k = artifacts.payload?.kind;
+  if (k === "markdown") return "编辑（左边改 Markdown，右边实时预览，Ctrl+S 保存）";
+  if (k === "text") return "编辑此文件（Ctrl+S 保存）";
+  return "编辑（放大到编辑器，可拖动/缩放元素、改文字/换主题/改源码）";
+});
+
+// ── 抽屉宽度拖拽（WorkBuddy 式收缩条）：抓左缘拖动，三种形态各记各的宽 ──
+const drEl = ref<HTMLElement | null>(null);
+const drDragging = ref(false);
+function drawerWidthMode(): "default" | "preview" | "expand" {
+  if (artifacts.current) {
+    return artifacts.expanded || artifacts.editing ? "expand" : "preview";
+  }
+  if (projects.activeRoot) return "preview";
+  return "default";
+}
+function startDrawerDrag(e: MouseEvent) {
+  const el = drEl.value;
+  if (!el) return;
+  const mode = drawerWidthMode();
+  drDragging.value = true;
+  app.drawerResizing = true; // shell 据此关掉列宽过渡，拖拽才跟手
+  const startX = e.clientX;
+  const startW = el.getBoundingClientRect().width;
+  // rAF 合帧：mousemove 一帧可能来好几个，只在画帧前应用最后一次（同侧栏拖拽）
+  let pending = startW;
+  let rafId = 0;
+  const flush = () => {
+    rafId = 0;
+    app.setDrawerWidth(mode, pending, false);
+  };
+  const move = (ev: MouseEvent) => {
+    pending = startW - (ev.clientX - startX); // 抓的是左缘：往左拖 = 变宽
+    if (!rafId) rafId = requestAnimationFrame(flush);
+  };
+  const up = () => {
+    drDragging.value = false;
+    app.drawerResizing = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    app.setDrawerWidth(mode, pending, true); // 松手落一次盘
+    window.removeEventListener("mousemove", move);
+    window.removeEventListener("mouseup", up);
+  };
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", up);
+}
+function resetDrawerWidth() {
+  app.resetDrawerWidth(drawerWidthMode());
+}
+
+// ── .pptx 也能编辑：找它的网页版源稿 deck.html ──
+// .pptx 是逐页截图死图，真正可编辑的是同目录的 deck.html。预览 pptx 时
+// 找同目录的伴生 html（同名优先，否则取最新），「编辑」= 编辑 html + 保存后一键重导出。
+const isPptx = computed(() => /\.pptx$/i.test(artifacts.current?.name ?? ""));
+const pptxDeckHtml = ref<string | null>(null);
+watch(
+  () => artifacts.current?.path,
+  async (p) => {
+    pptxDeckHtml.value = null;
+    if (!p || !/\.pptx$/i.test(p)) return;
+    try {
+      const norm = (s: string) => s.replace(/\\/g, "/");
+      const np = norm(p);
+      const dir = np.slice(0, np.lastIndexOf("/") + 1);
+      const base = (np.split("/").pop() ?? "").replace(/\.pptx$/i, "");
+      const list = await artifactsApi.list(app.currentConvId ?? undefined);
+      // 异步竞态守卫:list/read 期间用户可能已切到别的 pptx,过期回调若继续写
+      // pptxDeckHtml 会让「编辑/更新 PPT」指向上一个文件 → 覆盖错 deck。一律丢弃。
+      if (artifacts.current?.path !== p) return;
+      // 同目录有 polaris.slides.json = 原生 spec 导出的真可编辑 pptx ——
+      // 此时绝不能给 deck.html 重导出入口:任何 html 截图覆盖都会把真文本框毁成死图。
+      if (list.some((e) => norm(e.path) === `${dir}polaris.slides.json`)) return;
+      const htmls = list.filter(
+        (e) => /\.html?$/i.test(e.name) && norm(e.path).startsWith(dir)
+      );
+      if (!htmls.length) return;
+      const exact = htmls.find((e) => e.name.replace(/\.html?$/i, "") === base);
+      if (exact) {
+        pptxDeckHtml.value = exact.path;
+        return;
+      }
+      // 非同名兜底:必须验明内容确实是 deck(含 .slide 结构/导出 runtime),
+      // 否则同目录随便一个网页都会被当伴生、「更新 PPT」用它覆盖毁掉原 pptx。
+      const recent = [...htmls].sort((a, b) => b.modified - a.modified).slice(0, 3);
+      for (const h of recent) {
+        try {
+          const c = await artifactsApi.read(h.path);
+          if (artifacts.current?.path !== p) return; // 同上:read 期间已切走则丢弃
+          if (c?.text && /class=["'][^"']*\bslide\b|__deck|data-notext-capable/.test(c.text)) {
+            pptxDeckHtml.value = h.path;
+            return;
+          }
+        } catch {
+          /* 读不动就看下一个候选 */
+        }
+      }
+    } catch {
+      /* 找不到就不显示编辑入口 */
+    }
+  },
+  { immediate: true }
+);
+function editPptx() {
+  if (pptxDeckHtml.value && artifacts.current) {
+    artifacts.enterEditDeck(pptxDeckHtml.value, artifacts.current.path);
+  }
+}
 
 const headIcon = computed(() => {
   const k = artifacts.payload?.kind;
@@ -200,12 +310,25 @@ function fmtSize(n: number): string {
 
 <template>
   <aside
+    ref="drEl"
     class="dr"
     :class="{
       collapsed: app.drawerCollapsed && !artifacts.current && !projects.activeRoot,
       preview: !!artifacts.current || !!projects.activeRoot,
+      resizing: drDragging,
     }"
   >
+    <!-- 左缘收缩条：拖拽调宽（三种形态各记各的宽），双击恢复默认 -->
+    <div
+      class="dr-resizer"
+      title="拖拽调节面板宽度 · 双击恢复默认"
+      @mousedown.prevent="startDrawerDrag"
+      @dblclick="resetDrawerWidth"
+    >
+      <span class="dr-grip" />
+    </div>
+    <!-- 拖拽期间的全屏透明罩：防止鼠标滑进 iframe 后 mousemove 被吞、拖拽中断 -->
+    <div v-if="drDragging" class="dr-drag-veil"></div>
     <!-- ───────── 运行预览模式（一键启动的项目，内嵌 iframe 看应用 + 日志台） ───────── -->
     <template v-if="projects.activeRoot">
       <div class="pv-head">
@@ -308,8 +431,16 @@ function fmtSize(n: number): string {
           <button
             v-if="canEdit"
             class="pv-btn"
-            title="编辑（放大到编辑器，可拖动/缩放元素、改文字/换主题/改源码）"
+            :title="editTitle"
             @click="artifacts.enterEdit()"
+          >
+            <PencilLine :size="15" :stroke-width="1.8" />
+          </button>
+          <button
+            v-else-if="isPptx && pptxDeckHtml"
+            class="pv-btn"
+            title="编辑此 PPT（实际编辑它的网页版源稿，保存后一键重新导出 .pptx）"
+            @click="editPptx()"
           >
             <PencilLine :size="15" :stroke-width="1.8" />
           </button>
@@ -386,9 +517,20 @@ function fmtSize(n: number): string {
           <div v-else class="pv-state">
             <FileIcon :size="26" :stroke-width="1.4" />
             <span>该文件类型暂不支持内嵌预览</span>
+            <button
+              v-if="isPptx && pptxDeckHtml"
+              class="pv-open-ext primary"
+              @click="editPptx()"
+            >
+              <PencilLine :size="14" :stroke-width="1.8" />
+              <span>在 App 里编辑此 PPT</span>
+            </button>
+            <span v-if="isPptx && pptxDeckHtml" class="pv-edit-hint">
+              编辑的是它的网页版源稿，保存后可一键重新导出 .pptx
+            </span>
             <button class="pv-open-ext" @click="artifacts.openExternal()">
               <ExternalLink :size="14" :stroke-width="1.8" />
-              <span>{{ isTauri ? "用系统程序打开" : "在浏览器打开 / 下载" }}</span>
+              <span>用系统程序打开</span>
             </button>
           </div>
         </template>
@@ -621,6 +763,40 @@ function fmtSize(n: number): string {
   display: none;
 }
 
+/* ───────── 左缘收缩条（WorkBuddy 式）───────── */
+.dr-resizer {
+  position: absolute;
+  left: -2px;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  z-index: 60; /* 压过编辑器(z-index:5)与预览头，任何形态都能抓到 */
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dr-grip {
+  width: 3px;
+  height: 44px;
+  border-radius: 99px;
+  background: var(--border-strong, #c9c9c2);
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+.dr-resizer:hover .dr-grip,
+.dr.resizing .dr-grip {
+  opacity: 1;
+  background: var(--primary);
+}
+/* 拖拽期间盖住整窗（含 iframe），保证 mousemove 一直落在本文档上 */
+.dr-drag-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  cursor: col-resize;
+}
+
 /* ───────── 预览头 ───────── */
 .pv-head {
   display: flex;
@@ -677,7 +853,8 @@ function fmtSize(n: number): string {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  background: #fff;
+  /* 跟随主题（深色下不再白底衬浅字）；iframe 网页仍保持自身白底 */
+  background: var(--bg-chat);
 }
 .pv-frame {
   flex: 1;
@@ -700,6 +877,12 @@ function fmtSize(n: number): string {
   max-width: 100%;
   height: auto;
   box-shadow: var(--shadow-sm);
+}
+/* 深色主题下棋盘格透明底跟着变暗，不再刺眼 */
+html[data-theme="dark"] .pv-img-wrap,
+html[data-theme="aurora-dark"] .pv-img-wrap {
+  background:
+    repeating-conic-gradient(#242424 0% 25%, #1c1c1c 0% 50%) 50% / 20px 20px;
 }
 .pv-md {
   flex: 1;
@@ -752,6 +935,21 @@ function fmtSize(n: number): string {
 .pv-open-ext:hover {
   border-color: var(--primary);
   color: var(--primary);
+}
+.pv-open-ext.primary {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+.pv-open-ext.primary:hover {
+  filter: brightness(1.07);
+  color: #fff;
+}
+.pv-edit-hint {
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: -6px;
 }
 .spin {
   animation: pv-spin 0.9s linear infinite;
