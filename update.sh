@@ -69,9 +69,10 @@ recreate_from() {
 }
 
 # 新容器健康探测（容器内 8080 自检）。成功返回 0。
+# 窗口 180s：首次 PUID 归属化/冷启动索引恢复可能较慢，80s 会把好容器误判失败触发回滚。
 wait_healthy() {
   local target="$1" i code
-  for i in $(seq 1 40); do
+  for i in $(seq 1 90); do
     code="$(docker exec "$target" curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/health 2>/dev/null || true)"
     [ "$code" = "200" ] && return 0
     sleep 2
@@ -130,6 +131,14 @@ r2_helper() {
   hlog "校验 sha256 ..."
   echo "$sha  $file" | sha256sum -c - || { hlog "❌ sha256 不匹配，已中止（运行容器未动）"; rm -f "$file"; exit 1; }
 
+  # 备份必须在 docker load **之前**、且用镜像 sha256 ID（.Image）而非名字（.Config.Image）：
+  # load 会让新镜像顶掉同名 tag，之后再按名字备份，备份到的其实是刚 load 的新镜像——
+  # 新版起不来时「回滚」就是原地复读坏镜像，服务保持宕机。
+  hlog "备份旧镜像以便回滚 ..."
+  local oldimg
+  oldimg="$(docker inspect -f '{{.Image}}' "$target" 2>/dev/null || true)"
+  [ -n "$oldimg" ] && docker tag "$oldimg" polaris-rollback:prev >/dev/null 2>&1 || true
+
   # docker save 的层已是压缩态,镜像体优先用「裸 tar」(不再 gzip,体积更小、省两端 CPU);
   # 仍兼容旧的 .tar.gz(gunzip 解)。按文件名后缀分流。
   hlog "docker load ..."
@@ -137,11 +146,6 @@ r2_helper() {
     *.gz) gunzip -c "$file" | docker load ;;
     *)    docker load -i "$file" ;;
   esac
-
-  hlog "备份旧镜像以便回滚 ..."
-  local oldimg
-  oldimg="$(docker inspect -f '{{.Config.Image}}' "$target" 2>/dev/null || true)"
-  [ -n "$oldimg" ] && docker tag "$oldimg" polaris-rollback:prev >/dev/null 2>&1 || true
 
   hlog "按旧容器配置重建 $target → $img ..."
   recreate_from "$target" "$img" >/dev/null

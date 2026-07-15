@@ -73,7 +73,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 120s  # 首次 PUID 归属化/大库冷启动可能超 20s,误判 unhealthy
 # 说明：
 #   · GPU 推理不在本容器内（群晖 Container Manager 不开放容器 GPU 透传）。
 #     A2 推理（ASR/嵌入/重排）部署在独立 Linux 主机，经 POLARIS_INFER_ENDPOINT 对接（见 PRD §04）。

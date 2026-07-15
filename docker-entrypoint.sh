@@ -38,7 +38,17 @@ if [ -n "$PUID" ] && [ -n "$PGID" ]; then
   seed_feishu_bridge
   # HOME(/root) 及数据目录归属运行用户，确保 claude 配置/缓存可写。
   chown "$PUID:$PGID" /root 2>/dev/null || true
-  for d in $DATA_DIRS; do chown -R "$PUID:$PGID" "$d" 2>/dev/null || true; done
+  # 递归 chown 只在顶层属主不对时才做：大知识库（几十万+文件）在机械盘 NAS 上
+  # 一次 chown -R 要跑几分钟，每次启动都跑会击穿 healthcheck start_period 和
+  # 自更新的 wait_healthy 窗口（新容器被误判失败触发回滚）。首次归属化之后，
+  # 容器内新写文件的属主本来就是 PUID，无需重复全量刷。
+  for d in $DATA_DIRS; do
+    [ -d "$d" ] || continue
+    if [ "$(stat -c %u "$d" 2>/dev/null)" = "$PUID" ] && [ "$(stat -c %g "$d" 2>/dev/null)" = "$PGID" ]; then
+      continue
+    fi
+    chown -R "$PUID:$PGID" "$d" 2>/dev/null || true
+  done
 
   # ── docker.sock 自更新支持（Web UI「一键更新」所需）─────────────────
   # 群晖非 root 跑时，宿主 sock 属主是 root:<某GID>(DSM 默认 root:root)，降权后的

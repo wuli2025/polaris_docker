@@ -189,7 +189,15 @@ fn atomic_write_state(path: &std::path::Path, contents: &str) -> std::io::Result
     fs::rename(&tmp, path)
 }
 
+/// 落盘互斥锁: persist() 只持 STATE **读**锁, 多线程可同时进入, 而 tmp 文件名固定
+/// (`state.json.polaris.tmp`), 并发写会把 tmp 撕成交错字节再 rename 上位 → state.json
+/// 变坏 JSON, 下次启动回落空状态(历史清零)。rename 原子只防「崩溃写一半」, 防不了
+/// 并发写者 —— 这里把「快照 + 序列化 + 写 tmp + rename」整段串行化。
+static PERSIST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 fn persist() {
+    // 先拿落盘锁再取快照: 保证写入顺序与快照顺序一致, 文件终态不会停留在旧快照上。
+    let _g = PERSIST_LOCK.lock();
     let st = STATE.read();
     let path = STATE_PATH.read().clone();
     if path.as_os_str().is_empty() {

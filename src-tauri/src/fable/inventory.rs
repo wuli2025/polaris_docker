@@ -984,9 +984,21 @@ pub fn scan_root(
             .into_iter()
             .filter(|(_, rel)| {
                 // relpath 用 '/',Path::join 在 Windows 上也认 '/',无需替换分隔符。
-                let abs = root_base.join(rel);
-                let parent_ok = abs.parent().map(|p| p.exists()).unwrap_or(false);
-                parent_ok && !abs.exists()
+                // rel 是 decode_fs() 后的显示路径, Unix 上 GBK 名文件的磁盘字节与其
+                // 不同 → 先经 reencode_fs_path 还原真实路径, 否则 stat 恒失败被误删。
+                let abs = super::reencode_fs_path(&root_base.join(rel).to_string_lossy());
+                // Path::exists() 把 EACCES/SMB 认证过期等一切 IO 错误折叠成「不存在」,
+                // 会把只是暂时读不到的文件连 chunks(向量)+lex(倒排)一起误删。
+                // 只认 NotFound 才判「真消失」; 其余错误(权限/网络抖动)一律保留待下轮。
+                let parent_ok = abs
+                    .parent()
+                    .map(|p| std::fs::symlink_metadata(p).is_ok())
+                    .unwrap_or(false);
+                parent_ok
+                    && matches!(
+                        std::fs::symlink_metadata(&abs),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                    )
             })
             .map(|(id, _)| id)
             .collect();

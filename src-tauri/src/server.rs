@@ -103,7 +103,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/api/invoke", post(invoke))
         .route("/api/upload", post(upload))
         .route("/api/file", get(serve_file))
-        .route("/api/health", get(|| async { "ok" }))
+        .route("/api/health", get(health))
         .route("/api/status", get(status))
         .route("/ws", get(ws_handler))
         .fallback(get(spa_fallback))
@@ -321,11 +321,41 @@ async fn invoke(
     }
 
     // 其余命令同步执行，丢到阻塞线程池（内含 ureq 网络/文件 IO，勿阻塞 async worker）。
-    let out = tokio::task::spawn_blocking(move || dispatch_sync(&cmd, &args, app)).await;
+    // 必须设超时：阻塞池只有 64 线程，慢命令（df/目录遍历在僵死挂载上可无限挂）无超时
+    // 会一条条钉死线程，占满后 /api/invoke 整体假死而进程还「健康」。超时后线程本身
+    // 无法强杀（spawn_blocking 不可取消），但至少把 HTTP 侧放开、让前端拿到明确错误。
+    let timeout_secs: u64 = std::env::var("POLARIS_INVOKE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let cmd_for_err = cmd.clone();
+    let fut = tokio::task::spawn_blocking(move || dispatch_sync(&cmd, &args, app));
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            return err_resp(format!(
+                "命令 {cmd_for_err} 执行超时({timeout_secs}s)，已停止等待（任务可能仍在后台运行）"
+            ))
+        }
+    };
     match out {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => err_resp(e),
         Err(e) => err_resp(format!("内部任务失败: {e}")),
+    }
+}
+
+/// 健康检查连带自检阻塞线程池：池被慢命令占满时，服务对用户已经假死，
+/// 必须让 healthcheck 变红（纯 async 的 "ok" 会让 Docker 一直以为服务健康）。
+async fn health() -> Response {
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(|| ()),
+    )
+    .await;
+    match probe {
+        Ok(Ok(())) => "ok".into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "blocking pool saturated").into_response(),
     }
 }
 
@@ -931,24 +961,53 @@ async fn upload(
     if let Err(e) = std::fs::create_dir_all(&base) {
         return err_resp(format!("创建上传目录失败: {e}"));
     }
+    use tokio::io::AsyncWriteExt;
     let mut saved: Vec<Value> = Vec::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
+    // 逐字段流式落盘：field.bytes() 会把整个文件（上限 512MB）全量缓冲进内存，
+    // 几个大文件并发上传就能把容器顶到 OOM；chunk 边收边写，内存占用恒定。
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            // 断连/畸形 multipart 不再静默当「全部成功」返回 200：
+            // 部分文件可能已落盘，必须明确报错让前端提示重传。
+            Err(e) => return err_resp(format!("上传流中断: {e}")),
+        };
         let fname = field
             .file_name()
             .map(sanitize_filename)
             .unwrap_or_else(|| "upload.bin".to_string());
-        let data = match field.bytes().await {
-            Ok(b) => b,
-            Err(e) => return err_resp(format!("读取上传字段失败: {e}")),
-        };
         let dst = unique_path(&base, &fname);
-        if let Err(e) = std::fs::write(&dst, &data) {
+        let mut f = match tokio::fs::File::create(&dst).await {
+            Ok(f) => f,
+            Err(e) => return err_resp(format!("创建上传文件失败: {e}")),
+        };
+        let mut size: u64 = 0;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    size += chunk.len() as u64;
+                    if let Err(e) = f.write_all(&chunk).await {
+                        drop(f);
+                        let _ = tokio::fs::remove_file(&dst).await;
+                        return err_resp(format!("写入上传文件失败: {e}"));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    drop(f);
+                    let _ = tokio::fs::remove_file(&dst).await;
+                    return err_resp(format!("读取上传字段失败: {e}"));
+                }
+            }
+        }
+        if let Err(e) = f.flush().await {
             return err_resp(format!("写入上传文件失败: {e}"));
         }
         saved.push(json!({
             "name": fname,
             "path": dst.to_string_lossy().replace('\\', "/"),
-            "size": data.len(),
+            "size": size,
         }));
     }
     Json(json!({ "files": saved })).into_response()
@@ -1029,25 +1088,40 @@ async fn serve_file(
     if !allowed.iter().any(|root| crate::kb::path_contains(root, &canon)) {
         return (StatusCode::FORBIDDEN, "路径不在允许范围").into_response();
     }
-    match tokio::fs::read(&canon).await {
-        Ok(bytes) => {
-            let ct = mime_for(&canon);
-            let mut resp = ([(header::CONTENT_TYPE, ct)], bytes).into_response();
-            if q.download.as_deref() == Some("1") {
-                let fname = canon
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("download");
-                // RFC 5987：filename* 用 UTF-8 百分号编码，兼容中文名。
-                let cd = format!("attachment; filename*=UTF-8''{}", pct_encode(fname));
-                if let Ok(v) = header::HeaderValue::from_str(&cd) {
-                    resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
-                }
+    // 流式响应：tokio::fs::read 会把整个文件读进内存，点开一个 2GB 视频就是 2GB
+    // 常驻分配，几个并发即可把容器顶到 OOM；改为 64KB 分块边读边发。
+    let file = match tokio::fs::File::open(&canon).await {
+        Ok(f) => f,
+        Err(_) => return (StatusCode::NOT_FOUND, "读取失败").into_response(),
+    };
+    let stream = futures_util::stream::unfold(file, |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match f.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(buf)), f))
             }
-            resp
+            Err(e) => Some((Err(e), f)),
         }
-        Err(_) => (StatusCode::NOT_FOUND, "读取失败").into_response(),
+    });
+    let mut resp = Body::from_stream(stream).into_response();
+    if let Ok(v) = header::HeaderValue::from_str(mime_for(&canon)) {
+        resp.headers_mut().insert(header::CONTENT_TYPE, v);
     }
+    if q.download.as_deref() == Some("1") {
+        let fname = canon
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download");
+        // RFC 5987：filename* 用 UTF-8 百分号编码，兼容中文名。
+        let cd = format!("attachment; filename*=UTF-8''{}", pct_encode(fname));
+        if let Ok(v) = header::HeaderValue::from_str(&cd) {
+            resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    resp
 }
 
 /// RFC 5987 百分号编码：unreserved 原样，其余按 UTF-8 字节转 %XX。
