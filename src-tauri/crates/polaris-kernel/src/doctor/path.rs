@@ -327,6 +327,19 @@ pub(crate) fn prime_path_for_claude_inner() {
             }
         }
     }
+    // ⓪.5 Windows: PATH 里找不到 node 时, 把 Node 安装目录补进**进程** PATH。
+    // MSI/winget 只写注册表 PATH, **运行中的进程 PATH 是启动时的快照、不会刷新** → 用户在 app
+    // 开着的时候装完 Node, 面板仍说没有 npm、更新检测也拿不到 npm。仅在 PATH 确实解析不出 node
+    // 时才补, 不抢占用户自己配的 node (nvm 等多版本管理器)。
+    #[cfg(windows)]
+    if which_all("node").is_empty() {
+        if let Some(dir) = node_dir_candidates()
+            .into_iter()
+            .find(|d| d.join("node.exe").exists())
+        {
+            prepend_process_path(&dir.to_string_lossy());
+        }
+    }
     // ① claude 目录上进程 PATH
     if let Some(exe) = resolve_claude_exe() {
         if let Some(dir) = claude_dir_from_path(&exe) {

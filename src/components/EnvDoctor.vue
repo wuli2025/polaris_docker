@@ -290,9 +290,9 @@ async function updateClaude() {
   busyKind.value = "claude-update";
   try {
     installReqId.value = await envDoctor.updateClaude();
-    logs.value.push(
-      "$ npm install -g @anthropic-ai/claude-code@latest --registry=https://registry.npmmirror.com"
-    );
+    // 具体跑哪条由后端按「当初怎么装的」决定 (原生装 → claude update 就地更新; npm 装 →
+    // npm i -g @latest 走国内镜像), 这里不写死, 免得日志首行跟实际跑的对不上。
+    logs.value.push("$ 正在更新 Claude Code（按安装方式自动选择）…");
   } catch (e) {
     busyKind.value = "";
     banner.value = { kind: "err", text: String(e) };

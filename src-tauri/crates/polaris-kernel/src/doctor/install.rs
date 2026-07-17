@@ -59,7 +59,7 @@ pub fn env_install_node(app: AppHandle) -> Result<String, String> {
     {
         let req_id = next_req_id();
         #[cfg(windows)]
-        let cmd = build_powershell(NODE_INSTALL_SCRIPT);
+        let cmd = build_powershell(&node_install_script());
         #[cfg(target_os = "macos")]
         let cmd = build_install_shell(MAC_NODE_INSTALL_SCRIPT);
         stream_install(app, req_id.clone(), cmd, false, "Node.js");
@@ -113,10 +113,152 @@ echo "Node.js 安装完成: node $("$BIN/node" -v), npm $("$BIN/npm" -v)"
 echo "已写入 ~/.zshrc 等; 本次会话已即时生效。"
 "#;
 
-/// Node.js LTS 安装脚本: winget 优先, 失败则下载官方 MSI (国内 npmmirror 镜像加速) 静默安装。
-/// 选 20.x LTS ("Iron"): 长期支持、兼容 Windows 10。
-const NODE_INSTALL_SCRIPT: &str = r#"
+/// 三个 Windows 安装脚本 (PowerShell 7 / Node.js / uv) 共用的下载前奏 —— 两项环境设置 +
+/// 一个带校验和重试的下载函数。
+///
+/// **① 关掉 IWR 的进度条**: 本应用以**无窗口**方式 spawn PowerShell、stdout 又被重定向进管道,
+/// 这种上下文下 Windows PowerShell 5.1 的进度条渲染会把 `Invoke-WebRequest` 拖慢一个数量级 ——
+/// 同机同镜像实测 584 KB/s → 4266 KB/s (**7.3 倍**)。~107MB 的 PowerShell MSI 因此在网速一般的
+/// 机器上会一路摸到 `-TimeoutSec` 上限而失败。**这是「PowerShell 7 有些概率装不上」的主因**:
+/// 成败取决于当时网速, 所以时好时坏。
+///
+/// **② 显式并入 TLS 1.2**: 老的 / 受管的机器上 5.1 的默认安全协议可能仍是 TLS 1.0, 而 GitHub
+/// 与各镜像早已只收 TLS 1.2+ → 握手阶段直接失败。
+///
+/// **③ 下载校验**: 国内 GitHub 代理挂掉时常常回「200 + 一个 HTML/JSON 错误页」, 老代码只看
+/// `Length -gt 1MB`, 于是把错误页当安装包喂给 msiexec, 报一句用户看不懂的错。这里改成校验
+/// **体积下限 + 文件头魔数**, 且整轮镜像都没成会再重试一轮 (连接被重置在国内很常见)。
+const PS_DOWNLOAD_PRELUDE: &str = r#"
 $ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+
+# 结果写 $global:PolarisDlOk 而不是用返回值 —— 函数里的 Write-Output 会混进返回值 (PowerShell 老坑)。
+$global:PolarisDlOk = $false
+function Get-PolarisFile {
+  param([string[]]$Urls, [string]$Dest, [string]$Magic, [long]$MinBytes)
+  $global:PolarisDlOk = $false
+  foreach ($round in 1..2) {
+    foreach ($u in $Urls) {
+      try {
+        Write-Output "下载: $u"
+        if (Test-Path $Dest) { Remove-Item $Dest -Force -ErrorAction SilentlyContinue }
+        Invoke-WebRequest -Uri $u -OutFile $Dest -UseBasicParsing -TimeoutSec 600
+        if (-not (Test-Path $Dest)) { Write-Output '  下载后没见到文件'; continue }
+        $len = (Get-Item $Dest).Length
+        if ($len -lt $MinBytes) {
+          Write-Output ('  体积不对: {0:N0} 字节, 至少该有 {1:N0} —— 多半是代理回的错误页' -f $len, $MinBytes)
+          continue
+        }
+        $need = [int]($Magic.Length / 2)
+        $head = New-Object byte[] $need
+        $fs = [IO.File]::OpenRead($Dest)
+        $read = $fs.Read($head, 0, $need)
+        $fs.Close()
+        if ($read -lt $need) { Write-Output '  文件头都读不满, 显然不对'; continue }
+        $got = (($head | ForEach-Object { $_.ToString('x2') }) -join '')
+        if ($got -ne $Magic) {
+          Write-Output ('  文件头不对: {0} (应为 {1}) —— 多半是代理回的错误页' -f $got, $Magic)
+          continue
+        }
+        Write-Output ('  校验通过: {0:N1} MB' -f ($len / 1MB))
+        $global:PolarisDlOk = $true
+        return
+      } catch {
+        Write-Output ('  下载失败: ' + $_.Exception.Message)
+      }
+    }
+    if ($round -eq 1) { Write-Output '一轮镜像都没成功, 歇 2 秒再来一轮...'; Start-Sleep -Seconds 2 }
+  }
+}
+"#;
+
+/// msiexec 静默安装的共用封装 (PowerShell 7 / Node.js 两个 MSI 都用)。
+/// 装到 Program Files 要管理员 → `RunAs` 触发 UAC (用户拒绝则友好报错, 不静默失败)。
+/// **1618 = 「另一个安装正在进行」** (撞上 Windows Update 或别的 MSI) —— 这是典型的**概率性**
+/// 失败, 老代码直接判死, 这里等一会儿重试, 最多三次。结果写 $global:PolarisMsiCode。
+const PS_MSIEXEC_HELPER: &str = r#"
+$global:PolarisMsiCode = -1
+function Install-PolarisMsi {
+  param([string]$Path, [string]$ExtraArgs = '')
+  foreach ($try in 1..3) {
+    try {
+      $a = '/i "' + $Path + '" /quiet /norestart'
+      if ($ExtraArgs -ne '') { $a = $a + ' ' + $ExtraArgs }
+      $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru -Verb RunAs
+      $global:PolarisMsiCode = $p.ExitCode
+    } catch {
+      Write-Output ('安装启动失败 (可能未授予管理员权限): ' + $_.Exception.Message)
+      $global:PolarisMsiCode = -1
+      return
+    }
+    if ($global:PolarisMsiCode -ne 1618) { return }
+    Write-Output ('另一个安装程序正在运行 (msiexec 1618), 等 15 秒重试 ({0}/3)...' -f $try)
+    Start-Sleep -Seconds 15
+  }
+}
+"#;
+
+/// MSI = OLE 复合文档, 文件头魔数固定为 `D0CF11E0A1B11AE1`。
+const MSI_MAGIC: &str = "d0cf11e0a1b11ae1";
+/// zip 文件头魔数 (`PK\x03\x04`) —— uv 的 release 包。
+const ZIP_MAGIC: &str = "504b0304";
+
+/// 自家依赖包的分发基址 —— Cloudflare `/downloads/*` 由 `functions/downloads/[[path]].js`
+/// 从 R2 桶 `polaris-downloads` 流式取出 (支持 Range、边缘缓存 24h、出站免费)。
+/// 对应的 R2 key 前缀是 `deps/`(**不含** `downloads/`, 那是路由前缀不是 key 的一部分)。
+///
+/// 传新包: `wrangler r2 object put polaris-downloads/deps/<文件名> --file <本地路径> --remote`
+/// 传完务必对着生产域名核字节数与文件头魔数 —— 与发版终验同一套规矩。
+const DEPS_BASE: &str = "https://llmwiki.cloud/downloads/deps";
+
+/// 这三个版本号**同时**决定「下载哪个官方包」与「R2 里该有哪个包」——
+/// 改任何一个都必须把对应文件传进 R2 的 `deps/` (否则 R2 那跳 404, 白白退化到公共代理)。
+const PWSH_VER: &str = "7.4.6";
+const NODE_VER: &str = "20.18.1";
+const UV_VER: &str = "0.11.29";
+
+/// 把脚本正文里的占位符换成真值。用占位符而非 `format!` 的 `{}` —— PowerShell 脚本里全是
+/// `${...}`/`{0:N0}` 这类花括号, 走 format! 得把每个都转义成 `{{}}`, 既难读又极易写错。
+fn fill(script: &str) -> String {
+    script
+        .replace("DEPS_BASE", DEPS_BASE)
+        .replace("MSI_MAGIC", MSI_MAGIC)
+        .replace("ZIP_MAGIC", ZIP_MAGIC)
+        .replace("PWSH_VER", PWSH_VER)
+        .replace("NODE_VER", NODE_VER)
+        .replace("UV_VER", UV_VER)
+}
+
+/// Node.js LTS 安装脚本 (前奏 + msiexec 封装 + 正文)。
+fn node_install_script() -> String {
+    fill(&format!(
+        "{PS_DOWNLOAD_PRELUDE}\n{PS_MSIEXEC_HELPER}\n{NODE_INSTALL_BODY}"
+    ))
+}
+
+/// PowerShell 7 安装脚本 (前奏 + msiexec 封装 + 正文)。
+fn pwsh_install_script() -> String {
+    fill(&format!(
+        "{PS_DOWNLOAD_PRELUDE}\n{PS_MSIEXEC_HELPER}\n{PWSH_INSTALL_BODY}"
+    ))
+}
+
+/// uv 安装脚本 (前奏 + 正文; uv 是绿色单文件, 不走 msiexec)。
+#[cfg(windows)]
+fn uv_install_script() -> String {
+    fill(&format!("{PS_DOWNLOAD_PRELUDE}\n{UV_INSTALL_BODY}"))
+}
+
+/// macOS uv 安装脚本 (POSIX sh)。
+#[cfg(target_os = "macos")]
+fn mac_uv_install_script() -> String {
+    fill(MAC_UV_INSTALL_SCRIPT)
+}
+
+/// Node.js LTS 安装脚本正文: winget 优先, 失败则下载官方 MSI (国内 npmmirror 镜像加速) 静默安装。
+/// 选 20.x LTS ("Iron"): 长期支持、兼容 Windows 10。
+const NODE_INSTALL_BODY: &str = r#"
 # ① 优先 winget (能拿最新 LTS, 自带配 PATH)
 $wg = Get-Command winget -ErrorAction SilentlyContinue
 if ($wg) {
@@ -127,40 +269,26 @@ if ($wg) {
 } else {
   Write-Output '未检测到 winget (Windows 10 常见), 改用直接下载官方 MSI...'
 }
-# ② 下载官方 Node LTS MSI -> %TEMP% -> msiexec 静默安装。下载路径走国内 npmmirror 镜像兜底。
-$ver = '20.18.1'
+# ② 下载 Node LTS MSI -> %TEMP% -> msiexec 静默安装。自家 R2 打头, 后面依次 npmmirror、官方直连。
+$ver = 'NODE_VER'
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'AMD64' { 'x64' } default { 'x86' } }
 $msi = "node-v$ver-$arch.msi"
 $dst = Join-Path $env:TEMP $msi
 $urls = @(
+  "DEPS_BASE/$msi",
   "https://cdn.npmmirror.com/binaries/node/v$ver/$msi",
   "https://npmmirror.com/mirrors/node/v$ver/$msi",
   "https://nodejs.org/dist/v$ver/$msi"
 )
-$ok = $false
-foreach ($u in $urls) {
-  try {
-    Write-Output "下载: $u"
-    Invoke-WebRequest -Uri $u -OutFile $dst -UseBasicParsing -TimeoutSec 600
-    if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 1MB)) { $ok = $true; break }
-  } catch {
-    Write-Output ("  下载失败: " + $_.Exception.Message)
-  }
-}
-if (-not $ok) {
+Get-PolarisFile -Urls $urls -Dest $dst -Magic 'MSI_MAGIC' -MinBytes 15MB
+if (-not $global:PolarisDlOk) {
   Write-Output 'Node.js 安装包下载失败 (可检查网络 / 代理后重试)。'
   exit 1
 }
-# 安装到 Program Files 需要管理员权限 -> 用 RunAs 触发 UAC (拒绝则友好报错, 不静默失败)
 Write-Output "安装中 (msiexec, 会弹一次 UAC 授权): $dst"
-try {
-  $p = Start-Process msiexec.exe -ArgumentList ('/i "' + $dst + '" /quiet /norestart') -Wait -PassThru -Verb RunAs
-} catch {
-  Write-Output ('安装启动失败 (可能未授予管理员权限): ' + $_.Exception.Message)
-  exit 1
-}
+Install-PolarisMsi -Path $dst
 Remove-Item $dst -ErrorAction SilentlyContinue
-if ($p.ExitCode -ne 0) { Write-Output ('msiexec 退出码 ' + $p.ExitCode); exit 1 }
+if ($global:PolarisMsiCode -ne 0) { Write-Output ('msiexec 退出码 ' + $global:PolarisMsiCode); exit 1 }
 Write-Output 'Node.js 安装完成。'
 "#;
 
@@ -178,15 +306,14 @@ pub fn env_install_pwsh(app: AppHandle) -> Result<String, String> {
         return Err("PowerShell 7 自动安装仅支持 Windows。".into());
     }
     let req_id = next_req_id();
-    let cmd = build_powershell(PWSH_INSTALL_SCRIPT);
+    let cmd = build_powershell(&pwsh_install_script());
     stream_install(app, req_id.clone(), cmd, false, "PowerShell 7");
     Ok(req_id)
 }
 
-/// PowerShell 7 安装脚本: winget 优先, 失败则下载官方 MSI (国内代理加速) 静默安装。
+/// PowerShell 7 安装脚本正文: winget 优先, 失败则下载 MSI 静默安装。
 /// 版本仅用于 MSI 兜底直链 (winget 路径自动取最新); 选 7.4.x LTS, 稳定且长期可用。
-const PWSH_INSTALL_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Continue'
+const PWSH_INSTALL_BODY: &str = r#"
 # ① 优先 winget (能拿最新版, 自带配 PATH)
 $wg = Get-Command winget -ErrorAction SilentlyContinue
 if ($wg) {
@@ -197,42 +324,30 @@ if ($wg) {
 } else {
   Write-Output '未检测到 winget, 改用直接下载官方 MSI...'
 }
-# ② 下载官方 MSI -> %TEMP% -> msiexec 静默安装。下载路径走国内可达的 GitHub 代理兜底。
-$ver = '7.4.6'
+# ② 下载 MSI -> %TEMP% -> msiexec 静默安装。**自家 R2 排第一** —— 公共 GitHub 代理时好时坏
+#    (实测 gh-proxy.com 已 500, 故直接摘掉), 而 R2 的包是发版时自己传上去、字节数与官方逐一
+#    核对过的, 出站还免费。后面仍留公共代理与 GitHub 直连兜底: R2/CF 万一挂了也装得上。
+#    (arm64/x64 在 R2 里都有; 32 位 x86 没镜像 → R2 那跳 404, 自动落到后面的源, 不影响。)
+$ver = 'PWSH_VER'
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'AMD64' { 'x64' } default { 'x86' } }
 $msi = "PowerShell-$ver-win-$arch.msi"
 $dst = Join-Path $env:TEMP $msi
 $rel = "https://github.com/PowerShell/PowerShell/releases/download/v$ver/$msi"
 $urls = @(
-  "https://gh-proxy.com/$rel",
+  "DEPS_BASE/$msi",
   "https://ghfast.top/$rel",
   "https://ghproxy.net/$rel",
   $rel
 )
-$ok = $false
-foreach ($u in $urls) {
-  try {
-    Write-Output "下载: $u"
-    Invoke-WebRequest -Uri $u -OutFile $dst -UseBasicParsing -TimeoutSec 600
-    if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 1MB)) { $ok = $true; break }
-  } catch {
-    Write-Output ("  下载失败: " + $_.Exception.Message)
-  }
-}
-if (-not $ok) {
+Get-PolarisFile -Urls $urls -Dest $dst -Magic 'MSI_MAGIC' -MinBytes 40MB
+if (-not $global:PolarisDlOk) {
   Write-Output 'PowerShell 7 安装包下载失败 (可检查网络 / 代理后重试)。'
   exit 1
 }
-# 安装到 Program Files 需要管理员权限 -> 用 RunAs 触发 UAC (拒绝则友好报错, 不静默失败)
 Write-Output "安装中 (msiexec, 会弹一次 UAC 授权): $dst"
-try {
-  $p = Start-Process msiexec.exe -ArgumentList ('/i "' + $dst + '" /quiet /norestart ADD_PATH=1') -Wait -PassThru -Verb RunAs
-} catch {
-  Write-Output ('安装启动失败 (可能未授予管理员权限): ' + $_.Exception.Message)
-  exit 1
-}
+Install-PolarisMsi -Path $dst -ExtraArgs 'ADD_PATH=1'
 Remove-Item $dst -ErrorAction SilentlyContinue
-if ($p.ExitCode -ne 0) { Write-Output ('msiexec 退出码 ' + $p.ExitCode); exit 1 }
+if ($global:PolarisMsiCode -ne 0) { Write-Output ('msiexec 退出码 ' + $global:PolarisMsiCode); exit 1 }
 Write-Output 'PowerShell 7 安装完成。'
 "#;
 
@@ -259,40 +374,34 @@ pub fn env_install_uv(app: AppHandle) -> Result<String, String> {
     {
         let req_id = next_req_id();
         #[cfg(windows)]
-        let cmd = build_powershell(UV_INSTALL_SCRIPT);
+        let cmd = build_powershell(&uv_install_script());
         #[cfg(target_os = "macos")]
-        let cmd = build_install_shell(MAC_UV_INSTALL_SCRIPT);
+        let cmd = build_install_shell(&mac_uv_install_script());
         stream_install(app, req_id.clone(), cmd, false, "uv");
         Ok(req_id)
     }
 }
 
-/// Windows uv 安装脚本: 下载官方 release zip(国内代理加速)→ 解压到 `~/.local/bin` → 写国内镜像配置。
+/// Windows uv 安装脚本正文: 下载 release zip → 解压到 `~/.local/bin` → 写国内镜像配置。
 /// uv 是 MIT/Apache 双许可的单文件二进制, 解压即用, 不需要管理员权限。
+///
+/// **版本从 `latest/download` 改成锁定**: 要把包镜像进自家 R2 就必须锁版本 (R2 里放的是某个
+/// 确定版本的字节)。副作用是升 uv 得改这里的版本号并重传 R2 —— 换来的是不再被公共代理拖累。
 #[cfg(windows)]
-const UV_INSTALL_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Continue'
+const UV_INSTALL_BODY: &str = r#"
 $arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'aarch64' } 'AMD64' { 'x86_64' } default { 'x86_64' } }
+$ver = 'UV_VER'
 $asset = "uv-$arch-pc-windows-msvc.zip"
-$rel = "https://github.com/astral-sh/uv/releases/latest/download/$asset"
+$rel = "https://github.com/astral-sh/uv/releases/download/$ver/$asset"
 $urls = @(
-  "https://gh-proxy.com/$rel",
+  "DEPS_BASE/$asset",
   "https://ghfast.top/$rel",
   "https://ghproxy.net/$rel",
   $rel
 )
 $dst = Join-Path $env:TEMP $asset
-$ok = $false
-foreach ($u in $urls) {
-  try {
-    Write-Output "下载: $u"
-    Invoke-WebRequest -Uri $u -OutFile $dst -UseBasicParsing -TimeoutSec 600
-    if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 500KB)) { $ok = $true; break }
-  } catch {
-    Write-Output ("  下载失败: " + $_.Exception.Message)
-  }
-}
-if (-not $ok) { Write-Output 'uv 下载失败 (可检查网络 / 代理后重试)。'; exit 1 }
+Get-PolarisFile -Urls $urls -Dest $dst -Magic 'ZIP_MAGIC' -MinBytes 5MB
+if (-not $global:PolarisDlOk) { Write-Output 'uv 下载失败 (可检查网络 / 代理后重试)。'; exit 1 }
 $bin = Join-Path $env:USERPROFILE '.local\bin'
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 try {
@@ -331,17 +440,26 @@ case "$ARCH" in
   *) UARCH=x86_64 ;;
 esac
 ASSET="uv-${UARCH}-apple-darwin.tar.gz"
-REL="https://github.com/astral-sh/uv/releases/latest/download/${ASSET}"
+VER='UV_VER'
+REL="https://github.com/astral-sh/uv/releases/download/${VER}/${ASSET}"
 TMP="$(mktemp -d)"
 TARBALL="$TMP/$ASSET"
 OK=0
+# 自家 R2 打头 (发版时传上去、字节数与官方核对过), 公共代理与 GitHub 直连兜底。
+# 每个源都校验 gzip 魔数 (1f8b) —— 代理挂掉时常回「200 + HTML 错误页」, 只看「文件非空」会把
+# 错误页当安装包喂给 tar, 报一句看不懂的错。
 for U in \
-  "https://gh-proxy.com/$REL" \
+  "DEPS_BASE/$ASSET" \
   "https://ghfast.top/$REL" \
+  "https://ghproxy.net/$REL" \
   "$REL" ; do
   echo "下载: $U"
-  if curl -fsSL "$U" -o "$TARBALL" && [ -s "$TARBALL" ]; then OK=1; break; fi
-  echo "  下载失败, 试下一个镜像..."
+  if curl -fsSL --retry 2 --retry-delay 2 "$U" -o "$TARBALL" && [ -s "$TARBALL" ]; then
+    if [ "$(head -c 2 "$TARBALL" | od -An -tx1 | tr -d ' \n')" = "1f8b" ]; then OK=1; break; fi
+    echo "  文件头不是 gzip —— 多半是代理回的错误页, 换下一个源..."
+  else
+    echo "  下载失败, 试下一个镜像..."
+  fi
 done
 if [ "$OK" != "1" ]; then echo "uv 下载失败 (检查网络/代理后重试)。"; rm -rf "$TMP"; exit 1; fi
 BIN="$HOME/.local/bin"
@@ -596,17 +714,116 @@ pub(crate) fn stream_install(
 mod tests {
     use super::*;
 
-    /// 把内嵌的安装脚本原文 dump 到临时文件, 供外部用 PowerShell AST 解析器做语法校验
-    /// (内嵌脚本的语法错误只会在「真正安装」时才暴露, 这里提前抓出来)。`--ignored` 手动跑。
+    /// 占位符必须全部被填掉 —— 漏一个就会把 `DEPS_BASE/xxx.msi` 这种字面量当 URL 去下载。
+    #[test]
+    fn scripts_have_no_unfilled_placeholders() {
+        let mut all = vec![
+            ("node", node_install_script()),
+            ("pwsh", pwsh_install_script()),
+        ];
+        #[cfg(windows)]
+        all.push(("uv", uv_install_script()));
+        #[cfg(target_os = "macos")]
+        all.push(("mac-uv", mac_uv_install_script()));
+        for (name, s) in &all {
+            for ph in ["DEPS_BASE", "MSI_MAGIC", "ZIP_MAGIC", "PWSH_VER", "NODE_VER", "UV_VER"] {
+                assert!(!s.contains(ph), "{name} 脚本里还留着未替换的占位符 {ph}");
+            }
+            assert!(
+                s.contains(DEPS_BASE),
+                "{name} 脚本应把自家 R2 源排进候选 (否则镜像白传)"
+            );
+        }
+    }
+
+    /// R2 源必须排在公共代理**前面** —— 顺序错了等于没镜像 (用户仍先撞 gh-proxy 那类不稳定源)。
+    #[test]
+    fn r2_source_comes_first() {
+        for (name, s) in [("node", node_install_script()), ("pwsh", pwsh_install_script())] {
+            let r2 = s.find(DEPS_BASE).expect("应含 R2 源");
+            for other in ["ghfast.top", "ghproxy.net", "cdn.npmmirror.com", "nodejs.org"] {
+                if let Some(i) = s.find(other) {
+                    assert!(r2 < i, "{name}: R2 源应排在 {other} 之前");
+                }
+            }
+        }
+        // 实测已 500 的 gh-proxy.com 不该再出现在下载候选里。只认 `$urls` 里的 URL 字面量形态,
+        // 别把正文里解释「为什么摘掉它」的那句注释也算进来。
+        assert!(!pwsh_install_script().contains("\"https://gh-proxy.com/"));
+    }
+
+    /// 关掉 IWR 进度条是「PowerShell 7 有些概率装不上」的主修 —— 实测 584KB/s → 4266KB/s。
+    /// 三个 Windows 脚本一个都不能漏, 故在此锁死。
+    #[test]
+    fn windows_scripts_disable_progress_bar() {
+        let mut all = vec![node_install_script(), pwsh_install_script()];
+        #[cfg(windows)]
+        all.push(uv_install_script());
+        for s in &all {
+            assert!(s.contains("$ProgressPreference = 'SilentlyContinue'"));
+        }
+    }
+
+    /// 把最终生成的安装脚本原文 dump 到临时目录, 供真机手动跑「下载段」核对
+    /// (R2 源是否命中、魔数校验是否放行)。真下载几十上百 MB, 故不进常规测试。
+    /// `cargo test -p polaris-kernel dump_install_scripts -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn dump_install_scripts() {
         let dir = std::env::temp_dir();
-        let node = dir.join("polaris_node_install.ps1");
-        let pwsh = dir.join("polaris_pwsh_install.ps1");
-        std::fs::write(&node, NODE_INSTALL_SCRIPT).unwrap();
-        std::fs::write(&pwsh, PWSH_INSTALL_SCRIPT).unwrap();
-        println!("NODE_SCRIPT={}", node.display());
-        println!("PWSH_SCRIPT={}", pwsh.display());
+        let mut all = vec![
+            ("node", node_install_script()),
+            ("pwsh", pwsh_install_script()),
+        ];
+        #[cfg(windows)]
+        all.push(("uv", uv_install_script()));
+        #[cfg(target_os = "macos")]
+        all.push(("mac-uv", mac_uv_install_script()));
+        for (name, src) in &all {
+            let ext = if name.starts_with("mac") { "sh" } else { "ps1" };
+            let p = dir.join(format!("polaris_{name}_install.{ext}"));
+            let mut bytes = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM: 见上面解析测试里的说明
+            bytes.extend_from_slice(src.as_bytes());
+            std::fs::write(&p, &bytes).unwrap();
+            println!("{name} -> {}", p.display());
+        }
+    }
+
+    /// 内嵌 PowerShell 脚本的语法错误以前只有「用户真的点安装」时才暴露。
+    /// 这里用 PowerShell 自带的 AST 解析器在**测试期**就把它抓出来。
+    #[test]
+    #[cfg(windows)]
+    fn install_scripts_parse_as_valid_powershell() {
+        for (name, src) in [
+            ("node", node_install_script()),
+            ("pwsh", pwsh_install_script()),
+            ("uv", uv_install_script()),
+        ] {
+            let f = std::env::temp_dir().join(format!("polaris_test_{name}_install.ps1"));
+            // 必须写 UTF-8 BOM: Windows PowerShell 5.1 读**无 BOM** 的 .ps1 会按 ANSI(GBK) 解,
+            // 脚本里的中文当场被搅碎、引号配不上对, 报一堆假的语法错。
+            // (运行时那条路不经文件 —— build_powershell 用 `-Command` 传, Rust 经 CreateProcessW
+            //  给的是 UTF-16, 没这个问题。这里是为了让 ParseFile 看到跟内存里一样的字节。)
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice(src.as_bytes());
+            std::fs::write(&f, &bytes).expect("写临时脚本");
+            // 单引号字符串里反斜杠是字面量, 无需转义; 只需把路径里的单引号翻倍。
+            let path = f.display().to_string().replace('\'', "''");
+            let script = format!(
+                "$errs = $null; \
+                 $null = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$errs); \
+                 if ($errs -and $errs.Count -gt 0) {{ $errs | ForEach-Object {{ Write-Output $_.ToString() }}; exit 1 }}"
+            );
+            let out = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .expect("跑 PowerShell 解析器");
+            assert!(
+                out.status.success(),
+                "{name} 安装脚本语法有错:\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let _ = std::fs::remove_file(&f);
+        }
     }
 }

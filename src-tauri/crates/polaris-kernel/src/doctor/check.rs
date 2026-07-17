@@ -56,18 +56,30 @@ pub(crate) fn env_check_sync() -> EnvReport {
                 "未安装 —— 建议安装 (winget)",
             )
         });
+        // node/npm 必须带上安装目录候选: 只靠 PATH 的话, 「装好了但本进程 PATH 是旧快照」
+        // (Windows MSI/winget 只写注册表; GUI 从 Finder 拉起只有极简 PATH) 会被误报成「未安装」。
         let node = s.spawn(|| {
             detect(
                 "node",
                 "Node.js",
                 "node",
                 &["--version"],
-                &[],
+                &node_candidates(),
                 false,
                 "未安装 (npm 安装方式需要它)",
             )
         });
-        let npm = s.spawn(|| detect("npm", "npm", "npm", &["--version"], &[], false, "未安装"));
+        let npm = s.spawn(|| {
+            detect(
+                "npm",
+                "npm",
+                "npm",
+                &["--version"],
+                &npm_candidates(),
+                false,
+                "未安装",
+            )
+        });
         // uv —— Python 脚本运行时的统一托管者(脚本执行公约依赖它)。候选含 ~/.local/bin/uv(.exe)。
         let uv = s.spawn(|| {
             detect(
