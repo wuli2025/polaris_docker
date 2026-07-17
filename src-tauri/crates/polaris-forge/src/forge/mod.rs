@@ -13,6 +13,7 @@ pub mod capture; // 工业级化:持久 CDP + 5 档 fallback 链(替 video 的 p
                  // (Phase 0 文件归位; lib.rs 有 crate 根别名保持 `crate::figma_bridge` 旧路径)。
 pub mod figma_bridge;
 pub mod fx_safe; // 工业级化:动效错误隔离 + spring 闭式解(任务 c §C.2 §C.3)
+pub mod image; // 文生图(多家可配,纯 Rust)→ 配置由壳注入(见 polaris-app/src/imagegen.rs)
 pub mod pptx;
 pub mod pptx_native; // 路线 B:spec JSON → 原生可编辑 .pptx(零浏览器,Docker slim 可用)
 pub mod tts;

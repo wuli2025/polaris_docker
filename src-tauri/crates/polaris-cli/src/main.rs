@@ -20,6 +20,9 @@ const HELP: &str = r#"polaris-forge — Polaris Forge 渲染引擎 CLI
   polaris-forge spec-pptx --spec=<polaris.slides.json|JSON字符串> --out=<out.pptx>
       结构化 spec → 原生 100% 可编辑 .pptx(真文本框/形状/项目符号,零浏览器依赖)。
 
+  polaris-forge image --prompt=<画面描述> --out=<out.png> [--ratio=16:9]
+      文生图(纯 Rust,零 Python)。画幅:1:1|16:9|4:3|3:2|2:3|3:4|9:16|21:9。
+      用哪家由「设置 → API 供应商 → 生图模型」定(MiniMax / OpenAI / 豆包方舟…);没配则报错不猜。
   polaris-forge pptx --deck=<deck.html> --out=<out.pptx> [--width=1920] [--height=1080]
                      [--slides=N] [--no-text]
       deck.html → .pptx 分层导出:无字背景截图 + 可见文本框(可编辑);--no-text 纯图。
@@ -96,6 +99,12 @@ fn run(cmd: &str, args: &[String]) -> Result<Value, String> {
     match cmd {
         "preflight" => Ok(app::forge::forge_preflight()),
         "spec-pptx" => app::forge::spec_to_pptx_sync(req(args, "spec")?, req(args, "out")?),
+        // 走壳桥接而非直调 forge —— 生图配置在 kernel 的生图坞里, forge 不认识 kernel。
+        "image" => app::imagegen::forge_image_sync(
+            req(args, "prompt")?,
+            req(args, "out")?,
+            flag(args, "ratio"),
+        ),
         "pptx" => app::forge::pptx::render_deck_to_pptx(
             &req(args, "deck")?,
             &req(args, "out")?,

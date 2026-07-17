@@ -31,6 +31,8 @@ pub use forge::figma_bridge;
 pub use polaris_runtime as runtime;
 // 外壳拼装点: 把引擎实现注入内核桥(chat::bridges), 桌面 setup 与 server serve 共用。
 pub mod wiring;
+// 生图壳桥接: 唯一同时认识 kernel 生图坞与 forge 生图引擎的地方(forge 不认识 kernel, 见其 Cargo.toml)。
+pub mod imagegen;
 // 自动更新依赖 Tauri updater/restart/package_info → 桌面专属（Docker 用 docker pull 更新）。
 #[cfg(feature = "desktop")]
 pub mod updater;
@@ -335,6 +337,12 @@ pub fn run() {
             provider::provider_delete,
             provider::usage_summary,
             provider::provider_balance,
+            // 生图供应商坞(独立于聊天表 —— 理由见 provider/image_store.rs 文件头)
+            provider::image_provider_list,
+            provider::image_provider_save,
+            provider::image_provider_delete,
+            provider::image_provider_switch,
+            imagegen::forge_image,
             provider::codex_status,
             provider::codex_start_login,
             provider::codex_poll_login,

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from "vue";
+import ImageProviderPanel from "./ImageProviderPanel.vue";
 import {
   Zap,
   ChevronUp,
@@ -789,6 +790,9 @@ function subtitleOf(p: ProviderView): string {
                   <button class="add-row" @click="addCustom">
                     <Plus :size="13" :stroke-width="2.2" /> 添加自定义供应商
                   </button>
+
+                  <!-- 生图模型: 后端是**独立的一张表**(见 provider/image_store.rs 文件头) -->
+                  <ImageProviderPanel />
                 </template>
               </div>
 

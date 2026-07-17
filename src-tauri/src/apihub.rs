@@ -817,6 +817,22 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
             ok(provider::provider_save(input)?)
         }
         "provider_delete" => ok(provider::provider_delete(req_str(a, "id")?)?),
+        // ── 生图供应商坞(独立表)+ 生图 ──
+        "image_provider_list" => ok(provider::image_provider_list()?),
+        "image_provider_save" => {
+            let input: provider::ImageProviderInput =
+                serde_json::from_value(a.get("input").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| format!("image_provider_save 参数解析失败: {e}"))?;
+            ok(provider::image_provider_save(input)?)
+        }
+        "image_provider_delete" => ok(provider::image_provider_delete(req_str(a, "id")?)?),
+        "image_provider_switch" => ok(provider::image_provider_switch(req_str(a, "id")?)?),
+        // 桌面同名命令是 async 包装; apihub 本就在阻塞线程池里, 直调同步内核。
+        "forge_image" => ok(crate::imagegen::forge_image_sync(
+            req_str(a, "prompt")?,
+            req_str(a, "out")?,
+            opt_str(a, "ratio"),
+        )?),
         "usage_summary" => ok(provider::usage_summary()?),
         "provider_balance" => ok(provider::provider_balance(req_str(a, "id")?)?),
         "codex_status" => ok(provider::codex_status()?),

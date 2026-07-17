@@ -21,6 +21,8 @@
 
 pub mod claude_login;
 pub mod codex_login;
+/// 生图供应商坞 —— **独立于 store.rs 那张聊天表**(理由见文件头, 别合并)。
+pub mod image_store;
 pub mod oauth_loopback;
 pub mod store;
 pub mod usage;
@@ -85,6 +87,7 @@ fn ymd_string(z: i64) -> String {
 
 pub use claude_login::*;
 pub use codex_login::*;
+pub use image_store::*;
 pub use oauth_loopback::*;
 pub use store::*;
 pub use usage::*;

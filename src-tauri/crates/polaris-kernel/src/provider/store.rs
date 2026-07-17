@@ -898,32 +898,20 @@ fn apply_settings_config(cfg: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// 给「生图」用的当前供应商画像：返回 (当前供应商展示名, 是否疑似具备真实生图能力)。
+/// 给「生图」用的画像：返回 (可用的生图家展示名, 是否真能生图)。
 ///
-/// 真相：供应商坞里 55 家全部是 Anthropic 协议的文本 / 代码大模型，**没有一个能生图**；
-/// 真要生图得另配一份独立的图像 API（如 OpenAI gpt-image）。所以默认「不支持」，
-/// 仅当 settings.json 的 env 或进程环境里检测到 `OPENAI_API_KEY` 时才认为可尝试真实生图。
+/// 本表(聊天供应商坞)里 55 家全是文本/代码大模型,**没有一个能生图** —— 生图配置住在
+/// 独立的生图坞(`image_store.rs`,理由见其文件头)。这里只是把它转出来。
+///
+/// 旧实现是「settings.json 或进程 env 里有非空 `OPENAI_API_KEY` 就算支持」—— 那是张**空头
+/// 支票**:环境变量里有个 key 不代表我们真会去调它(当时压根没有生图调用路径),而
+/// `prompt.rs` 却照着它跟用户承诺「可以在 API 供应商里配置图像 API」。现在按**真配了生图家
+/// 且填了 Key** 判定,承诺才对得上实现。
 pub fn image_gen_capability() -> (String, bool) {
-    let store = STORE.read().clone();
-    let views = build_views(&store);
-    let cur = detect_current(&views, &store);
-    let name = views
-        .iter()
-        .find(|v| v.id == cur)
-        .map(|v| v.name.clone())
-        .unwrap_or_else(|| "Claude 官方".to_string());
-
-    let live = read_live_env();
-    let has_image_key = live
-        .get("OPENAI_API_KEY")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
-        || std::env::var("OPENAI_API_KEY")
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-
-    (name, has_image_key)
+    match image_store::current_image_config() {
+        Some(c) => (format!("{}({})", c.name, c.model), true),
+        None => (String::new(), false),
+    }
 }
 
 // ───────────────────────── Commands: 供应商 ─────────────────────────

@@ -1570,6 +1570,57 @@ export interface ProviderBalance {
   /** 控制台 / 官网链接(可空) */
   consoleUrl: string;
 }
+// ── 生图供应商坞(独立表, 与上面的聊天供应商无关) ──
+/** 请求/响应形状: minimax 吃 aspect_ratio→data.image_urls[0]; openai 系吃 size→data[0].url|b64_json */
+export type ImageFlavor = "minimax" | "openai";
+export interface ImageProviderView {
+  id: string;
+  name: string;
+  flavor: ImageFlavor;
+  endpoint: string;
+  model: string;
+  note: string;
+  /** 只回「配没配 key」, 后端绝不回明文 */
+  hasKey: boolean;
+  isCurrent: boolean;
+}
+export interface ImagePresetView {
+  id: string;
+  name: string;
+  flavor: ImageFlavor;
+  endpoint: string;
+  model: string;
+  note: string;
+}
+export interface ImageProviderListResult {
+  items: ImageProviderView[];
+  currentId: string;
+  /** 预设模板, 只为免手输; 用户仍需自己填 Key */
+  presets: ImagePresetView[];
+}
+export interface ImageProviderSaveInput {
+  /** 空 = 新建 */
+  id?: string;
+  name: string;
+  flavor: ImageFlavor;
+  endpoint: string;
+  model: string;
+  /** 空 = 保持原 key 不变(编辑时不必重填) */
+  apiKey?: string;
+  note?: string;
+}
+export interface ImageGenResult {
+  ok: boolean;
+  out: string;
+  bytes: number;
+  /** 按魔数认出的真实格式(png/jpeg), 可能与 out 的后缀不同 */
+  format: string;
+  ratio: string;
+  model: string;
+  attempts: number;
+  provider: string;
+}
+
 export interface CodexStatus {
   installed: boolean;
   loggedIn: boolean;
@@ -1637,6 +1688,24 @@ export const provider = {
     invoke<ClaudeAuthStatus>("claude_finish_login", { pasted, verifier, state }),
   claudeLoginPoll: () => invoke<LoginPollResult>("claude_login_poll"),
   claudeLoginCancel: () => invoke<void>("claude_login_cancel"),
+};
+/**
+ * 生图供应商坞 —— **独立于上面那张聊天表**。
+ * 后端是另一张表(provider/image_store.rs), 理由见其文件头: 聊天表的 switch/detect 会把
+ * 任何带 base_url 的条目当聊天家、把地址套进 ANTHROPIC_BASE_URL, 生图 endpoint 混进去
+ * 会把聊天整条链路搞挂。前端也照此分开, 别把两者的方法混到一个对象里。
+ */
+export const imageProvider = {
+  list: () => invoke<ImageProviderListResult>("image_provider_list"),
+  save: (input: ImageProviderSaveInput) =>
+    invoke<ImageProviderListResult>("image_provider_save", { input }),
+  delete: (id: string) =>
+    invoke<ImageProviderListResult>("image_provider_delete", { id }),
+  switch: (id: string) =>
+    invoke<ImageProviderListResult>("image_provider_switch", { id }),
+  /** 文生图。生图常 20–60s, 后端已 spawn_blocking, 前端记得给 loading 态。 */
+  generate: (prompt: string, out: string, ratio?: string) =>
+    invoke<ImageGenResult>("forge_image", { prompt, out, ratio }),
 };
 
 // ──────────────────────────────────────────────────────────────
@@ -2010,6 +2079,23 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       return "custom-stub";
     case "provider_delete":
       return undefined;
+    // 生图坞 stub: 浏览器预览下回「一家没配」——与真机首次打开同一形态,
+    // 让空态 UI 也能在浏览器里走查。presets 照抄后端 IMAGE_PRESETS。
+    case "image_provider_list":
+    case "image_provider_save":
+    case "image_provider_delete":
+    case "image_provider_switch":
+      return {
+        items: [],
+        currentId: "",
+        presets: [
+          { id: "minimax-image", name: "MiniMax 图像", flavor: "minimax", endpoint: "https://api.minimaxi.com/v1/image_generation", model: "image-01", note: "国内可直连;画幅走 aspect_ratio(16:9 等)" },
+          { id: "openai-image", name: "OpenAI 图像", flavor: "openai", endpoint: "https://api.openai.com/v1/images/generations", model: "gpt-image-1", note: "官方或任何兼容网关;画幅走 size(1024x1024 等)" },
+          { id: "doubao-image", name: "豆包 Seedream(方舟)", flavor: "openai", endpoint: "https://ark.cn-beijing.volces.com/api/v3/images/generations", model: "doubao-seedream-4-0-250828", note: "火山方舟;说 OpenAI 形状,模型名需在方舟控制台确认" },
+        ],
+      };
+    case "forge_image":
+      throw new Error("浏览器预览不支持真实生图（需要本机 forge 引擎）");
     case "codex_status":
       return { installed: false, loggedIn: false, authPath: "(browser-only)" };
     case "codex_start_login":

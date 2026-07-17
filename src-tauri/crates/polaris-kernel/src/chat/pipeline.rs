@@ -420,10 +420,13 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         if supported {
             None
         } else {
-            Some(format!(
-                "> ⚠️ **说明**：你当前使用的「{}」是文本大模型，**不支持生成真实图片**。下面用一张「HTML 模拟的画面」来替代；如需真实 AI 生图，请在「API 供应商」里配置支持文生图的图像接口。\n\n",
-                provider_name
-            ))
+            // 注意: 未配置时 image_gen_capability() 回的 provider_name 是**空串**
+            // (生图坞是独立的一张表, 没配就没有"当前家"这回事) —— 这句话里不能再引用它,
+            // 否则会渲染成「你当前使用的「」是文本大模型」。
+            Some(
+                "> ⚠️ **说明**：你还没配生图模型，聊天用的大模型**不支持生成真实图片**。下面用一张「HTML 模拟的画面」来替代；如需真实 AI 生图，到「设置 → API 供应商 → 生图模型」加一家并填 Key（MiniMax / OpenAI / 豆包方舟都行），配好后再让我重画即可。\n\n"
+                    .to_string(),
+            )
         }
     } else {
         None
