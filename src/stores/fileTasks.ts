@@ -13,7 +13,7 @@ import { files as fc, listen, invoke } from "../tauri";
 //   ③ done 时自增对应 doneTick → 关心的视图 watch 它来刷新数据。
 //
 // 后端事件契约:
-//   盘点      fable:inventory   {kind: progress(files,bytes) / done(files,...) / error(message)}
+//   盘点      fable:inventory   {kind: progress(files,bytes,dirs) / phase(text) / done(files,...) / error(message)}
 //   建索引    fable:index       {kind: progress(files,chunks) / done(files,stopped) / error}
 //   智能归类  file:cluster      {kind: phase(text) / done(clusters,files,note) / error}     ← 本轮改后台
 //   AI 归类   file:cluster_llm  {kind: phase(text) / done(clusters,assigned) / error}
@@ -66,11 +66,16 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     if (wired) return;
     wired = true;
     unlisteners.push(
-      await listen<{ kind: string; files?: number; message?: string; unreachable?: string[] }>(
+      await listen<{ kind: string; files?: number; dirs?: number; text?: string; message?: string; unreachable?: string[] }>(
         "fable:inventory",
         (p) => {
-          if (p.kind === "progress") detail.inventory = `已盘点 ${p.files ?? 0} 个文件…`;
-          else if (p.kind === "done") {
+          if (p.kind === "progress") {
+            const dirs = p.dirs ? ` · ${p.dirs} 个文件夹` : "";
+            detail.inventory = `已盘点 ${p.files ?? 0} 个文件${dirs}…`;
+          } else if (p.kind === "phase") {
+            // 收尾阶段(写清单/核对变更/清理消失文件…):以前是零反馈黑箱,数字冻住像卡死。
+            detail.inventory = p.text ?? detail.inventory;
+          } else if (p.kind === "done") {
             lastUnreachable.value = p.unreachable ?? [];
             finish("inventory", `盘点完成 · ${p.files ?? 0} 个文件`);
           } else if (p.kind === "error") {

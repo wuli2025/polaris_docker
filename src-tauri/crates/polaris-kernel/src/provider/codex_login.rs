@@ -173,11 +173,16 @@ pub(crate) fn codex_agent() -> ureq::Agent {
         .build()
 }
 
-/// ① 发起授权: 桌面端首选回环一键授权(浏览器点 Authorize 即完成), 兜底 Device Code
+/// ① 发起授权。两种交互:
+/// - `force_device=true`(前端「网站 + 效验码」主按钮, 同 cc-switch): 直接走 Device Code,
+///   给出验证网址 + 配对码, 用户在网页填码即完成 —— server flavor / 远端也能用。
+/// - `force_device=false`: 桌面端走回环一键(浏览器点 Authorize 即完成), 更省事。
+/// 两条路拿到的 token 都按官方格式写 ~/.codex/auth.json, Codex CLI 与 Claude Code 翻译代理共用。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn codex_start_login() -> Result<CodexDeviceLogin, String> {
-    // 回环一键: server flavor 浏览器在远端打不回本机, 只在桌面端启用
-    if cfg!(feature = "desktop") {
+pub fn codex_start_login(force_device: Option<bool>) -> Result<CodexDeviceLogin, String> {
+    // 回环一键: server flavor 浏览器在远端打不回本机, 只在桌面端启用;
+    // force_device=true(前端选「网站+效验码」)则跳过, 直接走 Device Code。
+    if cfg!(feature = "desktop") && !force_device.unwrap_or(false) {
         if let Some(listener) = loopback_take_port(&CODEX_LOOPBACK, CODEX_LOOPBACK_PORT) {
             let verifier = claude_rand_b64url(48)?;
             let state = claude_rand_b64url(32)?;

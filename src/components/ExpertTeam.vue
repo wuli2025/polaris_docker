@@ -170,7 +170,7 @@ const emit = defineEmits<{
     <div class="section-title">🧭 业务专家团 · 一句话组队</div>
     <div class="team-grid">
       <button v-for="tm in teams" :key="tm.id" class="team-card" @click="emit('select-team', tm.id)">
-        <img class="team-avatar" :src="avatarUrl(tm.leadId, tm.icon)" :alt="tm.name" />
+        <img class="team-avatar" decoding="async" :src="avatarUrl(tm.leadId, tm.icon)" :alt="tm.name" />
         <div class="team-body">
           <div class="team-name">{{ tm.icon }} {{ tm.name }}</div>
           <div class="team-tag">{{ tm.tagline }}</div>
@@ -209,7 +209,7 @@ const emit = defineEmits<{
         :title="exp.description"
         @click="emit('select-expert', exp.id)"
       >
-        <img class="exp-avatar" :src="avatarUrl(exp.id, exp.icon)" :alt="exp.name" />
+        <img class="exp-avatar" decoding="async" :src="avatarUrl(exp.id, exp.icon)" :alt="exp.name" />
         <div class="exp-info">
           <div class="exp-name-row">
             <span class="exp-name">{{ exp.name }}</span>

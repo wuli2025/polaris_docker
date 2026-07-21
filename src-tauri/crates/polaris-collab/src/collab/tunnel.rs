@@ -1,16 +1,23 @@
 //! collab/tunnel.rs —— iroh 组网隧道（v8 方案，做法参考 n0-computer/dumbpipe）。
 //!
-//! 主机侧:host.key 种子 → iroh Endpoint 监听 ALPN `polaris/1`,accept 到的每条连接
-//! 先查设备白名单(identity::is_node_allowed,隧道层准入硬闸),通过后每条双向流 ↔
-//! TCP 127.0.0.1:8080 双向拷贝。成员侧:本地 TcpListener,每个 TCP 连接开一条到主机
-//! NodeId 的 iroh 双向流。打洞失败自动走 relay(默认 n0 公共 relay,可 apply_relay_config
-//! 下发自定义 relay 列表)。
+//! 拓扑（多隧道形态）:
+//! - 主机侧: host.key 种子 → 专属 iroh Endpoint 监听 ALPN `polaris/1`,每条双向流 ↔
+//!   TCP 上游(hosting/server 上报的真实端口)双向拷贝。strict 模式下过设备白名单闸。
+//! - 成员侧: **所有出站隧道共享一个 Endpoint**(device.key 身份)——一个 UDP socket、
+//!   一份 n0 发现记录、一条 relay 连接,N 块远程盘不再各起一套(旧版每盘一个 Endpoint,
+//!   同一 device.key 多端上线会让发现记录来回抖动,互相打断打洞)。
+//!   每条隧道 = 一个本地 TcpListener(127.0.0.1:port) + 到对应主机的一条 QUIC 连接,
+//!   登记在 CLIENTS 注册表(port → ClientTunnel),状态/连接/重连互相独立。
+//! - connect_client 幂等: 同 port 同主机已活 = no-op;disconnect_client(port) 单独拆除。
+//! - 打洞失败自动走 relay(默认 n0 公共 relay,可 apply_relay_config 下发自定义列表)。
+//! - mDNS 内网发现(POLARIS_MDNS=0 可关): 断外网时同局域网设备照样互相发现直连。
 //!
 //! 全模块随 `collab-net` feature 编译(iroh 依赖树大,勿进 default)。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -53,28 +60,69 @@ fn upstream_addr() -> String {
     "127.0.0.1:8080".to_string()
 }
 
-// ── 全局状态:running / node_id / 活跃连接数 / 停止信号 / relay 配置 ──────────
+// ── 全局状态 ────────────────────────────────────────────────────────────────
+// 主机态与客户端态彻底分家:旧版共用一套 RUNNING/STATE/CLIENT_CONN,
+// 桌面「既当主机又连 NAS」或接两块盘时互相踩踏(is_running 误判、连接错用)。
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
+/// 活跃转发流总数(主机 accept 的 + 成员代理的),仅聚合展示用。
 static CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-static NODE_ID: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
-static SHUTDOWN: Lazy<tokio::sync::Notify> = Lazy::new(tokio::sync::Notify::new);
 /// 自定义 relay URL 列表;空 = 用 iroh 默认(n0 公共 relay)。
 static RELAYS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
-/// 连接状态机:stopped | connecting | connected | reconnecting | degraded。
-static STATE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("stopped".to_string()));
-/// 最近一次错误(中文),前端状态徽标展示;成功后清空。
-static LAST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
-/// 成员侧与主机的当前 QUIC 连接(健康巡检/状态上报共用)。主机侧不用。
-static CLIENT_CONN: Lazy<Mutex<Option<Connection>>> = Lazy::new(|| Mutex::new(None));
 
-fn set_state(s: &str) {
-    *STATE.lock().unwrap() = s.to_string();
+// 主机侧
+static HOST_RUNNING: AtomicBool = AtomicBool::new(false);
+/// start_host_blocking_thread 幂等闸:已有主机线程在跑就不再起第二个 accept 循环
+/// (旧版重复 POST /tunnel/start 会叠多个同 key Endpoint,发现记录抖动)。
+static HOST_STARTED: AtomicBool = AtomicBool::new(false);
+static HOST_STOPPING: AtomicBool = AtomicBool::new(false);
+static HOST_STATE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new("stopped".to_string()));
+static HOST_ERROR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+static HOST_NODE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+static HOST_SHUTDOWN: Lazy<tokio::sync::Notify> = Lazy::new(tokio::sync::Notify::new);
+
+// 成员侧
+/// 一条出站隧道:本地 127.0.0.1:port ↔ 主机 host_id。状态互相独立。
+struct ClientTunnel {
+    host_str: String,
+    host_id: EndpointId,
+    port: u16,
+    /// 隧道任务存活(创建即 true,任务退出置 false;状态细节看 state)。
+    alive: AtomicBool,
+    stopping: AtomicBool,
+    state: Mutex<String>,
+    last_error: Mutex<String>,
+    conn: Mutex<Option<Connection>>,
+    shutdown: tokio::sync::Notify,
 }
 
-fn set_error(e: impl Into<String>) {
-    *LAST_ERROR.lock().unwrap() = e.into();
+impl ClientTunnel {
+    fn set_state(&self, s: &str) {
+        *self.state.lock().unwrap() = s.to_string();
+    }
+    fn set_error(&self, e: impl Into<String>) {
+        *self.last_error.lock().unwrap() = e.into();
+    }
 }
+
+/// 出站隧道注册表:port → 隧道。BTreeMap 保证 status 输出稳定有序。
+static CLIENTS: Lazy<Mutex<BTreeMap<u16, Arc<ClientTunnel>>>> =
+    Lazy::new(|| Mutex::new(BTreeMap::new()));
+
+/// 隧道专用共享 runtime:所有客户端隧道任务跑在这 2 个 worker 上
+/// (旧版每盘一线程一 runtime,N 盘 = 2N 线程)。主机侧仍独享一线程(见下)。
+static TUNNEL_RT: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("polaris-tunnel")
+        .enable_all()
+        .build()
+        .expect("tunnel runtime 创建失败")
+});
+
+/// 共享客户端 Endpoint(device.key 身份),首个隧道触发构建,之后所有隧道复用。
+static CLIENT_EP: Lazy<tokio::sync::OnceCell<Endpoint>> = Lazy::new(tokio::sync::OnceCell::new);
+/// 共享 Endpoint 建成后记下 NodeId,status 聚合展示用。
+static DEVICE_NODE: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
 /// 活跃连接数守卫:创建 +1,Drop -1,防 panic 漏减。
 struct ConnGuard;
@@ -157,6 +205,7 @@ pub fn node_id_of_device_key() -> Result<String, String> {
 
 /// 接受 `{"relays":[{"url":"https://relay.example.com"}]}` 形式的配置。
 /// 空列表 = 恢复默认(n0 公共 relay)。v1 忽略证书指纹字段(预留)。
+/// 注意:客户端共享 Endpoint 建成后改 relay,要等全部隧道断开重连才生效(Endpoint 级配置)。
 pub fn apply_relay_config(json: &str) -> Result<(), String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("relay 配置非法 JSON: {e}"))?;
@@ -176,7 +225,8 @@ pub fn apply_relay_config(json: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 用种子建 Endpoint:N0 预设(打洞 + n0 DNS 发现 + 默认 relay),有自定义 relay 则覆盖 relay_mode。
+/// 用种子建 Endpoint:N0 预设(打洞 + n0 DNS 发现 + 默认 relay)+ mDNS 内网发现,
+/// 有自定义 relay 则覆盖 relay_mode。
 async fn build_endpoint(seed: [u8; 32]) -> Result<Endpoint, String> {
     // 保活 + 判死超时:没有它,NAT/relay 会静默回收空闲连接,直到下次请求才暴露断线。
     let transport = QuicTransportConfig::builder()
@@ -197,31 +247,66 @@ async fn build_endpoint(seed: [u8; 32]) -> Result<Endpoint, String> {
         }
         builder = builder.relay_mode(RelayMode::custom(urls));
     }
-    builder
+    let ep = builder
         .bind()
         .await
-        .map_err(|e| format!("iroh endpoint 绑定失败: {e}"))
+        .map_err(|e| format!("iroh endpoint 绑定失败: {e}"))?;
+    // mDNS 局域网发现(iroh-mdns-address-lookup):纯内网(n0 DNS/relay 全不可达)时,
+    // 同网段设备也能互相发现直连。尽力而为:失败只丢内网发现,不影响正常组网;
+    // POLARIS_MDNS=0 可关(某些企业网禁组播,mDNS 只会白噪音)。
+    let mdns_off = std::env::var("POLARIS_MDNS").map(|v| v == "0").unwrap_or(false);
+    if !mdns_off {
+        match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(ep.id()) {
+            Ok(mdns) => match ep.address_lookup() {
+                Ok(services) => services.add(mdns),
+                Err(e) => eprintln!("[tunnel] mDNS 挂载失败(忽略,仅失去纯内网发现): {e}"),
+            },
+            Err(e) => eprintln!("[tunnel] mDNS 启动失败(忽略,仅失去纯内网发现): {e}"),
+        }
+    }
+    Ok(ep)
+}
+
+/// 共享客户端 Endpoint:首用构建(device.key),失败可重试(OnceCell 不留错值)。
+async fn client_endpoint() -> Result<Endpoint, String> {
+    let ep = CLIENT_EP
+        .get_or_try_init(|| async {
+            let seed = get_or_create_device_key()?;
+            let ep = build_endpoint(seed).await?;
+            *DEVICE_NODE.lock().unwrap() = ep.id().to_string();
+            Ok::<Endpoint, String>(ep)
+        })
+        .await?;
+    Ok(ep.clone())
 }
 
 // ── 主机侧 ──────────────────────────────────────────────────────────────────
 
-/// 主机监听:accept 循环直到 stop()。每条连接过白名单闸,每条双向流转发到上游 TCP。
+/// 主机监听:accept 循环直到 stop()。strict 模式过白名单闸,每条双向流转发到上游 TCP。
 pub async fn host_listen() -> Result<(), String> {
-    set_state("connecting");
+    HOST_STOPPING.store(false, Ordering::SeqCst);
+    *HOST_STATE.lock().unwrap() = "connecting".to_string();
     let seed = identity::get_or_create_host_key()?;
-    let ep = build_endpoint(seed).await.inspect_err(|e| {
-        set_error(e.clone());
-        set_state("stopped");
-    })?;
-    *NODE_ID.lock().unwrap() = ep.id().to_string();
-    RUNNING.store(true, Ordering::SeqCst);
-    set_state("connected");
-    set_error("");
+    let ep = match build_endpoint(seed).await {
+        Ok(ep) => ep,
+        Err(e) => {
+            *HOST_ERROR.lock().unwrap() = e.clone();
+            *HOST_STATE.lock().unwrap() = "stopped".to_string();
+            return Err(e);
+        }
+    };
+    *HOST_NODE.lock().unwrap() = ep.id().to_string();
+    HOST_RUNNING.store(true, Ordering::SeqCst);
+    *HOST_STATE.lock().unwrap() = "connected".to_string();
+    HOST_ERROR.lock().unwrap().clear();
     eprintln!("[tunnel] 主机隧道已启动 node_id={}", ep.id());
 
     loop {
+        if HOST_STOPPING.load(Ordering::SeqCst) {
+            break;
+        }
         let incoming = tokio::select! {
-            _ = SHUTDOWN.notified() => break,
+            _ = HOST_SHUTDOWN.notified() => break,
             inc = ep.accept() => match inc {
                 Some(inc) => inc,
                 None => break, // endpoint 已关闭
@@ -280,8 +365,8 @@ pub async fn host_listen() -> Result<(), String> {
         });
     }
 
-    RUNNING.store(false, Ordering::SeqCst);
-    set_state("stopped");
+    HOST_RUNNING.store(false, Ordering::SeqCst);
+    *HOST_STATE.lock().unwrap() = "stopped".to_string();
     ep.close().await;
     eprintln!("[tunnel] 主机隧道已停止");
     Ok(())
@@ -289,62 +374,126 @@ pub async fn host_listen() -> Result<(), String> {
 
 // ── 成员侧 ──────────────────────────────────────────────────────────────────
 
-/// 取一条健康的主机连接:缓存里已死(close_reason=Some)的直接丢弃重建。
-async fn healthy_conn(ep: &Endpoint, host_id: EndpointId) -> Result<Connection, String> {
-    let cached = CLIENT_CONN.lock().unwrap().clone();
+/// 取一条到该隧道主机的健康连接:缓存里已死(close_reason=Some)的直接丢弃重建。
+async fn healthy_conn(t: &ClientTunnel, ep: &Endpoint) -> Result<Connection, String> {
+    let cached = t.conn.lock().unwrap().clone();
     if let Some(c) = cached {
         if c.close_reason().is_none() {
             return Ok(c);
         }
         // 连接已死:清缓存,走重建。
-        *CLIENT_CONN.lock().unwrap() = None;
+        *t.conn.lock().unwrap() = None;
     }
-    set_state("connecting");
+    t.set_state("connecting");
     let c = ep
-        .connect(host_id, ALPN)
+        .connect(t.host_id, ALPN)
         .await
         .map_err(|e| format!("连主机失败: {e}"))?;
-    *CLIENT_CONN.lock().unwrap() = Some(c.clone());
-    set_state("connected");
-    set_error("");
-    eprintln!("[tunnel] 已连上主机 {host_id}");
+    *t.conn.lock().unwrap() = Some(c.clone());
+    t.set_state("connected");
+    t.set_error("");
+    eprintln!("[tunnel] 已连上主机 {}(:{})", t.host_str, t.port);
     Ok(c)
 }
 
-/// 成员端本地代理:127.0.0.1:listen_port 上每个 TCP 连接 → 一条到主机的 iroh 双向流。
-/// 多条 TCP 复用同一条 QUIC 连接(多路流)。后台巡检任务每 10s 查连接健康,
-/// 断了主动重连(退避 1s→2s→…→30s 封顶),不再等下一个请求才暴露断线。
-pub async fn client_proxy(host_node_id: &str, listen_port: u16) -> Result<(), String> {
-    let host_id: EndpointId = host_node_id
-        .trim()
+/// 发起(或复用)一条出站隧道:127.0.0.1:listen_port ↔ host_node_id。幂等:
+/// 同端口同主机且任务还活着 = 直接返回 Ok;同端口不同主机且活着 = 报错;
+/// 死任务(启动失败/已停)= 拆掉重建。坏 NodeId 在这里同步报错,不再吞进后台线程。
+pub fn connect_client(host_node_id: &str, listen_port: u16) -> Result<(), String> {
+    let host_str = host_node_id.trim().to_string();
+    let host_id: EndpointId = host_str
         .parse()
         .map_err(|e| format!("主机 NodeId 非法: {e}"))?;
-    set_state("connecting");
-    let seed = get_or_create_device_key()?;
-    let ep = build_endpoint(seed).await.inspect_err(|e| {
-        set_error(e.clone());
-        set_state("stopped");
-    })?;
-    *NODE_ID.lock().unwrap() = ep.id().to_string();
+    let t = {
+        let mut reg = CLIENTS.lock().unwrap();
+        if let Some(existing) = reg.get(&listen_port) {
+            if existing.alive.load(Ordering::SeqCst) {
+                if existing.host_str == host_str {
+                    return Ok(()); // 已在跑,幂等
+                }
+                return Err(format!("本地端口 {listen_port} 已被另一远程源占用"));
+            }
+            reg.remove(&listen_port); // 死条目,重建
+        }
+        let t = Arc::new(ClientTunnel {
+            host_str,
+            host_id,
+            port: listen_port,
+            alive: AtomicBool::new(true),
+            stopping: AtomicBool::new(false),
+            state: Mutex::new("connecting".to_string()),
+            last_error: Mutex::new(String::new()),
+            conn: Mutex::new(None),
+            shutdown: tokio::sync::Notify::new(),
+        });
+        reg.insert(listen_port, t.clone());
+        t
+    };
+    TUNNEL_RT.spawn(run_client(t));
+    Ok(())
+}
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
-        .await
-        .map_err(|e| format!("本地端口 {listen_port} 监听失败: {e}"))?;
-    RUNNING.store(true, Ordering::SeqCst);
-    eprintln!("[tunnel] 成员代理已启动 127.0.0.1:{listen_port} → {host_node_id}");
+/// 拆除一条出站隧道(移除远程盘时用):通知任务退出并摘出注册表。幂等。
+pub fn disconnect_client(listen_port: u16) {
+    let t = CLIENTS.lock().unwrap().remove(&listen_port);
+    if let Some(t) = t {
+        t.stopping.store(true, Ordering::SeqCst);
+        t.shutdown.notify_waiters();
+        eprintln!("[tunnel] 已拆除隧道 127.0.0.1:{listen_port}");
+    }
+}
+
+/// 一条出站隧道的主体:本地 TCP accept → 共享 Endpoint 上到主机的 QUIC 双向流。
+/// 多条 TCP 复用同一条 QUIC 连接(多路流)。后台巡检每 10s 查连接健康,
+/// 断了主动重连(退避 1s→2s→…→30s 封顶),不再等下一个请求才暴露断线。
+async fn run_client(t: Arc<ClientTunnel>) {
+    // 收尾统一走这里:任务退出即 alive=false,connect_client 见死条目会重建。
+    let finish = |t: &ClientTunnel| {
+        t.alive.store(false, Ordering::SeqCst);
+        t.set_state("stopped");
+        let conn = t.conn.lock().unwrap().take();
+        if let Some(c) = conn {
+            c.close(0u32.into(), b"tunnel closed");
+        }
+    };
+
+    let ep = match client_endpoint().await {
+        Ok(ep) => ep,
+        Err(e) => {
+            t.set_error(&e);
+            eprintln!("[tunnel] 共享 endpoint 构建失败: {e}");
+            finish(&t);
+            return;
+        }
+    };
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", t.port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            t.set_error(format!("本地端口 {} 监听失败: {e}", t.port));
+            eprintln!("[tunnel] 本地端口 {} 监听失败: {e}", t.port);
+            finish(&t);
+            return;
+        }
+    };
+    eprintln!(
+        "[tunnel] 成员代理已启动 127.0.0.1:{} → {}",
+        t.port, t.host_str
+    );
 
     // 后台健康巡检:发现连接死亡 → 标 reconnecting 并主动重连,退避封顶 30s;
     // 重连成功即恢复 connected。空闲期断线由此兜住(QUIC keepalive 保证判死及时)。
     let watchdog = {
+        let t = t.clone();
         let ep = ep.clone();
-        tokio::spawn(async move {
+        TUNNEL_RT.spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                if !RUNNING.load(Ordering::SeqCst) {
+                if t.stopping.load(Ordering::SeqCst) {
                     break;
                 }
-                let dead = CLIENT_CONN
+                let dead = t
+                    .conn
                     .lock()
                     .unwrap()
                     .as_ref()
@@ -354,20 +503,24 @@ pub async fn client_proxy(host_node_id: &str, listen_port: u16) -> Result<(), St
                     backoff = Duration::from_secs(1);
                     continue;
                 }
-                set_state("reconnecting");
+                t.set_state("reconnecting");
                 loop {
-                    match healthy_conn(&ep, host_id).await {
+                    match healthy_conn(&t, &ep).await {
                         Ok(_) => {
                             backoff = Duration::from_secs(1);
                             break;
                         }
                         Err(e) => {
-                            set_state("reconnecting");
-                            set_error(&e);
-                            eprintln!("[tunnel] 重连失败({e}),{}s 后再试", backoff.as_secs());
+                            t.set_state("reconnecting");
+                            t.set_error(&e);
+                            eprintln!(
+                                "[tunnel] :{} 重连失败({e}),{}s 后再试",
+                                t.port,
+                                backoff.as_secs()
+                            );
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(Duration::from_secs(30));
-                            if !RUNNING.load(Ordering::SeqCst) {
+                            if t.stopping.load(Ordering::SeqCst) {
                                 return;
                             }
                         }
@@ -378,38 +531,41 @@ pub async fn client_proxy(host_node_id: &str, listen_port: u16) -> Result<(), St
     };
 
     // 首连(失败不退出,交给巡检/下个请求重试)。
-    if let Err(e) = healthy_conn(&ep, host_id).await {
-        set_error(&e);
-        eprintln!("[tunnel] 首次连主机失败: {e}");
+    if let Err(e) = healthy_conn(&t, &ep).await {
+        t.set_error(&e);
+        eprintln!("[tunnel] :{} 首次连主机失败: {e}", t.port);
     }
 
     loop {
+        if t.stopping.load(Ordering::SeqCst) {
+            break;
+        }
         let (mut tcp, _peer) = tokio::select! {
-            _ = SHUTDOWN.notified() => break,
+            _ = t.shutdown.notified() => break,
             acc = listener.accept() => match acc {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("[tunnel] 本地 accept 失败: {e}");
+                    eprintln!("[tunnel] :{} 本地 accept 失败: {e}", t.port);
                     continue;
                 }
             },
         };
         // 取健康连接开流;开流失败(竞态死亡)再重建一次。
-        let bi = match healthy_conn(&ep, host_id).await {
+        let bi = match healthy_conn(&t, &ep).await {
             Ok(c) => match c.open_bi().await {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("[tunnel] 开流失败({e}),重建连接");
-                    *CLIENT_CONN.lock().unwrap() = None;
-                    match healthy_conn(&ep, host_id).await {
+                    eprintln!("[tunnel] :{} 开流失败({e}),重建连接", t.port);
+                    *t.conn.lock().unwrap() = None;
+                    match healthy_conn(&t, &ep).await {
                         Ok(c2) => c2.open_bi().await.ok(),
                         Err(_) => None,
                     }
                 }
             },
             Err(e) => {
-                set_error(&e);
-                eprintln!("[tunnel] {e}");
+                t.set_error(&e);
+                eprintln!("[tunnel] :{} {e}", t.port);
                 None
             }
         };
@@ -421,36 +577,91 @@ pub async fn client_proxy(host_node_id: &str, listen_port: u16) -> Result<(), St
         });
     }
 
-    RUNNING.store(false, Ordering::SeqCst);
-    set_state("stopped");
     watchdog.abort();
-    *CLIENT_CONN.lock().unwrap() = None;
-    ep.close().await;
-    eprintln!("[tunnel] 成员代理已停止");
-    Ok(())
+    finish(&t);
+    eprintln!("[tunnel] 成员代理已停止 127.0.0.1:{}", t.port);
+    // 注:共享 Endpoint 不关,别的隧道还在用;进程退出统一回收。
 }
 
 // ── 状态 / 停止 / 同步包装 ───────────────────────────────────────────────────
 
-/// 隧道状态:{running, state, node_id, connections, upstream, relays, latency_ms, last_error}。
-/// state: stopped|connecting|connected|reconnecting;latency_ms 仅成员侧有连接时给出。
+/// 当前选中路径的链路类型与 RTT:direct=打洞直连,relay=中继兜底。
+/// 「NAS 链路如实标 P2P」靠这里的真值,不再前端写死。
+fn conn_path(c: &Connection) -> (&'static str, Option<u64>) {
+    let paths = c.paths();
+    if let Some(p) = paths.iter().find(|p| p.is_selected()) {
+        let kind = if p.is_relay() { "relay" } else { "direct" };
+        return (kind, Some(p.rtt().as_millis() as u64));
+    }
+    ("", c.rtt(PathId::ZERO).map(|d| d.as_millis() as u64))
+}
+
+/// 隧道状态。顶层字段与旧版兼容(CollabView 徽标直接读),新增:
+/// - `tunnels`: 每条出站隧道明细 [{port, host_node_id, running, state, path, latency_ms, last_error}]
+///   其中 path: "direct"(打洞直连) | "relay"(中继兜底) | ""(未连上)。
+/// - `host`: {running, state, node_id} 主机侧独立状态,不再与成员侧混一个值。
 pub fn status() -> serde_json::Value {
-    let latency_ms = CLIENT_CONN
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|c| c.close_reason().is_none())
-        .and_then(|c| c.rtt(PathId::ZERO))
-        .map(|d| d.as_millis() as u64);
+    let host_running = HOST_RUNNING.load(Ordering::SeqCst);
+    let clients: Vec<Arc<ClientTunnel>> = CLIENTS.lock().unwrap().values().cloned().collect();
+
+    let mut tunnels = Vec::new();
+    let mut best_latency: Option<u64> = None;
+    let mut states: Vec<String> = Vec::new();
+    let mut first_err = String::new();
+    for t in &clients {
+        let conn = t.conn.lock().unwrap().clone();
+        let (path, latency) = conn
+            .as_ref()
+            .filter(|c| c.close_reason().is_none())
+            .map(conn_path)
+            .unwrap_or(("", None));
+        if let Some(l) = latency {
+            best_latency = Some(best_latency.map_or(l, |b| b.min(l)));
+        }
+        let state = t.state.lock().unwrap().clone();
+        let err = t.last_error.lock().unwrap().clone();
+        if first_err.is_empty() && !err.is_empty() {
+            first_err = err.clone();
+        }
+        states.push(state.clone());
+        tunnels.push(serde_json::json!({
+            "port": t.port,
+            "host_node_id": t.host_str,
+            "running": t.alive.load(Ordering::SeqCst),
+            "state": state,
+            "path": path,
+            "latency_ms": latency,
+            "last_error": err,
+        }));
+    }
+
+    // 聚合 state:reconnecting > connecting > connected > stopped(主机在跑算 connected)。
+    let host_state = HOST_STATE.lock().unwrap().clone();
+    if host_running {
+        states.push(host_state.clone());
+    }
+    let agg = ["reconnecting", "connecting", "connected"]
+        .iter()
+        .find(|s| states.iter().any(|x| x == *s))
+        .copied()
+        .unwrap_or("stopped");
+
+    let host_err = HOST_ERROR.lock().unwrap().clone();
+    let host_node = HOST_NODE.lock().unwrap().clone();
+    let device_node = DEVICE_NODE.lock().unwrap().clone();
+    let any_client_alive = clients.iter().any(|t| t.alive.load(Ordering::SeqCst));
+
     serde_json::json!({
-        "running": RUNNING.load(Ordering::SeqCst),
-        "state": STATE.lock().unwrap().clone(),
-        "node_id": NODE_ID.lock().unwrap().clone(),
+        "running": host_running || any_client_alive,
+        "state": agg,
+        "node_id": if host_running && !host_node.is_empty() { host_node.clone() } else { device_node },
         "connections": CONNECTIONS.load(Ordering::Relaxed),
         "upstream": upstream_addr(),
         "relays": RELAYS.lock().unwrap().clone(),
-        "latency_ms": latency_ms,
-        "last_error": LAST_ERROR.lock().unwrap().clone(),
+        "latency_ms": best_latency,
+        "last_error": if !host_err.is_empty() { host_err } else { first_err },
+        "host": { "running": host_running, "state": host_state, "node_id": host_node },
+        "tunnels": tunnels,
     })
 }
 
@@ -460,19 +671,33 @@ pub fn host_node_id() -> Result<String, String> {
     Ok(SecretKey::from_bytes(&seed).public().to_string())
 }
 
-/// 主机(或成员)隧道是否在跑。挂牌前据此判断要不要先起 host_listen。
+/// 主机隧道是否在跑(仅主机侧;成员侧隧道看 CLIENTS 注册表)。
+/// 挂牌/hosting 据此判断要不要起 host_listen —— 旧版主客共用一个 RUNNING,
+/// 连着 NAS 时误判「主机已在跑」导致 host_listen 永远不启动。
 pub fn is_running() -> bool {
-    RUNNING.load(Ordering::SeqCst)
+    HOST_RUNNING.load(Ordering::SeqCst)
 }
 
-/// 通知隧道主循环退出(主机侧与成员侧通用)。
+/// 停掉全部隧道(主机 + 所有出站),应用退出/测试收尾用。
 pub fn stop() {
-    SHUTDOWN.notify_waiters();
+    HOST_STOPPING.store(true, Ordering::SeqCst);
+    HOST_SHUTDOWN.notify_waiters();
+    let ports: Vec<u16> = CLIENTS.lock().unwrap().keys().copied().collect();
+    for p in ports {
+        disconnect_client(p);
+    }
 }
 
 /// 同步包装:独立线程 + 独立 tokio runtime 跑主机隧道,供非 async 调用方(桌面/服务器启动路径)。
-pub fn start_host_blocking_thread() -> std::thread::JoinHandle<Result<(), String>> {
-    std::thread::Builder::new()
+/// 幂等:已有主机线程在跑则返回 None,不再叠第二个 accept 循环。
+pub fn start_host_blocking_thread() -> Option<std::thread::JoinHandle<Result<(), String>>> {
+    if HOST_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return None;
+    }
+    let handle = std::thread::Builder::new()
         .name("polaris-tunnel-host".into())
         .spawn(|| {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -480,27 +705,12 @@ pub fn start_host_blocking_thread() -> std::thread::JoinHandle<Result<(), String
                 .enable_all()
                 .build()
                 .map_err(|e| format!("tokio runtime 创建失败: {e}"))?;
-            rt.block_on(host_listen())
+            let res = rt.block_on(host_listen());
+            HOST_STARTED.store(false, Ordering::SeqCst);
+            res
         })
-        .expect("spawn tunnel host thread")
-}
-
-/// 同步包装:独立线程跑成员端代理。
-pub fn start_client_blocking_thread(
-    host_node_id: String,
-    listen_port: u16,
-) -> std::thread::JoinHandle<Result<(), String>> {
-    std::thread::Builder::new()
-        .name("polaris-tunnel-client".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|e| format!("tokio runtime 创建失败: {e}"))?;
-            rt.block_on(client_proxy(&host_node_id, listen_port))
-        })
-        .expect("spawn tunnel client thread")
+        .expect("spawn tunnel host thread");
+    Some(handle)
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────────
@@ -536,6 +746,103 @@ mod tests {
         assert!(apply_relay_config(r#"{"relays":[{"url":"::bad::"}]}"#).is_err());
         apply_relay_config(r#"{"relays":[]}"#).expect("清空恢复默认");
         assert!(RELAYS.lock().unwrap().is_empty());
+    }
+
+    /// connect_client 幂等与冲突:坏 NodeId 同步报错;同端口同主机 no-op;
+    /// 同端口不同主机报「被占用」。NodeId 用固定种子构造(不碰 env/文件,
+    /// 免与 device_key_idempotent 抢 POLARIS_DEVICE_KEY);连接在后台重试,不阻塞断言。
+    #[test]
+    fn connect_idempotent_and_conflict() {
+        assert!(
+            connect_client("not-a-node-id", 39990).is_err(),
+            "坏 NodeId must 同步报错"
+        );
+
+        let nid = SecretKey::from_bytes(&[7u8; 32]).public().to_string();
+        let nid2 = SecretKey::from_bytes(&[8u8; 32]).public().to_string();
+        assert_ne!(nid, nid2);
+        connect_client(&nid, 39991).expect("首连发起");
+        connect_client(&nid, 39991).expect("同端口同主机幂等");
+        assert!(
+            connect_client(&nid2, 39991).is_err(),
+            "同端口不同主机 must 报占用"
+        );
+        disconnect_client(39991);
+    }
+
+    /// 纯内网自证:两端 Endpoint 关死 relay、不带 n0 DNS 发现,只挂 mDNS ——
+    /// 能凭 EndpointId 连通并回显,即证明断外网时同局域网设备照样成网。
+    /// POLARIS_NET_TEST=1 门控(mDNS 走组播,部分 CI/企业网禁,不进默认闸)。
+    #[test]
+    fn mdns_lan_only_roundtrip() {
+        if std::env::var("POLARIS_NET_TEST").map(|v| v == "1").unwrap_or(false) == false {
+            eprintln!("[tunnel-test] 未设 POLARIS_NET_TEST=1,跳过 mDNS 纯内网测试");
+            return;
+        }
+        use iroh_mdns_address_lookup::MdnsAddressLookup;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 主机端:Minimal 预设 + relay 禁用,唯一的发现渠道是 mDNS。
+            let host_ep = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![ALPN.to_vec()])
+                .bind()
+                .await
+                .expect("host endpoint");
+            host_ep
+                .address_lookup()
+                .expect("host address_lookup")
+                .add(MdnsAddressLookup::builder().build(host_ep.id()).expect("host mdns"));
+            let host_id = host_ep.id();
+            tokio::spawn({
+                let ep = host_ep.clone();
+                async move {
+                    while let Some(inc) = ep.accept().await {
+                        tokio::spawn(async move {
+                            let Ok(acc) = inc.accept() else { return };
+                            let Ok(conn) = acc.await else { return };
+                            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                                tokio::spawn(async move {
+                                    let _ = tokio::io::copy(&mut recv, &mut send).await;
+                                    let _ = send.finish();
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+
+            // 成员端:同样只有 mDNS,凭 EndpointId 找主机。
+            let cli_ep = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .expect("client endpoint");
+            cli_ep
+                .address_lookup()
+                .expect("client address_lookup")
+                .add(MdnsAddressLookup::builder().build(cli_ep.id()).expect("client mdns"));
+
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cli_ep.connect(host_id, ALPN),
+            )
+            .await
+            .expect("30s 内应经 mDNS 发现主机")
+            .expect("mDNS-only 连接成功");
+            let (mut send, mut recv) = conn.open_bi().await.expect("开流");
+            send.write_all(b"lan-only-ping").await.unwrap();
+            let _ = send.finish();
+            let mut got = vec![0u8; b"lan-only-ping".len()];
+            tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut got))
+                .await
+                .expect("10s 内应收到回显")
+                .unwrap();
+            assert_eq!(&got[..], b"lan-only-ping", "纯内网回显必须一致");
+        });
     }
 
     /// 本机自环集成测试:host + client 两端各自 Endpoint,经真实 iroh 隧道打通,
@@ -577,9 +884,13 @@ mod tests {
                 }
             });
 
-            // 2) 白名单放行自己的设备 NodeId(隧道闸依赖)
+            // 2) 白名单放行自己的设备 NodeId。默认(非 strict)模式隧道不查白名单,
+            //    这步只为顺手覆盖 strict 路径 —— 失败(如与其它测试共库时 user 1 不存在
+            //    触发外键)不致命,别让环境耦合挂掉网络主链路断言。
             let my_node = node_id_of_device_key().unwrap();
-            identity::add_device(1, "loopback-test", &my_node).expect("加白名单");
+            if let Err(e) = identity::add_device(1, "loopback-test", &my_node) {
+                eprintln!("[tunnel-test] 加白名单失败(忽略,默认模式不查白名单): {e}");
+            }
 
             // 3) 起主机隧道,拿主机 NodeId
             let host_seed = identity::get_or_create_host_key().unwrap();
@@ -587,12 +898,11 @@ mod tests {
             tokio::spawn(async { host_listen().await.unwrap() });
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-            // 4) 起成员代理
+            // 4) 起成员隧道(共享 Endpoint + 注册表路径,即生产同款)
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
             drop(l);
-            let hn = host_node.clone();
-            tokio::spawn(async move { client_proxy(&hn, port).await.unwrap() });
+            connect_client(&host_node, port).expect("发起成员隧道");
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
             // 5) 经隧道往返

@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from "vue";
-import ImageProviderPanel from "./ImageProviderPanel.vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch, nextTick } from "vue";
+// 懒加载:绘图供应商面板只在 Dock 展开到对应页时才渲染,静态 import 会把它
+// (连同其依赖)吸进首屏 chunk。ProviderDock 本体保持静态 —— 首屏可能立刻用。
+const ImageProviderPanel = defineAsyncComponent(() => import("./ImageProviderPanel.vue"));
 import {
   Zap,
   ChevronUp,
@@ -66,6 +68,11 @@ const periods: { key: Period; label: string }[] = [
   { key: "year", label: "近 1 年" },
 ];
 
+// 注:这里曾有个「Claude Code ⇄ Codex」分段器, 已删。它把 Codex 说成一个与
+// Claude Code 并列的「后端/CLI」, 而 Polaris 从不 spawn codex CLI —— 对话永远由
+// claude CLI 跑, 「Codex」只是「ChatGPT 订阅」这一家供应商(经本地翻译代理, 上游
+// 写死 chatgpt.com)。那个二元框架凭空让人以为能「在 Codex 下选 MiniMax」, 实际
+// MiniMax 等各家本就在下方供应商列表里点选即用。真相只有一层: 选哪家供应商。
 onMounted(() => {
   store.refresh();
   store.refreshUsage();
@@ -111,6 +118,13 @@ function onEsc(e: KeyboardEvent) {
 async function toggleLink() {
   await store.setLinkMode(!store.linkGlobal);
   await store.refresh();
+}
+
+/** 本地路由总开关(cc-switch 式);开关立即对当前供应商重新生效,顺带刷新路由端口展示 */
+async function toggleRoute() {
+  await store.setRouteMode(!store.routeLocal);
+  await store.refresh();
+  await store.refreshCodexProxy();
 }
 
 function fmt(n: number): string {
@@ -185,9 +199,14 @@ function balClass(b?: ProviderBalance | null): string {
   if (b.kind === "error") return "err";
   return "muted";
 }
-/** 仅 key/official 类供应商有「额度」概念(codex/copilot 走授权,无额度数字) */
+/** 仅 key/official 类供应商有「额度」概念(codex/copilot 走授权; OpenAI 协议家的
+ *  额度接口非 Anthropic 形态, 通用探测多半失败, 一并不查省噪音) */
 const showBalance = computed(
-  () => !!current.value && current.value.kind !== "codex" && current.value.kind !== "copilot"
+  () =>
+    !!current.value &&
+    current.value.kind !== "codex" &&
+    current.value.kind !== "copilot" &&
+    current.value.protocol !== "openai"
 );
 const currentModel = computed(() => {
   const c = current.value;
@@ -262,11 +281,12 @@ function openSite(url: string) {
 }
 
 // ── Codex 授权 ─────────────────────────
-async function startCodexAuth() {
+// forceDevice=true(默认) → 「网站 + 效验码」交互(同 cc-switch);false → 桌面回环一键
+async function startCodexAuth(forceDevice = true) {
   codexErr.value = null;
   codexCopied.value = false;
   codexBusy.value = true;
-  const dev = await store.codexStartLogin();
+  const dev = await store.codexStartLogin(forceDevice);
   codexBusy.value = false;
   if (!dev) {
     codexErr.value = store.error || "发起授权失败";
@@ -451,6 +471,7 @@ function subtitleOf(p: ProviderView): string {
     return store.codex?.loggedIn ? "ChatGPT · 已授权 · 点即用" : "ChatGPT · 需先授权";
   }
   if (p.kind === "copilot") return "需 OAuth · 代理";
+  if (p.protocol === "openai") return `${hostOf(p.baseUrl)} · OpenAI 协议 · 本地转发`;
   return hostOf(p.baseUrl);
 }
 </script>
@@ -537,6 +558,31 @@ function subtitleOf(p: ProviderView): string {
                 </button>
               </div>
 
+              <!-- 本地路由总开关(cc-switch 式代理模式):开 = 所有供应商统一经
+                   127.0.0.1 本地路由转发,Key 由路由实时注入,改 Key/切换即刻生效 -->
+              <div class="link-row">
+                <div class="link-info">
+                  <span class="link-title">本地路由 · 热切换</span>
+                  <span class="link-desc">{{
+                    store.routeLocal
+                      ? (store.codexProxy?.running
+                          ? `全部请求经 127.0.0.1:${store.codexProxy.port} 转发到当前供应商,改 Key 即刻生效`
+                          : "全部请求经本地路由转发到当前供应商,改 Key 即刻生效")
+                      : "直连:切换时把地址/Key 注入环境;GPT/Codex 等非 Anthropic 协议仍自动走本地路由"
+                  }}</span>
+                </div>
+                <button
+                  class="link-switch"
+                  :class="{ on: store.routeLocal }"
+                  role="switch"
+                  :aria-checked="store.routeLocal"
+                  :title="store.routeLocal ? '点击关闭(回到直连注入)' : '点击开启(cc-switch 式本地转发,热切换)'"
+                  @click="toggleRoute"
+                >
+                  <span class="knob" />
+                </button>
+              </div>
+
               <!-- ★ 上段:当前供应商状态卡 (放大) -->
               <section v-if="current" class="now-card" :class="{ codex: current.kind === 'codex' }">
                 <div class="now-row">
@@ -558,8 +604,14 @@ function subtitleOf(p: ProviderView): string {
                         <span v-if="store.claudeAuth?.loggedIn">Claude 订阅 · 已登录</span>
                         <span v-else class="need-auth">未登录订阅 · 可用 API Key 或点下方授权</span>
                       </template>
+                      <template v-else-if="current.protocol === 'openai'">
+                        {{ hostOf(current.baseUrl) }}<span v-if="currentModel"> · {{ currentModel }}</span>
+                        <span v-if="store.codexProxy?.running"> · 本地路由 127.0.0.1:{{ store.codexProxy.port }}</span>
+                        <span v-else> · OpenAI 协议 · 本地转发</span>
+                      </template>
                       <template v-else>
                         {{ hostOf(current.baseUrl) }}<span v-if="currentModel"> · {{ currentModel }}</span>
+                        <span v-if="store.routeLocal && store.codexProxy?.running"> · 本地路由 127.0.0.1:{{ store.codexProxy.port }}</span>
                       </template>
                     </div>
                   </div>
@@ -597,7 +649,7 @@ function subtitleOf(p: ProviderView): string {
                   @click="codexOpen = true"
                 >
                   <LogIn :size="14" :stroke-width="2" />
-                  ChatGPT 一键授权
+                  授权 ChatGPT
                 </button>
                 <!-- Claude 官方未登录订阅时,主操作 = 授权登录 -->
                 <button
@@ -636,7 +688,7 @@ function subtitleOf(p: ProviderView): string {
                       <span class="prov-info">
                         <span class="prov-name">
                           {{ p.name }}
-                          <span v-if="p.kind === 'codex'" class="kcodex">GPT</span>
+                          <span v-if="p.kind === 'codex'" class="kcodex">GPT</span><span v-else-if="p.protocol === 'openai'" class="kcodex">OpenAI</span>
                         </span>
                         <span class="prov-host">{{ subtitleOf(p) }}</span>
                       </span>
@@ -661,7 +713,7 @@ function subtitleOf(p: ProviderView): string {
                             <Pencil :size="12" :stroke-width="1.8" />
                           </button>
                           <button
-                            v-if="(p.isPreset && p.hasKey && p.kind === 'key') || p.kind === 'custom'"
+                            v-if="(p.isPreset && p.hasKey && (p.kind === 'key' || p.kind === 'openai')) || p.kind === 'custom'"
                             class="mini-act danger"
                             :title="p.isPreset ? '清除配置' : '删除'"
                             @click.stop="removeProvider(p)"
@@ -694,7 +746,7 @@ function subtitleOf(p: ProviderView): string {
                         <span class="prov-info">
                           <span class="prov-name">
                             {{ p.name }}
-                            <span v-if="p.kind === 'codex'" class="kcodex">GPT</span>
+                            <span v-if="p.kind === 'codex'" class="kcodex">GPT</span><span v-else-if="p.protocol === 'openai'" class="kcodex">OpenAI</span>
                           </span>
                           <span class="prov-host">{{ subtitleOf(p) }}</span>
                         </span>
@@ -719,7 +771,7 @@ function subtitleOf(p: ProviderView): string {
                               <Pencil :size="12" :stroke-width="1.8" />
                             </button>
                             <button
-                              v-if="(p.isPreset && p.hasKey && p.kind === 'key') || p.kind === 'custom'"
+                              v-if="(p.isPreset && p.hasKey && (p.kind === 'key' || p.kind === 'openai')) || p.kind === 'custom'"
                               class="mini-act danger"
                               :title="p.isPreset ? '清除配置' : '删除'"
                               @click.stop="removeProvider(p)"
@@ -749,7 +801,7 @@ function subtitleOf(p: ProviderView): string {
                         <span class="prov-info">
                           <span class="prov-name">
                             {{ p.name }}
-                            <span v-if="p.kind === 'codex'" class="kcodex">GPT</span>
+                            <span v-if="p.kind === 'codex'" class="kcodex">GPT</span><span v-else-if="p.protocol === 'openai'" class="kcodex">OpenAI</span>
                           </span>
                           <span class="prov-host">{{ subtitleOf(p) }}</span>
                         </span>
@@ -774,7 +826,7 @@ function subtitleOf(p: ProviderView): string {
                               <Pencil :size="12" :stroke-width="1.8" />
                             </button>
                             <button
-                              v-if="(p.isPreset && p.hasKey && p.kind === 'key') || p.kind === 'custom'"
+                              v-if="(p.isPreset && p.hasKey && (p.kind === 'key' || p.kind === 'openai')) || p.kind === 'custom'"
                               class="mini-act danger"
                               :title="p.isPreset ? '清除配置' : '删除'"
                               @click.stop="removeProvider(p)"
@@ -791,7 +843,8 @@ function subtitleOf(p: ProviderView): string {
                     <Plus :size="13" :stroke-width="2.2" /> 添加自定义供应商
                   </button>
 
-                  <!-- 生图模型: 后端是**独立的一张表**(见 provider/image_store.rs 文件头) -->
+                  <!-- 生图模型: 后端是**独立的一张表**(见 provider/image_store.rs 文件头),
+                       故前端也用独立组件, 与上面的聊天供应商状态物理隔离。 -->
                   <ImageProviderPanel />
                 </template>
               </div>
@@ -818,14 +871,15 @@ function subtitleOf(p: ProviderView): string {
                         授权会自动送回 Polaris,无需核对配对码:
                       </p>
                     </template>
-                    <!-- 设备码兜底:1455 端口被占时的旧流程 -->
+                    <!-- 网站 + 效验码(device code · 同 cc-switch):开网址 → 填码 → 自动识别 -->
                     <template v-else>
                       <p class="codex-note">
-                        已为你打开 ChatGPT 授权页。在浏览器里确认设备码后回到这里,授权完成会自动识别:
+                        ① 打开验证网址 <code>{{ codexDevice.verificationUri }}</code>(已自动打开)
+                        → ② 登录后在网页填入下面这个效验码,授权完成会自动识别,无需回到这里操作:
                       </p>
                       <button
                         class="codex-code"
-                        :title="codexCopied ? '已复制' : '点击复制'"
+                        :title="codexCopied ? '已复制' : '点击复制效验码'"
                         @click="copyUserCode"
                       >
                         {{ codexDevice.userCode }}
@@ -847,19 +901,19 @@ function subtitleOf(p: ProviderView): string {
                       <ShieldCheck :size="14" :stroke-width="2" /> 已授权 ChatGPT
                     </p>
                     <p v-if="store.currentId === 'codex'" class="codex-note">
-                      Claude Code 正经本地翻译代理使用你的 ChatGPT 订阅(<code>gpt-5.5</code>)<template
+                      Claude Code 正经本地翻译代理使用你的 ChatGPT 订阅(<code>gpt5.6-sol</code>)<template
                         v-if="store.codexProxy?.running"
                       > · 127.0.0.1:{{ store.codexProxy.port }}</template
                       >。
                     </p>
                     <p v-else class="codex-note">
-                      凭据已写入 <code>~/.codex/auth.json</code>。点「用 GPT 对话」即让 Claude Code 经本地翻译代理用上 ChatGPT 订阅(<code>gpt-5.5</code>)。
+                      凭据已写入 <code>~/.codex/auth.json</code>。点「用 GPT 对话」即让 Claude Code 经本地翻译代理用上 ChatGPT 订阅(<code>gpt5.6-sol</code>)。
                     </p>
                     <p v-if="store.codexProxy?.lastError" class="codex-fail">
                       代理上次报错:{{ store.codexProxy.lastError }}
                     </p>
                     <div class="ed-actions">
-                      <button class="ed-cancel" @click="startCodexAuth" :disabled="codexBusy">
+                      <button class="ed-cancel" @click="startCodexAuth()" :disabled="codexBusy">
                         <RefreshCw :size="13" :stroke-width="2" /> 重新授权
                       </button>
                       <button
@@ -878,22 +932,29 @@ function subtitleOf(p: ProviderView): string {
                   <!-- 未授权:显著大按钮 -->
                   <template v-else>
                     <p class="codex-note">
-                      用 ChatGPT 账号授权(无需安装 codex CLI)。点击后将自动打开浏览器,
-                      登录并点「Authorize」即自动完成,凭据写入
-                      <code>~/.codex/auth.json</code>,授权后点「用 GPT 对话」即生效。
+                      用 ChatGPT 账号授权一次(无需安装 codex CLI)。点击后会打开验证网址并给出一个效验码,
+                      在网页填码即完成,凭据写入 <code>~/.codex/auth.json</code>。
+                      <b>授权后 Claude Code(经本地翻译代理)与 codex CLI 都直接用上这份 ChatGPT 订阅。</b>
                     </p>
                     <div class="ed-actions">
                       <button class="ed-cancel" @click="codexOpen = false">关闭</button>
                       <button
                         class="ed-save login big"
-                        @click="startCodexAuth"
+                        @click="startCodexAuth(true)"
                         :disabled="codexBusy"
                       >
                         <span v-if="codexBusy" class="spinner" />
                         <LogIn v-else :size="14" :stroke-width="2" />
-                        {{ codexBusy ? "正在发起…" : "ChatGPT 一键授权" }}
+                        {{ codexBusy ? "正在发起…" : "网站 + 效验码授权" }}
                       </button>
                     </div>
+                    <button
+                      class="codex-alt"
+                      @click="startCodexAuth(false)"
+                      :disabled="codexBusy"
+                    >
+                      改用浏览器一键授权(点 Authorize 即完成)
+                    </button>
                   </template>
 
                   <p v-if="codexErr" class="codex-fail">
@@ -1283,6 +1344,9 @@ function subtitleOf(p: ProviderView): string {
 .codex-code:hover { background: #10a37f22; }
 .code-copy { font-family: var(--sans); font-size: 10px; font-weight: 500; letter-spacing: 0; color: var(--muted); }
 .codex-poll { margin: 0; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-2); }
+.codex-alt { width: 100%; margin-top: 8px; background: none; border: none; font-size: 10.5px; color: var(--muted); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.codex-alt:hover:not(:disabled) { color: var(--text-2); }
+.codex-alt:disabled { opacity: 0.55; cursor: default; }
 
 /* ── Claude 官方订阅授权大卡 (暖橙) ───────────────────────── */
 .now-cta.claude-cta { background: #cc785c; border-color: #cc785c; color: #fff; font-weight: 600; box-shadow: 0 1px 0 #cc785c33, 0 0 0 3px #cc785c14; }

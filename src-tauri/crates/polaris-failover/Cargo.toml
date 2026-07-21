@@ -1,0 +1,13 @@
+# ═══════════════════════════════════════════════════════════════
+# polaris-failover — 供应商故障滑窗(纯逻辑, 零 IO)
+# 蓝本: 有戏剧场 mica provider/store.rs 的 record_failure 滑窗。
+# 只做「计数 + 判阈」; 真正切哪个供应商/怎么通知前端由接线方(kernel)决定。
+# ═══════════════════════════════════════════════════════════════
+[package]
+name = "polaris-failover"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+parking_lot = "0.12"

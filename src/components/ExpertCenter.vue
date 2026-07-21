@@ -100,7 +100,7 @@ function onSelectExpert(id: string) {
     <section class="ec-rec" :class="{ has: rec?.team }">
       <div v-if="recLoading" class="ec-rec-loading">正在按知识库反推最适合你的专家团…</div>
       <template v-else-if="rec?.team">
-        <img v-if="leadAvatar" :src="leadAvatar" class="ec-rec-avatar" :alt="rec.team.name" />
+        <img v-if="leadAvatar" decoding="async" :src="leadAvatar" class="ec-rec-avatar" :alt="rec.team.name" />
         <div class="ec-rec-body">
           <div class="ec-rec-head">
             <span class="ec-rec-badge">按你的知识库推荐</span>

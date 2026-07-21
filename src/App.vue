@@ -22,7 +22,7 @@ import TaskCenter from "./components/TaskCenter.vue";
 import FaultBoundary from "./components/FaultBoundary.vue";
 import { useHotkeys } from "./composables/useHotkeys";
 import { installMarkdownDelegation } from "./lib/markdown";
-import { openUrl, onWsStatus, isTauri, files as fc } from "./tauri";
+import { openUrl, onWsStatus, isTauri, files as fc, listen } from "./tauri";
 import { toast } from "./composables/useToast";
 import { isLowSpec } from "./composables/useLowSpec";
 // ── 重 / 非首屏视图：懒加载，切到对应视图时才拉各自 chunk ──
@@ -174,6 +174,13 @@ onMounted(() => {
   // 脱离任何视图生命周期 → 在文件中心点了任务后切走/关掉该视图,进度照常推进、回来即见,
   // 全局任务中心浮层也据此随处显示「还在跑」。
   tasks.ensureListeners();
+  // 供应商故障转移(polaris-failover 滑窗)通知:后端在 5 分钟内同一供应商连续失败
+  // 达阈并自动切换后 emit 此事件;App 级注册一次,任何视图下都能看到 toast。
+  // App 全程挂载,监听与应用同生命周期,不专门存 unlisten。
+  // 注意:tauri.ts 的 listen 封装回调直接收 payload(不是 Tauri Event 对象)。
+  void listen<{ message?: string }>("provider://failover", (p) => {
+    if (p?.message) toast.info(p.message);
+  });
   // 向量索引「默认不开机自启」(见 autoBuildIndexOnStartup 注释):后台嵌入持写锁会让主线程
   // 读命令卡 busy 锁 → 窗口无响应被强杀。建索引改纯手动(文件中心点「建索引」)。这里仅在
   // 用户显式开了 polaris.indexAutoResume 开关时才走旧的开机续建,默认是个立即返回的空操作。

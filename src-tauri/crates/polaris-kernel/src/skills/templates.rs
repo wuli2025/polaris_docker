@@ -42,7 +42,7 @@ pub(crate) const PVS_WORKFLOW: &str =
 // 与 PVS 同套路：全部编译期内嵌、启动时确保落到 ~/Polaris/skills（靠 DECK_VERSION 比对覆盖）。
 pub(crate) const DECK_ID: &str = "polaris-deck-studio";
 // 改动任一内嵌资源后必须 +1，让已安装用户下次启动拿到更新。
-pub(crate) const DECK_VERSION: &str = "11";
+pub(crate) const DECK_VERSION: &str = "13";
 pub(crate) const DECK_SKILL_MD: &str =
     include_str!("../../../../src/templates/skills/polaris-deck-studio/SKILL.md");
 pub(crate) const DECK_DESIGN_MD: &str =

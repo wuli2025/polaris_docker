@@ -85,6 +85,21 @@ async function toggleUser(u: AdminUser) {
     toast.error((e as Error).message);
   }
 }
+/** owner 兜底改密:成员没绑邮箱/邮件服务没配时,当面给一把新密码 */
+async function resetPassword(u: AdminUser) {
+  const pw = prompt(`给「${u.username}」设一个新密码(至少 8 位)。\n改完对方所有旧登录会被踢下线。`);
+  if (pw == null) return;
+  if (pw.length < 8) {
+    toast.error("新密码至少 8 位");
+    return;
+  }
+  try {
+    await collabApi.adminUserResetPassword(u.id, pw);
+    toast.info(`「${u.username}」的密码已重置,把新密码告诉对方吧`);
+  } catch (e) {
+    toast.error((e as Error).message);
+  }
+}
 
 // ── 设备 ──
 const devices = ref<AdminDevice[]>([]);
@@ -170,18 +185,20 @@ onMounted(() => {
       <div v-else-if="!users.length" class="dim">还没有其他用户,先生成票据邀请同事吧</div>
       <table v-else class="tbl">
         <thead>
-          <tr><th>用户名</th><th>昵称</th><th>角色</th><th>状态</th><th></th></tr>
+          <tr><th>用户名</th><th>昵称</th><th>邮箱</th><th>角色</th><th>状态</th><th></th></tr>
         </thead>
         <tbody>
           <tr v-for="u in users" :key="u.id" :class="{ off: u.disabled }">
             <td>{{ u.username }}</td>
             <td>{{ u.display_name || "—" }}</td>
+            <td :title="u.email || '未绑定邮箱,不能自助找回密码'">{{ u.email || "未绑定" }}</td>
             <td>{{ u.role }}</td>
             <td>
               <span class="dot" :class="{ ok: !u.disabled }"></span>
               {{ u.disabled ? "已停用" : "正常" }}
             </td>
             <td class="ta-r">
+              <button class="btn ghost sm" @click="resetPassword(u)">重置密码</button>
               <button class="btn ghost sm" @click="toggleUser(u)">
                 {{ u.disabled ? "启用" : "停用" }}
               </button>

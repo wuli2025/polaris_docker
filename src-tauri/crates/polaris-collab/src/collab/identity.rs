@@ -202,11 +202,11 @@ pub fn redeem_ticket(
     if expires_at < now() {
         return Err("票据已过期".into());
     }
-    // 先原子占用票据，防并发重复兑换。
+    // 先原子占用票据，防并发重复兑换。used_by 记下兑换账号(管理面可溯源)。
     let claimed = tx
         .execute(
-            "UPDATE tickets SET used_at=?1 WHERE code=?2 AND used_at IS NULL",
-            params![now(), code.trim()],
+            "UPDATE tickets SET used_at=?1, used_by=?3 WHERE code=?2 AND used_at IS NULL",
+            params![now(), code.trim(), username],
         )
         .map_err(|e| e.to_string())?;
     if claimed != 1 {
@@ -222,6 +222,90 @@ pub fn redeem_ticket(
     tx.commit().map_err(|e| format!("提交兑换失败: {e}"))?;
     db::audit(username, "ticket.redeem", code.trim(), &role);
     Ok((user, token))
+}
+
+/// 已登录账号凭邀请码入伙:**不建新账号**,只把这台设备绑到当前账号并核销票据。
+/// 用户要求的「同账号的人通过邀请码进来」—— 票据上记 used_by=该账号,全程可溯源。
+/// 返回设备 id。node_id 已属别的账号会被 ensure_device_for 拒绝(防顶替)。
+pub fn redeem_ticket_existing(
+    code: &str,
+    user: &auth::User,
+    device_name: &str,
+    node_id: &str,
+) -> Result<String, String> {
+    let device_name = device_name.trim();
+    let node_id = node_id.trim();
+    if device_name.is_empty()
+        || device_name.chars().count() > 80
+        || device_name.chars().any(char::is_control)
+    {
+        return Err("设备名称长度须为 1–80 个字符且不能包含控制字符".into());
+    }
+    if node_id.is_empty() || node_id.len() > 256 || node_id.chars().any(char::is_control) {
+        return Err("设备标识无效".into());
+    }
+    let mut conn = open_db()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("兑换事务失败: {e}"))?;
+    let (expires_at, used_at) = tx
+        .query_row(
+            "SELECT expires_at,used_at FROM tickets WHERE code=?1",
+            params![code.trim()],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(|_| "票据无效".to_string())?;
+    if used_at.is_some() {
+        return Err("票据已被使用".into());
+    }
+    if expires_at < now() {
+        return Err("票据已过期".into());
+    }
+    // 原子核销 + 记账号(与新建号路径同一并发语义)。
+    let claimed = tx
+        .execute(
+            "UPDATE tickets SET used_at=?1, used_by=?3 WHERE code=?2 AND used_at IS NULL",
+            params![now(), code.trim(), user.username],
+        )
+        .map_err(|e| e.to_string())?;
+    if claimed != 1 {
+        return Err("票据已被使用".into());
+    }
+    // 设备绑定(事务内,防并发抢绑同一 node_id)。
+    let existing = tx
+        .query_row(
+            "SELECT id,user_id FROM devices WHERE node_id=?1",
+            params![node_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other.to_string()),
+        })?;
+    let device_id = match existing {
+        Some((_, owner)) if owner != user.id => {
+            return Err("该设备已属其他账号,拒绝顶替".into());
+        }
+        Some((id, _)) => id,
+        None => {
+            let id = random_device_id()?;
+            tx.execute(
+                "INSERT INTO devices(id,user_id,name,node_id,added_at) VALUES(?1,?2,?3,?4,?5)",
+                params![id, user.id, device_name, node_id, now()],
+            )
+            .map_err(|e| format!("登记设备失败: {e}"))?;
+            id
+        }
+    };
+    tx.commit().map_err(|e| format!("提交兑换失败: {e}"))?;
+    db::audit(
+        &user.username,
+        "ticket.redeem_existing",
+        code.trim(),
+        device_name,
+    );
+    Ok(device_id)
 }
 
 // ───────────────────────── 分享码(配对码带地址) ─────────────────────────
@@ -321,7 +405,8 @@ pub fn ensure_device_for(
 
 /// 吊销设备并删除它的全部 HTTP/WS 会话。已建立的长连接会在断开/重连时失效；
 /// 真正“即时踢线”还需要连接注册表主动 close，不能在 UI 中宣称已经完成。
-pub fn revoke_device(device_id: &str) -> Result<(), String> {
+/// 返回该设备的 node_id —— 调用方据此同步踢掉云机中继上的挂牌(gateway::unregister_node)。
+pub fn revoke_device(device_id: &str) -> Result<String, String> {
     let mut conn = open_db()?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -343,8 +428,8 @@ pub fn revoke_device(device_id: &str) -> Result<(), String> {
     tx.commit().map_err(|e| format!("提交吊销失败: {e}"))?;
     // 会话短缓存立即失效:否则被吊销设备的 token 还能在缓存 TTL(10s)内继续鉴权通过。
     super::auth::bump_session_revocation();
-    db::audit("owner", "device.revoke", device_id, "");
-    Ok(())
+    db::audit("owner", "device.revoke", device_id, &node_id);
+    Ok(node_id)
 }
 
 /// 某 NodeId 是否在白名单内且未吊销 —— tunnel.rs 准入判定的确定性入口。
@@ -455,6 +540,36 @@ mod tests {
             "node-alice-2",
         )
         .is_err());
+        std::env::remove_var("POLARIS_COLLAB_DB");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn redeem_existing_binds_device_and_records_account() {
+        let (_guard, path) = with_tmp_db();
+        let alice = crate::collab::auth::create_user("alice", "correct-horse", "owner", "Alice")
+            .unwrap();
+        let bob =
+            crate::collab::auth::create_user("bob", "correct-horse", "collaborator", "Bob")
+                .unwrap();
+        // 已登录账号凭码入伙:不建新号,设备绑到 alice,票据核销并记 used_by。
+        let t = create_ticket("collaborator", "for-alice-laptop").unwrap();
+        let dev = redeem_ticket_existing(&t.code, &alice, "Alice 二号机", "node-alice-2").unwrap();
+        assert!(!dev.is_empty());
+        let conn = open_db().unwrap();
+        let used_by: String = conn
+            .query_row(
+                "SELECT used_by FROM tickets WHERE code=?1",
+                params![t.code],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(used_by, "alice");
+        // 票据用后即废:同码再兑失败。
+        assert!(redeem_ticket_existing(&t.code, &alice, "又一台", "node-x").is_err());
+        // 防顶替:bob 拿新票据也不能绑走 alice 的 node_id。
+        let t2 = create_ticket("collaborator", "bob-tries").unwrap();
+        assert!(redeem_ticket_existing(&t2.code, &bob, "Bob 机", "node-alice-2").is_err());
         std::env::remove_var("POLARIS_COLLAB_DB");
         let _ = std::fs::remove_file(path);
     }

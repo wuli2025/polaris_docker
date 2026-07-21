@@ -407,10 +407,17 @@ pub fn ensure_admin() -> Result<String, String> {
 
 // ───────────────────────── REST 薄封装 ─────────────────────────
 
+// 进程级共享: Agent 持有连接池, 每次现建 = 每个 REST 调用重做 TCP 握手且丢弃连接。
+// 协作同步(outbox flush 等)对同一 Gitea 主机连发多个请求, 共享后走 keep-alive。
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
-        .build()
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(10))
+                .build()
+        })
+        .clone()
 }
 
 /// 带 Bearer 的 POST/PUT,把「已存在」状态码集合视为成功(幂等)。

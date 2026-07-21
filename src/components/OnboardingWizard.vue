@@ -44,6 +44,7 @@ import { useAppStore } from "../stores/app";
 import { useWorkflowsStore } from "../stores/workflows";
 import { useWizardStore } from "../stores/wizard";
 import { useFileTasksStore } from "../stores/fileTasks";
+import { takeScan } from "../lib/scanPrewarm";
 // 星河图谱依赖 cytoscape(~562KB),只在「知识图谱」步骤(v-if 网住)才渲染 → 按需加载。
 const KnowledgeGraph = defineAsyncComponent(() => import("./KnowledgeGraph.vue"));
 
@@ -77,7 +78,8 @@ const excludeKeywords = ref("");
 function loadRoots() {
   loadingRoots.value = true;
   rootsErr.value = "";
-  fc.scanFolders(null)
+  // 走 scanPrewarm 缓存:文件中心挂载时已空闲预扫,这一步通常秒出。
+  takeScan()
     .then((r) => {
       roots.value = r.roots;
       uncheckedRoots.clear();
@@ -193,7 +195,7 @@ async function startScan() {
   scanMsg.value = "正在扫描你电脑上的文件…";
   try {
     if (!unScan) {
-      unScan = await listen<{ kind: string; files?: number; message?: string }>(
+      unScan = await listen<{ kind: string; files?: number; dirs?: number; text?: string; message?: string }>(
         "fable:inventory",
         (p) => {
           // 已离开 scan 步(转后台 / 已往下走)就不再让迟到的事件改动这屏 UI;
@@ -205,7 +207,12 @@ async function startScan() {
           if (p.kind === "progress") {
             scanFailed.value = false;
             scanFiles.value = p.files ?? 0;
-            scanMsg.value = `已扫描 ${scanFiles.value.toLocaleString()} 个文件…`;
+            // 目录数也报出来:纯目录段文件数不动,目录数仍在涨 → 一眼可见「没卡住」。
+            const dirs = p.dirs ? ` · ${p.dirs.toLocaleString()} 个文件夹` : "";
+            scanMsg.value = `已扫描 ${scanFiles.value.toLocaleString()} 个文件${dirs}…`;
+          } else if (p.kind === "phase") {
+            // 收尾阶段(写清单/核对变更/清理消失文件…):后端如实播报,不再黑箱。
+            scanMsg.value = p.text ?? scanMsg.value;
           } else if (p.kind === "done") {
             scanFiles.value = p.files ?? scanFiles.value;
             scanMsg.value = `扫描完成 · 共 ${scanFiles.value.toLocaleString()} 个文件`;

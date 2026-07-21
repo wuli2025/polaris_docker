@@ -1,0 +1,14 @@
+# ═══════════════════════════════════════════════════════════════
+# polaris-watchdog — 任务看门狗(纯逻辑, 零 IO)
+# 只做「计时判定核」: 空闲阈值 + 硬顶阈值 → verdict。
+# 谁去杀进程、怎么向前端报错, 全留给接线方(kernel), 保证本 crate 可独立测试。
+# ═══════════════════════════════════════════════════════════════
+[package]
+name = "polaris-watchdog"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# 与 workspace 其他板块一致: 无毒锁(不会 poisoned), 且比 std Mutex 轻
+parking_lot = "0.12"

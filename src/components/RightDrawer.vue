@@ -2,6 +2,8 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, defineAsyncComponent } from "vue";
 import { marked } from "marked";
 import { sanitizeHtml } from "../lib/sanitize";
+import { resolveSpecImages } from "../lib/specImages";
+import { usePolling } from "../composables/usePolling";
 import {
   X,
   RefreshCw,
@@ -34,6 +36,12 @@ import {
 // 懒加载(与 App.vue 的四个 Studio 同模式): 编辑器 149KB+figmaPull/deckThemes 只在
 // 用户真正进入编辑态(artifacts.editing)时才拉取, 不再吸进首屏 chunk。
 const ArtifactEditor = defineAsyncComponent(() => import("./ArtifactEditor.vue"));
+// PPT 渲染链懒加载:DeckViewer 自身也 import slidesSpec(40KB),静态引用会把整条
+// spec 解析/渲染链吸进首屏 chunk。只有用户真的打开演示类 artifact 才需要它。
+const DeckViewer = defineAsyncComponent(() => import("./DeckViewer.vue"));
+// slidesSpec 模块级懒单例:parseSpecLoose/setSpecText 的调用点(buildDeck/onDeckEdit)
+// 都在 async 函数里,惰性 import 对行为零影响;首次触发后浏览器缓存模块,无重复开销。
+const loadSlidesSpec = () => import("../lib/slidesSpec");
 import { useAppStore } from "../stores/app";
 import { useArtifactsStore } from "../stores/artifacts";
 import { useWorkflowsStore, type WorkflowPack } from "../stores/workflows";
@@ -231,10 +239,13 @@ function resetDrawerWidth() {
 // 找同目录的伴生 html（同名优先，否则取最新），「编辑」= 编辑 html + 保存后一键重导出。
 const isPptx = computed(() => /\.pptx$/i.test(artifacts.current?.name ?? ""));
 const pptxDeckHtml = ref<string | null>(null);
+// 原生 spec 导出的 pptx:同目录的 polaris.slides.json(有它,预览就走豆包式播放器)
+const pptxSiblingSpec = ref<string | null>(null);
 watch(
   () => artifacts.current?.path,
   async (p) => {
     pptxDeckHtml.value = null;
+    pptxSiblingSpec.value = null;
     if (!p || !/\.pptx$/i.test(p)) return;
     try {
       const norm = (s: string) => s.replace(/\\/g, "/");
@@ -247,7 +258,12 @@ watch(
       if (artifacts.current?.path !== p) return;
       // 同目录有 polaris.slides.json = 原生 spec 导出的真可编辑 pptx ——
       // 此时绝不能给 deck.html 重导出入口:任何 html 截图覆盖都会把真文本框毁成死图。
-      if (list.some((e) => norm(e.path) === `${dir}polaris.slides.json`)) return;
+      // 记下 spec 路径:预览改走确定性播放器(与演示工坊同一渲染器,预览即导出)。
+      const sib = list.find((e) => norm(e.path) === `${dir}polaris.slides.json`);
+      if (sib) {
+        pptxSiblingSpec.value = sib.path;
+        return;
+      }
       const htmls = list.filter(
         (e) => /\.html?$/i.test(e.name) && norm(e.path).startsWith(dir)
       );
@@ -281,6 +297,174 @@ watch(
 function editPptx() {
   if (pptxDeckHtml.value && artifacts.current) {
     artifacts.enterEditDeck(pptxDeckHtml.value, artifacts.current.path);
+  }
+}
+
+// ── 演示 spec / 原生 pptx → 豆包式播放器预览(DeckViewer 组件) ──
+// 对话里(演示工坊之外)模型也会产 polaris.slides.json:它 kind=text,原来只能看生 JSON;
+// 原生 spec 导出的 .pptx 是 binary,原来只有「暂不支持预览」。两者都改走 DeckViewer
+// —— 与演示工坊同一个确定性渲染器,预览即导出。(不用 srcdoc iframe:Tauri CSP 会拦
+// 它的内联脚本,播放器 runtime 跑不起来 —— 排查过,壳在页全空。)
+// 生成中(chat 正在发送)每 3s 直接重读 spec 文件:配合宽容解析,模型边写页边点亮,
+// 这是「一句话生成课件」主链路的豆包式实时感。不用 artifacts.refresh() —— 那会把
+// loading 置真,整个预览区每 3s 闪一次加载态。
+const deckSpec = ref<any | null>(null);
+const deckSpecPath = ref<string | null>(null);
+const deckKey = ref<string>("");
+const deckPages = ref(0);
+// 导出目标 = 同目录**已有的那份 pptx**(模型做的、聊天里列为交付物的那个)。
+// 绝不能写死成「演示.pptx」—— 那会新建一个重复文件,而用户认识的那份纹丝不动,
+// 看起来就是「导出没保存」(真踩过)。没有已存在的 pptx 时才用 spec 同名兜底。
+const deckPptxPath = ref<string | null>(null);
+// 【必须声明在下面那个 immediate watch 之前】它在 setup 期就同步跑并会写这两个 ref;
+// 声明在后 = TDZ「Cannot access before initialization」,整个抽屉被错误边界吞掉(真踩过)。
+const deckExported = ref<string | null>(null); // 刚导出的文件名(回执)
+const deckExporting = ref(false);
+const deckError = ref<string | null>(null);
+async function resolvePptxTarget(specPath: string): Promise<string> {
+  const norm = (s: string) => s.replace(/\\/g, "/");
+  const np = norm(specPath);
+  const dir = np.slice(0, np.lastIndexOf("/") + 1);
+  try {
+    const list = await artifactsApi.list(app.currentConvId ?? undefined);
+    const sibs = list
+      .filter((e) => /\.pptx$/i.test(e.name) && norm(e.path).startsWith(dir))
+      .sort((a, b) => b.modified - a.modified);
+    if (sibs.length) return sibs[0].path;
+  } catch {
+    /* 列不出来就走兜底名 */
+  }
+  return specPath.replace(/polaris\.slides\.json$/i, "课件.pptx");
+}
+const deckGenerating = computed(() => chat.isSending(app.currentConvId ?? null));
+// 生成中且还没有可渲染的页:用等待态盖住 loading/error(spec 未落盘时 read 必然报错)
+const deckPending = computed(
+  () => deckGenerating.value && !!deckCandidatePath.value && !deckSpec.value
+);
+
+/** spec 文本 → 解析+内联图 → 喂 DeckViewer。内容没变(key 相同)就不重复解析。 */
+async function buildDeck(specText: string, specPath: string, expectPayload: unknown) {
+  const key = `${specPath}|${specText}`;
+  if (key === deckKey.value) return;
+  const { parseSpecLoose } = await loadSlidesSpec();
+  const { spec } = parseSpecLoose(specText);
+  if (!spec || !Array.isArray(spec.slides) || !spec.slides.length) return;
+  await resolveSpecImages(spec);
+  if (artifacts.payload !== expectPayload) return; // 竞态:内联图期间已切走
+  deckSpec.value = spec;
+  deckSpecPath.value = specPath;
+  deckKey.value = key;
+  deckPages.value = spec.slides.length;
+}
+
+watch(
+  [() => artifacts.payload, pptxSiblingSpec],
+  async ([p, sib]) => {
+    deckSpec.value = null;
+    deckSpecPath.value = null;
+    deckKey.value = "";
+    deckPages.value = 0;
+    deckPptxPath.value = null;
+    deckExported.value = null;
+    if (!p) return;
+    if (/^polaris\.slides\.json$/i.test(p.name) && p.text) {
+      await buildDeck(p.text, p.path, p);
+      // 正看 spec:导出目标 = 同目录已有的那份 pptx
+      if (artifacts.payload === p) deckPptxPath.value = await resolvePptxTarget(p.path);
+    } else if (/\.pptx$/i.test(p.name) && sib) {
+      // 正看 pptx 本身:它就是导出目标(覆盖自己)
+      deckPptxPath.value = p.path;
+      try {
+        const r = await artifactsApi.read(sib);
+        if (artifacts.payload !== p) return; // 竞态:读盘期间已切走
+        if (r?.text) await buildDeck(r.text, sib, p);
+      } catch {
+        /* 读不到就维持原分支(binary 提示) */
+      }
+    }
+  },
+  { immediate: true }
+);
+
+// 候选 spec 路径:当前正看的就是 spec,或正看的 pptx 有伴生 spec。
+// 用 current(用户意图)而不用 payload:后端的 artifact 事件可能先于文件真正落盘,
+// 自动打开时 read 失败 → payload 是 null、error 挂着 —— 若轮询门要求 payload 非空,
+// 文件稍后落盘也没人再去读,抽屉就死在「文件不存在」上了。
+const deckCandidatePath = computed<string | null>(() => {
+  const cur = artifacts.current;
+  if (!cur) return null;
+  if (/^polaris\.slides\.json$/i.test(cur.name)) return cur.path;
+  if (/\.pptx$/i.test(cur.name) && pptxSiblingSpec.value) return pptxSiblingSpec.value;
+  return null;
+});
+// 生成中轮询重读 spec(逐页点亮);生成结束再读最后一次(撤占位、回封面)
+async function pollDeckSpec() {
+  const sp = deckCandidatePath.value;
+  if (!sp) return;
+  // 早开晚落盘的恢复:抽屉停在错误态(payload 空)时,重开一次 —— 文件已落盘就能翻身
+  if (!artifacts.payload) {
+    if (artifacts.error && !artifacts.loading) await artifacts.refresh();
+    return; // payload 就位后由 watch 正常构建
+  }
+  const p = artifacts.payload;
+  try {
+    const r = await artifactsApi.read(sp);
+    if (r?.text && artifacts.payload === p) await buildDeck(r.text, sp, p);
+  } catch {
+    /* 下次轮询再试 */
+  }
+}
+const deckPoller = usePolling(pollDeckSpec, 3000);
+watch(
+  () => deckGenerating.value && !!deckCandidatePath.value,
+  (on, was) => {
+    if (on) deckPoller.start();
+    else {
+      deckPoller.stop();
+      if (was) void pollDeckSpec(); // 下降沿补一拍:重建成「完成态」播放器
+    }
+  }
+);
+// 点字直改:写回 spec 盘 + 同步重转 pptx(否则导出还是旧字)。autofit 会按新内容重算字号。
+async function onDeckEdit(slideIdx: number, path: string, value: string) {
+  const sp = deckSpecPath.value;
+  if (!sp) return;
+  deckError.value = null;
+  try {
+    // 从盘上重读再改:内存里的 deckSpec 已把图换成 dataURL,直接回写会把 base64 写进文件
+    const r = await artifactsApi.read(sp);
+    const obj = JSON.parse(r?.text ?? "");
+    if (!obj?.slides?.[slideIdx]) throw new Error("spec 结构不符");
+    const { setSpecText } = await loadSlidesSpec();
+    if (!setSpecText(obj.slides[slideIdx], path, value)) return; // 没改动/路径不符:静默跳过
+    const text = JSON.stringify(obj, null, 2);
+    await artifactsApi.write(sp, text);
+    await buildDeck(text, sp, artifacts.payload); // 立刻按新字重排
+    const out = deckPptxPath.value ?? (await resolvePptxTarget(sp));
+    await artifactsApi.specToPptx(sp, out); // 导出物跟着走
+    deckPptxPath.value = out;
+  } catch (e: any) {
+    deckError.value = `保存修改失败：${e?.message ?? e}`;
+  }
+}
+// 用户主动导出 = 无条件重转(不做 mtime 短路),**覆盖用户认识的那份 pptx**,
+// 转完在资源管理器里选中它 —— 让「导出」这个词兑现:他看得见文件真的更新了。
+async function exportDeckPptx() {
+  const sp = deckSpecPath.value;
+  if (!sp || deckExporting.value) return;
+  deckExporting.value = true;
+  deckError.value = null;
+  deckExported.value = null;
+  try {
+    const out = deckPptxPath.value ?? (await resolvePptxTarget(sp));
+    await artifactsApi.specToPptx(sp, out);
+    deckPptxPath.value = out;
+    deckExported.value = out.replace(/\\/g, "/").split("/").pop() ?? "";
+    await artifactsApi.reveal(out);
+  } catch (e: any) {
+    deckError.value = `导出 PPTX 失败：${e?.message ?? e}`;
+  } finally {
+    deckExporting.value = false;
   }
 }
 
@@ -470,7 +654,15 @@ function fmtSize(n: number): string {
       </div>
 
       <div class="pv-body">
-        <div v-if="artifacts.loading" class="pv-state">
+        <!-- 课件生成中、spec 还没落盘:后端的 artifact 事件在模型「叙述路径」时就触发,
+             比真正写盘早一两分钟。这段窗口必须给等待态 —— 否则用户盯着的是一句刺眼的
+             「文件不存在或无法访问」(那是真相,但不是此刻该说的话)。轮询会在文件落盘的
+             那一刻自动接上,无需用户操作。必须排在 loading/error 分支前把它们盖住。 -->
+        <div v-if="deckPending" class="pv-state">
+          <Loader :size="22" :stroke-width="1.6" class="spin" />
+          <span>课件生成中…第一页出来就会显示</span>
+        </div>
+        <div v-else-if="artifacts.loading" class="pv-state">
           <Loader :size="22" :stroke-width="1.6" class="spin" />
           <span>正在加载…</span>
         </div>
@@ -483,9 +675,39 @@ function fmtSize(n: number): string {
         </div>
 
         <template v-else-if="artifacts.payload">
+          <!-- 演示 spec / 原生 pptx → 豆包式播放器(与演示工坊同一渲染器,预览即导出)。
+               必须排在 text/binary 分支前:spec 是 kind=text、原生 pptx 是 kind=binary。 -->
+          <div v-if="deckSpec" class="pv-deck">
+            <div v-if="deckError" class="pv-deck-err">{{ deckError }}</div>
+            <div class="pv-deck-bar">
+              <button
+                class="pv-deck-export"
+                :disabled="deckExporting || deckGenerating"
+                :title="deckGenerating ? '生成完成后可导出' : '无条件重转并在文件夹中定位'"
+                @click="exportDeckPptx()"
+              >
+                <Loader v-if="deckExporting" :size="13" :stroke-width="1.8" class="spin" />
+                <Download v-else :size="13" :stroke-width="1.8" />
+                <span>{{ deckExporting ? "导出中…" : "导出 PPTX" }}</span>
+              </button>
+              <span v-if="deckGenerating" class="pv-deck-live">
+                <Loader :size="12" :stroke-width="1.8" class="spin" /> 生成中 · 已出 {{ deckPages }} 页
+              </span>
+              <!-- 导出回执:明说存成了哪个文件 —— 否则用户以为「没保存」(真踩过) -->
+              <span v-else-if="deckExported" class="pv-deck-ok">已保存到 {{ deckExported }}</span>
+              <span v-else class="pv-deck-hint">原生可编辑 · 预览即导出</span>
+            </div>
+            <DeckViewer
+              class="pv-deck-viewer"
+              :spec="deckSpec"
+              :generating="deckGenerating"
+              :editable="!deckGenerating"
+              @edit="onDeckEdit"
+            />
+          </div>
           <!-- HTML / SVG → iframe 完整渲染 -->
           <iframe
-            v-if="
+            v-else-if="
               artifacts.payload.kind === 'html' ||
               artifacts.payload.kind === 'svg'
             "
@@ -500,7 +722,7 @@ function fmtSize(n: number): string {
             v-else-if="artifacts.payload.kind === 'image'"
             class="pv-img-wrap"
           >
-            <img :src="artifacts.payload.dataUrl" :alt="artifacts.payload.name" />
+            <img decoding="async" :src="artifacts.payload.dataUrl" :alt="artifacts.payload.name" />
           </div>
           <!-- Markdown → 渲染 -->
           <div
@@ -862,6 +1084,69 @@ function fmtSize(n: number): string {
   height: 100%;
   border: none;
   background: #fff;
+}
+/* 演示播放器包壳:顶部导出条 + DeckViewer(自带深底) */
+.pv-deck {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.pv-deck-viewer {
+  flex: 1;
+  min-height: 0;
+  border-radius: 0;
+}
+.pv-deck-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+}
+.pv-deck-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: 7px;
+  background: var(--primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pv-deck-export:hover:not(:disabled) {
+  filter: brightness(1.07);
+}
+.pv-deck-export:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.pv-deck-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+.pv-deck-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--primary-deep, var(--primary));
+}
+.pv-deck-ok {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ok, #2f7a4f);
+}
+.pv-deck-err {
+  padding: 6px 10px;
+  background: var(--vermilion-soft, rgba(168, 62, 50, 0.08));
+  color: var(--vermilion, #a83e32);
+  font-size: 12px;
 }
 .pv-img-wrap {
   flex: 1;

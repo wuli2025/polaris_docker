@@ -13,9 +13,10 @@ pub mod capture; // 工业级化:持久 CDP + 5 档 fallback 链(替 video 的 p
                  // (Phase 0 文件归位; lib.rs 有 crate 根别名保持 `crate::figma_bridge` 旧路径)。
 pub mod figma_bridge;
 pub mod fx_safe; // 工业级化:动效错误隔离 + spring 闭式解(任务 c §C.2 §C.3)
-pub mod image; // 文生图(多家可配,纯 Rust)→ 配置由壳注入(见 polaris-app/src/imagegen.rs)
+pub mod image; // 文生图(MiniMax image-01,纯 Rust)→ 喂 pptx_native 的 image-* 版式
 pub mod pptx;
 pub mod pptx_native; // 路线 B:spec JSON → 原生可编辑 .pptx(零浏览器,Docker slim 可用)
+pub mod pptx_python; // 路线 B 上层:同一份 spec 交 py/pptx_bridge.py(python-pptx)→ 无限版式
 pub mod tts;
 pub mod video;
 
@@ -284,6 +285,7 @@ pub fn forge_preflight() -> Value {
             "fonts": fonts,
             "pptx_pack": { "ready": true, "note": "纯 Rust OOXML，平台无关(引擎 P1 落地)" },
             "pptx_native": { "ready": true, "note": "spec JSON → 原生可编辑 PPT(路线 B)，零浏览器，slim/CLI 可用" },
+            "pptx_python": { "ready": crate::forge::pptx_python::available(), "note": "同一份 spec 交 python-pptx 桥 → 无限版式(engine:python/auto)，需本机 python-pptx，非零安装" },
             "animation_fx": { "ready": true, "note": "Web 标准 __fx.seek，三平台一致(引擎 P3 落地)" }
         },
         "summary": {
@@ -364,7 +366,29 @@ pub fn spec_to_pptx_sync(spec: String, out: String) -> Result<Value, String> {
     } else {
         std::fs::read_to_string(&spec).map_err(|e| format!("读 spec 文件 {spec} 失败: {e}"))?
     };
-    crate::forge::pptx_native::build_pptx_from_spec(json.trim_start_matches('\u{feff}'), &out)
+    let json = json.trim_start_matches('\u{feff}');
+
+    // engine 路由:顶层 `"engine"` 字段决定走哪条梯队。缺省/native → 原生 Rust 引擎(零行为变化);
+    // python → 强制走 py 桥(失败即报错);auto → 优先 py 桥,不可用/失败静默回退原生 + 告警。
+    let engine = serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|v| v.get("engine").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    match engine.as_str() {
+        "python" | "py" => crate::forge::pptx_python::build_via_python(json, &out),
+        "auto" => match crate::forge::pptx_python::build_via_python(json, &out) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // 回退原生并在 warnings 里留痕,让用户知道「本该用 python 但没成」。
+                let mut v = crate::forge::pptx_native::build_pptx_from_spec(json, &out)?;
+                if let Some(arr) = v.get_mut("warnings").and_then(|w| w.as_array_mut()) {
+                    arr.insert(0, Value::String(format!("python 桥不可用,已回退原生引擎: {e}")));
+                }
+                Ok(v)
+            }
+        },
+        _ => crate::forge::pptx_native::build_pptx_from_spec(json, &out),
+    }
 }
 
 /// spec JSON → 原生可编辑 .pptx。async + spawn_blocking 防大 spec 冻 UI(与 deck 导出同策略)。

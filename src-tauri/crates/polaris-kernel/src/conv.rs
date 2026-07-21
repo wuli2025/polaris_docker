@@ -898,6 +898,8 @@ pub fn conv_delete_conversation(conversation_id: String) -> Result<(), String> {
     st.messages.retain(|m| m.conversation_id != conversation_id);
     drop(st);
     persist();
+    // 该对话若挂着常驻 claude agent 进程, 一并收割(对话没了, 进程与其上下文再无意义)。
+    crate::chat::session_pool::kill_conv(&conversation_id);
     Ok(())
 }
 

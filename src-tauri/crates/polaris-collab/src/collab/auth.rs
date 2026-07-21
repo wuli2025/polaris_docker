@@ -102,7 +102,7 @@ pub struct User {
     pub disabled: bool,
 }
 
-fn hash_password(pw: &str) -> Result<String, String> {
+pub(crate) fn hash_password(pw: &str) -> Result<String, String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(pw.as_bytes(), &salt)
@@ -110,7 +110,7 @@ fn hash_password(pw: &str) -> Result<String, String> {
         .map_err(|e| format!("密码哈希失败: {e}"))
 }
 
-fn verify_password(pw: &str, phc: &str) -> bool {
+pub(crate) fn verify_password(pw: &str, phc: &str) -> bool {
     match PasswordHash::new(phc) {
         Ok(parsed) => Argon2::default()
             .verify_password(pw.as_bytes(), &parsed)
@@ -247,6 +247,109 @@ pub fn create_user(
     tx.commit().map_err(|e| format!("提交账号失败: {e}"))?;
     db::audit(username, "user.create", role, "");
     Ok(user)
+}
+
+/// 密码单独校验(找回密码改密用:不新建账号,只换口令)。
+pub(crate) fn validate_password(password: &str) -> Result<(), String> {
+    let n = password.chars().count();
+    if !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&n) {
+        return Err(format!(
+            "密码长度须为 {PASSWORD_MIN_CHARS}–{PASSWORD_MAX_CHARS} 个字符"
+        ));
+    }
+    Ok(())
+}
+
+/// 邮箱格式浅校验(真正的所有权证明是「收到验证码」,这里只挡明显垃圾输入)。
+pub(crate) fn validate_email(email: &str) -> Result<String, String> {
+    let e = email.trim().to_ascii_lowercase();
+    let ok = e.len() >= 6
+        && e.len() <= 254
+        && e.matches('@').count() == 1
+        && !e.starts_with('@')
+        && !e.ends_with('@')
+        && e.split('@').nth(1).is_some_and(|d| d.contains('.'))
+        && !e.chars().any(|c| c.is_whitespace() || c.is_control());
+    if !ok {
+        return Err("邮箱格式不对".into());
+    }
+    Ok(e)
+}
+
+/// 该邮箱是否已绑定账号(注册前查重;返回命中的用户,找回密码也用它)。
+pub fn find_user_by_email(email: &str) -> Result<Option<User>, String> {
+    let e = validate_email(email)?;
+    let conn = open_db()?;
+    let row = conn.query_row(
+        "SELECT id,username,role,display_name,disabled FROM users WHERE email=?1",
+        params![e],
+        |r| {
+            Ok(User {
+                id: r.get(0)?,
+                username: r.get(1)?,
+                role: r.get(2)?,
+                display_name: r.get(3)?,
+                disabled: r.get::<_, i64>(4)? != 0,
+            })
+        },
+    );
+    match row {
+        Ok(u) => Ok(Some(u)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 邮箱验证注册:建账号并绑定已验证的邮箱(同一事务)。邮箱唯一索引兜底防并发重复绑定。
+pub fn create_user_with_email(
+    username: &str,
+    password: &str,
+    role: &str,
+    display_name: &str,
+    email: &str,
+) -> Result<User, String> {
+    let e = validate_email(email)?;
+    let phc = prepare_new_account(username, password, display_name)?;
+    let mut conn = open_db()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("建账号事务失败: {e}"))?;
+    let user = insert_user_tx(&tx, username, &phc, role, display_name)?;
+    tx.execute(
+        "UPDATE users SET email=?1 WHERE id=?2",
+        params![e, user.id],
+    )
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE") {
+            "该邮箱已被其他账号绑定".to_string()
+        } else {
+            format!("绑定邮箱失败: {err}")
+        }
+    })?;
+    tx.commit().map_err(|e| format!("提交账号失败: {e}"))?;
+    db::audit(username, "user.create", role, "email-signup");
+    Ok(user)
+}
+
+/// 找回密码:换口令 + 踢掉该账号全部会话(旧 token 立刻作废)。
+pub fn set_password(user_id: i64, new_password: &str) -> Result<(), String> {
+    validate_password(new_password)?;
+    let phc = hash_password(new_password)?;
+    let conn = open_db()?;
+    let n = conn
+        .execute(
+            "UPDATE users SET pass_hash=?1 WHERE id=?2",
+            params![phc, user_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("账号不存在".into());
+    }
+    conn.execute("DELETE FROM sessions WHERE user_id=?1", params![user_id])
+        .ok();
+    bump_session_revocation();
+    db::audit("system", "user.reset_password", &user_id.to_string(), "");
+    Ok(())
 }
 
 /// 首次 owner 原子创建。`is_bootstrap()` 再 `create_user()` 是 TOCTOU：两个并发请求都能
@@ -435,20 +538,32 @@ pub fn logout(token: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// owner 管理面的用户行:比会话 User 多一列邮箱(找回密码的绑定情况一目了然)。
+#[derive(serde::Serialize)]
+pub struct AdminUserRow {
+    pub id: i64,
+    pub username: String,
+    pub role: String,
+    pub display_name: String,
+    pub disabled: bool,
+    pub email: String,
+}
+
 /// 列所有账号（owner 管理面用）。
-pub fn list_users() -> Result<Vec<User>, String> {
+pub fn list_users() -> Result<Vec<AdminUserRow>, String> {
     let conn = open_db()?;
     let mut stmt = conn
-        .prepare("SELECT id,username,role,display_name,disabled FROM users ORDER BY id")
+        .prepare("SELECT id,username,role,display_name,disabled,email FROM users ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
-            Ok(User {
+            Ok(AdminUserRow {
                 id: r.get(0)?,
                 username: r.get(1)?,
                 role: r.get(2)?,
                 display_name: r.get(3)?,
                 disabled: r.get::<_, i64>(4)? != 0,
+                email: r.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?;

@@ -45,6 +45,8 @@ export interface HostInfo {
   remoteAccess?: boolean;
   /** 本机 iroh 主机 NodeId —— 手机据此打洞 P2P 直连(连接码里带上它)。 */
   nodeId?: string;
+  /** 主机访问口令:仅经 Tauri IPC 给本机前端,bootstrap(首次建 owner)必须带它。 */
+  accessToken?: string;
 }
 
 function loadCachedUser(): CollabUser | null {
@@ -170,6 +172,22 @@ export const useCollabStore = defineStore("collab", () => {
     await hostStatus();
   }
 
+  /** 桌面端登录/注册前自保:base 指向本机(或还没填)时,主机没跑先拉起、端口漂了先校正。
+   *  base 指向远端主机(用户手动填过地址/粘过分享码)时绝不动它。
+   *  修的就是「点登录直接报 无法连接协作主机」—— 此前提交前没人保证主机在跑。 */
+  async function ensureLocalHost() {
+    if (!isTauri) return;
+    const isLocal = (b: string) =>
+      !b || /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(b);
+    if (!isLocal(base.value)) return;
+    const info = await hostStatus();
+    if (!info?.running) {
+      await hostStart(); // 起主机并把 base 指到 127.0.0.1:port
+    } else {
+      applyBase(`http://127.0.0.1:${info.port}`); // base 空/端口漂移 → 校正
+    }
+  }
+
   /** 切换局域网直连(绑 0.0.0.0):后端会重启主机重绑地址,urls 随之带上局域网 IP。 */
   async function hostSetRemoteAccess(enabled: boolean): Promise<HostInfo> {
     const info = await invoke<HostInfo>("collab_host_set_remote_access", { enabled });
@@ -204,9 +222,30 @@ export const useCollabStore = defineStore("collab", () => {
     displayName: string,
     hostSelf = false
   ) {
+    // 首次建 owner 需要主机访问口令(仅 Tauri IPC 可得);没带后端必 401。
+    const setupToken = hostInfo.value?.accessToken || undefined;
     const r = requireAuth(
-      await collabApi.bootstrap({ username, password, displayName, hostSelf })
+      await collabApi.bootstrap({
+        username,
+        password,
+        displayName,
+        hostSelf,
+        setupToken,
+      })
     );
+    persistSession(r.user, r.token);
+    await afterAuth();
+  }
+
+  /** 邮箱验证码注册(注册成功即登录) */
+  async function emailSignup(args: {
+    email: string;
+    code: string;
+    username: string;
+    password: string;
+    displayName: string;
+  }) {
+    const r = requireAuth(await collabApi.emailSignup(args));
     persistSession(r.user, r.token);
     await afterAuth();
   }
@@ -643,8 +682,10 @@ export const useCollabStore = defineStore("collab", () => {
     hostStart,
     hostStop,
     hostSetRemoteAccess,
+    ensureLocalHost,
     login,
     signup,
+    emailSignup,
     bootstrap,
     redeem,
     logout,

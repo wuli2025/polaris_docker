@@ -168,6 +168,8 @@ export interface AdminUser {
   display_name: string;
   role: string;
   disabled: boolean;
+  /** 绑定邮箱(空 = 未绑,不能自助找回,只能 owner 重置) */
+  email?: string;
 }
 
 export interface AdminDevice {
@@ -333,10 +335,11 @@ export function deviceId(): string {
 
 async function req<T>(
   path: string,
-  init?: { method?: string; body?: unknown }
+  init?: { method?: string; body?: unknown; token?: string }
 ): Promise<T> {
   const headers: Record<string, string> = {};
-  const token = getToken();
+  // init.token:一次性覆写凭据(bootstrap 用主机访问口令,而非会话 token)
+  const token = init?.token ?? getToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
   if (init?.body !== undefined) headers["Content-Type"] = "application/json";
   let res: Response;
@@ -390,15 +393,40 @@ export interface AuthResult {
   token: string;
 }
 
+/** 邮箱服务状态(公开):configured=能发信,signupOpen=开放邮箱自助注册 */
+export interface EmailStatus {
+  configured: boolean;
+  signupOpen: boolean;
+}
+
+/** owner 邮箱服务配置(SMTP 授权码永不回显,只有 passSet) */
+export interface EmailConfig {
+  configured: boolean;
+  host: string;
+  port: number;
+  user: string;
+  from: string;
+  passSet: boolean;
+  signupOpen: boolean;
+}
+
 export const collabApi = {
-  /** 仅零账号时可用:首次初始化,创建 owner。hostSelf=本机正当主机(设备页点亮主机徽标) */
+  /** 仅零账号时可用:首次初始化,创建 owner。hostSelf=本机正当主机(设备页点亮主机徽标)。
+   *  setupToken = 主机访问口令(collab_host_status.accessToken)—— 后端 bootstrap 现在
+   *  强制校验它,不带必 401。 */
   bootstrap(args: {
     username: string;
     password: string;
     displayName: string;
     hostSelf?: boolean;
+    setupToken?: string;
   }): Promise<AuthResult> {
-    return post("/api/collab/bootstrap", { ...args, deviceId: deviceId() });
+    const { setupToken, ...rest } = args;
+    return req("/api/collab/bootstrap", {
+      method: "POST",
+      body: { ...rest, deviceId: deviceId() },
+      token: setupToken,
+    });
   },
 
   login(args: { username: string; password: string }): Promise<AuthResult> {
@@ -412,6 +440,48 @@ export const collabApi = {
     displayName: string;
   }): Promise<AuthResult> {
     return post("/api/collab/signup", { ...args, deviceId: deviceId() });
+  },
+
+  // ── 邮箱验证码:注册 / 找回密码 ──
+  emailStatus(): Promise<EmailStatus> {
+    return get("/api/collab/email/status");
+  },
+  /** 发验证码(60s 重发间隔 + 每小时 5 封,后端频控) */
+  sendEmailCode(email: string, purpose: "signup" | "reset"): Promise<void> {
+    return post("/api/collab/email/send_code", { email, purpose });
+  },
+  /** 邮箱验证码注册:验证通过即建号+绑邮箱+登录 */
+  emailSignup(args: {
+    email: string;
+    code: string;
+    username: string;
+    password: string;
+    displayName: string;
+  }): Promise<AuthResult> {
+    return post("/api/collab/email/signup", { ...args, deviceId: deviceId() });
+  },
+  /** 邮箱找回密码:改密并踢掉旧会话;回 username 提示用哪个名登录 */
+  emailReset(args: {
+    email: string;
+    code: string;
+    newPassword: string;
+  }): Promise<{ ok: boolean; username?: string }> {
+    return post("/api/collab/email/reset", args);
+  },
+  adminEmailConfig(): Promise<EmailConfig> {
+    return get("/api/collab/admin/email_config");
+  },
+  /** pass 留空 = 保留旧授权码;testTo 非空则顺手发测试信 */
+  adminEmailConfigSet(cfg: {
+    host: string;
+    port: number;
+    user: string;
+    pass: string;
+    from: string;
+    signupOpen: boolean;
+    testTo?: string;
+  }): Promise<{ ok: boolean; configured: boolean }> {
+    return post("/api/collab/admin/email_config", cfg);
   },
 
   /** 用户名/昵称模糊搜索(登录后可用,限 20 条) */
@@ -469,6 +539,10 @@ export const collabApi = {
   },
   adminUserDisable(userId: number, disabled: boolean): Promise<void> {
     return post("/api/collab/admin/user_disable", { userId, disabled });
+  },
+  /** owner 直接重置某用户密码(邮箱没绑时的兜底通道,旧会话全部作废) */
+  adminUserResetPassword(userId: number, newPassword: string): Promise<void> {
+    return post("/api/collab/admin/user_reset_password", { userId, newPassword });
   },
   adminDevices(): Promise<AdminDevice[]> {
     return get("/api/collab/admin/devices");

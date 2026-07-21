@@ -4,6 +4,9 @@
 //! 但 git 工作集操作发生在**成员本机**——这里把 workset 六件套暴露给前端 invoke。
 //! 隧道客户端(空壳/完整端连主机)也在此启停。
 #![cfg(feature = "desktop")]
+// 参数名必须与前端 invoke 的 camelCase key 逐字对齐(tauri 按名字反序列化),
+// 改成 snake_case 会让前端调用当场丢参,故此文件整体豁免命名 lint。
+#![allow(non_snake_case)]
 
 use super::workset;
 
@@ -108,16 +111,31 @@ pub fn collab_device_node_id() -> Result<String, String> {
 }
 
 /// 成员端隧道:本地端口 ↔ 主机 NodeId。起来后前端把 collab base 设为 http://127.0.0.1:<port>。
+/// 幂等:同端口同主机重复调用 = no-op(前端启动兜底/重试可放心多次调);坏 NodeId 同步报错。
 #[tauri::command]
 pub fn collab_tunnel_connect(hostNodeId: String, listenPort: u16) -> Result<(), String> {
     #[cfg(feature = "collab-net")]
     {
-        super::tunnel::start_client_blocking_thread(hostNodeId, listenPort);
-        return Ok(());
+        return super::tunnel::connect_client(&hostNodeId, listenPort);
     }
     #[cfg(not(feature = "collab-net"))]
     {
         let _ = (hostNodeId, listenPort);
+        Err("本构建未启用 collab-net(iroh) 功能".into())
+    }
+}
+
+/// 拆除一条成员端隧道(移除远程盘时调,别让孤儿隧道永远在后台重连)。幂等。
+#[tauri::command]
+pub fn collab_tunnel_disconnect(listenPort: u16) -> Result<(), String> {
+    #[cfg(feature = "collab-net")]
+    {
+        super::tunnel::disconnect_client(listenPort);
+        return Ok(());
+    }
+    #[cfg(not(feature = "collab-net"))]
+    {
+        let _ = listenPort;
         Err("本构建未启用 collab-net(iroh) 功能".into())
     }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   envDoctor,
   listen,
@@ -10,7 +10,9 @@ import {
   type ToolStatus,
   type UvCacheInfo,
 } from "../tauri";
-import McpConfigModal from "./McpConfigModal.vue";
+// 懒加载:EnvDoctor 是常驻组件,这里若静态 import 会把 McpConfigModal 拽回主包,
+// 把 App.vue:49 的 defineAsyncComponent 架空。模板处已有 v-if 条件,异步化零行为差异。
+const McpConfigModal = defineAsyncComponent(() => import("./McpConfigModal.vue"));
 
 /**
  * 环境医生 — 新用户开箱的「环境监测 + 配置安装」。

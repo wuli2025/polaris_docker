@@ -17,6 +17,8 @@ pub mod attach;
 pub mod bridges;
 pub mod pipeline;
 pub mod prompt;
+// 常驻 claude agent 进程池(省每消息 ~6.4s CLI 自举; POLARIS_PERSISTENT_AGENT=0 回落旧路径)
+pub mod session_pool;
 pub mod types;
 
 #[cfg(not(feature = "desktop"))]
@@ -33,8 +35,8 @@ pub use artifacts::{
     artifact_write, ArtifactEntry, ArtifactPayload, ArtifactSearchHit, ARTIFACT_MARKER_PREFIX,
 };
 pub use attach::{chat_attach_files, chat_attach_image, AttachedFile};
-pub use pipeline::{chat_build_manifest, chat_cancel, chat_send};
-pub use types::{ChatSendArgs, ChatStreamEvent, PermissionMode};
+pub use pipeline::{chat_build_manifest, chat_cancel, chat_prewarm, chat_send};
+pub use types::{ChatPrewarmArgs, ChatSendArgs, ChatStreamEvent, PermissionMode};
 
 // tauri::command 生成的 __cmd__* 宏也要跟着 re-export, generate_handler!(chat::xxx)
 // 才能在 chat:: 路径下找到它们(宏与函数是两个名字空间)。
@@ -56,11 +58,13 @@ pub use attach::{
     __tauri_command_name_chat_attach_files, __tauri_command_name_chat_attach_image,
 };
 #[cfg(feature = "desktop")]
-pub use pipeline::{__cmd__chat_build_manifest, __cmd__chat_cancel, __cmd__chat_send};
+pub use pipeline::{
+    __cmd__chat_build_manifest, __cmd__chat_cancel, __cmd__chat_prewarm, __cmd__chat_send,
+};
 #[cfg(feature = "desktop")]
 pub use pipeline::{
     __tauri_command_name_chat_build_manifest, __tauri_command_name_chat_cancel,
-    __tauri_command_name_chat_send,
+    __tauri_command_name_chat_prewarm, __tauri_command_name_chat_send,
 };
 
 pub fn init(_app: &AppHandle) -> Result<(), anyhow::Error> {

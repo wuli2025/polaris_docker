@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   Handshake,
   LoaderCircle,
@@ -17,7 +17,8 @@ import {
   X,
 } from "@lucide/vue";
 import { invoke, isTauri } from "../../tauri";
-import { parseShareCode } from "./api";
+import { usePolling } from "../../composables/usePolling";
+import { collabApi, parseShareCode, type EmailStatus } from "./api";
 import { useCollabStore } from "./stores/collab";
 import TaskBoard from "./TaskBoard.vue";
 import CollabAdmin from "./CollabAdmin.vue";
@@ -64,9 +65,11 @@ function pollTunnel() {
       tunnel.value = null;
     });
 }
+// usePolling: 卸载自动清(裸 setInterval 每进一次协作页就漏一个永久计时器)、
+// 窗口隐藏自动停、回前台立刻补拉一次。
+const tunnelPoll = usePolling(pollTunnel, 10_000);
 onMounted(() => {
-  pollTunnel();
-  if (isTauri) setInterval(pollTunnel, 10_000);
+  if (isTauri) tunnelPoll.start();
 });
 
 // ── 一键当主机(桌面版):本机起协作服务 → 直接进初始化/登录 ──
@@ -77,6 +80,7 @@ async function makeHost() {
     const info = await collab.hostStart();
     tab.value = info.needsBootstrap ? "bootstrap" : "login";
     authErr.value = "";
+    void probeEmail(); // 主机就位 → 探邮箱服务,注册/找回入口按真实能力亮
     toast.info(
       info.needsBootstrap
         ? `主机已在本机启动(端口 ${info.port}),注册你的管理者账号吧`
@@ -105,10 +109,11 @@ function saveHost() {
   collab.applyBase(v);
   toast.info("已保存主机地址");
   hostOpen.value = false;
+  void probeEmail();
 }
 
-// ── 登录 / 注册 为主,票据入伙收进第三个小 tab ──
-type AuthTab = "login" | "signup" | "redeem" | "bootstrap";
+// ── 登录 / 注册 为主,票据入伙收进第三个小 tab;reset = 邮箱找回密码 ──
+type AuthTab = "login" | "signup" | "redeem" | "bootstrap" | "reset";
 const tab = ref<AuthTab>("login");
 const busy = ref(false);
 const authErr = ref("");
@@ -118,7 +123,85 @@ const f = ref({
   displayName: "",
   code: "",
   deviceName: "",
+  email: "",
+  ecode: "",
+  newPassword: "",
 });
+
+// ── 邮箱服务状态:决定注册 tab 走「邮箱验证注册」还是老的开放注册,忘记密码亮不亮 ──
+const emailInfo = ref<EmailStatus | null>(null);
+async function probeEmail() {
+  if (collab.needsHost) return; // 桌面版还没定主机地址,探不了
+  try {
+    emailInfo.value = await collabApi.emailStatus();
+  } catch {
+    emailInfo.value = null; // 旧版主机无此端点 → 维持老行为
+  }
+}
+onMounted(() => {
+  if (!collab.authed) void probeEmail();
+});
+
+const codeCooldown = ref(0);
+let codeTimer: ReturnType<typeof setInterval> | null = null;
+onUnmounted(() => {
+  if (codeTimer) clearInterval(codeTimer);
+});
+async function sendEmailCode() {
+  const email = f.value.email.trim();
+  if (!email) {
+    authErr.value = "请先填写邮箱";
+    return;
+  }
+  if (codeCooldown.value > 0) return;
+  authErr.value = "";
+  try {
+    await collabApi.sendEmailCode(email, tab.value === "reset" ? "reset" : "signup");
+    toast.info(`验证码已发往 ${email},10 分钟内有效`);
+    codeCooldown.value = 60;
+    if (codeTimer) clearInterval(codeTimer);
+    codeTimer = setInterval(() => {
+      codeCooldown.value--;
+      if (codeCooldown.value <= 0 && codeTimer) {
+        clearInterval(codeTimer);
+        codeTimer = null;
+      }
+    }, 1000);
+  } catch (e) {
+    authErr.value = (e as Error).message;
+  }
+}
+
+/** 邮箱找回密码(独立提交:不建号,只换口令) */
+async function doReset() {
+  authErr.value = "";
+  const v = f.value;
+  if (!v.email.trim() || !v.ecode.trim()) {
+    authErr.value = "请填写邮箱并获取验证码";
+    return;
+  }
+  if (!v.newPassword) {
+    authErr.value = "请填写新密码(至少 8 位)";
+    return;
+  }
+  busy.value = true;
+  try {
+    const r = await collabApi.emailReset({
+      email: v.email.trim(),
+      code: v.ecode.trim(),
+      newPassword: v.newPassword,
+    });
+    if (r.username) v.username = r.username;
+    v.ecode = "";
+    v.newPassword = "";
+    tab.value = "login";
+    toast.info(`密码已重置${r.username ? `,请用「${r.username}」登录` : ""}`);
+  } catch (e) {
+    authErr.value = (e as Error).message;
+  } finally {
+    busy.value = false;
+  }
+}
 
 // 连接失败时自动展开高级设置提醒检查主机地址
 watch(authErr, (e) => {
@@ -127,13 +210,19 @@ watch(authErr, (e) => {
 
 async function doAuth() {
   authErr.value = "";
+  if (tab.value === "reset") return doReset();
   const v = f.value;
   if (!v.username.trim() || !v.password) {
     authErr.value = "用户名和密码不能为空";
     return;
   }
-  if (tab.value !== "login" && !v.displayName.trim()) {
+  if (tab.value !== "login" && tab.value !== "signup" && !v.displayName.trim()) {
     authErr.value = "请填写显示昵称";
+    return;
+  }
+  // 邮箱注册:验证码是硬门槛
+  if (tab.value === "signup" && emailInfo.value?.signupOpen && (!v.email.trim() || !v.ecode.trim())) {
+    authErr.value = "请填写邮箱并获取验证码";
     return;
   }
   if (tab.value === "redeem" && !v.code.trim()) {
@@ -154,7 +243,18 @@ async function doAuth() {
     if (tab.value === "login") {
       await collab.login(v.username.trim(), v.password);
     } else if (tab.value === "signup") {
-      await collab.signup(v.username.trim(), v.password, v.displayName.trim());
+      if (emailInfo.value?.signupOpen) {
+        // 邮箱验证注册(主机配了 SMTP 且开放):验证码即邮箱所有权证明
+        await collab.emailSignup({
+          email: v.email.trim(),
+          code: v.ecode.trim(),
+          username: v.username.trim(),
+          password: v.password,
+          displayName: v.displayName.trim() || v.username.trim(),
+        });
+      } else {
+        await collab.signup(v.username.trim(), v.password, v.displayName.trim() || v.username.trim());
+      }
     } else if (tab.value === "bootstrap") {
       await collab.bootstrap(
         v.username.trim(),
@@ -326,25 +426,52 @@ const MAIN_TABS: { key: AuthTab; label: string }[] = [
             tab === "login"
               ? "已有账号,直接登录"
               : tab === "signup"
-                ? "开放注册:用户名 + 密码 + 昵称,注册成功直接进入"
+                ? (emailInfo?.signupOpen
+                    ? "邮箱验证注册:收验证码证明邮箱是你的,注册成功直接进入"
+                    : "开放注册:用户名 + 密码 + 昵称,注册成功直接进入")
                 : tab === "redeem"
                   ? "拿到管理者发的配对码?在这里建号加入"
-                  : "全新协作服务:创建第一个管理者账号(仅零账号时可用)"
+                  : tab === "reset"
+                    ? "验证码发到注册时绑定的邮箱,验证通过即可重设密码"
+                    : "全新协作服务:创建第一个管理者账号(仅零账号时可用)"
           }}
         </p>
 
         <form class="auth-form" @submit.prevent="doAuth">
-          <input v-if="tab === 'redeem'" v-model="f.code" class="inp code" placeholder="邀请配对码(整串粘贴,自动找到主机)" />
-          <input v-model="f.username" class="inp" placeholder="用户名" autocomplete="username" />
-          <input
-            v-model="f.password"
-            class="inp"
-            type="password"
-            placeholder="密码"
-            :autocomplete="tab === 'login' ? 'current-password' : 'new-password'"
-          />
-          <input v-if="tab !== 'login'" v-model="f.displayName" class="inp" placeholder="显示昵称(同事看到的名字)" />
-          <input v-if="tab === 'redeem'" v-model="f.deviceName" class="inp" placeholder="本机备注名(如「小王的笔记本」,可选)" />
+          <!-- 忘记密码:邮箱 + 验证码 + 新密码,不建号只换口令 -->
+          <template v-if="tab === 'reset'">
+            <div class="email-row">
+              <input v-model="f.email" class="inp" placeholder="注册时绑定的邮箱" autocomplete="email" />
+              <button type="button" class="btn ghost code-send" :disabled="codeCooldown > 0" @click="sendEmailCode">
+                {{ codeCooldown > 0 ? `${codeCooldown}s` : "发验证码" }}
+              </button>
+            </div>
+            <input v-model="f.ecode" class="inp" placeholder="邮箱验证码(6 位)" inputmode="numeric" />
+            <input v-model="f.newPassword" class="inp" type="password" placeholder="新密码(至少 8 位)" autocomplete="new-password" />
+          </template>
+          <template v-else>
+            <input v-if="tab === 'redeem'" v-model="f.code" class="inp code" placeholder="邀请配对码(整串粘贴,自动找到主机)" />
+            <!-- 邮箱验证注册(主机已配 SMTP 且开放) -->
+            <template v-if="tab === 'signup' && emailInfo?.signupOpen">
+              <div class="email-row">
+                <input v-model="f.email" class="inp" placeholder="邮箱(如 xxx@qq.com)" autocomplete="email" />
+                <button type="button" class="btn ghost code-send" :disabled="codeCooldown > 0" @click="sendEmailCode">
+                  {{ codeCooldown > 0 ? `${codeCooldown}s` : "发验证码" }}
+                </button>
+              </div>
+              <input v-model="f.ecode" class="inp" placeholder="邮箱验证码(6 位)" inputmode="numeric" />
+            </template>
+            <input v-model="f.username" class="inp" placeholder="用户名" autocomplete="username" />
+            <input
+              v-model="f.password"
+              class="inp"
+              type="password"
+              placeholder="密码"
+              :autocomplete="tab === 'login' ? 'current-password' : 'new-password'"
+            />
+            <input v-if="tab !== 'login'" v-model="f.displayName" class="inp" :placeholder="tab === 'signup' ? '显示昵称(可选,默认用户名)' : '显示昵称(同事看到的名字)'" />
+            <input v-if="tab === 'redeem'" v-model="f.deviceName" class="inp" placeholder="本机备注名(如「小王的笔记本」,可选)" />
+          </template>
           <div v-if="authErr" class="auth-err">{{ authErr }}</div>
           <button class="btn solid wide" type="submit" :disabled="busy">
             <LoaderCircle v-if="busy" :size="14" class="spin" />
@@ -355,18 +482,36 @@ const MAIN_TABS: { key: AuthTab; label: string }[] = [
                   ? "注册并进入"
                   : tab === "redeem"
                     ? "入伙并登录"
-                    : "初始化并登录"
+                    : tab === "reset"
+                      ? "重设密码"
+                      : "初始化并登录"
             }}
           </button>
         </form>
 
-        <button
-          v-if="tab !== 'bootstrap'"
-          class="link-btn"
-          @click="tab = 'bootstrap'; authErr = ''"
-        >
-          全新主机?首次初始化 →
-        </button>
+        <div class="auth-links">
+          <button
+            v-if="tab === 'login' && emailInfo?.configured"
+            class="link-btn"
+            @click="tab = 'reset'; authErr = ''"
+          >
+            忘记密码?
+          </button>
+          <button
+            v-if="tab === 'reset'"
+            class="link-btn"
+            @click="tab = 'login'; authErr = ''"
+          >
+            ← 回到登录
+          </button>
+          <button
+            v-if="tab !== 'bootstrap'"
+            class="link-btn"
+            @click="tab = 'bootstrap'; authErr = ''"
+          >
+            全新主机?首次初始化 →
+          </button>
+        </div>
 
         <!-- 桌面模式:主机地址收进「高级设置」,保存过默认收起 -->
         <div v-if="isTauri" class="adv">
@@ -657,6 +802,12 @@ const MAIN_TABS: { key: AuthTab; label: string }[] = [
   font-size: 11.5px; color: var(--muted); padding: 0;
 }
 .link-btn:hover { color: var(--ink); text-decoration: underline; }
+.auth-links { display: flex; gap: 16px; flex-wrap: wrap; }
+
+/* 邮箱验证码:输入框 + 发码按钮同排 */
+.email-row { display: flex; gap: 8px; }
+.email-row .inp { flex: 1; min-width: 0; }
+.code-send { flex: none; white-space: nowrap; }
 
 .adv { margin-top: 16px; border-top: 1px dashed var(--border-soft); padding-top: 10px; }
 .adv-toggle {

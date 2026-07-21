@@ -114,7 +114,7 @@ function avatarUrl(id: string, icon: string): string {
         :style="{ '--tier-left': tierColor[m.costTier] }"
       >
         <div class="member-avatar-wrap">
-          <img :src="avatarUrl(m.id, m.icon)" :alt="m.name" class="member-avatar" />
+          <img :src="avatarUrl(m.id, m.icon)" :alt="m.name" class="member-avatar" decoding="async" />
           <div v-if="activeTeam && idx === 0" class="orchestrator-badge">🧭</div>
         </div>
         <div class="member-info">

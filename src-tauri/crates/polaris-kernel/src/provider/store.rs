@@ -33,9 +33,10 @@ const MODEL_ENV_KEYS: &[&str] = &[
 ];
 const MANAGED_TOP_KEYS: &[&str] = &["attribution", "includeCoAuthoredBy"];
 
-// ───────────────────────── 预设供应商表 (全量 55) ─────────────────────────
+// ───────────────────────── 预设供应商表 (全量 56) ─────────────────────────
 // base_url / apiKeyField / category 取自 cc-switch claudeProviderPresets。
-// kind: official(清空 env) | key(写 base+token) | codex / copilot(需授权代理)
+// kind: official(清空 env) | key(写 base+token) | codex(ChatGPT 订阅·本地路由)
+//       | openai(OpenAI 协议 API key·本地路由) | copilot(暂未支持)
 
 struct Preset {
     id: &'static str,
@@ -95,6 +96,7 @@ const PRESETS: &[Preset] = &[
     Preset { id: "novita-ai", name: "Novita AI", base_url: "https://api.novita.ai/anthropic", token_field: DEFAULT_TOKEN_FIELD, category: "aggregator", kind: "key" },
     Preset { id: "github-copilot", name: "GitHub Copilot", base_url: "https://api.githubcopilot.com", token_field: DEFAULT_TOKEN_FIELD, category: "third_party", kind: "copilot" },
     Preset { id: "codex", name: "Codex (ChatGPT)", base_url: "https://chatgpt.com/backend-api/codex", token_field: DEFAULT_TOKEN_FIELD, category: "third_party", kind: "codex" },
+    Preset { id: "openai", name: "OpenAI (GPT API)", base_url: "https://api.openai.com/v1", token_field: DEFAULT_TOKEN_FIELD, category: "third_party", kind: "openai" },
     Preset { id: "lemondata", name: "LemonData", base_url: "https://api.lemondata.cc", token_field: API_KEY_FIELD, category: "third_party", kind: "key" },
     Preset { id: "nvidia", name: "Nvidia", base_url: "https://integrate.api.nvidia.com", token_field: DEFAULT_TOKEN_FIELD, category: "aggregator", kind: "key" },
     Preset { id: "pipellm", name: "PIPELLM", base_url: "https://cc-api.pipellm.ai", token_field: DEFAULT_TOKEN_FIELD, category: "aggregator", kind: "key" },
@@ -151,6 +153,10 @@ struct StoredProvider {
     website_url: String,
     #[serde(default)]
     token_field: String,
+    /// 上游协议: ""(默认, Anthropic 兼容·claude 直连) | "openai"(OpenAI chat/completions,
+    /// 切换时经本地路由翻译转发)。老 store 无此字段 → serde 默认 "" → 行为不变。
+    #[serde(default)]
+    protocol: String,
     #[serde(default)]
     settings_config: Value,
 }
@@ -184,6 +190,12 @@ pub(crate) struct Store {
     /// 老 store 没有此字段 → serde 默认 false → 升级即自动隔离, 串台就此止住。
     #[serde(default)]
     link_global: bool,
+    /// 本地路由总开关(cc-switch 式代理模式)。true = Anthropic 兼容供应商也统一走
+    /// 127.0.0.1 本地路由透传(key 由路由实时注入, 改 key 即刻生效、不进子进程 env);
+    /// false(默认) = 直连(base/key 直接注入环境)。GPT/Codex 等非 Anthropic 协议
+    /// 不受此开关影响 —— 它们必须经路由翻译, 恒走路由。
+    #[serde(default)]
+    route_local: bool,
     #[serde(default)]
     items: Vec<StoredProvider>,
     // legacy（迁移后清空, 不再写出）
@@ -199,6 +211,90 @@ static STORE_PATH: Lazy<RwLock<PathBuf>> = Lazy::new(|| RwLock::new(PathBuf::new
 /// Tauri 命令可并发跑在线程池上, 两个 provider_switch 同时进来若不串行化, 会交错写同一份
 /// settings.json → 撕裂成半截。此锁保证整条 RMW 原子, 与 atomic_write 一起根治配置损坏。
 static IO_LOCK: Lazy<parking_lot::Mutex<()>> = Lazy::new(|| parking_lot::Mutex::new(()));
+
+// ─────────────────── 故障转移(polaris-failover 滑窗) ───────────────────
+// 5 分钟窗口内同一供应商第 3 次网络/鉴权/欠费类失败 → 自动切到列表里下一个可用
+// 供应商, 并 emit 事件让前端 toast。不自动切回(防抖动), 切回由用户在坞里确认。
+static FAILOVER: Lazy<polaris_failover::FailoverTracker> =
+    Lazy::new(polaris_failover::FailoverTracker::new);
+/// init() 时存一份 AppHandle 供故障转移线程 emit 事件用 —— 失败上报点(本地路由
+/// codex_proxy 的 TCP 线程)手里没有 app 句柄, 只能走全局。
+static FAILOVER_APP: Lazy<RwLock<Option<AppHandle>>> = Lazy::new(|| RwLock::new(None));
+
+/// 当前激活供应商 id(本地路由无 `/p/{id}` 前缀的旧版路径需要它做故障归因)。
+pub fn current_provider_id() -> String {
+    STORE.read().current_id.clone()
+}
+
+/// 请求成功: 清零该供应商的失败计数(偶发抖动不积累)。
+pub fn note_provider_success(id: &str) {
+    FAILOVER.record_success(id);
+}
+
+/// 记一次网络/鉴权/欠费类失败; 达到滑窗阈值时自动切换到下一个可用供应商。
+/// 取舍说明: 最理想的上报点是「claude 子进程每次上游请求的结果」, 但直连模式下
+/// 请求发生在 claude CLI 内部, kernel 看不见 —— 所以接在**本地路由**(codex_proxy,
+/// cc-switch 式代理, 每请求过手)的错误分类点上: 透传 4xx/5xx、OpenAI 兼容 401、
+/// ChatGPT 刷新失败、连接超时等都会走到这里。直连供应商享受不到自动转移, 属已知边界。
+pub fn note_provider_failure(id: &str) {
+    if !FAILOVER.record_failure(id) {
+        return; // 未达阈值: 只计数
+    }
+    // 达阈: 挑「当前供应商列表里失败者之后的下一个可用项」(环形), 沿用 provider_switch
+    // 完成真正切换(env/settings 写入逻辑零重复)。仅当失败者就是当前供应商才切 ——
+    // 用户手动在用别家时, 后台某路由请求失败不该抢方向盘。
+    let (views, current_id) = {
+        let store = STORE.read().clone();
+        (build_views(&store), store.current_id.clone())
+    };
+    if current_id != id {
+        return;
+    }
+    let Some(pos) = views.iter().position(|v| v.id == id) else {
+        return;
+    };
+    let failed_name = views[pos].name.clone();
+    // 环形找下一个「有 key 且不是失败者」的供应商; 找不到备用就只广播失败, 不切。
+    let next = (1..views.len())
+        .map(|off| &views[(pos + off) % views.len()])
+        .find(|v| v.has_key && v.id != id)
+        .cloned();
+    let Some(next) = next else {
+        eprintln!("[provider-failover] {failed_name} 连续失败, 但没有其他可用供应商, 不切换");
+        return;
+    };
+    match provider_switch(next.id.clone()) {
+        Ok(_) => {
+            let msg = format!("供应商「{failed_name}」连续失败, 已自动切换到「{}」", next.name);
+            eprintln!("[provider-failover] {msg}");
+            emit_failover(&json!({
+                "kind": "switched",
+                "from": id,
+                "fromName": failed_name,
+                "to": next.id,
+                "toName": next.name,
+                "message": msg,
+            }));
+        }
+        Err(e) => eprintln!("[provider-failover] 自动切换失败: {e}"),
+    }
+}
+
+fn emit_failover(payload: &Value) {
+    #[cfg(feature = "desktop")]
+    {
+        use tauri::Emitter;
+        if let Some(app) = FAILOVER_APP.read().as_ref() {
+            let _ = app.emit("provider://failover", payload.clone());
+        }
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        if let Some(app) = FAILOVER_APP.read().as_ref() {
+            let _ = app.emit("provider://failover", payload.clone());
+        }
+    }
+}
 
 /// 还原构建期注入的「粉丝福利」MiniMax key。
 /// 二进制内为 XOR 混淆字节, 此处解出明文; 未注入(本地 dev 构建)时返回空串。
@@ -286,6 +382,7 @@ fn seed_gift_minimax(store: &mut Store, data_dir: &Path) -> bool {
         note: "粉丝福利 · 预置额度，开箱即用 · MiniMax-M3".to_string(),
         website_url: "https://www.minimaxi.com".to_string(),
         token_field: DEFAULT_TOKEN_FIELD.to_string(),
+        protocol: String::new(),
         settings_config: cfg,
     });
     true
@@ -321,6 +418,7 @@ fn seed_gift_kimi(store: &mut Store, data_dir: &Path) -> bool {
         note: "免费额度赠送 · 开箱即用 · K2.7 Code".to_string(),
         website_url: "https://www.kimi.com/code".to_string(),
         token_field: DEFAULT_TOKEN_FIELD.to_string(),
+        protocol: String::new(),
         settings_config: cfg,
     });
     true
@@ -348,29 +446,120 @@ fn config_with_model(mut cfg: Value, model: &str) -> Value {
     cfg
 }
 
-/// Codex 路由配置: 把 base_url 指到本地翻译代理, 钉模型为 gpt-5.5(含小任务档),
-/// AUTH_TOKEN 给个占位串(代理只认 ~/.codex/auth.json, 不看这个), 让 claude 愿意发请求。
-fn codex_route_config(port: u16) -> Value {
+/// OpenAI 协议供应商未钉模型时的默认模型名。
+const DEFAULT_OPENAI_MODEL: &str = "gpt5.6-sol";
+
+/// 本地路由配置: 把 base_url 指到本地路由的 `/p/{id}` 前缀(路由按 id 实时解析该家上游,
+/// 每对话可并发指向不同家而不串台), 钉四档模型(含小任务档), AUTH_TOKEN 给个占位串
+/// (路由不看它 —— ChatGPT 认 ~/.codex/auth.json, OpenAI 协议认 store 里该家的 key),
+/// 让 claude 愿意发请求。
+fn local_route_config(port: u16, id: &str, model: &str) -> Value {
     let mut env = Map::new();
     env.insert(
         "ANTHROPIC_BASE_URL".into(),
-        Value::String(format!("http://127.0.0.1:{port}")),
+        Value::String(format!("http://127.0.0.1:{port}/p/{id}")),
     );
     env.insert(
         "ANTHROPIC_AUTH_TOKEN".into(),
-        Value::String("polaris-codex-proxy".into()),
+        Value::String("polaris-local-router".into()),
     );
     for k in MODEL_ENV_KEYS {
-        env.insert((*k).into(), Value::String("gpt-5.5".into()));
+        env.insert((*k).into(), Value::String(model.into()));
     }
     env.insert(
         "ANTHROPIC_SMALL_FAST_MODEL".into(),
-        Value::String("gpt-5.5".into()),
+        Value::String(model.into()),
     );
     json!({ "env": Value::Object(env) })
 }
 
+/// 供应商钉选的模型名(ANTHROPIC_MODEL), 空则回落 OpenAI 默认。
+fn pinned_model_or_default(cfg: &Value) -> String {
+    let m = cfg_env_str(cfg, "ANTHROPIC_MODEL");
+    let m = m.trim();
+    if m.is_empty() {
+        DEFAULT_OPENAI_MODEL.to_string()
+    } else {
+        m.to_string()
+    }
+}
+
+/// 本地路由的上游目标 —— codex_proxy 按请求路径里的供应商 id 实时解析(改 key/换模型
+/// 立即生效, 不用重启会话), 这是 cc-switch 式「本地转发热切换」的根。
+pub enum RouteTarget {
+    /// ChatGPT 订阅(Responses 协议, 鉴权走 ~/.codex/auth.json)
+    Chatgpt,
+    /// OpenAI 兼容 chat/completions(鉴权走该供应商存的 API key)
+    OpenAiCompat {
+        base_url: String,
+        api_key: String,
+        model: String,
+    },
+    /// Anthropic 兼容上游 —— 本地路由总开关下的纯透传(不翻译, 只按 token_field
+    /// 实时注入鉴权头): ANTHROPIC_API_KEY → x-api-key, 其余 → Authorization Bearer。
+    AnthropicCompat {
+        base_url: String,
+        api_key: String,
+        token_field: String,
+    },
+}
+
+/// 按供应商 id 解析路由目标。空 id / "codex" → ChatGPT(兼容旧版裸端口 base_url)。
+pub fn route_target(id: &str) -> Result<RouteTarget, String> {
+    if id.is_empty() || id == "codex" {
+        return Ok(RouteTarget::Chatgpt);
+    }
+    let store = STORE.read().clone();
+    let views = build_views(&store);
+    let v = views
+        .iter()
+        .find(|v| v.id == id)
+        .ok_or_else(|| format!("未知路由目标: {id}"))?;
+    if v.kind == "codex" {
+        return Ok(RouteTarget::Chatgpt);
+    }
+    if v.protocol == "openai" {
+        let key = v.auth_token.trim();
+        if key.is_empty() {
+            return Err(format!("供应商「{}」未配置 API Key", v.name));
+        }
+        let base = normalize_url(&v.base_url);
+        if base.is_empty() {
+            return Err(format!("供应商「{}」未配置请求地址", v.name));
+        }
+        return Ok(RouteTarget::OpenAiCompat {
+            base_url: base,
+            api_key: key.to_string(),
+            model: pinned_model_or_default(&v.settings_config),
+        });
+    }
+    // Anthropic 兼容(key/custom)→ 透传目标。不看 route_local 开关: 只要配置指到了
+    // /p/{id}(开关开过 / 旧配置残留), 就该被正确转发, 比拒接更稳。
+    if v.protocol.is_empty() && (v.kind == "key" || v.kind == "custom") {
+        let key = v.auth_token.trim();
+        if key.is_empty() {
+            return Err(format!("供应商「{}」未配置 API Key", v.name));
+        }
+        let base = normalize_url(&v.base_url);
+        if base.is_empty() {
+            return Err(format!("供应商「{}」未配置请求地址", v.name));
+        }
+        return Ok(RouteTarget::AnthropicCompat {
+            base_url: base,
+            api_key: key.to_string(),
+            token_field: if v.token_field.is_empty() {
+                DEFAULT_TOKEN_FIELD.to_string()
+            } else {
+                v.token_field.clone()
+            },
+        });
+    }
+    Err(format!("供应商「{}」不经本地路由", v.name))
+}
+
 pub fn init(_app: &AppHandle) -> Result<()> {
+    // 故障转移事件通道: 失败上报点在无 app 句柄的 TCP 线程里, 这里存一份全局。
+    *FAILOVER_APP.write() = Some(_app.clone());
     let user = UserDirs::new().ok_or_else(|| anyhow::anyhow!("no user dir"))?;
     let dir = user.home_dir().join("Polaris").join("data");
     fs::create_dir_all(&dir)?;
@@ -415,6 +604,7 @@ pub fn init(_app: &AppHandle) -> Result<()> {
             note: String::new(),
             website_url: String::new(),
             token_field: field.clone(),
+            protocol: String::new(),
             settings_config: default_config(&c.base_url, &field, &c.auth_token),
         });
         migrated = true;
@@ -435,6 +625,7 @@ pub fn init(_app: &AppHandle) -> Result<()> {
                 note: String::new(),
                 website_url: String::new(),
                 token_field: field.clone(),
+                protocol: String::new(),
                 settings_config: default_config(p.base_url, &field, &k.auth_token),
             });
             migrated = true;
@@ -454,13 +645,16 @@ pub fn init(_app: &AppHandle) -> Result<()> {
         let store = STORE.read().clone();
         let views = build_views(&store);
         if store.link_global {
-            // 联动: 若上次退出时正路由到 Codex(本地代理), 重启后端口可能变 → 重新拉起
-            // 代理并校正 ANTHROPIC_BASE_URL, 否则 settings.json 残留旧端口 claude 连不上。
-            if detect_current(&views, &store) == "codex" {
-                if let Ok(port) = crate::integrations::codex_proxy::ensure_running() {
-                    let cfg = codex_route_config(port);
-                    let _ = apply_settings_config(&cfg);
-                    apply_process_env(&cfg);
+            // 联动: 若上次退出时正走本地路由(Codex / OpenAI 协议 / 路由总开关), 重启后
+            // 端口可能变 → 重新拉起路由并校正 ANTHROPIC_BASE_URL, 否则 settings.json
+            // 残留旧端口 claude 连不上。直连供应商的 settings.json 本来就是对的, 不重写。
+            let cur = detect_current(&views, &store);
+            if let Some(v) = views.iter().find(|v| v.id == cur) {
+                if let Ok(cfg) = cfg_for_view(v, store.route_local) {
+                    if cfg_env_str(&cfg, "ANTHROPIC_BASE_URL").starts_with("http://127.0.0.1:") {
+                        let _ = apply_settings_config(&cfg);
+                        apply_process_env(&cfg);
+                    }
                 }
             }
         } else {
@@ -473,7 +667,7 @@ pub fn init(_app: &AppHandle) -> Result<()> {
             // ② 重启后进程 env 是空的, 把当前供应商重新作用上去, 否则 Polaris 内的
             //    选择一重启就回落官方。配置不全(如 key 被删)就静默跳过 = 官方。
             if let Some(v) = views.iter().find(|v| v.id == store.current_id) {
-                if let Ok(cfg) = cfg_for_view(v) {
+                if let Ok(cfg) = cfg_for_view(v, store.route_local) {
                     apply_process_env(&cfg);
                 }
             }
@@ -568,6 +762,9 @@ pub struct ProviderView {
     pub website_url: String,
     pub color: String,
     pub kind: String,
+    /// 上游协议: "" = Anthropic 兼容(claude 直连) | "openai" = OpenAI chat/completions
+    /// (经本地路由翻译) | "chatgpt" = ChatGPT 订阅(codex, 经本地路由)。
+    pub protocol: String,
     pub is_preset: bool,
     pub has_key: bool,
     pub auth_token: String,
@@ -581,6 +778,8 @@ pub struct ProviderListResult {
     pub current_id: String,
     /// true = 联动(写全局 settings.json), false = 隔离(仅 Polaris 内生效)
     pub link_global: bool,
+    /// 本地路由总开关: true = 所有供应商统一经 127.0.0.1 本地路由转发(热切换)
+    pub route_local: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,6 +794,9 @@ pub struct ProviderInput {
     pub website_url: String,
     #[serde(default)]
     pub token_field: Option<String>,
+    /// ""/None = Anthropic 兼容(直连); "openai" = OpenAI 协议(经本地路由转发)
+    #[serde(default)]
+    pub protocol: Option<String>,
     #[serde(default)]
     pub settings_config: Value,
 }
@@ -610,6 +812,7 @@ fn make_view(
     token_field: &str,
     category: &str,
     kind: &str,
+    protocol: &str,
     is_preset: bool,
     preset_base: &str,
     website: &str,
@@ -627,6 +830,12 @@ fn make_view(
         "codex" | "copilot" => false,
         _ => !token.is_empty(),
     };
+    // 预设 kind 即协议来源; 自定义供应商由存储的 protocol 决定。
+    let protocol = match kind {
+        "codex" => "chatgpt",
+        "openai" => "openai",
+        _ => protocol,
+    };
     let website = if website.is_empty() {
         website_from_base(&base_url)
     } else {
@@ -642,6 +851,7 @@ fn make_view(
         website_url: website,
         color: color_for(category).to_string(),
         kind: kind.to_string(),
+        protocol: protocol.to_string(),
         is_preset,
         has_key,
         auth_token: token,
@@ -669,6 +879,7 @@ pub(crate) fn build_views(store: &Store) -> Vec<ProviderView> {
             &token_field,
             p.category,
             p.kind,
+            "",
             true,
             p.base_url,
             "",
@@ -692,6 +903,7 @@ pub(crate) fn build_views(store: &Store) -> Vec<ProviderView> {
             &token_field,
             "custom",
             "custom",
+            &it.protocol,
             false,
             "",
             &it.website_url,
@@ -925,17 +1137,20 @@ pub fn provider_list() -> Result<ProviderListResult, String> {
         providers,
         current_id,
         link_global: store.link_global,
+        route_local: store.route_local,
     })
 }
 
-/// 把供应商视图换算成待生效的 settings_config(codex 会顺带拉起本地翻译代理)。
-fn cfg_for_view(v: &ProviderView) -> Result<Value, String> {
+/// 把供应商视图换算成待生效的 settings_config(codex / OpenAI 协议会顺带拉起本地路由)。
+/// `route_all` = 本地路由总开关(store.route_local): 开着时 Anthropic 兼容供应商
+/// 也统一改走 127.0.0.1 本地路由透传(cc-switch 式代理模式)。
+fn cfg_for_view(v: &ProviderView, route_all: bool) -> Result<Value, String> {
     if v.kind == "copilot" {
-        return Err("GitHub Copilot 说 OpenAI 协议, 翻译代理暂未覆盖".to_string());
+        return Err("GitHub Copilot 需 GitHub OAuth + token 交换, 本地路由暂未覆盖".to_string());
     }
     if v.kind == "codex" {
-        // Codex(ChatGPT) → 路由到本地翻译代理: 先确认已授权, 再拉起代理并把
-        // ANTHROPIC_BASE_URL 指到 127.0.0.1:port, claude 即透明用上 ChatGPT 订阅。
+        // Codex(ChatGPT) → 路由到本地翻译代理: 先确认已授权, 再拉起路由并把
+        // ANTHROPIC_BASE_URL 指到 127.0.0.1:port/p/codex, claude 即透明用上 ChatGPT 订阅。
         let authed = codex_auth_path()
             .map(|p| codex_auth_has_tokens(&p))
             .unwrap_or(false);
@@ -943,13 +1158,56 @@ fn cfg_for_view(v: &ProviderView) -> Result<Value, String> {
             return Err("请先授权 ChatGPT (Codex), 再切换到它".to_string());
         }
         let port = crate::integrations::codex_proxy::ensure_running()?;
-        return Ok(codex_route_config(port));
+        return Ok(local_route_config(port, "codex", "gpt5.6-sol"));
+    }
+    if v.protocol == "openai" {
+        // OpenAI 协议(GPT API / 各家 OpenAI 兼容网关)→ 同样走本地路由转发:
+        // claude 说 Anthropic 协议发到 127.0.0.1:port/p/{id}, 路由实时查 store 里
+        // 这家的 base_url + key, 翻译成 chat/completions 转发 —— cc-switch 式本地转发。
+        if v.auth_token.trim().is_empty() {
+            return Err("该供应商尚未配置 API Key, 请先在弹窗中填写".to_string());
+        }
+        if normalize_url(&v.base_url).is_empty() {
+            return Err("该供应商尚未配置请求地址, 请先在弹窗中填写".to_string());
+        }
+        let port = crate::integrations::codex_proxy::ensure_running()?;
+        let model = pinned_model_or_default(&v.settings_config);
+        return Ok(local_route_config(port, &v.id, &model));
     }
     if v.kind == "official" {
         return Ok(json!({ "env": {} }));
     }
     if v.auth_token.trim().is_empty() {
         return Err("该供应商尚未配置 API Key, 请先在弹窗中填写".to_string());
+    }
+    if route_all && !normalize_url(&v.base_url).is_empty() {
+        // 本地路由总开关: Anthropic 兼容供应商也统一走 /p/{id} 透传。base 指到本地路由,
+        // key 从 env 里拿掉换占位(真 key 由路由每请求实时注入 —— 改 key 即刻生效,
+        // 且不再进子进程 env); 模型钉选等其余 env 原样保留。
+        let port = crate::integrations::codex_proxy::ensure_running()?;
+        let mut cfg = v.settings_config.clone();
+        if !cfg.is_object() {
+            cfg = json!({});
+        }
+        let obj = cfg.as_object_mut().unwrap();
+        let env = obj.entry("env".to_string()).or_insert_with(|| json!({}));
+        if !env.is_object() {
+            *env = json!({});
+        }
+        let env = env.as_object_mut().unwrap();
+        env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            Value::String(format!("http://127.0.0.1:{port}/p/{}", v.id)),
+        );
+        env.remove("ANTHROPIC_AUTH_TOKEN");
+        env.remove("ANTHROPIC_API_KEY");
+        let field = if v.token_field.is_empty() {
+            DEFAULT_TOKEN_FIELD
+        } else {
+            v.token_field.as_str()
+        };
+        env.insert(field.into(), Value::String("polaris-local-router".into()));
+        return Ok(cfg);
     }
     Ok(v.settings_config.clone())
 }
@@ -1114,9 +1372,9 @@ pub fn scope_child_claude_by_id(cmd: &mut Command, provider_id: Option<&str>) {
         scope_child_claude(cmd);
         return;
     };
-    // 解析待生效 env(codex 会确保本地代理在跑并把 base_url 指到 127.0.0.1:port)。
+    // 解析待生效 env(codex / OpenAI 协议 / 路由总开关下会确保本地路由在跑)。
     // 未配 key / 未授权 → 回落全局当前, 不阻断对话。
-    let cfg = match cfg_for_view(v) {
+    let cfg = match cfg_for_view(v, store.route_local) {
         Ok(c) => c,
         Err(_) => {
             scope_child_claude(cmd);
@@ -1160,7 +1418,7 @@ pub fn provider_switch(id: String) -> Result<String, String> {
         .find(|v| v.id == id)
         .ok_or_else(|| format!("供应商不存在: {id}"))?;
 
-    let cfg = cfg_for_view(v)?;
+    let cfg = cfg_for_view(v, store.route_local)?;
     // 联动才碰全局 settings.json; 隔离只走进程 env, 外部 CLI 原封不动 ——
     // 但顺手做一次残留体检: 全局若还躺着我们(旧版/联动时代)写的受管键, 先清掉,
     // 用户不用重启 Polaris 外部 CLI 就立即恢复干净。
@@ -1187,7 +1445,7 @@ pub fn provider_set_link_mode(link: bool) -> Result<bool, String> {
     if link {
         // 开联动: 当前供应商立刻写入全局, 终端 CLI 即刻跟上。
         if let Some(v) = cur {
-            if let Ok(cfg) = cfg_for_view(v) {
+            if let Ok(cfg) = cfg_for_view(v, store.route_local) {
                 apply_settings_config(&cfg)?;
                 apply_process_env(&cfg);
             }
@@ -1197,12 +1455,33 @@ pub fn provider_set_link_mode(link: bool) -> Result<bool, String> {
         // Polaris 自身改用进程 env 维持当前选择 —— 终端立刻恢复干净。
         apply_settings_config(&json!({ "env": {} }))?;
         if let Some(v) = cur {
-            if let Ok(cfg) = cfg_for_view(v) {
+            if let Ok(cfg) = cfg_for_view(v, store.route_local) {
                 apply_process_env(&cfg);
             }
         }
     }
     Ok(link)
+}
+
+/// 本地路由总开关(cc-switch 式代理模式)。开 = 当前及后续切换的 Anthropic 兼容供应商
+/// 统一改走 127.0.0.1 本地路由透传(热切换: 改 key 即刻生效); 关 = 回到直连。
+/// 切换开关立即对「当前供应商」重新生效, 联动模式下全局 settings.json 同步校正。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn provider_set_route_mode(route: bool) -> Result<bool, String> {
+    STORE.write().route_local = route;
+    persist();
+
+    let store = STORE.read().clone();
+    let views = build_views(&store);
+    if let Some(v) = views.iter().find(|v| v.id == store.current_id) {
+        if let Ok(cfg) = cfg_for_view(v, store.route_local) {
+            if store.link_global {
+                apply_settings_config(&cfg)?;
+            }
+            apply_process_env(&cfg);
+        }
+    }
+    Ok(route)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -1226,12 +1505,19 @@ pub fn provider_save(input: ProviderInput) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("custom-{}", now_ms()));
 
+    // 协议只认 "openai", 其余一律归一成 ""(Anthropic 兼容), 防前端传来脏值。
+    let protocol = match input.protocol.as_deref().map(str::trim) {
+        Some("openai") => "openai".to_string(),
+        _ => String::new(),
+    };
+
     let item = StoredProvider {
         id: id.clone(),
         name: input.name.trim().to_string(),
         note: input.note.trim().to_string(),
         website_url: normalize_url(&input.website_url),
         token_field,
+        protocol,
         settings_config: cfg,
     };
 
@@ -1256,6 +1542,174 @@ pub fn provider_delete(id: String) -> Result<(), String> {
     drop(store);
     persist();
     Ok(())
+}
+
+#[cfg(test)]
+mod local_route_tests {
+    use super::*;
+
+    fn save_openai(id: &str, cfg: Value) {
+        provider_save(ProviderInput {
+            id: Some(id.to_string()),
+            name: format!("测试 {id}"),
+            note: String::new(),
+            website_url: String::new(),
+            token_field: None,
+            protocol: Some("openai".into()),
+            settings_config: cfg,
+        })
+        .expect("保存应成功");
+    }
+
+    /// OpenAI 协议供应商: route_target 解析出上游三元组(尾斜杠归一 + 模型钉选),
+    /// cfg_for_view 生成指向本地路由 /p/{id} 的配置 —— 这是本地转发热切换的两半。
+    #[test]
+    fn openai_provider_routes_via_local_router() {
+        save_openai(
+            "t-openai-route",
+            json!({"env": {
+                "ANTHROPIC_BASE_URL": "https://gw.example.com/v1/",
+                "ANTHROPIC_AUTH_TOKEN": "sk-test",
+                "ANTHROPIC_MODEL": "gpt-5.5-mini",
+            }}),
+        );
+
+        match route_target("t-openai-route").expect("应解析成功") {
+            RouteTarget::OpenAiCompat {
+                base_url,
+                api_key,
+                model,
+            } => {
+                assert_eq!(base_url, "https://gw.example.com/v1");
+                assert_eq!(api_key, "sk-test");
+                assert_eq!(model, "gpt-5.5-mini");
+            }
+            _ => panic!("应是 OpenAiCompat"),
+        }
+
+        let store = STORE.read().clone();
+        let views = build_views(&store);
+        let v = views
+            .iter()
+            .find(|v| v.id == "t-openai-route")
+            .expect("视图应在");
+        assert_eq!(v.protocol, "openai");
+        let cfg = cfg_for_view(v, false).expect("cfg 应生成(顺带拉起本地路由)");
+        let base = cfg_env_str(&cfg, "ANTHROPIC_BASE_URL");
+        assert!(
+            base.starts_with("http://127.0.0.1:"),
+            "应指向本地路由: {base}"
+        );
+        assert!(base.ends_with("/p/t-openai-route"), "应带 /p/{{id}} 前缀: {base}");
+        for k in MODEL_ENV_KEYS {
+            assert_eq!(cfg_env_str(&cfg, k), "gpt-5.5-mini", "{k} 应钉到该家模型");
+        }
+
+        provider_delete("t-openai-route".to_string()).unwrap();
+    }
+
+    #[test]
+    fn route_target_fallbacks_and_errors() {
+        // 空 id / codex → ChatGPT(兼容旧版裸端口 base_url)
+        assert!(matches!(route_target(""), Ok(RouteTarget::Chatgpt)));
+        assert!(matches!(route_target("codex"), Ok(RouteTarget::Chatgpt)));
+        assert!(route_target("no-such-provider-xyz").is_err());
+
+        // 没配 key 的 openai 供应商 → 拒绝路由
+        save_openai(
+            "t-openai-nokey",
+            json!({"env": {"ANTHROPIC_BASE_URL": "https://gw.example.com"}}),
+        );
+        assert!(route_target("t-openai-nokey").is_err());
+
+        // Anthropic 兼容供应商 → 透传目标(路由总开关下会被指到 /p/{id}, 目标始终可解析)
+        provider_save(ProviderInput {
+            id: Some("t-anthropic-direct".into()),
+            name: "直连".into(),
+            note: String::new(),
+            website_url: String::new(),
+            token_field: None,
+            protocol: None,
+            settings_config: json!({"env": {
+                "ANTHROPIC_BASE_URL": "https://a.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "k",
+            }}),
+        })
+        .unwrap();
+        assert!(matches!(
+            route_target("t-anthropic-direct"),
+            Ok(RouteTarget::AnthropicCompat { .. })
+        ));
+
+        provider_delete("t-openai-nokey".to_string()).unwrap();
+        provider_delete("t-anthropic-direct".to_string()).unwrap();
+    }
+
+    /// 本地路由总开关: Anthropic 兼容供应商 ①route_target 解析成 AnthropicCompat 透传目标;
+    /// ②开关开 → cfg 改指 /p/{id}、真 key 摘出换占位、模型钉选保留; ③开关关 → 原配置直连。
+    #[test]
+    fn route_all_switch_reroutes_anthropic_provider() {
+        provider_save(ProviderInput {
+            id: Some("t-anthropic-routed".into()),
+            name: "透传测试".into(),
+            note: String::new(),
+            website_url: String::new(),
+            token_field: None,
+            protocol: None,
+            settings_config: json!({"env": {
+                "ANTHROPIC_BASE_URL": "https://api.example-relay.com/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "sk-real-key",
+                "ANTHROPIC_MODEL": "SomeModel-X",
+            }}),
+        })
+        .expect("保存应成功");
+
+        match route_target("t-anthropic-routed").expect("应解析成功") {
+            RouteTarget::AnthropicCompat {
+                base_url,
+                api_key,
+                token_field,
+            } => {
+                assert_eq!(base_url, "https://api.example-relay.com/anthropic");
+                assert_eq!(api_key, "sk-real-key");
+                assert_eq!(token_field, DEFAULT_TOKEN_FIELD);
+            }
+            _ => panic!("应是 AnthropicCompat"),
+        }
+
+        let store = STORE.read().clone();
+        let views = build_views(&store);
+        let v = views
+            .iter()
+            .find(|v| v.id == "t-anthropic-routed")
+            .expect("视图应在");
+
+        // 开关开: 走本地路由, key 不落 env
+        let routed = cfg_for_view(v, true).expect("路由 cfg 应生成");
+        let base = cfg_env_str(&routed, "ANTHROPIC_BASE_URL");
+        assert!(base.starts_with("http://127.0.0.1:"), "应指向本地路由: {base}");
+        assert!(base.ends_with("/p/t-anthropic-routed"));
+        assert_eq!(
+            cfg_env_str(&routed, "ANTHROPIC_AUTH_TOKEN"),
+            "polaris-local-router",
+            "真 key 不应进 env"
+        );
+        assert_eq!(
+            cfg_env_str(&routed, "ANTHROPIC_MODEL"),
+            "SomeModel-X",
+            "模型钉选应原样保留"
+        );
+
+        // 开关关: 原配置直连
+        let direct = cfg_for_view(v, false).expect("直连 cfg 应生成");
+        assert_eq!(
+            cfg_env_str(&direct, "ANTHROPIC_BASE_URL"),
+            "https://api.example-relay.com/anthropic"
+        );
+        assert_eq!(cfg_env_str(&direct, "ANTHROPIC_AUTH_TOKEN"), "sk-real-key");
+
+        provider_delete("t-anthropic-routed".to_string()).unwrap();
+    }
 }
 
 #[cfg(test)]

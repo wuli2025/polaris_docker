@@ -78,6 +78,29 @@ pub struct ChatSendArgs {
     pub provider_id: Option<String>,
 }
 
+/// chat_prewarm(预热常驻 claude 进程)的入参: 只带**会进指纹**的那几项设置。
+/// 与 ChatSendArgs 分开: 预热发生在用户还没写出 prompt 时, prompt 相关字段
+/// (skill/goal/批量等)都还不存在; 预热只需算出与真发送一致的进程指纹。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatPrewarmArgs {
+    pub conversation_id: String,
+    /// None = 按工作模式套前端同款默认(work=手动/fast=自动批准, 见 ChatComposer
+    /// applyModeDefaults) —— 保证「切对话即预热」这种拿不到输入区状态的触发点,
+    /// 算出的指纹与随后真发送大概率一致, 预热才不白做。
+    #[serde(default)]
+    pub permission_mode: Option<PermissionMode>,
+    /// "fast"(默认) | "work" —— 决定 model/工具面, 是指纹的一部分。
+    #[serde(default)]
+    pub work_mode: Option<String>,
+    /// 本对话钉的供应商 id(None/""/"auto" = 跟随全局)。
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// 动态编排开关(with_task 入指纹)。
+    #[serde(default)]
+    pub dynamic_workflow: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatStreamEvent {

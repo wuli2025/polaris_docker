@@ -21,6 +21,7 @@ use crate::runtime::procs::no_window;
 
 use super::artifacts::*;
 use super::prompt::*;
+use super::session_pool;
 use super::types::*;
 
 /// 默认预授权的联网工具 (逗号分隔, 传给 `--allowedTools`)。
@@ -186,6 +187,37 @@ pub async fn chat_send(app: AppHandle, args: ChatSendArgs) -> Result<String, Str
     Ok(req_id)
 }
 
+/// 预热常驻 claude 进程(best-effort, **永不报错**): 前端在「打开/切换对话」「输入框
+/// 首次聚焦/键入」时调用 —— claude CLI spawn 后立即自举(~6.4s), 不等首条消息, 把
+/// 自举挪进用户打字期间, 首条消息首响可从 ~10s 压到 ~3s。
+/// 永远 Ok: 预热失败对话照常能发(run_persistent_turn 有完整的重建路径), 报错只会
+/// 让前端多一条无意义的错误分支; spawn 本身丢后台线程, 命令即刻返回不占 IPC。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn chat_prewarm(app: AppHandle, args: ChatPrewarmArgs) -> Result<(), String> {
+    let conv_id = args.conversation_id.trim().to_string();
+    if conv_id.is_empty() || !session_pool::persistent_enabled() {
+        return Ok(());
+    }
+    let work_full = args.work_mode.as_deref() == Some("work");
+    // 权限档位没传(触发点拿不到输入区状态)时, 套前端 applyModeDefaults 同款默认:
+    // work=手动(default) / fast=自动批准(acceptEdits) —— 指纹与随后真发送对齐。
+    let perm = match &args.permission_mode {
+        Some(pm) => pm.cli_value().to_string(),
+        None => if work_full { "default" } else { "acceptEdits" }.to_string(),
+    };
+    std::thread::spawn(move || {
+        session_pool::prewarm(
+            app,
+            conv_id,
+            perm,
+            args.dynamic_workflow,
+            work_full,
+            args.provider_id,
+        );
+    });
+    Ok(())
+}
+
 /// chat_send 的重活管线(后台线程执行): 拼 prompt(静态指令按意图门控) → KB 召回 →
 /// spawn claude → 挂 stdin 写入 / 看门狗 / stderr / stdout reader 线程。
 /// 事件契约与旧同步实现完全一致(时序仍是 meta → stream(delta/tool/artifact/error) →
@@ -209,12 +241,17 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     let cm_ctx =
         claude_md::render_for_project(current_project_id.as_deref(), &args.prompt, args.use_kb);
 
-    let mut final_prompt = String::new();
+    // prompt 改为「分段计划」而非单个大字符串: 旧路径照旧取 full_text()(逐段拼接,
+    // 顺序与此前完全一致); 常驻 agent 路径按分段类别做首条/续轮拆分(见 session_pool):
+    // - session(): 会话级不变 → 续轮剔除(claude 进程内自持上下文);
+    // - keyed():   意图门控块 → 按 key 去重, 本会话没发过且本轮触发才发;
+    // - turn():    每轮都变(KB 召回/手改产物/专家块/用户问题) → 续轮照发。
+    let mut plan = session_pool::PromptPlan::new();
 
     // 1(先算). Skill system prompts —— 显式点选 + 按任务意图自动激活(去重)。
-    //    先收集进独立缓冲: 命中创作型 skill 时本轮进「创作模式」(CREATIVE_SKILL_IDS),
+    //    先收集进独立列表: 命中创作型 skill 时本轮进「创作模式」(CREATIVE_SKILL_IDS),
     //    下面的 KB 指令与回答风格据此取舍; 拼装顺序保持不变(KB 指令仍在最前)。
-    let mut skill_section = String::new();
+    let mut skill_prompts: Vec<(String, String)> = Vec::new();
     let mut injected: Vec<String> = Vec::new();
     // 1a. 用户在对话框显式激活的 skill
     if let Some(ids) = &args.skill_ids {
@@ -223,8 +260,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
                 continue;
             }
             if let Some((meta, system_prompt)) = skills::find(id) {
-                skill_section.push_str(&system_prompt);
-                skill_section.push('\n');
+                skill_prompts.push((meta.id.clone(), system_prompt));
                 injected.push(meta.id);
             }
         }
@@ -235,8 +271,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         if injected.iter().any(|x| *x == meta.id) {
             continue;
         }
-        skill_section.push_str(&system_prompt);
-        skill_section.push('\n');
+        skill_prompts.push((meta.id.clone(), system_prompt));
         injected.push(meta.id);
     }
     let creative = injected
@@ -258,26 +293,27 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     // 这条指令在 prompt 最前面, 离用户问题最远——但因 Claude 的"system 指令优先"特性,
     // 它仍然约束着整轮回复。配合 `claude_md::render_for_project` 注入的结构化 wiki,
     // 模型就能沿 Read/Glob/Grep + [[双链]] 自主取证。
+    // (会话级: creative 已入常驻指纹, 翻转即重建, 会话内该段稳定不变)
     if creative {
-        final_prompt.push_str(&kb_isolation_directive_light());
+        plan.session(format!("{}\n\n---\n\n", kb_isolation_directive_light()));
     } else {
-        final_prompt.push_str(&kb_first_directive());
+        plan.session(format!("{}\n\n---\n\n", kb_first_directive()));
     }
-    final_prompt.push_str("\n\n---\n\n");
 
-    if !skill_section.is_empty() {
-        final_prompt.push_str(&skill_section);
-        final_prompt.push_str("\n---\n\n");
+    // skill 逐个成为门控段(key=skill id): 第 5 轮才点选/意图激活的 skill 也能在
+    // 常驻续轮里补发, 不因「续轮剔除」永远缺席。(分隔符从整节末尾一个改为每个 skill
+    // 各带一个, 语义等价。)
+    for (id, sp) in skill_prompts {
+        plan.keyed(format!("skill:{id}"), format!("{sp}\n---\n\n"));
     }
 
     // 1.5 回答风格约定。普通对话 = Codex 式扁平(砍废话); 创作模式 = 「回复克制、成品丰满」
     //     —— 扁平风格的「压缩字数」倾向会渗进幻灯片/网页文案, 把成品也写干瘪。
     if creative {
-        final_prompt.push_str(&creative_style_directive());
+        plan.session(format!("{}\n\n---\n\n", creative_style_directive()));
     } else {
-        final_prompt.push_str(&reply_style_directive());
+        plan.session(format!("{}\n\n---\n\n", reply_style_directive()));
     }
-    final_prompt.push_str("\n\n---\n\n");
 
     // 静态指令门控总闸: POLARIS_PROMPT_FULL=1 恢复全部静态指令全量注入(排障/对比用)。
     let prompt_full = prompt_full_forced();
@@ -287,27 +323,38 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     // 2. 输出文件约定 (Polaris) — 让成品文件落到产物目录, 侧边栏即可预览。
     //    门控: work 模式 / 创作模式 / 消息含「生成文件·成品产物」意图 → 全量(~700 tokens);
     //    否则精简版(只告知产物目录 + 末尾报绝对路径, 2 句)。
+    //    门控段: 首轮只发精简版、后某轮命中产物意图时, 常驻续轮能补发全量版
+    //    (两个 key 各自去重; 全量版语义覆盖精简版, 重复无害)。
     if prompt_full || work_full || creative || artifact_intent {
-        final_prompt.push_str(&output_convention(&art_dir));
+        plan.keyed(
+            "conv:output-full",
+            format!("{}\n\n---\n\n", output_convention(&art_dir)),
+        );
     } else {
-        final_prompt.push_str(&output_convention_lite(&art_dir));
+        plan.keyed(
+            "conv:output-lite",
+            format!("{}\n\n---\n\n", output_convention_lite(&art_dir)),
+        );
     }
-    final_prompt.push_str("\n\n---\n\n");
 
     // 2.1 可运行项目约定 (板块⑮) — 要跑起来的应用(尤其前后端)打包成带运行清单的项目文件夹,
     //     用户在右侧点「运行」即一键启动前后端并内嵌预览。创作模式跳过(成品是单文件);
     //     **仅工作模式注入**: 快速模式只为「查库+答」, 不打包工程, 注入只会膨胀 prompt。
     if !creative && work_full {
-        final_prompt.push_str(&project_convention(&art_dir));
-        final_prompt.push_str("\n\n---\n\n");
+        plan.keyed(
+            "conv:project",
+            format!("{}\n\n---\n\n", project_convention(&art_dir)),
+        );
     }
 
     // 2.2 长任务铁律: 回合结束 = claude 退出 = 其整棵子进程树被回收(防孤儿)。模型若把出片/上传/
     //     下载等耗时任务放后台再结束回复, 任务必死且无人知晓。**工作模式 + 创作模式注入**(那里
     //     才有长产出); 快速模式只做秒级问答、无长任务, 跳过这段 → 提示词更短、首 token 更快。
     if work_full || creative {
-        final_prompt.push_str(longtask_convention());
-        final_prompt.push_str("\n\n---\n\n");
+        plan.keyed(
+            "conv:longtask",
+            format!("{}\n\n---\n\n", longtask_convention()),
+        );
     }
 
     // 2.21 脚本执行公约: 模型爱写临时脚本干活, 但用户机器上的 `python`/`python3`
@@ -326,16 +373,17 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         || skills::detect_dev_intent(&args.prompt)
         || detect_script_intent(&args.prompt)
     {
-        final_prompt.push_str(script_convention());
-        final_prompt.push_str("\n\n---\n\n");
+        plan.keyed("conv:script", format!("{}\n\n---\n\n", script_convention()));
     }
 
     // 2.22 大文件下载公约 (按需注入): >200MB 大文件禁单线 wget, 必须 aria2c 多连接分段并行。
     //      此前每轮都注入, 但绝大多数对话(尤其办公)从不下大文件 —— 改成**仅下载意图命中才注入**,
     //      办公/日常提示词随之瘦身, 首 token 更快、也少一段无关上下文诱导模型跑题。
     if skills::detect_download_intent(&args.prompt) {
-        final_prompt.push_str(download_convention());
-        final_prompt.push_str("\n\n---\n\n");
+        plan.keyed(
+            "conv:download",
+            format!("{}\n\n---\n\n", download_convention()),
+        );
     }
 
     // 2.23 高效检索公约: 大库上 grep/glob 全树盲扫会慢 —— 注入「先缩范围(path+
@@ -344,19 +392,26 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     //      门控(此前 always-on, ~1000 tokens): work 模式 / 显式开 KB(use_kb) / 消息含
     //      文件·查找·检索意图(detect_search_intent) → 全量; 否则一句话精简版。
     if prompt_full || work_full || args.use_kb || detect_search_intent(&args.prompt) {
-        final_prompt.push_str(search_convention());
+        plan.keyed(
+            "conv:search-full",
+            format!("{}\n\n---\n\n", search_convention()),
+        );
     } else {
-        final_prompt.push_str(search_convention_lite());
+        plan.keyed(
+            "conv:search-lite",
+            format!("{}\n\n---\n\n", search_convention_lite()),
+        );
     }
-    final_prompt.push_str("\n\n---\n\n");
 
     // 2.15 分批长任务: 超长生成(60 页 PPT 这类)拆成有界批次, 每轮只建 ≤K 个 pending 单元,
     //      用 polaris.build.json 清单做 checkpoint, 断线从下一个 pending 续跑 ——
     //      规避单轮输出过长把流式连接拖死(socket closed → 进程坏死)。
     if args.batch_build {
         let bs = args.batch_size.unwrap_or(8).clamp(1, 50);
-        final_prompt.push_str(&batch_build_directive(&art_dir, bs));
-        final_prompt.push_str("\n\n---\n\n");
+        plan.keyed(
+            format!("conv:batch:{bs}"), // 批量大小变了按新块补发
+            format!("{}\n\n---\n\n", batch_build_directive(&art_dir, bs)),
+        );
     }
 
     // 2.5 目标模式: 用户设了完成条件时, 注入「持续推进直到达成」指令
@@ -366,15 +421,20 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         .map(str::trim)
         .filter(|g| !g.is_empty())
     {
-        final_prompt.push_str(&goal_directive(goal));
-        final_prompt.push_str("\n\n---\n\n");
+        plan.keyed(
+            format!("conv:goal:{goal}"), // 目标文本变了按新块补发
+            format!("{}\n\n---\n\n", goal_directive(goal)),
+        );
     }
 
     // 2.65 动态编排: 把本轮当成多智能体编排, 用 Task 子代理并行扇出, 每条流水线
     //      实现 -> 对抗式校验 -> 修复, 最后汇总(详见 dynamic_workflow_directive)。
     if args.dynamic_workflow {
-        final_prompt.push_str(&dynamic_workflow_directive());
-        final_prompt.push_str("\n\n---\n\n");
+        // with_task 已入常驻指纹(工具面不同), 该段在会话内稳定; 仍用门控 key 表达。
+        plan.keyed(
+            "conv:dynwf",
+            format!("{}\n\n---\n\n", dynamic_workflow_directive()),
+        );
     }
 
     // 2.68 专家团 / 智能匹配
@@ -411,12 +471,11 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     //     **确定性地**插入这句中文说明(见下方 image_notice), 保证用户一上来就看到。
     let image_notice: Option<String> = if skills::detect_image_intent(&args.prompt) {
         let (provider_name, supported) = crate::provider::image_gen_capability();
-        final_prompt.push_str(&image_capability_directive(
-            &provider_name,
-            supported,
-            &art_dir,
+        // 每轮段: 生图能力随「设置→生图模型」随时变, 常驻续轮也要重报当下事实。
+        plan.turn(format!(
+            "{}\n\n---\n\n",
+            image_capability_directive(&provider_name, supported, &art_dir)
         ));
-        final_prompt.push_str("\n\n---\n\n");
         if supported {
             None
         } else {
@@ -432,10 +491,10 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         None
     };
 
-    // 3. CLAUDE.md 上下文 (KB 地图 + 项目人格)
+    // 3. CLAUDE.md 上下文 (KB 地图 + 项目人格) —— 会话级: wiki 结构轮间基本不动,
+    //    常驻续轮不重发(变更会在下次进程重建时带上; 权衡: 省数千 token vs 极小的时滞)。
     if !cm_ctx.is_empty() {
-        final_prompt.push_str(&cm_ctx);
-        final_prompt.push_str("\n\n---\n\n");
+        plan.session(format!("{cm_ctx}\n\n---\n\n"));
     }
 
     // fable 状态只查一次(打开 SQLite + COUNT): 此前家底概览与强制召回各自调一次
@@ -447,8 +506,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     {
         let ov = kb_overview_block(fable_st.as_ref());
         if !ov.is_empty() {
-            final_prompt.push_str(&ov);
-            final_prompt.push_str("\n\n---\n\n");
+            plan.session(format!("{ov}\n\n---\n\n")); // 会话级: 家底轮间基本不变
         }
     }
 
@@ -469,8 +527,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         let recall =
             forced_recall_block(&args.prompt, recall_budget, fast_recall, fable_st.as_ref());
         if !recall.is_empty() {
-            final_prompt.push_str(&recall);
-            final_prompt.push_str("\n\n---\n\n");
+            plan.turn(format!("{recall}\n\n---\n\n")); // 每轮段: 召回是本轮问题的增量取证
         }
     }
 
@@ -480,8 +537,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     {
         let mmap = memory_map_block(MEMORY_MAP_BUDGET);
         if !mmap.is_empty() {
-            final_prompt.push_str(&mmap);
-            final_prompt.push_str("\n\n---\n\n");
+            plan.session(format!("{mmap}\n\n---\n\n")); // 会话级: 每日做梦才更新
         }
     }
 
@@ -492,8 +548,10 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         let amap =
             project_artifacts_block(pid, args.conversation_id.as_deref(), ARTIFACT_MAP_BUDGET);
         if !amap.is_empty() {
-            final_prompt.push_str(&amap);
-            final_prompt.push_str("\n\n---\n\n");
+            // 会话级(权衡): 常驻会话存续期内, **其它对话**新生成的文件对本会话不可见,
+            // 直到进程重建(TTL/指纹变化)。本对话自己的产物经工具事件天然在上下文里,
+            // 跨对话取新文件是低频动作 → 换取每轮省一整段地图, 值得。
+            plan.session(format!("{amap}\n\n---\n\n"));
         }
     }
 
@@ -509,8 +567,10 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         };
         let hist = history_block(cid, hist_budget);
         if !hist.is_empty() {
-            final_prompt.push_str(&hist);
-            final_prompt.push_str("\n\n---\n\n");
+            // 会话级: 这是常驻模式最大的省 —— 续轮的上文就在 claude 进程自己的
+            // 上下文里(它亲历了前几轮), 重发历史纯属浪费; 进程重建(首条)时才需要
+            // 这份落库历史来"回忆"。
+            plan.session(format!("{hist}\n\n---\n\n"));
         }
     }
 
@@ -520,28 +580,28 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     if let Some(cid) = args.conversation_id.as_deref() {
         let edited = user_edited_artifacts_block(cid);
         if !edited.is_empty() {
-            final_prompt.push_str(&edited);
-            final_prompt.push_str("\n\n---\n\n");
+            plan.turn(format!("{edited}\n\n---\n\n")); // 每轮段: 手改检测就是逐轮增量
         }
     }
 
     // 3.9 专家块(智能匹配/专家团): 在 2.68 计算, 此处注入 —— 贴着用户问题, 准则不被
     //     KB/历史大段上下文稀释。
     if let Some(block) = expert_block {
-        final_prompt.push_str(&block);
-        final_prompt.push_str("\n\n---\n\n");
+        plan.turn(format!("{block}\n\n---\n\n")); // 每轮段: 专家路由按本轮问题算
     }
 
     // 4. 用户原始问题
-    final_prompt.push_str("## 用户问题\n\n");
-    final_prompt.push_str(&args.prompt);
+    plan.turn(format!("## 用户问题\n\n{}", args.prompt));
 
     let perm = args.permission_mode.cli_value();
     let conv_id_opt = args.conversation_id.clone();
 
     // 上下文预算自检: 估算本轮注入的总 token 并 emit 给前端(kind=meta) —— 分批编排据此
     // 自适应批量大小(input 越大则每批越小), 也让「自动检测上下文优化」有据可依。
-    let est_tokens = estimate_tokens(&final_prompt);
+    // 常驻续轮实际只写增量, 但 claude 的**有效上下文**仍 ≈ 全量(进程内自持), 报全量口径
+    // 对「上下文预算」语义才是对的。
+    let full_prompt = plan.full_text();
+    let est_tokens = estimate_tokens(&full_prompt);
     emit_event(
         app,
         ChatStreamEvent {
@@ -559,6 +619,32 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         return Ok(());
     }
 
+    // ── 常驻 agent 路径(默认开, POLARIS_PERSISTENT_AGENT=0 回落) ──
+    // claude CLI 自举 ~6.4s(bun 解包)是每消息 spawn 的硬成本; 常驻进程 + stream-json
+    // 输入把续轮首事件降到 1.4-2.6s。仅宿主机 + 有 conv_id 的对话走此路(沙箱路径不动;
+    // 无 conv_id 没有池 key, 也没有续轮语义)。
+    if session_pool::persistent_enabled() && !args.use_sandbox {
+        if let Some(cid) = conv_id_opt.clone() {
+            return session_pool::run_persistent_turn(session_pool::TurnParams {
+                app: app.clone(),
+                req_id: req_id.to_string(),
+                conv_id: cid,
+                plan,
+                perm: perm.to_string(),
+                art_dir,
+                art_before,
+                image_notice,
+                with_task: args.dynamic_workflow,
+                work_full,
+                provider_id: args.provider_id.clone(),
+                creative,
+            });
+        }
+    }
+
+    // ── 旧路径(每消息 spawn): 逻辑保持不变, prompt 取分段计划的全量拼接 ──
+    let mut final_prompt = full_prompt;
+
     // 默认走宿主机执行（沙箱可选，但默认关闭）；动态编排时放行 Task 子代理；
     // work_full 决定快速模式是否禁用冗余工具(disallowedTools)、是否传按模式的 --model。
     let mut child = spawn_on_host(
@@ -568,6 +654,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         args.dynamic_workflow,
         work_full,
         args.provider_id.as_deref(),
+        false, // 一次性进程: stdin 只当 prompt 通道, 不进 stream-json 输入模式
     )?;
 
     // prompt 经 stdin 喂给 claude (而非命令行参数): 大 prompt 不会撞 Windows 命令行
@@ -594,89 +681,97 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
 
     CHILDREN.insert(req_id.to_string(), child);
 
-    // 「最近一次活动」时间戳: stdout/stderr 每产出一行就刷新(见下面两个 reader 线程)。
-    // 看门狗据此判「空闲挂死」而非「绝对超时」—— 正在活跃流式输出的长任务(批量 PPT/
-    // 长脚本等)不会被误杀, 只有真的长时间零输出(claude 子代理对 `/` 无界扫描卡住)才判挂死。
-    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
-
     // 看门狗(容器/服务端稳健性): 个别 prompt 会让 claude 触发子代理(`claude --print`,
     // 容器内其 cwd 落在 `/`)对文件系统做无界扫描而长时间不返回 —— 既拖死本轮, 又占住
     // OAuth 订阅的并发槽拖垮后续消息。判据分两层:
-    // ① **连续空闲**超过阈值(而非一启动就倒计时)才进入嫌疑区(POLARIS_CHAT_TIMEOUT_SECS,
-    //    桌面 600s / 容器 180s, 0=关);
-    // ② 空闲超阈后先**深检进程树**: 还有活的子孙进程(claude 正在跑 Bash 工具里的构建/
-    //    ffmpeg/下载等, 工具执行期整段零输出是常态), 或整树 CPU 时间仍在推进(claude 本体
-    //    在算) —— 都算「静默但在干活」, 不杀, 转入 30s 低频复查; 只有**连续两次采样都
-    //    完全静止**(零子孙 + CPU 零推进, 真挂死/网络吊死的特征)才杀整树。深检失败(平台
-    //    探测不可用)退回旧的空闲即杀, 保住容器自愈。
-    // 另有绝对硬顶 POLARIS_CHAT_HARD_CAP_SECS: 到点无条件收回(防失控子代理靠"有 CPU 活动"
-    // 永久霸占并发槽)。桌面默认 0=不设(用户看得见, 有停止按钮, 长任务不设顶); 容器默认
-    // 3600s。杀前 Child 已从 CHILDREN 摘出, 回收原因由看门狗自己 emit error 告知前端;
+    // ① **计时判定核**已抽到 polaris-watchdog crate(空闲 idle + 绝对硬顶 hard cap,
+    //    纯逻辑可独立测试): stdout/stderr 每产出一行就 touch → 持续有输出的长任务
+    //    (批量 PPT/长脚本)idle 永不触发; 阈值仍由原有 env 控制(与旧行为完全融合,
+    //    不叠两套): POLARIS_CHAT_TIMEOUT_SECS 桌面 600s / 容器 180s, 0=关;
+    //    POLARIS_CHAT_HARD_CAP_SECS 桌面 0=不设(用户看得见, 有停止按钮) / 容器 3600s。
+    // ② idle 判定后 kernel 保留**深检进程树的否决权**: 还有活的子孙进程(claude 正在跑
+    //    Bash 工具里的构建/ffmpeg/下载等, 工具执行期整段零输出是常态), 或整树 CPU 时间
+    //    仍在推进(claude 本体在算) —— 都算「静默但在干活」, 不杀, 转入 30s 低频复查;
+    //    只有**连续两次采样都完全静止**(零子孙 + CPU 零推进, 真挂死/网络吊死的特征)
+    //    才杀整树。深检失败(平台探测不可用)退回空闲即杀, 保住容器自愈。深检依赖平台
+    //    进程探测, 不属于纯逻辑, 故留在 kernel 而不进 watchdog crate。
+    // 杀前 Child 已从 CHILDREN 摘出, 回收原因由看门狗自己 emit error 告知前端;
     // 杀掉后 claude stdout 随之关闭 → 下面 reader 线程照常收尾 emit done, 系统自愈。
-    let watchdog_timeout = std::env::var("POLARIS_CHAT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        // 桌面此前默认 0=不启用 → 挂死的 claude 子进程(及其 cwd=/ 子代理)永不超时,
-        // 一年长跑里偶发网络故障累积出几十个吊死进程+阻塞线程,耗尽句柄/FD。默认常开,
-        // 仍可经 POLARIS_CHAT_TIMEOUT_SECS 覆写(设 0 显式关闭)。
-        .unwrap_or(if cfg!(feature = "desktop") { 600 } else { 180 });
-    if watchdog_timeout > 0 {
+    // 桌面此前默认 0=不启用 → 挂死的 claude 子进程(及其 cwd=/ 子代理)永不超时,
+    // 一年长跑里偶发网络故障累积出几十个吊死进程+阻塞线程,耗尽句柄/FD。默认常开,
+    // 仍可经 POLARIS_CHAT_TIMEOUT_SECS 覆写(设 0 显式关闭)。阈值读取抽到
+    // watchdog_config(常驻路径复用同一套)。
+    let (watchdog_timeout, hard_cap) = watchdog_config();
+    let watchdog = Arc::new(polaris_watchdog::Watchdog::new(
+        polaris_watchdog::WatchdogConfig {
+            idle_secs: watchdog_timeout,
+            hard_cap_secs: hard_cap,
+        },
+    ));
+    if watchdog_timeout > 0 || hard_cap > 0 {
+        use polaris_watchdog::WatchdogVerdict;
         let wd_req = req_id.to_string();
-        let wd_activity = last_activity.clone();
+        let wd = watchdog.clone();
         let wd_app = app.clone();
         let wd_conv = conv_id_opt.clone();
         std::thread::spawn(move || {
-            let timeout = std::time::Duration::from_secs(watchdog_timeout);
-            let started = std::time::Instant::now();
-            let hard_cap = std::env::var("POLARIS_CHAT_HARD_CAP_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(if cfg!(feature = "desktop") { 0 } else { 3600 });
             // 检查节拍: 常态每 5s 看一次空闲; 进入「静默但在干活」延期区后放缓到 30s,
-            // 深检(进程快照)只在延期区跑, 常态零开销。
-            let base_tick = std::cmp::min(timeout, std::time::Duration::from_secs(5));
+            // 深检(进程快照)只在延期区跑, 常态零开销。轻量线程 + sleep 轮询,
+            // 不引入任何异步运行时依赖(与旧实现一致)。
+            let base_tick = if watchdog_timeout > 0 {
+                std::cmp::min(
+                    std::time::Duration::from_secs(watchdog_timeout),
+                    std::time::Duration::from_secs(5),
+                )
+            } else {
+                std::time::Duration::from_secs(5)
+            };
             let mut tick = base_tick;
             let mut last_cpu: Option<u64> = None;
             loop {
                 std::thread::sleep(tick);
-                // 先读空闲时长(不与 CHILDREN 锁同时持有, 避免锁序问题), 再持锁取 pid:
+                // 先做纯计时判定(不与 CHILDREN 锁同时持有, 避免锁序问题), 再持锁取 pid:
                 // 取到 Some 才证明仍是本 req 的活进程; 取到 None = 已正常结束被 stdout
                 // 线程 remove → 退出看门狗。深检可能耗几十 ms, 不在锁内做。
-                let idle = wd_activity.lock().elapsed();
+                let verdict = wd.check();
                 let pid = {
                     let g = CHILDREN.lock();
                     let Some(c) = g.get(&wd_req) else { break };
                     c.id()
                 };
-                let over_cap =
-                    hard_cap > 0 && started.elapsed() >= std::time::Duration::from_secs(hard_cap);
-                if !over_cap && idle < timeout {
-                    // 有输出在推进, 回到常态节拍并清掉 CPU 基线。
-                    last_cpu = None;
-                    tick = base_tick;
-                    continue;
-                }
-                if !over_cap {
-                    if let Some(s) = sample_tree(pid) {
-                        // 首次越阈只建 CPU 基线不杀(cpu_advancing 视为 true), 下次采样再比对。
-                        let cpu_advancing = last_cpu.is_none_or(|prev| s.cpu > prev);
-                        last_cpu = Some(s.cpu);
-                        if s.descendants > 0 || cpu_advancing {
-                            tick = std::time::Duration::from_secs(30);
-                            continue; // 静默但在干活: 不杀, 低频续看
+                let over_cap = matches!(verdict, Some(WatchdogVerdict::HardTimeout { .. }));
+                let idle = wd.idle();
+                match verdict {
+                    None => {
+                        // 有输出在推进, 回到常态节拍并清掉 CPU 基线。
+                        last_cpu = None;
+                        tick = base_tick;
+                        continue;
+                    }
+                    Some(WatchdogVerdict::IdleKilled { idle_secs }) => {
+                        // idle 判定进入嫌疑区 → 深检进程树行使否决权(见文件头注释②)。
+                        if let Some(s) = sample_tree(pid) {
+                            // 首次越阈只建 CPU 基线不杀(cpu_advancing 视为 true), 下次采样再比对。
+                            let cpu_advancing = last_cpu.is_none_or(|prev| s.cpu > prev);
+                            last_cpu = Some(s.cpu);
+                            if s.descendants > 0 || cpu_advancing {
+                                tick = std::time::Duration::from_secs(30);
+                                continue; // 静默但在干活: 不杀, 低频续看
+                            }
+                            eprintln!(
+                                "[chat-watchdog] req={wd_req} 空闲 {idle_secs}s 且进程树静止(0 子孙/CPU 无推进), 判挂死回收"
+                            );
+                        } else {
+                            eprintln!(
+                                "[chat-watchdog] req={wd_req} 空闲 {idle_secs}s, 进程树深检不可用, 按旧策略回收"
+                            );
                         }
+                    }
+                    Some(WatchdogVerdict::HardTimeout { elapsed_secs }) => {
                         eprintln!(
-                            "[chat-watchdog] req={wd_req} 空闲 {}s 且进程树静止(0 子孙/CPU 无推进), 判挂死回收",
-                            idle.as_secs()
-                        );
-                    } else {
-                        eprintln!(
-                            "[chat-watchdog] req={wd_req} 空闲 {}s, 进程树深检不可用, 按旧策略回收",
-                            idle.as_secs()
+                            "[chat-watchdog] req={wd_req} 总时长 {elapsed_secs}s 超硬顶 {hard_cap}s, 无条件回收"
                         );
                     }
-                } else {
-                    eprintln!("[chat-watchdog] req={wd_req} 总时长超硬顶 {hard_cap}s, 无条件回收");
                 }
                 // 重新确认仍是本 req 的同一进程再杀(防深检窗口内正常结束 + PID 复用误杀)。
                 // 锁内只做「确认 + 摘出 Child」; kill_tree(Windows taskkill 同步等待常见
@@ -708,10 +803,10 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
                         // Child 已摘出, reader 线程收尾时查不到 → 不再发「异常退出」error
                         // (同 chat_cancel 语义)。回收原因由这里告知前端, 不至于无声中断。
                         let reason = if over_cap {
-                            format!("本轮总时长超过硬顶 {hard_cap}s, 已被看门狗强制回收")
+                            format!("任务超硬顶时限: 本轮总时长超过 {hard_cap}s, 已被看门狗强制终止")
                         } else {
                             format!(
-                                "claude 进程空闲 {}s 无任何输出且进程树静止, 判定挂死, 已被看门狗回收",
+                                "空闲超时, 进程疑似卡死已终止: claude 进程连续 {}s 无任何输出且进程树静止",
                                 idle.as_secs()
                             )
                         };
@@ -738,7 +833,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     let conv_id_err = conv_id_opt.clone();
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     let stderr_buf_clone = stderr_buf.clone();
-    let act_err = last_activity.clone();
+    let act_err = watchdog.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
@@ -746,7 +841,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
             if line.trim().is_empty() {
                 continue;
             }
-            *act_err.lock() = std::time::Instant::now(); // 刷新活动: 有产出就不算挂死
+            act_err.touch(); // 刷新活动: 有产出就不算挂死
             {
                 // 单次加锁 + 封顶: 异常时 stderr 也可能狂刷, 不让它无界累积。
                 let mut buf = stderr_buf_clone.lock();
@@ -774,92 +869,27 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     let conv_id_thread = conv_id_opt.clone();
     let stderr_buf_for_done = stderr_buf.clone();
     let art_dir_thread = art_dir.clone();
-    let act_out = last_activity.clone();
+    let act_out = watchdog.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        let mut assistant_text = String::new();
-        // 生图不支持时: 后端确定性地把中文说明作为**第一段**发出去并计入正文,
-        // 不依赖模型遵守「开头摊牌」指令 → 用户一定先看到「当前模型不支持生图」。
-        if let Some(notice) = image_notice {
-            assistant_text.push_str(&notice);
-            emit_event(
-                &app_out,
-                ChatStreamEvent {
-                    req_id: req_out.clone(),
-                    kind: "delta".into(),
-                    text: Some(notice),
-                    tool: None,
-                    conversation_id: conv_id_thread.clone(),
-                },
-            );
-        }
-        // 本轮生成的成品文件 (绝对路径, 正斜杠), 既来自 Write/Edit 工具调用,
-        // 也来自产物目录的前后快照 diff (覆盖 Bash/脚本生成的文件)
-        let mut artifacts: Vec<String> = Vec::new();
-        // 落库缓冲封顶: claude 若异常死循环狂打输出, 不让 assistant_text 无界增长撑爆内存。
-        // 超限后改写入可丢弃的 scrap (实时 delta 仍照常 emit, 前端实时可见), 不再增长落库缓冲。
-        let mut scrap = String::new();
-        let mut capped = false;
-        let mut partial = PartialStreamState::default();
-        // delta 合批器: --include-partial-messages 下 CLI 每 token 吐一条 text_delta,
-        // 逐条 emit = 每 token 一次跨 webview IPC。这里按 30ms 时间窗合并后再 emit;
-        // 非 delta 事件到达前与流结束时必 flush(见 handle_stream_event 与循环末尾),
-        // 事件顺序 / payload 结构完全不变。
-        let mut batcher = DeltaBatcher::new();
+        // 单轮事件流状态机(解析/合批/记账/产物)抽到 TurnStream: 与常驻 agent 路径
+        // (session_pool::reader_loop)共用同一实现, 事件契约只此一份。
+        let mut ts = TurnStream::new(
+            app_out.clone(),
+            req_out.clone(),
+            conv_id_thread.clone(),
+            image_notice,
+        );
         for line in reader.lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
                 continue;
             }
-            *act_out.lock() = std::time::Instant::now(); // 刷新活动: 流式产出即视为推进, 防误杀
-            let target = if capped {
-                &mut scrap
-            } else {
-                &mut assistant_text
-            };
-            match serde_json::from_str::<Value>(&line) {
-                Ok(v) => handle_stream_event(
-                    &app_out,
-                    &req_out,
-                    conv_id_thread.as_deref(),
-                    &v,
-                    target,
-                    &mut artifacts,
-                    &mut partial,
-                    &mut batcher,
-                ),
-                Err(_) => {
-                    // 非 JSON 行: 当作 delta 直接显示 (调试友好)。先 flush 挂起的合批
-                    // delta, 保证屏上文本顺序与到达顺序一致。
-                    batcher.flush(&app_out, &req_out, conv_id_thread.as_deref());
-                    // 正文已进 accum 且已上屏 → 置记账位, 否则后续 result 携带同一内容时
-                    // 会因 saw_assistant_text=false 再补一遍, 屏上/落库都成双份。
-                    if !line.trim().is_empty() {
-                        partial.saw_assistant_text = true;
-                    }
-                    target.push_str(&line);
-                    target.push('\n');
-                    emit_event(
-                        &app_out,
-                        ChatStreamEvent {
-                            req_id: req_out.clone(),
-                            kind: "delta".into(),
-                            text: Some(line),
-                            tool: None,
-                            conversation_id: conv_id_thread.clone(),
-                        },
-                    );
-                }
-            }
-            if capped {
-                scrap.clear(); // scrap 只为让上面 emit 继续工作, 不能自己变成无界
-            } else if assistant_text.len() > MAX_ASSISTANT_BYTES {
-                assistant_text.push_str("\n\n[⚠️ 输出过长，后续内容已省略]");
-                capped = true;
-            }
+            act_out.touch(); // 刷新活动: 流式产出即视为推进, 防误杀
+            let _ = ts.feed_line(&line); // 一次性进程以 EOF 收尾, result 界标只有常驻路径用
         }
         // 流结束必 flush: 缓冲里最后一撮 delta 要先于 error/artifact/done 事件落地。
-        batcher.flush(&app_out, &req_out, conv_id_thread.as_deref());
+        ts.flush();
 
         // 等子进程退出, 检查 exit code (不能持锁 wait, 否则 chat_cancel 死锁)
         let child_opt = CHILDREN.remove(&req_out);
@@ -931,77 +961,8 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
             );
         }
 
-        // 产物目录前后快照 diff: 捕获 Bash / 脚本 / Skill 生成的新增或改动文件。
-        // 只上报常见成品格式; 打包应用 (含 polaris.project.json 的文件夹) 的内部文件
-        // 不逐个上报, 整个应用归并成一个「应用文件夹」chip (路径带尾随 `/`)。
-        let art_after = dir_snapshot(&art_dir_thread);
-        for (path, mtime) in art_after.iter() {
-            let changed = match art_before.get(path) {
-                None => true,
-                Some(old) => mtime > old,
-            };
-            if !changed {
-                continue;
-            }
-            let s = if let Some(root) = packaged_project_root(path) {
-                folder_artifact_repr(&root)
-            } else {
-                let s = path.to_string_lossy().replace('\\', "/");
-                if !is_displayable_artifact(&s) {
-                    continue; // 脚本 / 配置 / 临时文件等中间产物: 不进对话框
-                }
-                s
-            };
-            if !artifacts.contains(&s) {
-                artifacts.push(s.clone());
-                emit_event(
-                    &app_out,
-                    ChatStreamEvent {
-                        req_id: req_out.clone(),
-                        kind: "artifact".into(),
-                        text: Some(s),
-                        tool: None,
-                        conversation_id: conv_id_thread.clone(),
-                    },
-                );
-            }
-        }
-
-        // 落库前最后一道修剪: 实时阶段上报的文件可能事后被删 / 被归并进应用文件夹,
-        // 不让「没有的文件」进历史记录 (重载历史时 chip 全部真实可点)。
-        artifacts.retain(|p| {
-            if let Some(dir) = p.strip_suffix('/') {
-                return Path::new(dir).is_dir();
-            }
-            let pb = Path::new(p);
-            pb.is_file() && is_displayable_artifact(p) && packaged_project_root(pb).is_none()
-        });
-
-        // 持久化 assistant 消息 (产物清单以注释 marker 形式存入正文, 重载历史时解析)
-        if let Some(cid) = &conv_id_thread {
-            let mut content = assistant_text.trim().to_string();
-            if !artifacts.is_empty() {
-                if let Ok(json) = serde_json::to_string(&artifacts) {
-                    content.push_str(&format!("\n\n{}{}-->", ARTIFACT_MARKER_PREFIX, json));
-                }
-            }
-            if !content.trim().is_empty() {
-                let _ = conv::append_message(cid, "assistant", &content);
-            }
-        }
-
-        emit_event(
-            &app_out,
-            ChatStreamEvent {
-                req_id: req_out.clone(),
-                kind: "done".into(),
-                text: None,
-                tool: None,
-                conversation_id: conv_id_thread.clone(),
-            },
-        );
-        // 本轮已终态: 清掉可能残留的「取消挂起」标记(如 stop 恰在收尾窗口内到达), 防积攒。
-        CHILDREN.take_cancel(&req_out);
+        // 收尾(产物快照 diff → 落库 → done → 清取消标记)与常驻路径共用 TurnStream::finish。
+        ts.finish(&art_dir_thread, &art_before);
     });
 
     // stop 在「spawn 后、child 注册进 CHILDREN 前」的窄窗口内到达的兜底: 那一刻
@@ -1021,6 +982,11 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn chat_cancel(req_id: String) -> Result<(), String> {
+    // 常驻 agent 路径: req 命中池内某会话的活跃轮 → 直接杀常驻进程(简单可靠),
+    // reader 收 EOF 静默发 done 收尾, 下一条消息自动重建进程。
+    if session_pool::cancel_by_req(&req_id) {
+        return Ok(());
+    }
     if let Some(mut child) = CHILDREN.remove(&req_id) {
         kill_tree(child.id()); // 先杀整树: claude 扇出的 python/node/dev server 等子孙
         let _ = child.kill(); // 再杀 claude 本体 (taskkill /T 通常已带走它, 这步兜底)
@@ -1046,9 +1012,9 @@ pub fn chat_build_manifest(conversation_id: Option<String>) -> Option<Value> {
 
 /// 看门狗深检采样: root 进程树(含 root)的子孙数 + 整树累计 CPU 时间。
 /// cpu 单位各平台不同(Windows 100ns / Linux jiffies / mac 秒), 只用于跨采样单调比较。
-struct TreeSample {
-    descendants: usize,
-    cpu: u64,
+pub(super) struct TreeSample {
+    pub(super) descendants: usize,
+    pub(super) cpu: u64,
 }
 
 /// 从 (pid, ppid) 全表收出以 root 为根的进程树(含 root)。`contains` 防 PID 复用造出的环。
@@ -1070,7 +1036,7 @@ fn collect_tree(root: u32, pairs: &[(u32, u32)]) -> Vec<u32> {
 /// Windows: toolhelp 快照收 (pid, ppid), 再只对树内成员查 GetProcessTimes。
 /// None = 快照失败(调用方退回空闲即杀)。
 #[cfg(windows)]
-fn sample_tree(root: u32) -> Option<TreeSample> {
+pub(super) fn sample_tree(root: u32) -> Option<TreeSample> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
@@ -1122,7 +1088,7 @@ fn sample_tree(root: u32) -> Option<TreeSample> {
 /// Linux(容器/server): 单遍扫 /proc/<pid>/stat 同时拿 ppid 与 utime+stime。
 /// stat 第 2 字段(comm)可含空格/括号, 一律从最后一个 ')' 之后再按空格切。
 #[cfg(target_os = "linux")]
-fn sample_tree(root: u32) -> Option<TreeSample> {
+pub(super) fn sample_tree(root: u32) -> Option<TreeSample> {
     let mut procs: Vec<(u32, u32, u64)> = Vec::new(); // (pid, ppid, cpu)
     for ent in std::fs::read_dir("/proc").ok()? {
         let Ok(ent) = ent else { continue };
@@ -1163,7 +1129,7 @@ fn sample_tree(root: u32) -> Option<TreeSample> {
 /// macOS 及其它 unix: 一次 `ps -axo pid=,ppid=,cputime=` 全表。cputime 形如
 /// "0:00.12" / "1:02:03" / "1-02:03:04", 解析成秒(只求单调可比)。
 #[cfg(all(unix, not(target_os = "linux")))]
-fn sample_tree(root: u32) -> Option<TreeSample> {
+pub(super) fn sample_tree(root: u32) -> Option<TreeSample> {
     fn parse_cputime(s: &str) -> u64 {
         let (days, rest) = match s.split_once('-') {
             Some((d, r)) => (d.parse::<u64>().unwrap_or(0), r),
@@ -1274,6 +1240,206 @@ impl DeltaBatcher {
             },
         );
         self.last_emit = std::time::Instant::now();
+    }
+}
+
+/// 单轮 claude 事件流状态机: 逐行喂 stream-json → emit 前端事件 + 记账落库缓冲 +
+/// 产物追踪, 最后统一收尾。旧「每消息 spawn」路径与常驻 agent 路径(session_pool)
+/// 共用这一份实现 —— 事件契约(meta→delta/tool/artifact/error→done)只此一处, 不会分叉。
+/// (逻辑从旧 stdout reader 闭包原样抽出, 行为零变化。)
+pub(super) struct TurnStream {
+    app: AppHandle,
+    req_id: String,
+    conv_id: Option<String>,
+    assistant_text: String,
+    /// 落库缓冲封顶后改写 scrap(可丢弃): 实时 delta 仍照常 emit, 内存不无界增长。
+    scrap: String,
+    capped: bool,
+    artifacts: Vec<String>,
+    partial: PartialStreamState,
+    batcher: DeltaBatcher,
+}
+
+impl TurnStream {
+    pub(super) fn new(
+        app: AppHandle,
+        req_id: String,
+        conv_id: Option<String>,
+        image_notice: Option<String>,
+    ) -> Self {
+        let mut ts = Self {
+            app,
+            req_id,
+            conv_id,
+            assistant_text: String::new(),
+            scrap: String::new(),
+            capped: false,
+            artifacts: Vec::new(),
+            partial: PartialStreamState::default(),
+            batcher: DeltaBatcher::new(),
+        };
+        // 生图不支持时: 后端确定性地把中文说明作为**第一段**发出去并计入正文,
+        // 不依赖模型遵守「开头摊牌」指令 → 用户一定先看到「当前模型不支持生图」。
+        if let Some(notice) = image_notice {
+            ts.assistant_text.push_str(&notice);
+            emit_event(
+                &ts.app,
+                ChatStreamEvent {
+                    req_id: ts.req_id.clone(),
+                    kind: "delta".into(),
+                    text: Some(notice),
+                    tool: None,
+                    conversation_id: ts.conv_id.clone(),
+                },
+            );
+        }
+        ts
+    }
+
+    /// 喂一行 stdout。返回「这行是不是 result 收尾事件」—— 常驻路径以它为本轮界标
+    /// (每轮末 CLI 必吐一条 {"type":"result",...}); 一次性进程路径忽略返回值, 以 EOF 收尾。
+    pub(super) fn feed_line(&mut self, line: &str) -> bool {
+        let mut is_result = false;
+        let target = if self.capped {
+            &mut self.scrap
+        } else {
+            &mut self.assistant_text
+        };
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => {
+                is_result = v.get("type").and_then(|x| x.as_str()) == Some("result");
+                handle_stream_event(
+                    &self.app,
+                    &self.req_id,
+                    self.conv_id.as_deref(),
+                    &v,
+                    target,
+                    &mut self.artifacts,
+                    &mut self.partial,
+                    &mut self.batcher,
+                );
+            }
+            Err(_) => {
+                // 非 JSON 行: 当作 delta 直接显示 (调试友好)。先 flush 挂起的合批
+                // delta, 保证屏上文本顺序与到达顺序一致。
+                self.batcher
+                    .flush(&self.app, &self.req_id, self.conv_id.as_deref());
+                // 正文已进 accum 且已上屏 → 置记账位, 否则后续 result 携带同一内容时
+                // 会因 saw_assistant_text=false 再补一遍, 屏上/落库都成双份。
+                if !line.trim().is_empty() {
+                    self.partial.saw_assistant_text = true;
+                }
+                target.push_str(line);
+                target.push('\n');
+                emit_event(
+                    &self.app,
+                    ChatStreamEvent {
+                        req_id: self.req_id.clone(),
+                        kind: "delta".into(),
+                        text: Some(line.to_string()),
+                        tool: None,
+                        conversation_id: self.conv_id.clone(),
+                    },
+                );
+            }
+        }
+        if self.capped {
+            self.scrap.clear(); // scrap 只为让上面 emit 继续工作, 不能自己变成无界
+        } else if self.assistant_text.len() > MAX_ASSISTANT_BYTES {
+            self.assistant_text
+                .push_str("\n\n[⚠️ 输出过长，后续内容已省略]");
+            self.capped = true;
+        }
+        is_result
+    }
+
+    /// 把挂起的合批 delta 冲出去(流结束/本轮收尾时必调, 保证正文先于终态事件落地)。
+    pub(super) fn flush(&mut self) {
+        self.batcher
+            .flush(&self.app, &self.req_id, self.conv_id.as_deref());
+    }
+
+    /// 本轮收尾: 产物快照 diff → 修剪 → 落库 assistant 消息 → done → 清取消标记。
+    pub(super) fn finish(self, art_dir: &Path, art_before: &std::collections::HashMap<std::path::PathBuf, SystemTime>) {
+        let Self {
+            app,
+            req_id,
+            conv_id,
+            assistant_text,
+            mut artifacts,
+            ..
+        } = self;
+        // 产物目录前后快照 diff: 捕获 Bash / 脚本 / Skill 生成的新增或改动文件。
+        // 只上报常见成品格式; 打包应用 (含 polaris.project.json 的文件夹) 的内部文件
+        // 不逐个上报, 整个应用归并成一个「应用文件夹」chip (路径带尾随 `/`)。
+        let art_after = dir_snapshot(art_dir);
+        for (path, mtime) in art_after.iter() {
+            let changed = match art_before.get(path) {
+                None => true,
+                Some(old) => mtime > old,
+            };
+            if !changed {
+                continue;
+            }
+            let s = if let Some(root) = packaged_project_root(path) {
+                folder_artifact_repr(&root)
+            } else {
+                let s = path.to_string_lossy().replace('\\', "/");
+                if !is_displayable_artifact(&s) {
+                    continue; // 脚本 / 配置 / 临时文件等中间产物: 不进对话框
+                }
+                s
+            };
+            if !artifacts.contains(&s) {
+                artifacts.push(s.clone());
+                emit_event(
+                    &app,
+                    ChatStreamEvent {
+                        req_id: req_id.clone(),
+                        kind: "artifact".into(),
+                        text: Some(s),
+                        tool: None,
+                        conversation_id: conv_id.clone(),
+                    },
+                );
+            }
+        }
+
+        // 落库前最后一道修剪: 实时阶段上报的文件可能事后被删 / 被归并进应用文件夹,
+        // 不让「没有的文件」进历史记录 (重载历史时 chip 全部真实可点)。
+        artifacts.retain(|p| {
+            if let Some(dir) = p.strip_suffix('/') {
+                return Path::new(dir).is_dir();
+            }
+            let pb = Path::new(p);
+            pb.is_file() && is_displayable_artifact(p) && packaged_project_root(pb).is_none()
+        });
+
+        // 持久化 assistant 消息 (产物清单以注释 marker 形式存入正文, 重载历史时解析)
+        if let Some(cid) = &conv_id {
+            let mut content = assistant_text.trim().to_string();
+            if !artifacts.is_empty() {
+                if let Ok(json) = serde_json::to_string(&artifacts) {
+                    content.push_str(&format!("\n\n{}{}-->", ARTIFACT_MARKER_PREFIX, json));
+                }
+            }
+            if !content.trim().is_empty() {
+                let _ = conv::append_message(cid, "assistant", &content);
+            }
+        }
+
+        emit_event(
+            &app,
+            ChatStreamEvent {
+                req_id: req_id.clone(),
+                kind: "done".into(),
+                text: None,
+                tool: None,
+                conversation_id: conv_id,
+            },
+        );
+        // 本轮已终态: 清掉可能残留的「取消挂起」标记(如 stop 恰在收尾窗口内到达), 防积攒。
+        CHILDREN.take_cancel(&req_id);
     }
 }
 
@@ -1460,7 +1626,7 @@ fn handle_stream_event(
     }
 }
 
-fn emit_event(app: &AppHandle, ev: ChatStreamEvent) {
+pub(super) fn emit_event(app: &AppHandle, ev: ChatStreamEvent) {
     let _ = app.emit("chat:stream", ev);
 }
 
@@ -1511,13 +1677,67 @@ fn spawn_in_sandbox(prompt: &str, perm: &str) -> Result<Child, String> {
     Ok(child)
 }
 
-fn spawn_on_host(
+/// 需要 --add-dir 显式放行的目录(KB 根/产物目录, 均可能不在 cwd 子树)。
+/// 抽成独立函数: spawn 与常驻会话的「配置指纹」共用同一来源 —— 目录集合变了
+/// (用户移动 KB / 换对话产物目录)意味着旧进程的可访问面已不对, 指纹判变触发重建。
+pub(super) fn extra_claude_dirs(art_dir: &Path) -> Vec<String> {
+    let cwd = claude_md::project_root().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+    // 如果 KB root 不在 cwd 子树下(用户可能把 KB 移到别处), 用 --add-dir 显式放行
+    let kb_root = std::path::PathBuf::from(
+        super::bridges::kb_bridge()
+            .map(|b| b.root())
+            .unwrap_or_default(),
+    );
+    let mut dirs: Vec<String> = Vec::new();
+    if !kb_root.as_os_str().is_empty() && kb_root.exists() && !kb_root.starts_with(&cwd) {
+        dirs.push(kb_root.to_string_lossy().to_string());
+    }
+    // 产物目录在 ~/Polaris 下, 不在 cwd 子树, 显式放行 claude 可写入
+    if art_dir.exists() && !art_dir.starts_with(&cwd) {
+        dirs.push(art_dir.to_string_lossy().to_string());
+    }
+    dirs
+}
+
+/// 按模式取显式配置的 --model(未配置返回 None, 保持供应商钉死的模型)。
+/// 抽出来供常驻会话指纹使用: 用户改了 POLARIS_WORK_MODEL/POLARIS_FAST_MODEL,
+/// 旧常驻进程还钉着老模型, 必须判变重建。
+pub(super) fn model_for_mode(work_full: bool) -> Option<String> {
+    let model_env = if work_full {
+        "POLARIS_WORK_MODEL"
+    } else {
+        "POLARIS_FAST_MODEL"
+    };
+    std::env::var(model_env)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 看门狗阈值 (idle_secs, hard_cap_secs): env 覆写语义与默认值不变(详注见
+/// chat_send_pipeline 内看门狗一节); 抽出来让常驻路径每轮的看门狗吃同一套配置。
+pub(super) fn watchdog_config() -> (u64, u64) {
+    let idle = std::env::var("POLARIS_CHAT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(if cfg!(feature = "desktop") { 600 } else { 180 });
+    let cap = std::env::var("POLARIS_CHAT_HARD_CAP_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(if cfg!(feature = "desktop") { 0 } else { 3600 });
+    (idle, cap)
+}
+
+pub(super) fn spawn_on_host(
     prompt: &str,
     perm: &str,
     art_dir: &Path,
     with_task: bool,
     work_full: bool,
     provider_id: Option<&str>,
+    persistent: bool,
 ) -> Result<Child, String> {
     let perm_flag = format!("--permission-mode={}", perm);
     // cwd = polaris-app 根 (env!("CARGO_MANIFEST_DIR") 的父级),
@@ -1529,35 +1749,28 @@ fn spawn_on_host(
     // KB 根写一份 .ignore(幂等), 让 ripgrep(Grep 工具/rg)自动跳 output/二进制/大素材 → 检索更快
     ensure_kb_search_ignore();
 
-    // 如果 KB root 不在 cwd 子树下(用户可能把 KB 移到别处), 用 --add-dir 显式放行
-    let kb_root = std::path::PathBuf::from(
-        super::bridges::kb_bridge()
-            .map(|b| b.root())
-            .unwrap_or_default(),
-    );
-    let mut extra_dirs: Vec<String> = Vec::new();
-    if !kb_root.as_os_str().is_empty() && kb_root.exists() && !kb_root.starts_with(&cwd) {
-        extra_dirs.push("--add-dir".into());
-        extra_dirs.push(kb_root.to_string_lossy().to_string());
-    }
-    // 产物目录在 ~/Polaris 下, 不在 cwd 子树, 显式放行 claude 可写入
-    if art_dir.exists() && !art_dir.starts_with(&cwd) {
-        extra_dirs.push("--add-dir".into());
-        extra_dirs.push(art_dir.to_string_lossy().to_string());
-    }
-
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
     ];
+    // 常驻 agent 模式: stdin 从「一次性 prompt 通道」变成逐轮 stream-json 消息通道,
+    // 进程收完一轮吐 result 事件后**不退出**, 阻塞等下一行 user 消息 —— 这是免掉
+    // 每消息 ~6.4s CLI 自举的关键(见 session_pool 模块头注释)。
+    if persistent {
+        args.push("--input-format".into());
+        args.push("stream-json".into());
+    }
     // token 级部分流:CLI 吐 content_block_delta 逐字增量 → 前端豆包式逐字上屏。
     // 默认开;POLARIS_PARTIAL_STREAM=0 关(兼容旧版 CLI,见 partial_stream_enabled)。
     if partial_stream_enabled() {
         args.push("--include-partial-messages".into());
     }
-    args.extend(extra_dirs);
+    for d in extra_claude_dirs(art_dir) {
+        args.push("--add-dir".into());
+        args.push(d);
+    }
     // 联网工具默认放行; 非「拒绝授权」档位再叠加本地读写执行 (Bash/PowerShell/文件),
     // 否则 headless 下连 `python xxx.py` 都被拒, .pptx/.xlsx 这类成品根本产不出来。
     args.push("--allowedTools".into());
@@ -1570,16 +1783,7 @@ fn spawn_on_host(
     // 模型档跟随模式(可选, 默认不启用): 多模型供应商上可让快速模式走快档(便宜快)、工作模式走强档。
     // 仅当对应环境变量显式设了 model id 才传 --model —— 单模型网关/未配置时**保持原样**(供应商
     // 钉死的模型), 绝不因传错 model 名把请求打挂。POLARIS_WORK_MODEL / POLARIS_FAST_MODEL。
-    let model_env = if work_full {
-        "POLARIS_WORK_MODEL"
-    } else {
-        "POLARIS_FAST_MODEL"
-    };
-    if let Some(m) = std::env::var(model_env)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(m) = model_for_mode(work_full) {
         args.push("--model".into());
         args.push(m);
     }
@@ -1631,7 +1835,20 @@ fn spawn_on_host(
     }
 
     cmd.spawn().map_err(|e| {
-        // 错误只在 spawn 本身失败 (e.g. exe 找不到), 不再是 prompt 太长
+        // 错误只在 spawn 本身失败 (e.g. exe 找不到), 不再是 prompt 太长。
+        // Windows 上架构不符的 exe 会返回 os error 193 (ERROR_BAD_EXE_FORMAT ——
+        // 系统原文「%1 不是有效的 Win32 应用程序」)。裸透传会在界面上冒出「Win32 不匹配」这种
+        // 让人摸不着头脑的串, 这里翻成人话 + 修复指引 (多半是本机装的 claude 二进制架构与系统不符)。
+        #[cfg(windows)]
+        if e.raw_os_error() == Some(193) {
+            let arch = std::env::consts::ARCH; // x86_64 / aarch64
+            return format!(
+                "调起宿主机 claude CLI 失败: 本机安装的 claude 二进制架构与系统 ({arch}) 不符 \
+                 (Windows: 不是有效的 Win32 应用程序 / ERROR_BAD_EXE_FORMAT)。\
+                 请卸载后按本机架构重装: npm uninstall -g @anthropic-ai/claude-code 再 \
+                 npm i -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com"
+            );
+        }
         format!("调起宿主机 claude CLI 失败: {}", e)
     })
 }

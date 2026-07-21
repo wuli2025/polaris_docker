@@ -194,6 +194,7 @@ pub fn fable_inventory_start(
         // 多根串行盘点;进度按「已盘过的根」累加,前端看到的是全量计数。
         let mut acc_files = 0u64;
         let mut acc_bytes = 0u64;
+        let mut acc_dirs = 0u64;
         let mut acc_removed = 0u64;
         let mut acc_skipped = 0u64;
         let mut acc_secs = 0.0f64;
@@ -208,15 +209,25 @@ pub fn fable_inventory_start(
             let app_p = app.clone();
             let base_f = acc_files;
             let base_b = acc_bytes;
-            match scan_root(r, &exclude, full, &move |files, bytes| {
-                emit(
+            let base_d = acc_dirs;
+            match scan_root(r, &exclude, full, &move |beat| match beat {
+                ScanBeat::Progress { files, bytes, dirs } => emit(
                     &app_p,
-                    json!({ "kind": "progress", "files": base_f + files, "bytes": base_b + bytes }),
-                );
+                    json!({
+                        "kind": "progress",
+                        "files": base_f + files,
+                        "bytes": base_b + bytes,
+                        "dirs": base_d + dirs,
+                    }),
+                ),
+                // 收尾阶段(写清单/核对变更/清理消失文件…)如实播报:这段以前是零反馈黑箱,
+                // 大库上跑几十秒,前端数字冻住 = 用户以为「全盘扫描卡死了」。
+                ScanBeat::Phase(text) => emit(&app_p, json!({ "kind": "phase", "text": text })),
             }) {
                 Ok(s) => {
                     acc_files += s.files;
                     acc_bytes += s.bytes;
+                    acc_dirs += s.dirs;
                     acc_removed += s.removed;
                     acc_skipped += s.skipped;
                     acc_secs += s.seconds;

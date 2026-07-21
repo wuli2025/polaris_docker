@@ -1,5 +1,56 @@
 use super::*;
 
+/// 「真消失」三态判定:真删除的子树(最近存活祖先证实 NotFound)= Gone;
+/// 扫描根自身不可达(挂载掉线)= Unknown 绝不判删;越出扫描根 = Unknown。
+#[test]
+fn dir_state_distinguishes_deleted_from_unreachable() {
+    let base = std::env::temp_dir().join(format!("polaris_dirstate_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("alive")).unwrap();
+    let mut cache = std::collections::HashMap::new();
+    let mut t = 0u32;
+    assert_eq!(
+        dir_state(&base.join("alive"), &base, false, 5, &mut cache, &mut t),
+        DirState::Alive,
+        "存在的目录 = Alive"
+    );
+    assert_eq!(
+        dir_state(&base.join("gonedir"), &base, false, 5, &mut cache, &mut t),
+        DirState::Gone,
+        "根存活 + 这一层 NotFound = 确证删除"
+    );
+    assert_eq!(
+        dir_state(
+            &base.join("gonedir").join("sub"),
+            &base,
+            false,
+            5,
+            &mut cache,
+            &mut t
+        ),
+        DirState::Gone,
+        "被删子树的更深层继承 Gone(且走缓存零 stat)"
+    );
+    let dead_root = base.join("nomount");
+    let mut cache2 = std::collections::HashMap::new();
+    assert_eq!(
+        dir_state(&dead_root, &dead_root, false, 5, &mut cache2, &mut t),
+        DirState::Unknown,
+        "扫描根自身读不到(挂载掉线)= Unknown,绝不据此删除"
+    );
+    assert_eq!(
+        dir_state(&dead_root.join("x"), &dead_root, false, 5, &mut cache2, &mut t),
+        DirState::Unknown,
+        "掉线根之下一律 Unknown"
+    );
+    assert_eq!(
+        dir_state(&base, &base.join("alive"), false, 5, &mut cache2, &mut t),
+        DirState::Unknown,
+        "越出扫描根的路径 = Unknown"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn prog_lang_maps_extensions() {
     assert_eq!(prog_lang("py"), Some("Python"));
@@ -458,7 +509,7 @@ fn incremental_rescan_e2e() {
     std::env::set_var("POLARIS_FABLE_DB", &db);
     let root_s = root.to_string_lossy().to_string();
     let empty = HashSet::new();
-    let noop = |_f: u64, _b: u64| {};
+    let noop = |_: ScanBeat| {};
 
     // ① 首扫(无缓存 → 等同全量):6 个文件,4 个目录(""/A/B/B/SUB)。
     let s1 = scan_root(&root_s, &empty, false, &noop).unwrap();
@@ -576,7 +627,7 @@ fn fable_audit_e2e() {
     std::env::set_var("POLARIS_FABLE_DB", &db);
     let root_s = root.to_string_lossy().to_string();
     let empty = HashSet::new();
-    let noop = |_f: u64, _b: u64| {};
+    let noop = |_: ScanBeat| {};
 
     scan_root(&root_s, &empty, false, &noop).unwrap();
 
@@ -647,7 +698,7 @@ fn rename_move_reuses_index() {
     std::env::set_var("POLARIS_FABLE_DB", &db);
     let root_s = root.to_string_lossy().to_string();
     let empty = HashSet::new();
-    let noop = |_f: u64, _b: u64| {};
+    let noop = |_: ScanBeat| {};
 
     scan_root(&root_s, &empty, false, &noop).unwrap();
     let conn = open_db().unwrap();
@@ -753,7 +804,7 @@ fn skipped_subtree_self_heals() {
     std::env::set_var("POLARIS_FABLE_DB", &db);
     let root_s = root.to_string_lossy().to_string();
     let empty = HashSet::new();
-    let noop = |_f: u64, _b: u64| {};
+    let noop = |_: ScanBeat| {};
 
     // ① 首扫:2 个文件,4 个目录(""/A/A/SUB)。
     let s1 = scan_root(&root_s, &empty, false, &noop).unwrap();

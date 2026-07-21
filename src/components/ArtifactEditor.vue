@@ -6,32 +6,41 @@
  * - 顶部：可视化/源码切换、翻页、主题、缩放、保存、退出
  * 保存 = 把编辑后的完整 HTML 写回原产物文件（artifact_write）。
  * 既支持多页 deck，也支持单页网页（无 .slide 时自动隐藏分页栏）。
+ *
+ * 拆分说明：左栏/检查器/气泡工具栏/右键菜单/查找替换/文档编辑/Figma 对话框在
+ * ./artifact/ 子组件里；共享纯函数与 DOM 工具在 ./artifact/shared.ts。
+ * 本文件保留跨块共享状态（选中/历史/缩放/画布交互编排）。
  */
-import { ref, shallowRef, computed, onMounted, onBeforeUnmount, nextTick, watch } from "vue";
+import { ref, shallowRef, computed, onMounted, onBeforeUnmount, nextTick, watch, defineAsyncComponent } from "vue";
 import {
-  Code2, Eye, ChevronLeft, ChevronRight, Plus, Copy, Trash2,
-  Save, X, Loader, Palette, ZoomIn, ZoomOut, Maximize, FileType2,
-  Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Minus, BringToFront,
-  MousePointer2, RotateCw, Type, Square, Circle, Image as ImageIcon, SendToBack,
-  Undo2, Redo2, Strikethrough, List, ListOrdered, Link2, Highlighter,
-  RemoveFormatting, FileText, Heading1, Heading2, Heading3, TextQuote,
-  Table, Search,
-  AlignStartVertical, AlignCenterVertical, AlignEndVertical,
-  AlignStartHorizontal, AlignCenterHorizontal, AlignEndHorizontal,
-  AlignHorizontalDistributeCenter, AlignVerticalDistributeCenter,
-  Layers, LayoutList, EyeOff, Lock, LockOpen, ChevronDown,
-  Hand, Frame, Group, Ungroup,
+  Code2, Eye, ChevronLeft, ChevronRight, Save, X, Loader, Palette,
+  ZoomIn, ZoomOut, Maximize, FileType2,
+  Bold, Italic, Strikethrough, List, ListOrdered, Link2,
+  FileText, Heading1, Heading2, Heading3, TextQuote, Table, Search,
+  MousePointer2, Type, Square, Circle, Minus, Image as ImageIcon,
+  Undo2, Redo2, Hand,
 } from "@lucide/vue";
-import { marked } from "marked";
-import { sanitizeHtml } from "../lib/sanitize";
 import { useArtifactsStore } from "../stores/artifacts";
 import { DECK_THEMES } from "../lib/deckThemes";
-import { figmaApi, openUrl } from "../tauri";
-import { collectVectorIds, figmaFrameToHtml } from "../lib/figmaPull";
+import {
+  type Mode, type Tool, type LayerNode,
+  BLOCK_SEL, SHADOWS, SKIP_TAGS,
+  isEditorNode, layerLabelFor, rgbToHex,
+  getTranslate, getRotate, setTranslate,
+  serializeDoc, buildThumbDoc, injectEditorStyle, ensureOverlay,
+  positionOverlayDom, showGuides as showGuidesDom, clearMeasureDom, drawMeasureDom,
+} from "./artifact/shared";
+import ArtifactRail from "./artifact/ArtifactRail.vue";
+import ArtifactInspector from "./artifact/ArtifactInspector.vue";
+import ArtifactBubbleBar from "./artifact/ArtifactBubbleBar.vue";
+import ArtifactCtxMenu from "./artifact/ArtifactCtxMenu.vue";
+import ArtifactFindBar from "./artifact/ArtifactFindBar.vue";
+// 非首屏必需：文档编辑（含 marked）与 Figma 对话框懒加载
+const ArtifactTextDoc = defineAsyncComponent(() => import("./artifact/ArtifactTextDoc.vue"));
+const ArtifactFigmaDialog = defineAsyncComponent(() => import("./artifact/ArtifactFigmaDialog.vue"));
 
 const artifacts = useArtifactsStore();
 
-type Mode = "visual" | "code";
 const mode = ref<Mode>("visual");
 
 // ── 文档类编辑（Markdown / 纯文本）：不走 iframe 画布，走「源码 + 实时预览」──
@@ -43,10 +52,6 @@ const isTextDoc = computed(
 // 画布 / 源码各自的工作副本
 const html = ref<string>(artifacts.payload?.text ?? "");
 const frameSrc = ref<string>(html.value); // 显式控制 iframe 重载，避免源码每键回灌
-// Markdown 实时预览（与 RightDrawer 预览同一条 marked+sanitize 管线）
-const mdPreview = computed(() =>
-  docKind.value === "markdown" ? sanitizeHtml(marked.parse(html.value) as string) : ""
-);
 const frame = ref<HTMLIFrameElement | null>(null);
 const canvasEl = ref<HTMLElement | null>(null);
 const stageEl = ref<HTMLElement | null>(null);
@@ -65,7 +70,6 @@ const selFill = ref<{ bg: string; hasBg: boolean; border: string; bw: number; ra
   { bg: "#4a86ff", hasBg: false, border: "#ffffff", bw: 0, radius: 0 }
 );
 const fileInput = ref<HTMLInputElement | null>(null);
-const HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 
 // deck 信息
 const isDeck = ref(false);
@@ -86,28 +90,16 @@ const designOn = computed(() => isDeck.value || pageDesign.value);
 // 多选（Shift+点选 / 空白处框选）：selEl 是主选，extraSels 是追加选
 const extraSels = ref<HTMLElement[]>([]);
 const allSels = computed(() => (selEl.value ? [selEl.value, ...extraSels.value] : []));
-// 图层树（Figma 左栏）：扁平行 + 深度缩进，折叠靠 parentId 链过滤
-type LayerNode = {
-  id: number; el: HTMLElement; parentId: number | null;
-  tag: string; label: string; depth: number; kids: number;
-  hidden: boolean; locked: boolean;
-};
+// 图层树数据（行构建在父层：撤销/换页都要同步重建；交互在 ArtifactRail 里）
 const layerRows = shallowRef<LayerNode[]>([]);
-const layerCollapsed = ref<Set<number>>(new Set());
-const railTab = ref<"pages" | "layers">("pages");
 const lids = new WeakMap<HTMLElement, number>();
 let lidSeq = 1;
-const layerDragId = ref<number | null>(null);
-const layerDropId = ref<number | null>(null);
-const layerDropPos = ref<"before" | "after" | "into" | null>(null);
 // 画布平移（按住空格 / 鼠标中键拖拽）
 const panHeld = ref(false);
 let panDrag: { sx: number; sy: number; sl: number; st: number } | null = null;
 // 框选（marquee）
 let marquee: { x0: number; y0: number } | null = null;
 let marqueeMoved = false;
-// 工具（Figma 式底部工具条）：select=点选/框选, hand=抓手, 其余=拖拽画出元素
-type Tool = "select" | "hand" | "text" | "rect" | "ellipse" | "line";
 const tool = ref<Tool>("select");
 let draw: { x0: number; y0: number } | null = null;
 // 右键上下文菜单（zone 坐标）
@@ -117,49 +109,9 @@ const zoneEl = ref<HTMLElement | null>(null);
 // Alt+悬停间距标注
 let lastHover: HTMLElement | null = null;
 
-// ── Figma 往返桥: 去程复制 HTML 走 html.to.design 插件, 回程 REST 拉回替换画布 ──
+// ── Figma 往返桥（对话框子组件懒加载，逻辑在 ArtifactFigmaDialog.vue）──
 const figmaOpen = ref(false);
-const figmaLink = ref<string>(localStorage.getItem("polaris.figma.link") ?? "");
-// PAT 只留内存:localStorage 会被同源 artifact 脚本(iframe allow-scripts+allow-same-origin)读走外传
-const figmaToken = ref<string>("");
-const figmaBusy = ref(false);
-const figmaErr = ref("");
-const figmaCopied = ref(false);
-async function figmaCopyHtml() {
-  figmaErr.value = "";
-  const out = !isTextDoc.value && mode.value === "visual" ? serialize() : html.value;
-  try {
-    await navigator.clipboard.writeText(out);
-    figmaCopied.value = true;
-    setTimeout(() => (figmaCopied.value = false), 2000);
-  } catch {
-    figmaErr.value = "复制失败：切到「源码」模式手动全选复制也一样";
-  }
-}
-async function figmaPullBack() {
-  figmaErr.value = "";
-  const link = figmaLink.value.trim();
-  const token = figmaToken.value.trim();
-  if (!link) { figmaErr.value = "先粘贴 Figma 文件链接"; return; }
-  if (!token) { figmaErr.value = "需要 Figma 访问令牌：Figma 头像 → Settings → Security → Personal access tokens"; return; }
-  figmaBusy.value = true;
-  try {
-    localStorage.setItem("polaris.figma.link", link);
-    // 不落盘 token(见上:同源 artifact 可读 localStorage)
-    const data = await figmaApi.pull(link, token);
-    const ids = collectVectorIds(data.doc);
-    const svgs = ids.length ? await figmaApi.exportSvgs(link, ids, token) : {};
-    const res = figmaFrameToHtml(data, svgs);
-    // 替换画布工作副本（可 Ctrl+Z 回退到 Figma 化之前, Ctrl+S 才真正落盘）
-    reloadFrom(res.html, null);
-    artifacts.markDirty(true);
-    figmaOpen.value = false;
-  } catch (e: any) {
-    figmaErr.value = e?.message ?? String(e);
-  } finally {
-    figmaBusy.value = false;
-  }
-}
+
 // 效果（不透明度 / 阴影）
 const selEffects = ref<{ opacity: number; shadow: string }>({ opacity: 100, shadow: "none" });
 
@@ -196,19 +148,13 @@ let restoring = false;
 // ── 元素剪贴板（Ctrl+C/X/V/D, 支持多选整组复制）: ref 是为了右键菜单「粘贴」禁用态响应 ──
 const elClipboard = ref<string[] | null>(null);
 
-// ── 查找替换（源码模式 / Markdown / 纯文本，Ctrl+F）──
+// ── 查找替换（源码模式 / Markdown / 纯文本，Ctrl+F）：条子在 ArtifactFindBar 里 ──
 const findOpen = ref(false);
-const findQ = ref("");
-const replQ = ref("");
-const findInput = ref<HTMLInputElement | null>(null);
-const findCount = computed(() =>
-  findQ.value ? html.value.split(findQ.value).length - 1 : 0
-);
+const findBar = ref<InstanceType<typeof ArtifactFindBar> | null>(null);
 
-// 文档编辑 / 源码编辑的 textarea 与预览引用
-const docTa = ref<HTMLTextAreaElement | null>(null);
+// 文档编辑组件（Markdown / 纯文本）/ 源码编辑的 textarea 引用
+const textDoc = ref<any>(null);
 const codeTa = ref<HTMLTextAreaElement | null>(null);
-const mdPrevEl = ref<HTMLElement | null>(null);
 
 // 图片替换目标（非空时 fileInput 选图 = 换掉它的 src，而不是插入新图）
 let imgReplaceTarget: HTMLImageElement | null = null;
@@ -251,28 +197,9 @@ function detectDeck() {
   cur.value = (w?.__deck?.current?.() as number) ?? 0;
 }
 
-// 把当前文档克隆成「只显示第 n 页」的静态缩略 HTML（去脚本/编辑物/动画/页脚，秒开无 JS）
 function buildThumb(n: number): string {
   const d = doc();
-  if (!d) return "";
-  const root = d.documentElement.cloneNode(true) as HTMLElement;
-  root.querySelectorAll("#__ed, #__obj, #__objcss, #__gv, #__gh, #__rb, #__meas, script").forEach((e) => e.remove());
-  root.querySelectorAll("[contenteditable]").forEach((e) => e.removeAttribute("contenteditable"));
-  root.querySelectorAll(".__hov, .__msel").forEach((e) => e.classList.remove("__hov", "__msel"));
-  root.querySelectorAll<HTMLElement>(".slide").forEach((s, i) => {
-    s.classList.remove("is-prev", "is-active");
-    if (i === n) s.classList.add("is-active");
-  });
-  const head = root.querySelector("head");
-  if (head) {
-    const st = document.createElement("style");
-    st.textContent =
-      "*{animation:none!important;transition:none!important}" +
-      ".slide.is-active [data-anim],.slide.is-active [class*=anim-],.slide.is-active .anim-stagger-list>*{opacity:1!important;transform:none!important}" +
-      ".progress-bar,.deck-footer,.deck-header{display:none!important}";
-    head.appendChild(st);
-  }
-  return "<!doctype html>\n" + root.outerHTML;
+  return d ? buildThumbDoc(d, n) : "";
 }
 function rebuildThumbs() {
   if (!isDeck.value) { thumbs.value = []; return; }
@@ -290,31 +217,14 @@ function applyEditable() {
   if (!isDeck.value && !pageDesign.value) d.body?.setAttribute("contenteditable", "true");
 }
 
-function injectEditorStyle() {
-  const d = doc();
-  if (!d) return;
-  if (d.getElementById("__ed")) return;
-  const st = d.createElement("style");
-  st.id = "__ed";
-  st.textContent = `
-    [contenteditable]{outline:none!important;}
-    [contenteditable] h1:hover,[contenteditable] h2:hover,[contenteditable] h3:hover,
-    [contenteditable] h4:hover,[contenteditable] p:hover,[contenteditable] li:hover,
-    [contenteditable] span:hover,[contenteditable] .kicker:hover,[contenteditable] .lede:hover{
-      outline:1px dashed rgba(125,150,255,.55);outline-offset:4px;border-radius:3px;cursor:text;}
-    [contenteditable] ::selection{background:rgba(120,160,255,.4);}
-  `;
-  d.head?.appendChild(st);
-}
-
 function onFrameLoad() {
   const d = doc();
   if (!d) return;
-  injectEditorStyle();
+  injectEditorStyle(d);
   detectDeck();
   applyEditable();
   rebuildThumbs();
-  ensureOverlay();
+  ensureOverlay(d, startResize);
   clearSel();
   // 输入即脏
   inputHandler = () => { if (!artifacts.dirty) artifacts.markDirty(true); refreshSel(); pushHistory(600); };
@@ -479,9 +389,6 @@ function setTheme(id: string) {
 }
 
 // ───────── 对象编辑：选中 / 拖动 / 缩放 / 改格式 ─────────
-const BLOCK_SEL =
-  "h1,h2,h3,h4,h5,h6,p,li,img,ul,ol,table,blockquote,pre,.card,.pill,.kicker,.lede,.eyebrow,.h1,.h2,.h3,.big-num,.gradient-text,.divider-accent,.row,.grid";
-
 function activeSlide(): HTMLElement | null {
   const d = doc();
   return d ? (d.querySelector<HTMLElement>(".slide.is-active") || d.body) : null;
@@ -500,117 +407,12 @@ function selectableFrom(t: HTMLElement): HTMLElement | null {
   return t;
 }
 
-function getTranslate(el: HTMLElement): { tx: number; ty: number } {
-  const m = /translate\(\s*([-0-9.]+)px\s*,\s*([-0-9.]+)px/.exec(el.style.transform || "");
-  return m ? { tx: parseFloat(m[1]), ty: parseFloat(m[2]) } : { tx: 0, ty: 0 };
-}
-function getRotate(el: HTMLElement): number {
-  const m = /rotate\(\s*([-0-9.]+)deg/.exec(el.style.transform || "");
-  return m ? Math.round(parseFloat(m[1])) : 0;
-}
-function applyTransform(el: HTMLElement, tx: number, ty: number, rot: number) {
-  el.style.transform = `translate(${Math.round(tx)}px, ${Math.round(ty)}px) rotate(${rot || 0}deg)`;
-}
-function setTranslate(el: HTMLElement, tx: number, ty: number) {
-  applyTransform(el, tx, ty, getRotate(el));
-}
-
-function ensureOverlay(): HTMLElement | null {
-  const d = doc();
-  if (!d) return null;
-  if (!d.getElementById("__objcss")) {
-    const st = d.createElement("style");
-    st.id = "__objcss";
-    /* Figma 视觉语言: #0d99ff 选中蓝 / #f24822 智能参考线红;
-       所有描边与手柄尺寸除以 --edscale(画布缩放), 保证任何缩放下都是屏幕 1px/8px 观感 */
-    st.textContent = `
-      :root{--edscale:1;}
-      #__obj{position:fixed;z-index:2147483600;pointer-events:none;border:calc(1.25px/var(--edscale)) solid #0d99ff;}
-      #__obj .__h{position:absolute;width:calc(9px/var(--edscale));height:calc(9px/var(--edscale));background:#fff;border:calc(1.25px/var(--edscale)) solid #0d99ff;border-radius:calc(1.5px/var(--edscale));pointer-events:auto;box-shadow:0 0 calc(3px/var(--edscale)) rgba(0,0,0,.18);}
-      #__obj .__h:hover{background:#0d99ff;}
-      #__sz{position:absolute;left:50%;top:100%;transform:translate(-50%,calc(6px/var(--edscale)));background:#0d99ff;color:#fff;font:500 calc(11px/var(--edscale))/1.5 -apple-system,'Segoe UI',sans-serif;padding:calc(2px/var(--edscale)) calc(7px/var(--edscale));border-radius:calc(4px/var(--edscale));white-space:nowrap;pointer-events:none;font-variant-numeric:tabular-nums;}
-      .__hov{outline:calc(2px/var(--edscale)) solid rgba(13,153,255,.65)!important;outline-offset:0;cursor:move;}
-      #__gv{position:fixed;top:0;bottom:0;width:0;border-left:calc(1px/var(--edscale)) solid #f24822;z-index:2147483599;pointer-events:none;display:none;}
-      #__gh{position:fixed;left:0;right:0;height:0;border-top:calc(1px/var(--edscale)) solid #f24822;z-index:2147483599;pointer-events:none;display:none;}
-      .__msel{outline:calc(1.5px/var(--edscale)) solid #0d99ff!important;outline-offset:0;}
-      #__rb{position:fixed;border:calc(1px/var(--edscale)) solid rgba(13,153,255,.9);background:rgba(13,153,255,.08);z-index:2147483601;pointer-events:none;display:none;}
-      #__meas{position:fixed;inset:0;pointer-events:none;z-index:2147483602;display:none;}
-      #__meas .__mlh{position:absolute;height:calc(1px/var(--edscale));background:#f24822;display:none;}
-      #__meas .__mlv{position:absolute;width:calc(1px/var(--edscale));background:#f24822;display:none;}
-      #__meas .__mt{position:absolute;transform:translate(-50%,-50%);background:#f24822;color:#fff;font:500 calc(10.5px/var(--edscale))/1.6 -apple-system,'Segoe UI',sans-serif;padding:calc(1px/var(--edscale)) calc(5px/var(--edscale));border-radius:calc(3px/var(--edscale));white-space:nowrap;display:none;font-variant-numeric:tabular-nums;}
-    `;
-    d.head?.appendChild(st);
-  }
-  // 磁吸对齐参考线（拖动元素贴近页面中线时亮起）+ 框选橡皮筋
-  for (const gid of ["__gv", "__gh", "__rb"]) {
-    if (!d.getElementById(gid)) {
-      const g = d.createElement("div");
-      g.id = gid;
-      d.body?.appendChild(g);
-    }
-  }
-  // Alt+悬停间距标注: 两条红线 + 两个数字标签（Figma 式测距）
-  if (!d.getElementById("__meas")) {
-    const m = d.createElement("div");
-    m.id = "__meas";
-    m.innerHTML =
-      '<div class="__mlh"></div><div class="__mlv"></div><span class="__mt"></span><span class="__mt"></span>';
-    d.body?.appendChild(m);
-  }
-  let box = d.getElementById("__obj");
-  if (!box) {
-    box = d.createElement("div");
-    box.id = "__obj";
-    box.style.display = "none";
-    for (const dir of HANDLES) {
-      const h = d.createElement("div");
-      h.className = "__h __h-" + dir;
-      h.setAttribute("data-dir", dir);
-      const pos: Record<string, string> = {
-        nw: "top:-6px;left:-6px;cursor:nwse-resize",
-        n: "top:-6px;left:calc(50% - 5px);cursor:ns-resize",
-        ne: "top:-6px;right:-6px;cursor:nesw-resize",
-        e: "top:calc(50% - 5px);right:-6px;cursor:ew-resize",
-        se: "bottom:-6px;right:-6px;cursor:nwse-resize",
-        s: "bottom:-6px;left:calc(50% - 5px);cursor:ns-resize",
-        sw: "bottom:-6px;left:-6px;cursor:nesw-resize",
-        w: "top:calc(50% - 5px);left:-6px;cursor:ew-resize",
-      };
-      h.setAttribute("style", pos[dir]);
-      h.addEventListener("pointerdown", (e) => startResize(e as PointerEvent, dir));
-      box.appendChild(h);
-    }
-    // Figma 式尺寸徽标: 选中框正下方的蓝色 W × H 胶囊
-    const sz = d.createElement("div");
-    sz.id = "__sz";
-    box.appendChild(sz);
-    d.body?.appendChild(box);
-  }
-  return box;
-}
-
 function positionOverlay() {
   const d = doc();
-  const box = d?.getElementById("__obj") as HTMLElement | null;
-  if (!d || !box) return;
-  // 编辑物尺寸随画布缩放反向补偿(线宽/手柄/徽标在屏幕上恒定大小, Figma 同款)
-  d.documentElement.style.setProperty("--edscale", String(scale.value || 1));
+  if (!d) return;
   // 多选时不显示手柄框（各元素用 __msel 描边），只有单选才有 8 手柄
-  if (!selEl.value || !selBox.value || extraSels.value.length) { box.style.display = "none"; return; }
-  const b = selBox.value;
-  box.style.display = "block";
-  box.style.left = b.x + "px";
-  box.style.top = b.y + "px";
-  box.style.width = b.w + "px";
-  box.style.height = b.h + "px";
-  const sz = d.getElementById("__sz");
-  if (sz) sz.textContent = `${Math.round(b.w)} × ${Math.round(b.h)}`;
-}
-function rgbToHex(c: string): string {
-  const m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(c);
-  if (!m) return c.startsWith("#") ? c : "#000000";
-  const h = (n: string) => (+n).toString(16).padStart(2, "0");
-  return "#" + h(m[1]) + h(m[2]) + h(m[3]);
+  const b = selEl.value && !extraSels.value.length ? selBox.value : null;
+  positionOverlayDom(d, b, scale.value || 1);
 }
 function readSelStyle() {
   const el = selEl.value;
@@ -714,10 +516,7 @@ let drag: null | {
 function showGuides(v: boolean, h: boolean, x = 0, y = 0) {
   const d = doc();
   if (!d) return;
-  const gv = d.getElementById("__gv") as HTMLElement | null;
-  const gh = d.getElementById("__gh") as HTMLElement | null;
-  if (gv) { gv.style.display = v ? "block" : "none"; if (v) gv.style.left = x + "px"; }
-  if (gh) { gh.style.display = h ? "block" : "none"; if (h) gh.style.top = y + "px"; }
+  showGuidesDom(d, v, h, x, y);
 }
 
 function startMove(e: PointerEvent) {
@@ -904,13 +703,6 @@ function onDocMouseOver(e: MouseEvent) {
   }
 }
 
-// 格式工具栏动作
-function fmtBold() { const el = selEl.value; if (!el) return; el.style.fontWeight = selStyle.value.bold ? "400" : "800"; afterFmt(); }
-function fmtItalic() { const el = selEl.value; if (!el) return; el.style.fontStyle = selStyle.value.italic ? "normal" : "italic"; afterFmt(); }
-function fmtUnderline() { const el = selEl.value; if (!el) return; el.style.textDecoration = selStyle.value.underline ? "none" : "underline"; afterFmt(); }
-function fmtAlign(a: string) { const el = selEl.value; if (!el) return; el.style.textAlign = a; afterFmt(); }
-function fmtFont(delta: number) { const el = selEl.value; if (!el) return; el.style.fontSize = Math.max(8, selStyle.value.size + delta) + "px"; afterFmt(); }
-function fmtColor(e: Event) { const el = selEl.value; if (!el) return; const c = (e.target as HTMLInputElement).value; el.style.color = c; (el.style as any).webkitTextFillColor = c; afterFmt(); }
 // 删除走统一快照历史：误删 Ctrl+Z 一步找回（连带位置/格式一起还原）
 function fmtDelete() {
   const els = allSels.value;
@@ -921,14 +713,6 @@ function fmtDelete() {
   rebuildThumbs();
   pushHistory();
 }
-function fmtFront() { const el = selEl.value; if (!el) return; if (getComputedStyle(el).position === "static") el.style.position = "relative"; el.style.zIndex = "60"; afterFmt(); }
-function fmtBack() { const el = selEl.value; if (!el) return; if (getComputedStyle(el).position === "static") el.style.position = "relative"; el.style.zIndex = "1"; afterFmt(); }
-// 填充 / 描边 / 圆角
-function fmtFill(e: Event) { const el = selEl.value; if (!el) return; el.style.backgroundColor = (e.target as HTMLInputElement).value; afterFmt(); }
-function fmtFillClear() { const el = selEl.value; if (!el) return; el.style.backgroundColor = "transparent"; afterFmt(); }
-function fmtBorderColor(e: Event) { const el = selEl.value; if (!el) return; const c = (e.target as HTMLInputElement).value; el.style.borderColor = c; if (!parseFloat(getComputedStyle(el).borderTopWidth)) el.style.borderWidth = "2px", el.style.borderStyle = "solid"; afterFmt(); }
-function fmtBorderWidth(v: number) { const el = selEl.value; if (!el) return; const w = Math.max(0, v); el.style.borderWidth = w + "px"; el.style.borderStyle = w ? "solid" : "none"; afterFmt(); }
-function fmtRadius(v: number) { const el = selEl.value; if (!el) return; el.style.borderRadius = Math.max(0, v) + "px"; afterFmt(); }
 
 // ───────── 插入元素（仿豆包顶栏：文本框 / 形状 / 线条 / 图片 = 自由浮动的 WPS 式框）─────────
 function insertNode(el: HTMLElement, w: number, h: number | null) {
@@ -1034,7 +818,7 @@ function redo() {
   if (canRedo.value) restoreHistory(hIndex.value + 1);
 }
 
-// ───────── 元素复制 / 粘贴 / 微调 / 一键对齐 ─────────
+// ───────── 元素复制 / 粘贴 / 微调 ─────────
 function copyEl() {
   if (allSels.value.length) elClipboard.value = allSels.value.map((el) => el.outerHTML);
 }
@@ -1096,24 +880,6 @@ function nudge(dx: number, dy: number) {
   }
   afterFmt();
 }
-/** 一键对齐到页面（PPT 式：左/水平居中/右/顶/垂直居中/底） */
-function alignToPage(which: "left" | "hcenter" | "right" | "top" | "vcenter" | "bottom") {
-  const el = selEl.value;
-  const slide = activeSlide();
-  if (!el || !slide) return;
-  const r = el.getBoundingClientRect();
-  const sr = slide.getBoundingClientRect();
-  const t = getTranslate(el);
-  const relX = r.left - sr.left;
-  const relY = r.top - sr.top;
-  if (which === "left") setTranslate(el, t.tx - relX, t.ty);
-  else if (which === "hcenter") setTranslate(el, t.tx + (sr.width - r.width) / 2 - relX, t.ty);
-  else if (which === "right") setTranslate(el, t.tx + (sr.width - r.width) - relX, t.ty);
-  else if (which === "top") setTranslate(el, t.tx, t.ty - relY);
-  else if (which === "vcenter") setTranslate(el, t.tx, t.ty + (sr.height - r.height) / 2 - relY);
-  else setTranslate(el, t.tx, t.ty + (sr.height - r.height) - relY);
-  afterFmt();
-}
 /** 选中的是图片 → 打开选图框换 src（保持原尺寸位置） */
 function replaceImage() {
   const el = selEl.value;
@@ -1122,7 +888,7 @@ function replaceImage() {
   fileInput.value?.click();
 }
 
-// ───────── Figma 式设计模式：模式切换 / 多选对齐分布 / 框选 / 图层树 / 抓手平移 ─────────
+// ───────── Figma 式设计模式：模式切换 / 全选 / 框选 / 抓手平移 ─────────
 function setPageDesign(v: boolean) {
   if (pageDesign.value === v) return;
   pageDesign.value = v;
@@ -1140,67 +906,6 @@ function selectAllEls() {
   extraSels.value = t.slice(1);
   syncSelClass();
   refreshSel();
-}
-/** 多选相互对齐（以选中集合的外接框为基准；单选时退化为对齐到页面） */
-function alignSel(which: "left" | "hcenter" | "right" | "top" | "vcenter" | "bottom") {
-  const els = allSels.value;
-  if (els.length < 2) { alignToPage(which); return; }
-  const rs = els.map((el) => ({ el, r: el.getBoundingClientRect(), t: getTranslate(el) }));
-  const minL = Math.min(...rs.map((x) => x.r.left));
-  const maxR = Math.max(...rs.map((x) => x.r.right));
-  const minT = Math.min(...rs.map((x) => x.r.top));
-  const maxB = Math.max(...rs.map((x) => x.r.bottom));
-  for (const x of rs) {
-    let dx = 0, dy = 0;
-    if (which === "left") dx = minL - x.r.left;
-    else if (which === "hcenter") dx = (minL + maxR) / 2 - (x.r.left + x.r.width / 2);
-    else if (which === "right") dx = maxR - x.r.right;
-    else if (which === "top") dy = minT - x.r.top;
-    else if (which === "vcenter") dy = (minT + maxB) / 2 - (x.r.top + x.r.height / 2);
-    else dy = maxB - x.r.bottom;
-    setTranslate(x.el, x.t.tx + dx, x.t.ty + dy);
-  }
-  afterFmt();
-}
-/** 等间距分布（≥3 个）：首尾不动，中间元素均摊间隙 */
-function distributeSel(axis: "h" | "v") {
-  const els = allSels.value;
-  if (els.length < 3) return;
-  const rs = els
-    .map((el) => ({ el, r: el.getBoundingClientRect(), t: getTranslate(el) }))
-    .sort((a, b) => (axis === "h" ? a.r.left - b.r.left : a.r.top - b.r.top));
-  const first = rs[0], last = rs[rs.length - 1];
-  const totalSize = rs.reduce((s, x) => s + (axis === "h" ? x.r.width : x.r.height), 0);
-  const span = axis === "h" ? last.r.right - first.r.left : last.r.bottom - first.r.top;
-  const gap = (span - totalSize) / (rs.length - 1);
-  let cursor = axis === "h" ? first.r.left : first.r.top;
-  for (const x of rs) {
-    const d2 = cursor - (axis === "h" ? x.r.left : x.r.top);
-    if (axis === "h") setTranslate(x.el, x.t.tx + d2, x.t.ty);
-    else setTranslate(x.el, x.t.tx, x.t.ty + d2);
-    cursor += (axis === "h" ? x.r.width : x.r.height) + gap;
-  }
-  afterFmt();
-}
-// 效果：不透明度 / 阴影
-const SHADOWS = [
-  { n: "无阴影", v: "none" },
-  { n: "轻", v: "0 2px 8px rgba(0,0,0,.14)" },
-  { n: "中", v: "0 6px 20px rgba(0,0,0,.22)" },
-  { n: "重", v: "0 14px 40px rgba(0,0,0,.32)" },
-];
-function fmtOpacity(v: number) {
-  const el = selEl.value;
-  if (!el || isNaN(v)) return;
-  el.style.opacity = String(Math.max(0, Math.min(100, v)) / 100);
-  afterFmt();
-}
-function fmtShadow(e: Event) {
-  const el = selEl.value;
-  if (!el) return;
-  const v = (e.target as HTMLSelectElement).value;
-  el.style.boxShadow = v === "none" ? "" : v;
-  afterFmt();
 }
 
 // ── 框选（marquee）：空白处按下拖出矩形，命中当前页顶层元素 ──
@@ -1347,45 +1052,14 @@ function zStep(upward: boolean) {
   afterFmt();
 }
 
-// ── Alt+悬停间距标注（Figma 测距）: 选中元素 ↔ 悬停元素之间的水平/垂直净距 ──
+// ── Alt+悬停间距标注（Figma 测距）──
 function clearMeasure() {
-  const m = doc()?.getElementById("__meas") as HTMLElement | null;
-  if (m) m.style.display = "none";
+  clearMeasureDom(doc());
 }
 function drawMeasure(sel: DOMRect, hov: DOMRect) {
   const d = doc();
-  const m = d?.getElementById("__meas") as HTMLElement | null;
-  if (!d || !m) return;
-  const [lh, lv, th, tv] = Array.from(m.children) as HTMLElement[];
-  // 水平净距: 两框在 x 轴上不相交时, 量最近两条竖边
-  let hx0 = 0, hx1 = 0, hOn = false;
-  if (sel.right <= hov.left) { hx0 = sel.right; hx1 = hov.left; hOn = true; }
-  else if (hov.right <= sel.left) { hx0 = hov.right; hx1 = sel.left; hOn = true; }
-  // 垂直净距同理
-  let vy0 = 0, vy1 = 0, vOn = false;
-  if (sel.bottom <= hov.top) { vy0 = sel.bottom; vy1 = hov.top; vOn = true; }
-  else if (hov.bottom <= sel.top) { vy0 = hov.bottom; vy1 = sel.top; vOn = true; }
-  // 线画在两框重叠区中线上(无重叠用选中框中线)
-  const oy0 = Math.max(sel.top, hov.top), oy1 = Math.min(sel.bottom, hov.bottom);
-  const cy = oy0 < oy1 ? (oy0 + oy1) / 2 : (sel.top + sel.bottom) / 2;
-  const ox0 = Math.max(sel.left, hov.left), ox1 = Math.min(sel.right, hov.right);
-  const cx = ox0 < ox1 ? (ox0 + ox1) / 2 : (sel.left + sel.right) / 2;
-  const k = scale.value || 1;
-  if (hOn && hx1 - hx0 >= 1) {
-    lh.style.display = "block";
-    lh.style.left = hx0 + "px"; lh.style.top = cy + "px"; lh.style.width = hx1 - hx0 + "px";
-    th.style.display = "block";
-    th.style.left = (hx0 + hx1) / 2 + "px"; th.style.top = cy - 12 / k + "px";
-    th.textContent = String(Math.round(hx1 - hx0));
-  } else { lh.style.display = "none"; th.style.display = "none"; }
-  if (vOn && vy1 - vy0 >= 1) {
-    lv.style.display = "block";
-    lv.style.left = cx + "px"; lv.style.top = vy0 + "px"; lv.style.height = vy1 - vy0 + "px";
-    tv.style.display = "block";
-    tv.style.left = cx + 14 / k + "px"; tv.style.top = (vy0 + vy1) / 2 + "px";
-    tv.textContent = String(Math.round(vy1 - vy0));
-  } else { lv.style.display = "none"; tv.style.display = "none"; }
-  m.style.display = hOn || vOn ? "block" : "none";
+  if (!d) return;
+  drawMeasureDom(d, scale.value, sel, hov);
 }
 
 // ── 右键上下文菜单 ──
@@ -1401,10 +1075,6 @@ function openCtxAt(fx: number, fy: number) {
     x: Math.max(4, Math.min(x, zr.width - 200)),
     y: Math.max(4, Math.min(y, zr.height - 360)),
   };
-}
-function ctxDo(fn: () => void) {
-  ctx.value = null;
-  fn();
 }
 function closeCtx() { ctx.value = null; }
 /** 右键菜单: 锁定选中元素（解锁去图层面板点锁图标） */
@@ -1425,27 +1095,6 @@ function hideSel() {
   artifacts.markDirty(true);
   rebuildThumbs();
   pushHistory();
-}
-
-// ── 检查器 hex 色值输入 ──
-function normHex(v: string): string | null {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec(v.trim());
-  return m ? "#" + m[1].toLowerCase() : null;
-}
-function fmtFillHex(e: Event) {
-  const h = normHex((e.target as HTMLInputElement).value);
-  const el = selEl.value;
-  if (!h || !el) return;
-  el.style.backgroundColor = h;
-  afterFmt();
-}
-function fmtColorHex(e: Event) {
-  const h = normHex((e.target as HTMLInputElement).value);
-  const el = selEl.value;
-  if (!h || !el) return;
-  el.style.color = h;
-  (el.style as any).webkitTextFillColor = h;
-  afterFmt();
 }
 
 // ── 系统剪贴板贴图: 复制截图/图片后 Ctrl+V 直接落画布（成 base64 内嵌 img）──
@@ -1598,31 +1247,7 @@ function onCanvasPointerMove(e: PointerEvent) {
 }
 function onCanvasPointerUp() { panDrag = null; }
 
-// ── 图层树（Figma 左栏）──
-const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "LINK", "META", "TITLE", "BR", "TEMPLATE"]);
-const VOID_TAGS = new Set(["img", "hr", "br", "input", "source", "svg", "video", "audio", "iframe", "canvas"]);
-function isEditorNode(el: Element): boolean {
-  return (el.id || "").startsWith("__");
-}
-/** 图层行的类型图标（Figma 式: 文本 T / 图片 / 列表 / 表格 / 容器框） */
-function layerIcon(tag: string) {
-  if (["img", "svg", "picture", "video", "canvas"].includes(tag)) return ImageIcon;
-  if (["h1", "h2", "h3", "h4", "h5", "h6", "p", "span", "a", "li", "blockquote", "strong", "em", "label", "b", "i"].includes(tag)) return Type;
-  if (tag === "ul" || tag === "ol") return List;
-  if (tag === "table") return Table;
-  return Frame;
-}
-function layerLabelFor(el: HTMLElement): string {
-  const t = el.tagName.toLowerCase();
-  if (t === "img") return "图片";
-  const txt = (el.textContent || "").trim().replace(/\s+/g, " ");
-  if (txt && el.childElementCount === 0) return txt.slice(0, 24);
-  const cls = (el.getAttribute("class") || "")
-    .split(/\s+/)
-    .filter((c) => c && !c.startsWith("__") && c !== "is-active" && c !== "is-prev")[0];
-  if (cls) return `.${cls}`;
-  return txt ? txt.slice(0, 24) : t;
-}
+// ── 图层树数据构建（交互面板在 ArtifactRail 里）──
 function buildLayers() {
   if (!designOn.value || mode.value !== "visual" || isTextDoc.value) { layerRows.value = []; return; }
   const root = activeSlide();
@@ -1647,149 +1272,6 @@ function buildLayers() {
   walk(root, 0, null);
   layerRows.value = rows;
 }
-/** 折叠过滤：祖先被折叠的行不显示 */
-const visibleLayers = computed(() => {
-  const hiddenUnder = new Set<number>();
-  const out: LayerNode[] = [];
-  for (const n of layerRows.value) {
-    if (n.parentId != null && hiddenUnder.has(n.parentId)) { hiddenUnder.add(n.id); continue; }
-    out.push(n);
-    if (layerCollapsed.value.has(n.id)) hiddenUnder.add(n.id);
-  }
-  return out;
-});
-function layerHover(n: LayerNode | null) {
-  const d = doc();
-  if (!d) return;
-  d.querySelectorAll(".__hov").forEach((x) => x.classList.remove("__hov"));
-  if (n && !allSels.value.includes(n.el)) n.el.classList.add("__hov");
-}
-function layerClick(n: LayerNode, e: MouseEvent) {
-  if (n.locked) return;
-  selectEl(n.el, e.shiftKey);
-  try { n.el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch { /* 部分实现不支持 */ }
-  refreshSel();
-}
-function layerToggleCollapse(n: LayerNode) {
-  const s = new Set(layerCollapsed.value);
-  if (s.has(n.id)) s.delete(n.id);
-  else s.add(n.id);
-  layerCollapsed.value = s;
-}
-function layerToggleEye(n: LayerNode) {
-  n.el.style.display = n.el.style.display === "none" ? "" : "none";
-  if (n.el.style.display === "none" && allSels.value.includes(n.el)) clearSel();
-  artifacts.markDirty(true);
-  rebuildThumbs();
-  refreshSel();
-  pushHistory(); // 同步重建图层树
-}
-function layerToggleLock(n: LayerNode) {
-  if (n.el.hasAttribute("data-plk")) n.el.removeAttribute("data-plk");
-  else {
-    n.el.setAttribute("data-plk", "1");
-    if (allSels.value.includes(n.el)) clearSel();
-  }
-  artifacts.markDirty(true);
-  pushHistory();
-}
-// 图层拖拽重排：上 1/3 = 插到前面，下 1/3 = 插到后面，中间 = 放进去（容器类）
-function onLayerDragStart(n: LayerNode, e: DragEvent) {
-  layerDragId.value = n.id;
-  if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-}
-function onLayerDragOver(n: LayerNode, e: DragEvent) {
-  e.preventDefault();
-  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-  const y = e.clientY - r.top;
-  layerDropId.value = n.id;
-  const canInto = !VOID_TAGS.has(n.tag);
-  layerDropPos.value =
-    canInto && y > r.height * 0.3 && y < r.height * 0.7 ? "into" : y < r.height / 2 ? "before" : "after";
-}
-function onLayerDrop() {
-  const fromId = layerDragId.value, toId = layerDropId.value, pos = layerDropPos.value;
-  layerDragId.value = null;
-  layerDropId.value = null;
-  layerDropPos.value = null;
-  if (fromId == null || toId == null || fromId === toId || !pos) return;
-  const from = layerRows.value.find((r) => r.id === fromId);
-  const to = layerRows.value.find((r) => r.id === toId);
-  if (!from || !to || from.el.contains(to.el)) return; // 不能拖进自己的后代
-  if (pos === "into") to.el.appendChild(from.el);
-  else if (pos === "before") to.el.before(from.el);
-  else to.el.after(from.el);
-  artifacts.markDirty(true);
-  rebuildThumbs();
-  refreshSel();
-  pushHistory(); // 同步重建图层树
-}
-function onLayerDragEnd() {
-  layerDragId.value = null;
-  layerDropId.value = null;
-  layerDropPos.value = null;
-}
-
-// ───────── 富文本工具栏（豆包式，作用于画布里 contenteditable 的当前选区）─────────
-// 网页模式整页可编辑，选中即可用；deck 模式双击文本进入文字编辑后可用。
-function exec(cmd: string, val?: string) {
-  const d = doc();
-  if (!d) return;
-  try { d.execCommand("styleWithCSS", false, "true"); } catch { /* 老命令，个别实现会抛 */ }
-  d.execCommand(cmd, false, val);
-  artifacts.markDirty(true);
-  refreshSel();
-  pushHistory(500);
-}
-function execBlock(e: Event) {
-  const sel = e.target as HTMLSelectElement;
-  if (sel.value) exec("formatBlock", `<${sel.value}>`);
-  sel.value = ""; // 复位成占位项，下次选同一项也能触发 change
-}
-function execFontSize(e: Event) {
-  const sel = e.target as HTMLSelectElement;
-  const px = parseInt(sel.value);
-  sel.value = "";
-  const d = doc();
-  if (!d || !px) return;
-  // execCommand 的 fontSize 只有 1–7 粗档：先打上 7 号标记，再把标记换成精确 px
-  try { d.execCommand("styleWithCSS", false, "true"); } catch { /* 同上 */ }
-  d.execCommand("fontSize", false, "7");
-  d.querySelectorAll('font[size="7"]').forEach((f) => {
-    const s = d.createElement("span");
-    s.style.fontSize = px + "px";
-    while (f.firstChild) s.appendChild(f.firstChild);
-    f.replaceWith(s);
-  });
-  d.querySelectorAll<HTMLElement>('span[style*="font-size"]').forEach((sp) => {
-    if (sp.style.fontSize === "xxx-large") sp.style.fontSize = px + "px";
-  });
-  artifacts.markDirty(true);
-  pushHistory(500);
-}
-const FONTS = [
-  { n: "微软雅黑", v: "Microsoft YaHei" },
-  { n: "宋体", v: "SimSun" },
-  { n: "黑体", v: "SimHei" },
-  { n: "楷体", v: "KaiTi" },
-  { n: "仿宋", v: "FangSong" },
-  { n: "Arial", v: "Arial" },
-  { n: "Georgia", v: "Georgia" },
-  { n: "Times", v: "Times New Roman" },
-  { n: "等宽 Consolas", v: "Consolas" },
-];
-function execLink() {
-  const url = window.prompt("链接地址", "https://");
-  if (url && url !== "https://") exec("createLink", url);
-}
-// 点工具条按钮不能抢走 iframe 里的文字选区焦点（否则命令落到空选区上）。
-// select 下拉除外——它需要 mousedown 默认行为才能弹开。
-function onFmtBarDown(e: MouseEvent) {
-  const t = e.target as HTMLElement;
-  if (!t.closest("select")) e.preventDefault();
-}
-function execColor(e: Event) { exec("foreColor", (e.target as HTMLInputElement).value); }
-function execHilite(e: Event) { exec("hiliteColor", (e.target as HTMLInputElement).value); }
 
 // ───────── 浮动气泡工具栏定位 ─────────
 // 选区矩形（iframe 内 1280×720 坐标）→ 乘缩放映射到画布容器坐标，浮在选区上方。
@@ -1838,141 +1320,13 @@ function onCanvasWheel(e: WheelEvent) {
   zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.12 : 1 / 1.12);
 }
 
-// 右侧面板：整个选中元素换字体（PPT 习惯）
-function fmtFontFamily(e: Event) {
-  const el = selEl.value;
-  const sel = e.target as HTMLSelectElement;
-  const v = sel.value;
-  sel.value = "";
-  if (!el || !v) return;
-  el.style.fontFamily = v;
-  afterFmt();
-}
-
-// ───────── Markdown 工具栏（作用于左侧 textarea 的选区/光标）─────────
-function mdWrap(before: string, after = before, placeholder = "文字") {
-  const ta = docTa.value;
-  if (!ta) return;
-  const s = ta.selectionStart, e2 = ta.selectionEnd, v = ta.value;
-  const sel = v.slice(s, e2) || placeholder;
-  html.value = v.slice(0, s) + before + sel + after + v.slice(e2);
-  artifacts.markDirty(true);
-  nextTick(() => {
-    ta.focus();
-    ta.setSelectionRange(s + before.length, s + before.length + sel.length);
-  });
-}
-/** 行首前缀开关（标题/引用/列表）：选中多行则逐行处理 */
-function mdPrefix(prefix: string) {
-  const ta = docTa.value;
-  if (!ta) return;
-  const s = ta.selectionStart, e2 = ta.selectionEnd, v = ta.value;
-  const ls = v.lastIndexOf("\n", s - 1) + 1; // 扩到行首
-  const seg = v.slice(ls, e2);
-  const done = seg
-    .split("\n")
-    .map((l) => (l.startsWith(prefix) ? l.slice(prefix.length) : prefix + l))
-    .join("\n");
-  html.value = v.slice(0, ls) + done + v.slice(e2);
-  artifacts.markDirty(true);
-  nextTick(() => {
-    ta.focus();
-    ta.setSelectionRange(ls, ls + done.length);
-  });
-}
-function mdInsertBlock(text: string) {
-  const ta = docTa.value;
-  if (!ta) return;
-  const s = ta.selectionStart, v = ta.value;
-  html.value = v.slice(0, s) + text + v.slice(s);
-  artifacts.markDirty(true);
-  nextTick(() => {
-    ta.focus();
-    ta.setSelectionRange(s + text.length, s + text.length);
-  });
-}
-function mdInsertTable() {
-  mdInsertBlock("\n| 列 1 | 列 2 | 列 3 |\n| --- | --- | --- |\n| 内容 | 内容 | 内容 |\n");
-}
-/** Tab 缩进两空格（否则 Tab 会把焦点带走） */
-function onDocTaKey(e: KeyboardEvent) {
-  if (e.key !== "Tab") return;
-  e.preventDefault();
-  const ta = e.target as HTMLTextAreaElement;
-  const s = ta.selectionStart, e2 = ta.selectionEnd;
-  html.value = ta.value.slice(0, s) + "  " + ta.value.slice(e2);
-  artifacts.markDirty(true);
-  nextTick(() => ta.setSelectionRange(s + 2, s + 2));
-}
-/** 左编辑右预览按比例同步滚动 */
-function onDocTaScroll() {
-  const ta = docTa.value, pv = mdPrevEl.value;
-  if (!ta || !pv) return;
-  const ratio = ta.scrollTop / Math.max(1, ta.scrollHeight - ta.clientHeight);
-  pv.scrollTop = ratio * (pv.scrollHeight - pv.clientHeight);
-}
-
 // ───────── 查找替换（源码 / Markdown / 纯文本）─────────
 function activeTa(): HTMLTextAreaElement | null {
-  return isTextDoc.value ? docTa.value : codeTa.value;
+  return isTextDoc.value ? (textDoc.value?.ta() ?? null) : codeTa.value;
 }
 function openFind() {
   findOpen.value = true;
-  nextTick(() => findInput.value?.focus());
-}
-function findNext() {
-  const ta = activeTa();
-  if (!ta || !findQ.value) return;
-  const v = ta.value;
-  let i = v.indexOf(findQ.value, ta.selectionEnd || 0);
-  if (i < 0) i = v.indexOf(findQ.value); // 到底回绕
-  if (i < 0) return;
-  ta.focus();
-  ta.setSelectionRange(i, i + findQ.value.length);
-}
-function replaceOne() {
-  const ta = activeTa();
-  if (!ta || !findQ.value) return;
-  const s = ta.selectionStart, e2 = ta.selectionEnd;
-  if (ta.value.slice(s, e2) === findQ.value) {
-    html.value = ta.value.slice(0, s) + replQ.value + ta.value.slice(e2);
-    artifacts.markDirty(true);
-    nextTick(() => {
-      ta.setSelectionRange(s + replQ.value.length, s + replQ.value.length);
-      findNext();
-    });
-  } else {
-    findNext(); // 先定位到第一处，再点一次替换
-  }
-}
-function replaceAll() {
-  if (!findQ.value || !findCount.value) return;
-  html.value = html.value.split(findQ.value).join(replQ.value);
-  artifacts.markDirty(true);
-}
-
-// 右侧面板：位置/大小/旋转
-function setGeom(field: "x" | "y" | "w" | "h" | "rot", v: number) {
-  const el = selEl.value;
-  const slide = activeSlide();
-  if (!el || !slide || isNaN(v)) return;
-  const r = el.getBoundingClientRect();
-  const sr = slide.getBoundingClientRect();
-  const t = getTranslate(el);
-  const rot = getRotate(el);
-  if (field === "x") applyTransform(el, t.tx + (v - (r.left - sr.left)), t.ty, rot);
-  else if (field === "y") applyTransform(el, t.tx, t.ty + (v - (r.top - sr.top)), rot);
-  else if (field === "rot") applyTransform(el, t.tx, t.ty, v);
-  else { el.style.boxSizing = "border-box"; el.style[field === "w" ? "width" : "height"] = Math.max(8, v) + "px"; }
-  afterFmt();
-}
-// 右侧面板：段落
-function setPara(field: "lh" | "ls", v: number) {
-  const el = selEl.value;
-  if (!el || isNaN(v)) return;
-  if (field === "lh") el.style.lineHeight = String(v);
-  else el.style.letterSpacing = v + "px";
-  afterFmt();
+  findBar.value?.focusInput();
 }
 
 // ───────── 结构编辑（加页/复制/删页）：改 DOM → 序列化 → 重载 ─────────
@@ -2006,22 +1360,8 @@ function deleteSlide() {
   active.remove();
   reloadFrom(serialize(), Math.max(0, idx - 1));
 }
-// ── 缩略图拖拽换页序 ──
-const thumbDragIdx = ref<number | null>(null);
-const thumbDragOver = ref<number | null>(null);
-function onThumbDragStart(i: number, e: DragEvent) {
-  thumbDragIdx.value = i;
-  if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-}
-function onThumbDragOver(i: number, e: DragEvent) {
-  e.preventDefault();
-  thumbDragOver.value = i;
-}
-function onThumbDrop(i: number) {
-  const from = thumbDragIdx.value;
-  thumbDragIdx.value = null;
-  thumbDragOver.value = null;
-  if (from == null || from === i) return;
+/** 缩略图拖拽换页序（拖拽状态在 ArtifactRail 里，这里做 DOM 重排 + 重载） */
+function reorderSlides(from: number, i: number) {
   const d = doc();
   if (!d) return;
   const secs = Array.from(d.querySelectorAll<HTMLElement>(".slide"));
@@ -2031,27 +1371,11 @@ function onThumbDrop(i: number) {
   else b.before(a);
   reloadFrom(serialize(), i); // onFrameLoad 会落快照，可撤销
 }
-function onThumbDragEnd() {
-  thumbDragIdx.value = null;
-  thumbDragOver.value = null;
-}
 
 // ───────── 序列化（去掉编辑器注入物）─────────
 function serialize(): string {
   const d = doc();
-  if (!d) return html.value;
-  const root = d.documentElement.cloneNode(true) as HTMLElement;
-  root.querySelectorAll("#__ed, #__obj, #__objcss, #__gv, #__gh, #__rb, #__meas").forEach((e) => e.remove());
-  root.querySelectorAll("[contenteditable]").forEach((e) => e.removeAttribute("contenteditable"));
-  root.querySelectorAll(".__hov, .__msel").forEach((e) => {
-    e.classList.remove("__hov", "__msel");
-    if (!e.getAttribute("class")) e.removeAttribute("class");
-  });
-  root.querySelectorAll(".is-active,.is-prev").forEach((e) => {
-    e.classList.remove("is-active", "is-prev");
-    if (!e.getAttribute("class")) e.removeAttribute("class");
-  });
-  return "<!doctype html>\n" + root.outerHTML;
+  return d ? serializeDoc(d) : html.value;
 }
 
 // ───────── 模式切换 ─────────
@@ -2188,6 +1512,7 @@ watch(scale, () => {
 });
 
 // 若外部重新打开了别的文件，刷新工作副本 + 清空历史/查找状态
+// （左栏页签/折叠等局部状态靠 ArtifactRail 的 :key 随文件重挂载复位）
 watch(
   () => artifacts.payload?.path,
   () => {
@@ -2203,12 +1528,44 @@ watch(
     tool.value = "select";
     extraSels.value = [];
     layerRows.value = [];
-    layerCollapsed.value = new Set();
-    railTab.value = "pages";
     pageDesign.value = true;
     panHeld.value = false;
   }
 );
+
+// ── 子组件 api（纯函数打包传下去，状态仍留在父层）──
+const railApi = {
+  doc, goSlide, addSlide, deleteSlide, reorderSlides,
+  selectEl, clearSel, refreshSel,
+  markDirty: () => artifacts.markDirty(true),
+  rebuildThumbs,
+  pushHistory: () => pushHistory(),
+};
+const inspectorApi = {
+  afterFmt, activeSlide, clearSel, fmtDelete,
+  groupSel, ungroupSel, duplicateEl, replaceImage,
+};
+const bubbleApi = {
+  doc,
+  markDirty: () => artifacts.markDirty(true),
+  refreshSel,
+  pushHistory,
+};
+const ctxApi = {
+  copyEl, pasteEl, duplicateEl, cutEl, zStep,
+  groupSel, ungroupSel, lockSel, hideSel, fmtDelete, selectAllEls,
+};
+const findApi = {
+  getTa: activeTa,
+  getHtml: () => html.value,
+  setHtml: (v: string) => { html.value = v; },
+  markDirty: () => artifacts.markDirty(true),
+};
+const figmaDlgApi = {
+  getOutHtml: () => (!isTextDoc.value && mode.value === "visual" ? serialize() : html.value),
+  // 替换画布工作副本（可 Ctrl+Z 回退到 Figma 化之前, Ctrl+S 才真正落盘）
+  applyHtml: (h: string) => reloadFrom(h, null),
+};
 </script>
 
 <template>
@@ -2286,23 +1643,23 @@ watch(
       <button class="ed-exit" title="退出编辑" @click="exit"><X :size="15" /></button>
     </div>
 
-    <!-- Markdown / 纯文本工具条：作用于左侧编辑区选区 -->
+    <!-- Markdown / 纯文本工具条：作用于文档编辑组件左侧编辑区选区 -->
     <div v-if="isTextDoc" class="ed-fmt">
       <template v-if="docKind === 'markdown'">
-        <button class="ed-ic" title="加粗" @click="mdWrap('**')"><Bold :size="14" /></button>
-        <button class="ed-ic" title="斜体" @click="mdWrap('*')"><Italic :size="14" /></button>
-        <button class="ed-ic" title="删除线" @click="mdWrap('~~')"><Strikethrough :size="14" /></button>
-        <button class="ed-ic" title="行内代码" @click="mdWrap('`', '`', '代码')"><Code2 :size="14" /></button>
+        <button class="ed-ic" title="加粗" @click="textDoc?.mdWrap('**')"><Bold :size="14" /></button>
+        <button class="ed-ic" title="斜体" @click="textDoc?.mdWrap('*')"><Italic :size="14" /></button>
+        <button class="ed-ic" title="删除线" @click="textDoc?.mdWrap('~~')"><Strikethrough :size="14" /></button>
+        <button class="ed-ic" title="行内代码" @click="textDoc?.mdWrap('`', '`', '代码')"><Code2 :size="14" /></button>
         <span class="ed-fmt-sep" />
-        <button class="ed-ic" title="一级标题" @click="mdPrefix('# ')"><Heading1 :size="14" /></button>
-        <button class="ed-ic" title="二级标题" @click="mdPrefix('## ')"><Heading2 :size="14" /></button>
-        <button class="ed-ic" title="三级标题" @click="mdPrefix('### ')"><Heading3 :size="14" /></button>
-        <button class="ed-ic" title="引用" @click="mdPrefix('> ')"><TextQuote :size="14" /></button>
-        <button class="ed-ic" title="无序列表" @click="mdPrefix('- ')"><List :size="14" /></button>
-        <button class="ed-ic" title="有序列表" @click="mdPrefix('1. ')"><ListOrdered :size="14" /></button>
+        <button class="ed-ic" title="一级标题" @click="textDoc?.mdPrefix('# ')"><Heading1 :size="14" /></button>
+        <button class="ed-ic" title="二级标题" @click="textDoc?.mdPrefix('## ')"><Heading2 :size="14" /></button>
+        <button class="ed-ic" title="三级标题" @click="textDoc?.mdPrefix('### ')"><Heading3 :size="14" /></button>
+        <button class="ed-ic" title="引用" @click="textDoc?.mdPrefix('> ')"><TextQuote :size="14" /></button>
+        <button class="ed-ic" title="无序列表" @click="textDoc?.mdPrefix('- ')"><List :size="14" /></button>
+        <button class="ed-ic" title="有序列表" @click="textDoc?.mdPrefix('1. ')"><ListOrdered :size="14" /></button>
         <span class="ed-fmt-sep" />
-        <button class="ed-ic" title="插入链接" @click="mdWrap('[', '](https://)', '链接文字')"><Link2 :size="14" /></button>
-        <button class="ed-ic" title="插入表格" @click="mdInsertTable"><Table :size="14" /></button>
+        <button class="ed-ic" title="插入链接" @click="textDoc?.mdWrap('[', '](https://)', '链接文字')"><Link2 :size="14" /></button>
+        <button class="ed-ic" title="插入表格" @click="textDoc?.mdInsertTable()"><Table :size="14" /></button>
         <span class="ed-fmt-sep" />
       </template>
       <button class="ed-ic" title="查找替换 (Ctrl+F)" @click="openFind"><Search :size="14" /></button>
@@ -2310,136 +1667,33 @@ watch(
     </div>
 
     <!-- 查找替换条（源码 / Markdown / 纯文本） -->
-    <div v-if="findOpen && (isTextDoc || mode === 'code')" class="ed-find">
-      <Search :size="13" class="ed-find-ic" />
-      <input
-        ref="findInput"
-        v-model="findQ"
-        class="ed-find-in"
-        placeholder="查找…"
-        @keydown.enter.prevent="findNext"
-        @keydown.esc="findOpen = false"
-      />
-      <span class="ed-find-n">{{ findCount }} 处</span>
-      <input
-        v-model="replQ"
-        class="ed-find-in"
-        placeholder="替换为…"
-        @keydown.enter.prevent="replaceOne"
-        @keydown.esc="findOpen = false"
-      />
-      <button class="ed-find-btn" :disabled="!findCount" @click="findNext">下一个</button>
-      <button class="ed-find-btn" :disabled="!findCount" @click="replaceOne">替换</button>
-      <button class="ed-find-btn" :disabled="!findCount" @click="replaceAll">全部替换</button>
-      <button class="ed-ic" title="关闭" @click="findOpen = false"><X :size="13" /></button>
-    </div>
+    <ArtifactFindBar
+      ref="findBar"
+      :visible="findOpen && (isTextDoc || mode === 'code')"
+      :api="findApi"
+      @close="findOpen = false"
+    />
 
     <input ref="fileInput" type="file" accept="image/*" style="display:none" @change="onImagePicked" />
 
     <!-- 主体 -->
     <div class="ed-body">
       <!-- 左栏：deck = 页面缩略 / 图层树 双页签；网页设计模式 = 图层树（Figma 式） -->
-      <aside v-if="!isTextDoc && mode === 'visual' && (isDeck || pageDesign)" class="ed-rail">
-        <div class="ed-rail-tabs">
-          <button v-if="isDeck" :class="{ on: railTab === 'pages' }" @click="railTab = 'pages'"><LayoutList :size="12" /> 页面</button>
-          <button v-if="isDeck" :class="{ on: railTab === 'layers' }" @click="railTab = 'layers'"><Layers :size="12" /> 图层</button>
-          <span v-if="!isDeck" class="ed-rail-title"><Layers :size="12" /> 图层</span>
-        </div>
-
-        <template v-if="isDeck && railTab === 'pages'">
-          <button
-            v-for="(s, i) in slides"
-            :key="i"
-            class="ed-thumb"
-            :class="{ on: i === cur, 'drag-over': thumbDragOver === i && thumbDragIdx !== i }"
-            :title="s.title + '（可拖拽调整页序）'"
-            draggable="true"
-            @click="goSlide(i)"
-            @dragstart="onThumbDragStart(i, $event)"
-            @dragover="onThumbDragOver(i, $event)"
-            @drop="onThumbDrop(i)"
-            @dragend="onThumbDragEnd"
-          >
-            <span class="ed-thumb-n">{{ i + 1 }}</span>
-            <span class="ed-thumb-prev">
-              <iframe
-                v-if="thumbs[i]"
-                class="ed-thumb-frame"
-                :srcdoc="thumbs[i]"
-                sandbox=""
-                scrolling="no"
-                tabindex="-1"
-                aria-hidden="true"
-              />
-              <span v-else class="ed-thumb-ph">{{ s.title }}</span>
-            </span>
-          </button>
-          <div class="ed-rail-acts">
-            <button class="ed-rail-btn" title="新增一页（空白同款）" @click="addSlide(false)"><Plus :size="13" /> 加页</button>
-            <button class="ed-rail-btn" title="复制当前页" @click="addSlide(true)"><Copy :size="12" /></button>
-            <button class="ed-rail-btn danger" title="删除当前页" :disabled="total <= 1" @click="deleteSlide"><Trash2 :size="12" /></button>
-          </div>
-        </template>
-
-        <div v-else class="ed-layers" @mouseleave="layerHover(null)">
-          <div
-            v-for="n in visibleLayers"
-            :key="n.id"
-            class="ed-layer"
-            :class="{
-              on: allSels.includes(n.el),
-              hidden: n.hidden,
-              'drop-before': layerDropId === n.id && layerDropPos === 'before',
-              'drop-after': layerDropId === n.id && layerDropPos === 'after',
-              'drop-into': layerDropId === n.id && layerDropPos === 'into',
-            }"
-            :style="{ paddingLeft: 6 + n.depth * 13 + 'px' }"
-            draggable="true"
-            @click="layerClick(n, $event)"
-            @mouseenter="layerHover(n)"
-            @dragstart="onLayerDragStart(n, $event)"
-            @dragover="onLayerDragOver(n, $event)"
-            @drop="onLayerDrop()"
-            @dragend="onLayerDragEnd"
-          >
-            <button v-if="n.kids" class="ed-layer-caret" :title="layerCollapsed.has(n.id) ? '展开' : '折叠'" @click.stop="layerToggleCollapse(n)">
-              <ChevronRight v-if="layerCollapsed.has(n.id)" :size="11" /><ChevronDown v-else :size="11" />
-            </button>
-            <span v-else class="ed-layer-caret ph" />
-            <component :is="layerIcon(n.tag)" :size="11" class="ed-layer-ico" />
-            <span class="ed-layer-name" :title="n.tag + ' · ' + n.label">{{ n.label }}</span>
-            <button class="ed-layer-act" :class="{ act: n.locked }" :title="n.locked ? '解锁' : '锁定（画布上不可选中）'" @click.stop="layerToggleLock(n)">
-              <Lock v-if="n.locked" :size="11" /><LockOpen v-else :size="11" />
-            </button>
-            <button class="ed-layer-act" :class="{ act: n.hidden }" :title="n.hidden ? '显示' : '隐藏'" @click.stop="layerToggleEye(n)">
-              <EyeOff v-if="n.hidden" :size="11" /><Eye v-else :size="11" />
-            </button>
-          </div>
-          <div v-if="!visibleLayers.length" class="ed-layers-empty">当前页没有可编辑元素</div>
-        </div>
-      </aside>
+      <ArtifactRail
+        v-if="!isTextDoc && mode === 'visual' && (isDeck || pageDesign)"
+        :key="artifacts.payload?.path ?? ''"
+        :is-deck="isDeck"
+        :slides="slides"
+        :cur="cur"
+        :total="total"
+        :thumbs="thumbs"
+        :layer-rows="layerRows"
+        :all-sels="allSels"
+        :api="railApi"
+      />
 
       <!-- 文档编辑（Markdown / 纯文本）：左源码右实时预览（纯文本只有左栏） -->
-      <template v-if="isTextDoc">
-        <div class="ed-split">
-          <textarea
-            ref="docTa"
-            v-model="html"
-            class="ed-code-area doc"
-            spellcheck="false"
-            :placeholder="docKind === 'markdown' ? '# 在这里写 Markdown，右侧实时预览' : ''"
-            @input="artifacts.markDirty(true)"
-            @keydown="onDocTaKey"
-            @scroll="onDocTaScroll"
-          />
-          <div
-            v-if="docKind === 'markdown'"
-            ref="mdPrevEl"
-            class="ed-md-preview markdown"
-            v-html="mdPreview"
-          />
-        </div>
-      </template>
+      <ArtifactTextDoc v-if="isTextDoc" ref="textDoc" v-model="html" :doc-kind="docKind" />
 
       <!-- 画布区: 滚动画布 + 悬浮工具药丸/提示条（不随内容滚动） -->
       <div v-if="!isTextDoc" v-show="mode === 'visual'" ref="zoneEl" class="ed-canvas-zone">
@@ -2466,47 +1720,7 @@ watch(
           </div>
         </div>
         <!-- 浮动气泡工具栏（现代编辑器式）：选中画布文字时浮现在选区上方 -->
-        <div
-          v-if="bubble"
-          class="ed-bubble"
-          :style="{ left: bubble.x + 'px', top: bubble.y + 'px' }"
-          @mousedown="onFmtBarDown"
-        >
-          <select class="ed-fmt-sel" title="段落格式" @change="execBlock">
-            <option value="" disabled selected>正文</option>
-            <option value="p">正文</option>
-            <option value="h1">标题 1</option>
-            <option value="h2">标题 2</option>
-            <option value="h3">标题 3</option>
-            <option value="blockquote">引用</option>
-          </select>
-          <select class="ed-fmt-sel" title="字号" @change="execFontSize">
-            <option value="" disabled selected>字号</option>
-            <option v-for="s in [12, 14, 16, 18, 20, 24, 28, 32, 40, 48, 64]" :key="s" :value="s">{{ s }}</option>
-          </select>
-          <span class="ed-fmt-sep" />
-          <button class="ed-ic" title="加粗" @click="exec('bold')"><Bold :size="14" /></button>
-          <button class="ed-ic" title="斜体" @click="exec('italic')"><Italic :size="14" /></button>
-          <button class="ed-ic" title="下划线" @click="exec('underline')"><Underline :size="14" /></button>
-          <button class="ed-ic" title="删除线" @click="exec('strikeThrough')"><Strikethrough :size="14" /></button>
-          <label class="ed-fmt-color" title="文字颜色">
-            <Type :size="13" />
-            <input type="color" @input="execColor" />
-          </label>
-          <label class="ed-fmt-color" title="高亮标记">
-            <Highlighter :size="13" />
-            <input type="color" value="#fff59d" @input="execHilite" />
-          </label>
-          <span class="ed-fmt-sep" />
-          <button class="ed-ic" title="左对齐" @click="exec('justifyLeft')"><AlignLeft :size="14" /></button>
-          <button class="ed-ic" title="居中" @click="exec('justifyCenter')"><AlignCenter :size="14" /></button>
-          <button class="ed-ic" title="右对齐" @click="exec('justifyRight')"><AlignRight :size="14" /></button>
-          <span class="ed-fmt-sep" />
-          <button class="ed-ic" title="无序列表" @click="exec('insertUnorderedList')"><List :size="14" /></button>
-          <button class="ed-ic" title="有序列表" @click="exec('insertOrderedList')"><ListOrdered :size="14" /></button>
-          <button class="ed-ic" title="插入链接" @click="execLink"><Link2 :size="14" /></button>
-          <button class="ed-ic" title="清除格式" @click="exec('removeFormat')"><RemoveFormatting :size="14" /></button>
-        </div>
+        <ArtifactBubbleBar v-if="bubble" :bubble="bubble" :api="bubbleApi" />
       </div>
 
       <!-- 底部悬浮工具药丸（Figma UI3 式）: 选择/抓手 + 画文本/矩形/圆/线 + 图片 -->
@@ -2528,29 +1742,16 @@ watch(
       </div>
 
       <!-- 右键上下文菜单（Figma 式） -->
-      <div v-if="ctx" class="ed-ctx" :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }" @pointerdown.stop>
-        <template v-if="selEl">
-          <button @click="ctxDo(copyEl)"><span>复制</span><kbd>Ctrl C</kbd></button>
-          <button :disabled="!elClipboard?.length" @click="ctxDo(pasteEl)"><span>粘贴</span><kbd>Ctrl V</kbd></button>
-          <button @click="ctxDo(duplicateEl)"><span>创建副本</span><kbd>Ctrl D</kbd></button>
-          <button @click="ctxDo(cutEl)"><span>剪切</span><kbd>Ctrl X</kbd></button>
-          <div class="sep" />
-          <button @click="ctxDo(() => zStep(true))"><span>上移一层</span><kbd>]</kbd></button>
-          <button @click="ctxDo(() => zStep(false))"><span>下移一层</span><kbd>[</kbd></button>
-          <div v-if="allSels.length > 1 || canUngroup" class="sep" />
-          <button v-if="allSels.length > 1" @click="ctxDo(groupSel)"><span>编组</span><kbd>Ctrl G</kbd></button>
-          <button v-if="canUngroup" @click="ctxDo(ungroupSel)"><span>取消编组</span><kbd>Ctrl⇧G</kbd></button>
-          <div class="sep" />
-          <button @click="ctxDo(lockSel)"><span>锁定</span></button>
-          <button @click="ctxDo(hideSel)"><span>隐藏</span></button>
-          <div class="sep" />
-          <button class="danger" @click="ctxDo(fmtDelete)"><span>删除</span><kbd>Del</kbd></button>
-        </template>
-        <template v-else>
-          <button :disabled="!elClipboard?.length" @click="ctxDo(pasteEl)"><span>粘贴</span><kbd>Ctrl V</kbd></button>
-          <button @click="ctxDo(selectAllEls)"><span>全选</span><kbd>Ctrl A</kbd></button>
-        </template>
-      </div>
+      <ArtifactCtxMenu
+        v-if="ctx"
+        :ctx="ctx"
+        :has-sel="!!selEl"
+        :multi="allSels.length > 1"
+        :can-ungroup="canUngroup"
+        :can-paste="!!elClipboard?.length"
+        :api="ctxApi"
+        @close="closeCtx"
+      />
       </div>
 
       <!-- 源码 -->
@@ -2565,198 +1766,22 @@ watch(
       </div>
 
       <!-- 右侧属性面板（Figma 式检查器：deck 和网页设计模式都有） -->
-      <aside v-if="!isTextDoc && mode === 'visual' && designOn" class="ed-panel">
-        <!-- 多选：相互对齐 / 等间距分布 / 批量删除 -->
-        <template v-if="extraSels.length">
-          <div class="ep-head"><span>已选 {{ allSels.length }} 个元素</span><button class="ep-x" title="取消选中" @click="clearSel"><X :size="14" /></button></div>
-          <div class="ep-sec">
-            <div class="ep-label">相互对齐</div>
-            <div class="ep-btns">
-              <button title="左对齐" @click="alignSel('left')"><AlignStartVertical :size="15" /></button>
-              <button title="水平居中" @click="alignSel('hcenter')"><AlignCenterVertical :size="15" /></button>
-              <button title="右对齐" @click="alignSel('right')"><AlignEndVertical :size="15" /></button>
-              <button title="顶对齐" @click="alignSel('top')"><AlignStartHorizontal :size="15" /></button>
-              <button title="垂直居中" @click="alignSel('vcenter')"><AlignCenterHorizontal :size="15" /></button>
-              <button title="底对齐" @click="alignSel('bottom')"><AlignEndHorizontal :size="15" /></button>
-            </div>
-          </div>
-          <div class="ep-sec">
-            <div class="ep-label">等间距分布</div>
-            <div class="ep-btns">
-              <button title="水平等距分布（需 ≥3 个）" :disabled="allSels.length < 3" @click="distributeSel('h')"><AlignHorizontalDistributeCenter :size="15" /></button>
-              <button title="垂直等距分布（需 ≥3 个）" :disabled="allSels.length < 3" @click="distributeSel('v')"><AlignVerticalDistributeCenter :size="15" /></button>
-            </div>
-          </div>
-          <div class="ep-acts">
-            <button title="编组 (Ctrl+G)：包成一个整体一起拖" @click="groupSel"><Group :size="14" /> 编组</button>
-            <button class="danger" @click="fmtDelete"><Trash2 :size="14" /> 删除全部</button>
-          </div>
-        </template>
-
-        <template v-else-if="selEl">
-          <div class="ep-head"><span>元素格式</span><button class="ep-x" title="取消选中" @click="clearSel"><X :size="14" /></button></div>
-
-          <!-- Figma 式: 顶部一排对齐图标(对齐到页面) -->
-          <div class="ep-sec ep-align-row">
-            <div class="ep-btns wide">
-              <button title="左对齐到页面" @click="alignToPage('left')"><AlignStartVertical :size="15" /></button>
-              <button title="水平居中" @click="alignToPage('hcenter')"><AlignCenterVertical :size="15" /></button>
-              <button title="右对齐到页面" @click="alignToPage('right')"><AlignEndVertical :size="15" /></button>
-              <button title="顶对齐到页面" @click="alignToPage('top')"><AlignStartHorizontal :size="15" /></button>
-              <button title="垂直居中" @click="alignToPage('vcenter')"><AlignCenterHorizontal :size="15" /></button>
-              <button title="底对齐到页面" @click="alignToPage('bottom')"><AlignEndHorizontal :size="15" /></button>
-            </div>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">位置与大小</div>
-            <div class="ep-grid">
-              <label class="ep-field"><span>W</span><input type="number" :value="selGeom.w" @change="setGeom('w', +($event.target as HTMLInputElement).value)" /></label>
-              <label class="ep-field"><span>H</span><input type="number" :value="selGeom.h" @change="setGeom('h', +($event.target as HTMLInputElement).value)" /></label>
-              <label class="ep-field"><span>X</span><input type="number" :value="selGeom.x" @change="setGeom('x', +($event.target as HTMLInputElement).value)" /></label>
-              <label class="ep-field"><span>Y</span><input type="number" :value="selGeom.y" @change="setGeom('y', +($event.target as HTMLInputElement).value)" /></label>
-              <label class="ep-field"><RotateCw :size="12" /><input type="number" :value="selGeom.rot" @change="setGeom('rot', +($event.target as HTMLInputElement).value)" /></label>
-            </div>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">外观</div>
-            <div class="ep-grid">
-              <label class="ep-field" title="不透明度 %"><span>透明</span><input type="number" min="0" max="100" :value="selEffects.opacity" @change="fmtOpacity(+($event.target as HTMLInputElement).value)" /></label>
-              <label class="ep-field" title="圆角 px"><span>圆角</span><input type="number" :value="selFill.radius" @change="fmtRadius(+($event.target as HTMLInputElement).value)" /></label>
-            </div>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">填充</div>
-            <label class="ep-color">
-              <span>{{ selFill.hasBg ? "背景色" : "无填充" }}</span>
-              <span class="ep-fill-end">
-                <input class="ep-hex" :value="selFill.hasBg ? selFill.bg : ''" placeholder="#RRGGBB" spellcheck="false" @change="fmtFillHex" @click.prevent />
-                <span class="ep-color-sw" :style="{ background: selFill.hasBg ? selFill.bg : 'transparent' }"><input type="color" :value="selFill.bg" @input="fmtFill" /></span>
-                <button v-if="selFill.hasBg" class="ep-clear" title="清除填充" @click.prevent="fmtFillClear"><X :size="12" /></button>
-              </span>
-            </label>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">描边</div>
-            <div class="ep-grid">
-              <label class="ep-color no-border">
-                <span class="ep-color-sw" :style="{ background: selFill.border }"><input type="color" :value="selFill.border" @input="fmtBorderColor" /></span>
-              </label>
-              <label class="ep-field" title="描边宽度 px"><span>宽</span><input type="number" :value="selFill.bw" @change="fmtBorderWidth(+($event.target as HTMLInputElement).value)" /></label>
-            </div>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">阴影</div>
-            <select class="ep-font full" :value="selEffects.shadow" @change="fmtShadow">
-              <option v-for="s in SHADOWS" :key="s.n" :value="s.v">{{ s.n }}</option>
-            </select>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">文字</div>
-            <div class="ep-row">
-              <div class="ep-stepper">
-                <button title="减小字号" @click="fmtFont(-2)"><Minus :size="13" /></button>
-                <span>{{ selStyle.size || "–" }}</span>
-                <button title="增大字号" @click="fmtFont(2)"><Plus :size="13" /></button>
-              </div>
-              <div class="ep-btns">
-                <button :class="{ on: selStyle.bold }" title="加粗" @click="fmtBold"><Bold :size="15" /></button>
-                <button :class="{ on: selStyle.italic }" title="斜体" @click="fmtItalic"><Italic :size="15" /></button>
-                <button :class="{ on: selStyle.underline }" title="下划线" @click="fmtUnderline"><Underline :size="15" /></button>
-              </div>
-            </div>
-            <div class="ep-row">
-              <div class="ep-btns">
-                <button :class="{ on: selStyle.align === 'left' }" title="文字左对齐" @click="fmtAlign('left')"><AlignLeft :size="15" /></button>
-                <button :class="{ on: selStyle.align === 'center' }" title="文字居中" @click="fmtAlign('center')"><AlignCenter :size="15" /></button>
-                <button :class="{ on: selStyle.align === 'right' }" title="文字右对齐" @click="fmtAlign('right')"><AlignRight :size="15" /></button>
-              </div>
-              <span class="ep-color-sw" title="文字颜色" :style="{ background: selStyle.color }"><input type="color" :value="selStyle.color" @input="fmtColor" /></span>
-              <input class="ep-hex" :value="selStyle.color" placeholder="#RRGGBB" spellcheck="false" @change="fmtColorHex" />
-            </div>
-            <label class="ep-color">
-              <span>字体</span>
-              <select class="ep-font" @change="fmtFontFamily">
-                <option value="" disabled selected>选择字体</option>
-                <option v-for="f in FONTS" :key="f.v" :value="f.v">{{ f.n }}</option>
-              </select>
-            </label>
-            <div class="ep-grid">
-              <label class="ep-field"><span>行高</span><input type="number" step="0.1" :value="selPara.lh" @change="setPara('lh', +($event.target as HTMLInputElement).value)" /></label>
-              <label class="ep-field"><span>字距</span><input type="number" :value="selPara.ls" @change="setPara('ls', +($event.target as HTMLInputElement).value)" /></label>
-            </div>
-          </div>
-
-          <div class="ep-sec">
-            <div class="ep-label">层级</div>
-            <div class="ep-row">
-              <button class="ep-layer" @click="fmtFront"><BringToFront :size="14" /> 置顶层</button>
-              <button class="ep-layer" @click="fmtBack"><SendToBack :size="14" /> 置底层</button>
-            </div>
-          </div>
-
-          <div class="ep-acts">
-            <button title="复制一份 (Ctrl+D)" @click="duplicateEl"><Copy :size="14" /> 复制</button>
-            <button v-if="canUngroup" title="取消编组 (Ctrl+Shift+G)" @click="ungroupSel"><Ungroup :size="14" /> 解组</button>
-            <button v-if="selEl.tagName === 'IMG'" title="换一张图（位置尺寸不变）" @click="replaceImage"><ImageIcon :size="14" /> 换图</button>
-            <button class="danger" @click="fmtDelete"><Trash2 :size="14" /> 删除元素</button>
-          </div>
-        </template>
-
-        <div v-else class="ep-empty">
-          <MousePointer2 :size="22" :stroke-width="1.6" />
-          <div class="ep-empty-t">单击画布里的文字或卡片</div>
-          <div class="ep-empty-s">选中后在这里改大小 / 位置 / 字号 / 颜色 / 对齐，<br>拖动移动、拖角缩放，双击改文字；<br>Shift+点选或空白处框选可多选</div>
-        </div>
-      </aside>
+      <ArtifactInspector
+        v-if="!isTextDoc && mode === 'visual' && designOn"
+        :sel-el="selEl"
+        :extra-count="extraSels.length"
+        :all-sels="allSels"
+        :sel-geom="selGeom"
+        :sel-style="selStyle"
+        :sel-para="selPara"
+        :sel-fill="selFill"
+        :sel-effects="selEffects"
+        :api="inspectorApi"
+      />
     </div>
 
     <!-- Figma 往返对话框 -->
-    <div v-if="figmaOpen" class="ed-figma-mask" @click.self="figmaOpen = false">
-      <div class="ed-figma-dlg">
-        <div class="fg-head">
-          <span>接入 Figma 网页端</span>
-          <button class="ep-x" title="关闭" @click="figmaOpen = false"><X :size="14" /></button>
-        </div>
-
-        <div class="fg-step">
-          <div class="fg-t">① 送去 Figma 编辑</div>
-          <p class="fg-p">
-            点「复制页面 HTML」→ 到 Figma 里运行社区插件 <b>html.to.design</b>（免费，网页端可用）→
-            选 <b>Paste HTML</b> 粘贴导入，页面就变成可自由编辑的 Figma 图层。
-          </p>
-          <div class="fg-row">
-            <button class="fg-btn primary" @click="figmaCopyHtml">{{ figmaCopied ? "已复制 ✓" : "复制页面 HTML" }}</button>
-            <button class="fg-btn" @click="openUrl('https://www.figma.com/community/plugin/1159123024924461424')">获取 html.to.design</button>
-            <button class="fg-btn" @click="openUrl('https://www.figma.com')">打开 Figma</button>
-          </div>
-        </div>
-
-        <div class="fg-step">
-          <div class="fg-t">② 改完拉回来</div>
-          <p class="fg-p">
-            粘贴 Figma 文件链接 + 访问令牌（Figma 头像 → Settings → Security → <b>Personal access tokens</b>，
-            只读权限即可，令牌只存在本机）。拉回会把文件里<b>面积最大的画框</b>转成页面替换当前画布——
-            视觉级还原，可 <b>Ctrl+Z</b> 撤销，<b>Ctrl+S</b> 才落盘。
-          </p>
-          <input v-model="figmaLink" class="fg-in" placeholder="https://www.figma.com/design/…" spellcheck="false" />
-          <input v-model="figmaToken" class="fg-in" type="password" placeholder="figd_… 访问令牌（自己的 Figma 账号生成，只存本机）" spellcheck="false" />
-          <div class="fg-row">
-            <button class="fg-btn primary" :disabled="figmaBusy" @click="figmaPullBack">
-              <Loader v-if="figmaBusy" :size="13" class="spin" />
-              {{ figmaBusy ? "拉取并转换中…（图片多会久一点）" : "拉回并替换画布" }}
-            </button>
-            <button class="fg-btn" title="打开 Figma 设置页 → Security → Personal access tokens → Generate new token" @click="openUrl('https://www.figma.com/settings')">去生成令牌</button>
-          </div>
-          <div v-if="figmaErr" class="fg-err">{{ figmaErr }}</div>
-        </div>
-      </div>
-    </div>
+    <ArtifactFigmaDialog v-if="figmaOpen" :api="figmaDlgApi" @close="figmaOpen = false" />
   </div>
 </template>
 
@@ -2799,97 +1824,10 @@ watch(
 .ed-fmt .ed-ic { border: none; background: transparent; }
 .ed-fmt .ed-ic:hover:not(:disabled) { background: var(--bg-soft); }
 .ed-fmt-sep { width: 1px; height: 18px; background: var(--border-soft); margin: 0 5px; flex-shrink: 0; }
-.ed-fmt-sel { border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text-2); font-size: 12px; padding: 4px 5px; cursor: pointer; max-width: 96px; }
-.ed-fmt-sel:hover { border-color: var(--primary); color: var(--primary); }
-.ed-fmt-color { position: relative; width: 30px; height: 28px; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; border-radius: 6px; cursor: pointer; color: var(--text-2); }
-.ed-fmt-color:hover { background: var(--bg-soft); }
-.ed-fmt-color::after { content: ""; width: 14px; height: 3px; border-radius: 2px; background: currentColor; opacity: .5; }
-.ed-fmt-color input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 .ed-fmt-tip { margin-left: auto; font-size: 11px; color: var(--dim); }
-
-/* 查找替换条 */
-.ed-find { display: flex; align-items: center; gap: 6px; padding: 5px 12px; border-bottom: 1px solid var(--border-soft); background: var(--bg-soft); }
-.ed-find-ic { color: var(--muted); flex-shrink: 0; }
-.ed-find-in { width: 170px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 12.5px; outline: none; }
-.ed-find-in:focus { border-color: var(--primary); }
-.ed-find-n { font-size: 11.5px; color: var(--muted); min-width: 34px; font-variant-numeric: tabular-nums; }
-.ed-find-btn { padding: 4px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text-2); font-size: 12px; cursor: pointer; }
-.ed-find-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
-.ed-find-btn:disabled { opacity: .4; cursor: default; }
-
-/* 浮动气泡工具栏：跟随文字选区，玻璃质感 */
-.ed-bubble {
-  position: absolute;
-  z-index: 40;
-  transform: translate(-50%, calc(-100% - 10px));
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 5px 7px;
-  border-radius: 11px;
-  border: 1px solid var(--hairline, var(--border-soft));
-  background: color-mix(in srgb, var(--panel) 86%, transparent);
-  backdrop-filter: blur(14px) saturate(1.3);
-  -webkit-backdrop-filter: blur(14px) saturate(1.3);
-  box-shadow: 0 10px 34px rgba(15, 25, 45, .18), 0 2px 8px rgba(15, 25, 45, .1);
-  animation: ed-bubble-in .14s ease;
-  white-space: nowrap;
-}
-@keyframes ed-bubble-in { from { opacity: 0; transform: translate(-50%, calc(-100% - 4px)); } }
-.ed-bubble .ed-ic { border: none; background: transparent; }
-.ed-bubble .ed-ic:hover:not(:disabled) { background: var(--bg-soft); }
 
 /* 主体 */
 .ed-body { flex: 1; display: flex; min-height: 0; overflow: hidden; }
-
-/* 缩略大纲 / 图层树 左栏 */
-.ed-rail { width: 200px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border-soft); background: var(--panel); padding: 10px; display: flex; flex-direction: column; gap: 9px; }
-/* 左栏页签（deck：页面/图层；网页：图层标题） */
-.ed-rail-tabs { display: flex; gap: 2px; padding: 2px; background: var(--bg-soft); border-radius: 8px; flex-shrink: 0; }
-.ed-rail-tabs button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 5px 0; border: none; background: transparent; color: var(--muted); font-size: 11.5px; font-weight: 600; border-radius: 6px; cursor: pointer; }
-.ed-rail-tabs button.on { background: var(--panel); color: var(--primary); box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
-.ed-rail-title { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 5px 0; color: var(--text-2); font-size: 11.5px; font-weight: 700; }
-
-/* 图层树（Figma 式）：悬停高亮画布元素、点选联动、拖拽重排、眼睛/锁 */
-.ed-layers { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 1px; margin: -2px -4px 0; padding: 2px 4px 0; }
-.ed-layer { position: relative; display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 6px; cursor: pointer; user-select: none; min-height: 26px; }
-.ed-layer:hover { background: var(--bg-soft); }
-.ed-layer.on { background: var(--primary-soft); }
-.ed-layer.on .ed-layer-name { color: var(--primary); font-weight: 600; }
-.ed-layer.hidden .ed-layer-name, .ed-layer.hidden .ed-layer-tag { opacity: .4; }
-.ed-layer.drop-before::before { content: ""; position: absolute; left: 4px; right: 4px; top: -1px; height: 2px; background: var(--primary); border-radius: 2px; }
-.ed-layer.drop-after::after { content: ""; position: absolute; left: 4px; right: 4px; bottom: -1px; height: 2px; background: var(--primary); border-radius: 2px; }
-.ed-layer.drop-into { box-shadow: inset 0 0 0 1.5px var(--primary); }
-.ed-layer-caret { width: 14px; height: 14px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; border: none; background: transparent; color: var(--muted); cursor: pointer; padding: 0; border-radius: 3px; }
-.ed-layer-caret:hover { background: var(--border-soft); }
-.ed-layer-caret.ph { pointer-events: none; }
-.ed-layer-ico { flex-shrink: 0; color: var(--muted); }
-.ed-layer.on .ed-layer-ico { color: var(--primary); }
-.ed-layer-name { flex: 1; min-width: 0; font-size: 11.5px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ed-layer-act { width: 18px; height: 18px; flex-shrink: 0; display: none; align-items: center; justify-content: center; border: none; background: transparent; color: var(--muted); cursor: pointer; padding: 0; border-radius: 4px; }
-.ed-layer:hover .ed-layer-act, .ed-layer-act.act { display: inline-flex; }
-.ed-layer-act:hover { background: var(--border-soft); color: var(--text); }
-.ed-layer-act.act { color: var(--primary); }
-.ed-layers-empty { padding: 20px 10px; text-align: center; font-size: 11.5px; color: var(--dim); }
-.ed-thumb { position: relative; display: flex; align-items: stretch; gap: 9px; padding: 0; border: none; background: transparent; cursor: pointer; }
-/* 序号在缩略左侧 */
-.ed-thumb-n { flex-shrink: 0; width: 18px; align-self: center; text-align: right; color: var(--muted); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.ed-thumb.on .ed-thumb-n { color: var(--primary); }
-/* 真实缩略：16:9 盒子里放等比缩放的 iframe */
-.ed-thumb-prev { position: relative; flex: 1; aspect-ratio: 16 / 9; border-radius: 7px; overflow: hidden; background: #fff; border: 1.5px solid var(--border-soft); box-shadow: var(--shadow-sm, 0 1px 3px rgba(0,0,0,.08)); transition: border-color .15s, box-shadow .15s; }
-.ed-thumb:hover .ed-thumb-prev { border-color: var(--border-strong); }
-.ed-thumb.on .ed-thumb-prev { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
-/* 拖拽换页序：落点页上沿亮一条主色插入线 */
-.ed-thumb.drag-over .ed-thumb-prev { box-shadow: 0 -3px 0 0 var(--primary); }
-.ed-thumb[draggable="true"] { cursor: grab; }
-.ed-thumb-frame { position: absolute; top: 0; left: 0; width: 1280px; height: 720px; border: 0; transform-origin: top left; transform: scale(0.119); pointer-events: none; background: #fff; }
-.ed-thumb-ph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 4px; font-size: 10px; color: var(--muted); text-align: center; }
-.ed-rail-acts { display: flex; gap: 5px; margin-top: 4px; position: sticky; bottom: 0; }
-.ed-rail-btn { display: inline-flex; align-items: center; gap: 4px; padding: 7px 9px; border: 1px dashed var(--border-strong); border-radius: 8px; background: var(--bg); color: var(--text-2); font-size: 12px; cursor: pointer; }
-.ed-rail-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
-.ed-rail-btn:disabled { opacity: .4; cursor: default; }
-.ed-rail-btn.danger:hover:not(:disabled) { border-color: var(--vermilion); color: var(--vermilion); }
-.ed-rail-btn:first-child { flex: 1; border-style: solid; justify-content: center; }
 
 /* 画布区: 滚动画布 + 悬浮工具药丸（不随内容滚动） */
 .ed-canvas-zone { flex: 1; min-width: 0; position: relative; display: flex; }
@@ -2925,24 +1863,6 @@ html[data-theme="aurora-dark"] .ed-stage-wrap { box-shadow: 0 0 0 1px rgba(255, 
 .ed-tools-sep { width: 1px; height: 20px; background: var(--border-soft); margin: 0 4px; }
 
 .ed-hint { position: absolute; left: 50%; bottom: 78px; transform: translateX(-50%); display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; background: color-mix(in srgb, var(--ink, #111) 82%, transparent); color: #fff; font-size: 11.5px; white-space: nowrap; pointer-events: none; transition: opacity .6s ease; z-index: 45; }
-
-/* 右键上下文菜单（Figma 式, 玻璃质感） */
-.ed-ctx { position: absolute; z-index: 60; min-width: 188px; padding: 5px;
-  border-radius: 12px; border: 1px solid var(--hairline, var(--border-soft));
-  background: color-mix(in srgb, var(--panel) 94%, transparent);
-  backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4);
-  box-shadow: 0 14px 44px rgba(15, 25, 45, .22), 0 3px 10px rgba(15, 25, 45, .12);
-  animation: ed-ctx-in .1s ease; }
-@keyframes ed-ctx-in { from { opacity: 0; transform: scale(.97); } }
-.ed-ctx button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 18px;
-  padding: 6px 10px; border: none; background: transparent; color: var(--text); font-size: 12.5px;
-  border-radius: 7px; cursor: pointer; text-align: left; }
-.ed-ctx button:hover:not(:disabled) { background: var(--primary); color: #fff; }
-.ed-ctx button:hover:not(:disabled) kbd { color: rgba(255, 255, 255, .75); }
-.ed-ctx button:disabled { opacity: .4; cursor: default; }
-.ed-ctx button.danger:hover { background: var(--vermilion); }
-.ed-ctx kbd { font-size: 10.5px; color: var(--dim); font-family: inherit; }
-.ed-ctx .sep { height: 1px; margin: 4px 8px; background: var(--border-soft); }
 /* 提示条 9 秒后自动淡出，不长期占画布视野 */
 .ed-hint.off { opacity: 0; }
 
@@ -2950,78 +1870,8 @@ html[data-theme="aurora-dark"] .ed-stage-wrap { box-shadow: 0 0 0 1px rgba(255, 
 .ed-code { flex: 1; min-width: 0; display: flex; }
 .ed-code-area { flex: 1; resize: none; border: none; padding: 16px 18px; background: #0f1115; color: #d6deeb; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; tab-size: 2; outline: none; white-space: pre; overflow: auto; }
 
-/* 文档编辑（Markdown / 纯文本）：左源码右预览 */
-.ed-split { flex: 1; min-width: 0; display: flex; }
-.ed-split .ed-code-area.doc { min-width: 0; white-space: pre-wrap; }
-.ed-md-preview { flex: 1; min-width: 0; overflow: auto; padding: 28px 32px; border-left: 1px solid var(--border-soft); background: var(--panel); color: var(--text); font-size: 14px; line-height: 1.75; }
-
-/* 右侧属性面板（仿豆包格式模块） */
-.ed-panel { width: 232px; flex-shrink: 0; overflow-y: auto; border-left: 1px solid var(--border-soft); background: var(--panel); padding: 0 0 16px; }
-.ep-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); background: var(--panel); font-size: 13px; font-weight: 600; color: var(--text); }
-.ep-x { width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; border: none; background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; }
-.ep-x:hover { background: var(--bg-soft); color: var(--text); }
-.ep-sec { padding: 12px 14px; border-bottom: 1px solid var(--border-soft); display: flex; flex-direction: column; gap: 9px; }
-.ep-label { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
-.ep-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.ep-btns { display: inline-flex; gap: 3px; padding: 2px; background: var(--bg-soft); border-radius: 8px; }
-.ep-btns button { width: 30px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border: none; background: transparent; color: var(--text-2); border-radius: 6px; cursor: pointer; }
-.ep-btns button:hover { background: var(--panel); color: var(--text); }
-.ep-btns button.on { background: var(--primary); color: #fff; }
-.ep-btns button:disabled { opacity: .35; cursor: default; }
-/* Figma 式顶部对齐排: 六钮均分一整行 */
-.ep-btns.wide { width: 100%; }
-.ep-btns.wide button { flex: 1; }
-.ep-align-row { padding-top: 10px; padding-bottom: 10px; }
-.ep-font.full { width: 100%; max-width: none; padding: 6px 8px; }
-.ep-color.no-border { border: none; background: transparent; padding: 4px 0; justify-content: center; }
-.ep-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.ep-field { display: flex; align-items: center; gap: 5px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); }
-.ep-field span { font-size: 11px; color: var(--muted); flex-shrink: 0; min-width: 12px; }
-.ep-field input { width: 100%; min-width: 0; border: none; background: transparent; color: var(--text); font-size: 12.5px; outline: none; font-variant-numeric: tabular-nums; }
-.ep-field input::-webkit-inner-spin-button { opacity: .4; }
-.ep-stepper { display: inline-flex; align-items: center; gap: 2px; padding: 2px; background: var(--bg-soft); border-radius: 8px; }
-.ep-stepper button { width: 26px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border: none; background: transparent; color: var(--text-2); border-radius: 6px; cursor: pointer; }
-.ep-stepper button:hover { background: var(--panel); color: var(--text); }
-.ep-stepper span { min-width: 26px; text-align: center; font-size: 12.5px; color: var(--text); font-variant-numeric: tabular-nums; }
-.ep-color { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); cursor: pointer; font-size: 12.5px; color: var(--text-2); }
-.ep-color-sw { position: relative; width: 30px; height: 18px; border-radius: 5px; border: 1px solid var(--border-strong); overflow: hidden; background-image: linear-gradient(45deg, #ddd 25%, transparent 25%), linear-gradient(-45deg, #ddd 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #ddd 75%), linear-gradient(-45deg, transparent 75%, #ddd 75%); background-size: 8px 8px; background-position: 0 0, 0 4px, 4px -4px, -4px 0; }
-.ep-color-sw input { position: absolute; inset: -4px; width: 200%; height: 200%; opacity: 0; cursor: pointer; }
-.ep-font { max-width: 118px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12px; padding: 3px 4px; cursor: pointer; }
-.ep-fill-end { display: inline-flex; align-items: center; gap: 6px; }
-/* hex 色值输入（Figma 式） */
-.ep-hex { width: 66px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 11.5px; font-family: var(--mono); outline: none; }
-.ep-hex:focus { border-color: var(--primary); }
-.ep-clear { width: 22px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--muted); cursor: pointer; }
-.ep-clear:hover { border-color: var(--vermilion); color: var(--vermilion); }
-.ep-layer { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 7px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-2); font-size: 12px; cursor: pointer; }
-.ep-layer:hover { border-color: var(--primary); color: var(--primary); }
-.ep-acts { display: flex; gap: 8px; padding: 12px 14px; }
-.ep-acts button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-2); font-size: 12.5px; cursor: pointer; }
-.ep-acts button:hover { border-color: var(--primary); color: var(--primary); }
-.ep-acts button.danger:hover { border-color: var(--vermilion); color: var(--vermilion); background: var(--vermilion-soft); }
-.ep-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; height: 100%; padding: 40px 22px; text-align: center; color: var(--muted); }
-.ep-empty-t { font-size: 13px; color: var(--text-2); font-weight: 500; }
-.ep-empty-s { font-size: 11.5px; color: var(--dim); line-height: 1.6; }
-
-/* Figma 往返按钮 + 对话框 */
+/* Figma 往返按钮 */
 .ed-figma { font-weight: 700; letter-spacing: .02em; }
-.ed-figma-mask { position: absolute; inset: 0; z-index: 70; display: flex; align-items: center; justify-content: center; background: rgba(15, 20, 30, .38); backdrop-filter: blur(3px); }
-.ed-figma-dlg { width: 520px; max-width: calc(100% - 48px); max-height: calc(100% - 48px); overflow-y: auto; border-radius: 16px; border: 1px solid var(--hairline, var(--border-soft)); background: var(--panel); box-shadow: 0 24px 80px rgba(10, 18, 35, .35); animation: ed-ctx-in .12s ease; }
-.fg-head { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border-soft); background: var(--panel); font-size: 14px; font-weight: 700; color: var(--text); }
-.fg-step { padding: 14px 18px; border-bottom: 1px solid var(--border-soft); }
-.fg-step:last-child { border-bottom: none; }
-.fg-t { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
-.fg-p { font-size: 12.5px; color: var(--text-2); line-height: 1.7; margin: 0 0 10px; }
-.fg-p b { color: var(--text); }
-.fg-row { display: flex; gap: 8px; flex-wrap: wrap; }
-.fg-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text-2); font-size: 12.5px; cursor: pointer; }
-.fg-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
-.fg-btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
-.fg-btn.primary:hover:not(:disabled) { filter: brightness(1.07); color: #fff; }
-.fg-btn:disabled { opacity: .55; cursor: default; }
-.fg-in { width: 100%; margin-bottom: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font-size: 12.5px; outline: none; }
-.fg-in:focus { border-color: var(--primary); }
-.fg-err { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--vermilion-soft, rgba(220, 80, 50, .1)); color: var(--vermilion); font-size: 12px; line-height: 1.6; }
 
 .spin { animation: ed-spin .9s linear infinite; }
 @keyframes ed-spin { to { transform: rotate(360deg); } }

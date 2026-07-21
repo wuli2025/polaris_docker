@@ -20,6 +20,9 @@ pub mod fsface;
 #[cfg(feature = "collab-host")]
 pub mod http;
 pub mod identity;
+/// 邮箱验证码(注册/找回密码)与 SMTP 发信。随协作路由走,仅 collab-host。
+#[cfg(feature = "collab-host")]
+pub mod mail;
 pub mod lead;
 pub mod lead_ai;
 pub mod mergectl;

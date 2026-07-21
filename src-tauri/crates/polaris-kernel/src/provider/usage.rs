@@ -285,9 +285,15 @@ pub struct ProviderBalance {
 
 /// 余额查询专用 agent:非流式请求-响应, 给 12s 全局 deadline 防认证端点黑洞挂死命令线程。
 fn balance_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(12))
-        .build()
+    // 进程级共享连接池:面板开着时会对同一供应商反复查余额, 免每次重握手。
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(12))
+                .build()
+        })
+        .clone()
 }
 
 /// 取 base_url 的纯主机名(去 scheme 与路径)。

@@ -46,7 +46,10 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(19000);
 struct HostEntry {
     node_id: String,
     local_port: u16,
-    name: String,
+    /// 挂牌账号(gw_register 鉴权后的 user_id)——踢人按它索引。
+    user_id: i64,
+    /// 踢下线信号:发 true 后该主机的本地桥接监听循环立即退出、端口释放。
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 /// hostId(=主机 NodeId 串) → 该主机的本地监听端口 + 元信息。
@@ -158,8 +161,10 @@ async fn healthy_conn(host_node_id: &str) -> Result<Connection, String> {
 
 // ── 注册主机:分配本地端口 + 起 iroh 桥接监听 ──────────────────────────────
 
-/// 注册一个桌面主机。幂等:已注册返回原端口。返回分配的本地回环端口。
-pub async fn register_host(host_node_id: &str, name: &str) -> Result<u16, String> {
+/// 注册一个桌面主机并绑定到账号。幂等:已注册返回原端口。返回分配的本地回环端口。
+/// `user_id` 必须是真实账号(免密/口令合成身份在 HTTP 层已拒);落库 gw_hosts,
+/// 云机重启后 `ensure_registered` 可按库懒恢复。
+pub async fn register_host(host_node_id: &str, name: &str, user_id: i64) -> Result<u16, String> {
     let host_node_id = host_node_id.trim().to_string();
     if host_node_id.is_empty() {
         return Err("主机 NodeId 为空".into());
@@ -169,7 +174,29 @@ pub async fn register_host(host_node_id: &str, name: &str) -> Result<u16, String
         .parse()
         .map_err(|e| format!("主机 NodeId 非法: {e}"))?;
     if let Some(e) = REGISTRY.read().get(&host_node_id) {
+        // 已在线:换了账号来注册同一 NodeId 直接拒(设备表那关也会拒,这里提前挡)。
+        if e.user_id != user_id {
+            return Err("该主机已由其他账号挂牌".into());
+        }
         return Ok(e.local_port);
+    }
+
+    // 落库(权威):重启可恢复、踢人可删。放阻塞池,不钉 reactor。
+    {
+        let node = host_node_id.clone();
+        let nm = name.to_string();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let conn = crate::collab::db::open_db()?;
+            conn.execute(
+                "INSERT INTO gw_hosts(node_id,user_id,name,registered_at) VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(node_id) DO UPDATE SET user_id=excluded.user_id, name=excluded.name",
+                rusqlite::params![node, user_id, nm, crate::collab::db::now()],
+            )
+            .map_err(|e| format!("记录挂牌失败: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("挂牌任务失败: {e}"))??;
     }
 
     // 分配本地端口并绑监听。
@@ -183,21 +210,30 @@ pub async fn register_host(host_node_id: &str, name: &str) -> Result<u16, String
     }
     let (listener, port) = listener.ok_or("网关本地端口耗尽")?;
 
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
     REGISTRY.write().insert(
         host_node_id.clone(),
         HostEntry {
             node_id: host_node_id.clone(),
             local_port: port,
-            name: name.to_string(),
+            user_id,
+            cancel: cancel_tx,
         },
     );
 
-    // 后台:该主机的本地监听 → 每条 TCP 开一条 iroh 双向流。
+    // 后台:该主机的本地监听 → 每条 TCP 开一条 iroh 双向流。踢下线信号到即退出释放端口。
     let host = host_node_id.clone();
     tokio::spawn(async move {
-        eprintln!("[gateway] 主机 {host} 本地桥接监听 127.0.0.1:{port}");
+        eprintln!("[gateway] 主机 {host} 本地桥接监听 127.0.0.1:{port} (user {user_id})");
         loop {
-            let (mut tcp, _peer) = match listener.accept().await {
+            let accepted = tokio::select! {
+                a = listener.accept() => a,
+                _ = cancel_rx.changed() => {
+                    eprintln!("[gateway] 主机 {host} 已被下线,桥接监听退出");
+                    return;
+                }
+            };
+            let (mut tcp, _peer) = match accepted {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("[gateway] 本地 accept 失败: {e}");
@@ -243,6 +279,87 @@ fn local_port_of(host_id: &str) -> Option<u16> {
     REGISTRY.read().get(host_id).map(|e| e.local_port)
 }
 
+/// 把一台主机踢下线:关桥接监听、断 iroh 连接、删挂牌记录。幂等。
+/// 「账号管理里把免密/免鉴的人踢出去」的执行端 —— 吊销设备/停用账号的 HTTP 处理器调这里。
+pub fn unregister_node(node_id: &str) {
+    let entry = REGISTRY.write().remove(node_id.trim());
+    if let Some(e) = entry {
+        let _ = e.cancel.send(true); // 监听循环退出,端口释放
+    }
+    if let Some(c) = CONNS.write().remove(node_id.trim()) {
+        c.close(0u32.into(), b"revoked");
+    }
+    if let Ok(conn) = crate::collab::db::open_db() {
+        let _ = conn.execute(
+            "DELETE FROM gw_hosts WHERE node_id=?1",
+            rusqlite::params![node_id.trim()],
+        );
+    }
+}
+
+/// 踢某账号名下的**全部**挂牌主机(停用账号时调)。
+pub fn unregister_user(user_id: i64) {
+    let nodes: Vec<String> = REGISTRY
+        .read()
+        .values()
+        .filter(|e| e.user_id == user_id)
+        .map(|e| e.node_id.clone())
+        .collect();
+    for n in &nodes {
+        unregister_node(n);
+    }
+    // 库里可能还有未在线恢复的挂牌行,一并删。
+    if let Ok(conn) = crate::collab::db::open_db() {
+        let _ = conn.execute(
+            "DELETE FROM gw_hosts WHERE user_id=?1",
+            rusqlite::params![user_id],
+        );
+    }
+}
+
+/// 反代入口的挂牌解析:内存命中直接用;未命中查 gw_hosts(云机重启后懒恢复),
+/// 且要求设备白名单未吊销 —— 被踢的主机即刻 404/403,不再是「重启前有效」的漏网。
+async fn ensure_registered(host_id: &str) -> Result<Option<u16>, String> {
+    if let Some(p) = local_port_of(host_id) {
+        // 在线也要过吊销闸:吊销后立即下线并拒绝。
+        let hid = host_id.to_string();
+        let allowed = tokio::task::spawn_blocking(move || {
+            crate::collab::identity::is_node_allowed(&hid)
+        })
+        .await
+        .map_err(|e| format!("鉴权任务失败: {e}"))?;
+        if !allowed {
+            unregister_node(host_id);
+            return Ok(None);
+        }
+        return Ok(Some(p));
+    }
+    // 懒恢复:库里有挂牌且设备未吊销 → 重新起桥接。
+    let hid = host_id.to_string();
+    let row = tokio::task::spawn_blocking(move || -> Result<Option<(i64, String)>, String> {
+        if !crate::collab::identity::is_node_allowed(&hid) {
+            return Ok(None);
+        }
+        let conn = crate::collab::db::open_db()?;
+        match conn.query_row(
+            "SELECT user_id,name FROM gw_hosts WHERE node_id=?1",
+            rusqlite::params![hid],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+    .map_err(|e| format!("恢复挂牌任务失败: {e}"))??;
+    let Some((user_id, name)) = row else {
+        return Ok(None);
+    };
+    let port = register_host(host_id, &name, user_id).await?;
+    Ok(Some(port))
+}
+
 // ── HTTP 反代:/h/:id/*rest → 127.0.0.1:port_N/rest ─────────────────────────
 
 /// `GET/POST /h/:hostId/*rest` 反代到该主机的本地桥接端口(经 iroh 到桌面 apihub)。
@@ -257,12 +374,17 @@ pub async fn gateway_proxy(
     ws: Option<WebSocketUpgrade>,
     body: axum::body::Bytes,
 ) -> Response {
-    let Some(port) = local_port_of(&host_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("主机 {host_id} 未注册或已离线"),
-        )
-            .into_response();
+    // 挂牌解析:在线过吊销闸;不在线按库懒恢复(云机重启不丢);被踢/吊销即拒。
+    let port = match ensure_registered(&host_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("主机 {host_id} 未注册、已离线或已被吊销"),
+            )
+                .into_response();
+        }
+        Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
     };
     let qs = build_qs(&q);
     // WebSocket 升级(手机 /ws 流式)→ 走双向 pump 反代;普通 HTTP 走下面 ureq。

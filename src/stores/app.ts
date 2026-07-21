@@ -383,6 +383,9 @@ export const useAppStore = defineStore("app", () => {
     useChatStore().markFresh(c.id);
     currentProjectId.value = projectId;
     if (navigate) setView("chat");
+    // 新建对话即预热: 新对话必然还没有常驻进程, 正是预热收益最大的时刻
+    // (用户接下来要打的就是首条消息)。
+    useChatStore().prewarm(c.id);
     return c;
   }
 
@@ -429,6 +432,9 @@ export const useAppStore = defineStore("app", () => {
     currentProjectId.value = conv.projectId;
     clearUnread(conv.id);
     setView("chat");
+    // 打开对话即预热常驻 claude 进程(fire-and-forget): 用户看历史/打字的几秒里
+    // 把 CLI ~6.4s 自举跑完, 首条消息首响 ~10s → ~3s。失败静默, 不影响任何流程。
+    useChatStore().prewarm(conv.id);
   }
 
   /** 按 id 找对话标题(任务中心给后台 AI 任务起可读名用);找不到返回空串。 */

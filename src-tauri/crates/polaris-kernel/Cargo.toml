@@ -15,6 +15,9 @@ publish = false
 
 [dependencies]
 polaris-runtime = { path = "../polaris-runtime" }
+# 纯逻辑板块: 看门狗计时核(chat 管线用) / 供应商故障滑窗(provider 坞用)
+polaris-watchdog = { path = "../polaris-watchdog" }
+polaris-failover = { path = "../polaris-failover" }
 # 版本与主 crate 逐条对齐(同 workspace 共享编译产物,零增量)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

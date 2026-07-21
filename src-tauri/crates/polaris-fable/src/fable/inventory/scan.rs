@@ -234,7 +234,10 @@ fn reconcile_renames(
                 .entry(c.0)
                 .or_insert_with(|| {
                     let abs = super::reencode_fs_path(&root_base.join(&c.1).to_string_lossy());
-                    let bytes = std::fs::read(&abs).ok()?;
+                    // 僵死挂载上的整文件读无法从外部中断 → 有界旁路读,超死线按「读不到」
+                    // 处理(放弃救援,维持删旧+增新)—— 收尾绝不因一次 IO 吊死。
+                    let bytes =
+                        sched::with_deadline(20, move || std::fs::read(&abs).ok()).flatten()?;
                     if bytes.iter().take(4096).any(|&b| b == 0) {
                         return None; // 伪文本,内容哈希只对文本有意义
                     }
@@ -276,11 +279,98 @@ fn reconcile_renames(
     moved
 }
 
+/// 盘点过程回调的载荷。
+///
+/// 为什么不是裸 `(files, bytes)`:①纯目录段(深树、空目录多)文件数长时间不动,前端数字
+/// 冻住 = 用户以为「卡死」——补上 `dirs` 计数,只要还在钻目录它就一直涨;②收尾段(写清单/
+/// 核对变更/清理消失文件)以前是**零反馈黑箱**,大库上要跑几十秒到几分钟,进度条僵在最后
+/// 一个数字上,正是「全盘扫描卡住了」的头号观感来源 —— `Phase` 把每一段如实播报出去。
+#[derive(Debug, Clone, Copy)]
+pub enum ScanBeat<'a> {
+    /// 计数进度:files/bytes 为累计文件数/字节,dirs 为已处理目录数(含增量跳过的)。
+    Progress { files: u64, bytes: u64, dirs: u64 },
+    /// 收尾阶段文案(可直接展示给用户)。
+    Phase(&'a str),
+}
+
+/// 「真消失」确认里目录的三态判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirState {
+    /// 目录还在 → 其下文件逐个 stat 定生死。
+    Alive,
+    /// **确证**已删除:父链上溯到「最近存活祖先」,它证实这一层 NotFound。其下文件同亡。
+    Gone,
+    /// 掉线 / 权限 / 探测超时 / 根不可达 → 说不清,文件一律保留待下轮对账(绝不误删)。
+    Unknown,
+}
+
+/// 判定一个目录的三态(带跨文件缓存 + 祖先递归)。
+///
+/// 旧判据是二值的「父目录 stat 得到 → 文件才可能被删」:把「目录真被用户删了」与「挂载
+/// 掉线」混为一谈,结果**删掉整个文件夹后其下文件永远留在库里当幽灵**(每轮重扫还要为
+/// 它们反复 stat,库越用越慢)。现在沿父链上溯:最近存活祖先证实这一层 NotFound = 真删除
+/// (Gone);链上任何一环读不到 / 权限 / 超时 = Unknown(保留)。扫描根自身读不到(挂载
+/// 整个掉了)也归 Unknown —— 掉线绝不触发删除,这条底线不变。
+///
+/// 防吊死:远程根(映射 NAS/UNC)的 stat 走 [`sched::with_deadline`] 有界旁路;且共享一个
+/// 超时预算 `timeouts`(≥3 次即认定挂载僵死,后续不再发起任何探测,全部按 Unknown 保留),
+/// 死 NAS 上收尾时长有硬上界,绝不逐目录撞超时把收尾拖成小时级。
+pub(crate) fn dir_state(
+    dir: &Path,
+    scan_root: &Path,
+    remote: bool,
+    deadline_secs: u64,
+    cache: &mut std::collections::HashMap<PathBuf, DirState>,
+    timeouts: &mut u32,
+) -> DirState {
+    if let Some(s) = cache.get(dir) {
+        return *s;
+    }
+    if !dir.starts_with(scan_root) {
+        return DirState::Unknown;
+    }
+    if remote && *timeouts >= 3 {
+        return DirState::Unknown; // 预算用尽:挂载已判僵死,不再探测
+    }
+    let stat = if remote {
+        let p = dir.to_path_buf();
+        match sched::with_deadline(deadline_secs, move || {
+            std::fs::symlink_metadata(&p).map_err(|e| e.kind())
+        }) {
+            Some(r) => r,
+            None => {
+                *timeouts += 1;
+                cache.insert(dir.to_path_buf(), DirState::Unknown);
+                return DirState::Unknown;
+            }
+        }
+    } else {
+        std::fs::symlink_metadata(dir).map_err(|e| e.kind())
+    };
+    let st = match stat {
+        Ok(_) => DirState::Alive,
+        Err(std::io::ErrorKind::NotFound) if dir != scan_root => match dir.parent() {
+            Some(pp) => match dir_state(pp, scan_root, remote, deadline_secs, cache, timeouts) {
+                // 父层存活或同样确证被删 → 这一层的 NotFound 可信,确证删除。
+                DirState::Alive | DirState::Gone => DirState::Gone,
+                DirState::Unknown => DirState::Unknown,
+            },
+            None => DirState::Unknown,
+        },
+        // 根自身 NotFound(挂载掉线)/ 权限 / IO 抖动 → 保留待下轮。
+        Err(_) => DirState::Unknown,
+    };
+    cache.insert(dir.to_path_buf(), st);
+    st
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanSummary {
     pub root: String,
     pub files: u64,
     pub bytes: u64,
+    /// 本轮处理过的目录数(供多根盘点在前端累加出连续的目录计数)。
+    pub dirs: u64,
     pub removed: u64,
     /// 因不可达(挂载掉线 / 权限挂起 / 反复读失败)被看门狗判定卡死、降级后仍失败而**跳过**的目录数。
     /// >0 表示这次盘点没冻死、但有部分目录没扫到(常因 NAS 掉线),如实上报供用户重扫。
@@ -290,7 +380,8 @@ pub struct ScanSummary {
 }
 
 /// 同步扫描一个根(CLI 直接调;桌面/Docker 由 `fable_inventory_start` 包后台线程)。
-/// `progress(files, bytes)` 每 ~5000 个文件回调一次。
+/// `progress` 回调进度([`ScanBeat::Progress`],文件/目录数任一变化就报)与收尾阶段文案
+/// ([`ScanBeat::Phase`])。
 /// `exclude` = 用户在「扫描」步骤里取消勾选的文件夹绝对路径集合,整棵跳过(空集=全盘点)。
 ///
 /// `full=false`(默认/智能增量):重扫时**目录 mtime 命中 dirs 缓存就整棵跳过 read_dir**——
@@ -309,7 +400,7 @@ pub fn scan_root(
     root: &str,
     exclude: &HashSet<String>,
     full: bool,
-    progress: &(dyn Fn(u64, u64) + Sync),
+    progress: &(dyn Fn(ScanBeat) + Sync),
 ) -> Result<ScanSummary, String> {
     // 是否叠加 OS 目录黑名单:整盘扫描 = 重剪;显式文件夹/卷/挂载点 = 只剪永远跳的噪音。
     // 关键:映射进来的 NAS 盘符(Z: 这类)虽是 `X:\` 形状,却**不是**本机系统盘 → 退回轻剪,
@@ -389,6 +480,9 @@ pub fn scan_root(
     let (tx, rx) = mpsc::channel::<Msg>();
     let n_files = Arc::new(AtomicU64::new(0));
     let n_bytes = Arc::new(AtomicU64::new(0));
+    // 已处理目录数(含增量命中缓存整棵跳过的)。文件数长时间不动时它仍在涨,
+    // 前端据此能看出「还在扫,没卡」。
+    let n_dirs = Arc::new(AtomicU64::new(0));
     let workers = worker_count();
     // 工作单元带 mtime(根的未知 → 0,pop 时现 stat);子目录由父 read_dir 顺手带出其 mtime。
     let queue = Arc::new(WorkQueue::new(vec![(root_path.clone(), 0i64)]));
@@ -560,6 +654,7 @@ pub fn scan_root(
         let problematic = problematic.clone();
         let n_files = n_files.clone();
         let n_bytes = n_bytes.clone();
+        let n_dirs = n_dirs.clone();
         let exclude = exclude_arc.clone();
         let root_path = root_arc.clone();
         let dir_mt = dir_mt.clone();
@@ -576,6 +671,7 @@ pub fn scan_root(
                 // 取到新目录:计数 +1,让看门狗看到「有进度」从而重置该 worker 的死线基线
                 // (否则可能拿上一件活儿留下的旧基线,刚接手就被误判卡死)。
                 progressed[i].fetch_add(1, Ordering::Relaxed);
+                n_dirs.fetch_add(1, Ordering::Relaxed);
 
                 // 增量盘点:本目录 mtime 命中缓存 → 整棵跳过 read_dir(及里面所有文件的逐项 stat)。
                 // mtime 由父目录的 read_dir 顺手带出(known_mtime,免再 stat);根 / 跳过路径排进来的
@@ -783,22 +879,30 @@ pub fn scan_root(
     }
 
     // 协调线程(本线程):零忙等地等盘点了结,其间交错上报进度;取消则关闭队列。
-    let mut last = 0u64;
+    // 文件数或**目录数**任一变化都上报 —— 纯目录段(空目录多/深树)文件数不动,
+    // 目录计数仍在涨,前端不再出现「数字冻住像卡死」。
+    let mut last = (0u64, 0u64);
     loop {
         if cancelled() {
             queue.cancel();
             break;
         }
         let f = n_files.load(Ordering::Relaxed);
-        if f != last {
-            progress(f, n_bytes.load(Ordering::Relaxed));
-            last = f;
+        let d = n_dirs.load(Ordering::Relaxed);
+        if (f, d) != last {
+            progress(ScanBeat::Progress {
+                files: f,
+                bytes: n_bytes.load(Ordering::Relaxed),
+                dirs: d,
+            });
+            last = (f, d);
         }
         if queue.wait_until_done_for(Duration::from_millis(200)) {
             break;
         }
     }
     scan_done.store(true, Ordering::SeqCst);
+    progress(ScanBeat::Phase("正在写入文件清单…"));
 
     // 剩余未处理目录:正常为空;若挂载掉线令 worker 卡死而提前了结,这些就是没扫到的目录。
     let skipped_dirs = queue.drain_remaining();
@@ -814,9 +918,11 @@ pub fn scan_root(
 
     let files = n_files.load(Ordering::Relaxed);
     let bytes = n_bytes.load(Ordering::Relaxed);
-    progress(files, bytes); // 收尾再报一次,确保进度条落到最终值
-                            // 本轮被跳过/反复读失败/看门狗放弃的目录绝对路径(用于①报数 ②下面给它们的父目录作废增量缓存,
-                            // 根治「一次读失败就永久漏扫」——见下方自愈逻辑)。
+    let dirs = n_dirs.load(Ordering::Relaxed);
+    // 收尾再报一次,确保进度条落到最终值。
+    progress(ScanBeat::Progress { files, bytes, dirs });
+    // 本轮被跳过/反复读失败/看门狗放弃的目录绝对路径(用于①报数 ②下面给它们的父目录作废增量缓存,
+    // 根治「一次读失败就永久漏扫」——见下方自愈逻辑)。
     let skipped_paths: Vec<String> = {
         let mut v = problematic.lock().unwrap();
         for (d, _mt) in skipped_dirs {
@@ -840,6 +946,7 @@ pub fn scan_root(
         // 文件其实还在。照删就会出现「下次登陆,有些数据从知识库里没了」(连向量/倒排一起抹)。
         // 故改为「逐个 stat 确认真消失」:文件仍在(含读不到、软链)→ 保留;父目录整个
         // 掉线(子树不可达)→ 保留;仅当「父目录还在、文件确实不存在」才判定真删除。
+        progress(ScanBeat::Phase("正在核对文件变更…"));
         let stale: Vec<(i64, String)> = {
             let mut stmt = conn
                 .prepare("SELECT id, relpath FROM files WHERE root_id=?1 AND seen<>?2")
@@ -852,31 +959,68 @@ pub fn scan_root(
             rows.filter_map(|r| r.ok()).collect()
         };
         let root_base = PathBuf::from(&root_canon);
-        let mut gone: Vec<i64> = stale
-            .into_iter()
-            .filter(|(_, rel)| {
-                // relpath 用 '/',Path::join 在 Windows 上也认 '/',无需替换分隔符。
-                // rel 是 decode_fs() 后的显示路径, Unix 上 GBK 名文件的磁盘字节与其
-                // 不同 → 先经 reencode_fs_path 还原真实路径, 否则 stat 恒失败被误删。
-                let abs = super::reencode_fs_path(&root_base.join(rel).to_string_lossy());
-                // Path::exists() 把 EACCES/SMB 认证过期等一切 IO 错误折叠成「不存在」,
-                // 会把只是暂时读不到的文件连 chunks(向量)+lex(倒排)一起误删。
-                // 只认 NotFound 才判「真消失」; 其余错误(权限/网络抖动)一律保留待下轮。
-                let parent_ok = abs
-                    .parent()
-                    .map(|p| std::fs::symlink_metadata(p).is_ok())
-                    .unwrap_or(false);
-                parent_ok
-                    && matches!(
+        // ── 「真消失」确认的硬化(这里以前是收尾卡死的头号现场)──────────────
+        // ① 目录三态按目录**缓存**([`dir_state`]):旧实现对每个 stale 文件都重复 stat 一次
+        //    父目录,十万级 stale = 二十万次串行 stat,本地都要几分钟,NAS 上一次 stat 可挂
+        //    几十秒 → 表现为「进度冻在最后一个数字上,永远不动」。现在一个目录只判一次,
+        //    死子树沿祖先缓存零 stat 短路。
+        // ② 真删除 vs 掉线分得清:整个文件夹被删 → Gone,其下文件同亡(旧判据把这俩混为
+        //    一谈,删掉的文件夹在库里永远留幽灵);挂载掉线/权限/超时 → Unknown,保留待下轮。
+        // ③ 远程根 stat 走有界旁路 + 超时预算(见 [`dir_state`]),死 NAS 上收尾有硬上界。
+        // 全程可取消(以前这段不理会取消,点「停止」也停不下来)。
+        let probe_deadline = probe_secs().max(10);
+        let mut dstate: std::collections::HashMap<PathBuf, DirState> =
+            std::collections::HashMap::new();
+        let mut probe_timeouts = 0u32;
+        let total_stale = stale.len();
+        let mut gone: Vec<i64> = Vec::new();
+        for (i, (id, rel)) in stale.iter().enumerate() {
+            if i % 256 == 0 && cancelled() {
+                return Err("已取消".into());
+            }
+            if i > 0 && i % 5000 == 0 {
+                progress(ScanBeat::Phase(&format!(
+                    "正在核对文件变更… {i}/{total_stale}"
+                )));
+            }
+            // relpath 用 '/',Path::join 在 Windows 上也认 '/',无需替换分隔符。
+            // rel 是 decode_fs() 后的显示路径, Unix 上 GBK 名文件的磁盘字节与其
+            // 不同 → 先经 reencode_fs_path 还原真实路径, 否则 stat 恒失败被误删。
+            let abs = super::reencode_fs_path(&root_base.join(rel).to_string_lossy());
+            let Some(parent) = abs.parent().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            match dir_state(
+                &parent,
+                &root_base,
+                remote,
+                probe_deadline,
+                &mut dstate,
+                &mut probe_timeouts,
+            ) {
+                // 父目录确证被删 → 文件同亡(免逐个 stat)。
+                DirState::Gone => gone.push(*id),
+                // 掉线/权限/超时 → 保留待下轮对账,绝不误删。
+                DirState::Unknown => {}
+                DirState::Alive => {
+                    // Path::exists() 把 EACCES/SMB 认证过期等一切 IO 错误折叠成「不存在」,
+                    // 会把只是暂时读不到的文件连 chunks(向量)+lex(倒排)一起误删。
+                    // 只认 NotFound 才判「真消失」; 其余错误(权限/网络抖动)一律保留待下轮。
+                    if matches!(
                         std::fs::symlink_metadata(&abs),
                         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
-                    )
-            })
-            .map(|(id, _)| id)
-            .collect();
+                    ) {
+                        gone.push(*id);
+                    }
+                }
+            }
+        }
 
         // 重命名/移动免重嵌:把「其实只是被移动了」的文件从 gone 里摘出来(改指新路径、保留向量),
         // 剩下的才是真正消失、该删的。整目录移动因此零重嵌。
+        if !gone.is_empty() {
+            progress(ScanBeat::Phase("正在识别被移动/重命名的文件…"));
+        }
         let moved = reconcile_renames(&conn, root_id, &root_base, gen, &gone);
         if !moved.is_empty() {
             gone.retain(|id| !moved.contains(id));
@@ -884,43 +1028,64 @@ pub fn scan_root(
 
         let mut n = 0u64;
         if !gone.is_empty() {
-            let lex_on = super::lex_available(&conn);
-            // IN 列表分批,避开 SQLite 变量上限(默认 ~999/32766)。
-            for batch in gone.chunks(512) {
-                let ph = vec!["?"; batch.len()].join(",");
-                conn.execute(
-                    &format!("DELETE FROM chunks WHERE file_id IN ({ph})"),
-                    rusqlite::params_from_iter(batch.iter()),
-                )
-                .map_err(|e| e.to_string())?;
-                if lex_on {
-                    // P1-2:消失文件同步清出 FTS 倒排(lex 未编入时跳过)。rowid=file_id。
-                    conn.execute(
-                        &format!("DELETE FROM lex WHERE rowid IN ({ph})"),
-                        rusqlite::params_from_iter(batch.iter()),
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                n += conn
-                    .execute(
-                        &format!("DELETE FROM files WHERE id IN ({ph})"),
-                        rusqlite::params_from_iter(batch.iter()),
-                    )
-                    .map_err(|e| e.to_string())? as u64;
-                // 悬挂去重指针自愈:canonical 被删 → 其副本失去归并目标,清 dup_of 且重置 chunked=0
-                // 让它们重新入索引(下次 dedupe_scan 会在其中重选 canonical);被压制的新版被删 →
-                // 清 superseded_by,让旧版不再被降权。避免删原件后副本/旧版永久隐身。
-                conn.execute(
-                    &format!("UPDATE files SET dup_of=0, chunked=0 WHERE dup_of IN ({ph})"),
-                    rusqlite::params_from_iter(batch.iter()),
-                )
-                .map_err(|e| e.to_string())?;
-                conn.execute(
-                    &format!("UPDATE files SET superseded_by=0 WHERE superseded_by IN ({ph})"),
-                    rusqlite::params_from_iter(batch.iter()),
-                )
-                .map_err(|e| e.to_string())?;
+            if cancelled() {
+                return Err("已取消".into());
             }
+            progress(ScanBeat::Phase("正在清理已消失的文件…"));
+            let lex_on = super::lex_available(&conn);
+            // 旧实现按 512 一批拼 IN 列表,每批还各做两次 UPDATE 全表扫描:十万级删除 =
+            // 数百批 × 全表扫,收尾又慢又黑箱。改为:临时表收齐 id,**单事务**里各表一次
+            // 子查询搞定(chunks 走 idx_chunks_file、superseded_by 走部分索引),一次 fsync。
+            let e2s = |e: rusqlite::Error| e.to_string();
+            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _scan_gone(id INTEGER PRIMARY KEY)",
+                [],
+            )
+            .map_err(e2s)?;
+            conn.execute("DELETE FROM _scan_gone", []).map_err(e2s)?;
+            {
+                let mut ins = conn
+                    .prepare_cached("INSERT OR IGNORE INTO _scan_gone(id) VALUES(?1)")
+                    .map_err(e2s)?;
+                for id in &gone {
+                    ins.execute([id]).map_err(e2s)?;
+                }
+            }
+            conn.execute(
+                "DELETE FROM chunks WHERE file_id IN (SELECT id FROM _scan_gone)",
+                [],
+            )
+            .map_err(e2s)?;
+            if lex_on {
+                // P1-2:消失文件同步清出 FTS 倒排(lex 未编入时跳过)。rowid=file_id。
+                conn.execute(
+                    "DELETE FROM lex WHERE rowid IN (SELECT id FROM _scan_gone)",
+                    [],
+                )
+                .map_err(e2s)?;
+            }
+            n = conn
+                .execute(
+                    "DELETE FROM files WHERE id IN (SELECT id FROM _scan_gone)",
+                    [],
+                )
+                .map_err(e2s)? as u64;
+            // 悬挂去重指针自愈:canonical 被删 → 其副本失去归并目标,清 dup_of 且重置 chunked=0
+            // 让它们重新入索引(下次 dedupe_scan 会在其中重选 canonical);被压制的新版被删 →
+            // 清 superseded_by,让旧版不再被降权。避免删原件后副本/旧版永久隐身。
+            conn.execute(
+                "UPDATE files SET dup_of=0, chunked=0 WHERE dup_of IN (SELECT id FROM _scan_gone)",
+                [],
+            )
+            .map_err(e2s)?;
+            conn.execute(
+                "UPDATE files SET superseded_by=0 WHERE superseded_by IN (SELECT id FROM _scan_gone)",
+                [],
+            )
+            .map_err(e2s)?;
+            conn.execute("DROP TABLE _scan_gone", []).map_err(e2s)?;
+            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         }
         // 目录缓存对账:本轮没确认(seen<>gen)的 dirs 行清掉 —— 目录已消失,或本轮没扫到
         // (挂载掉线 / 反复读失败被跳过)。后者只是丢掉它的「免遍历」资格,下次重扫当成新目录
@@ -949,6 +1114,7 @@ pub fn scan_root(
         root: root_canon,
         files,
         bytes,
+        dirs,
         removed,
         skipped,
         seconds: started.elapsed().as_secs_f64(),

@@ -33,11 +33,17 @@ import {
   Cpu,
   Plus,
   LogOut,
+  Mail,
 } from "@lucide/vue";
 import { invoke, isTauri } from "../../tauri";
 import { useCollabStore } from "../collab/stores/collab";
 import { useAppStore } from "../../stores/app";
-import { collabApi, type AdminDevice, type AuditRow } from "../collab/api";
+import {
+  collabApi,
+  type AdminDevice,
+  type AuditRow,
+  type EmailStatus,
+} from "../collab/api";
 import { toast } from "../../composables/useToast";
 import {
   loadRemoteSources,
@@ -75,7 +81,14 @@ const TABS: { key: Tab; label: string; icon: unknown }[] = [
 ];
 
 // ── 桌面:设为主机后注册/登录管理者(互联板块自足,不用去协作) ──
-const authForm = reactive({ username: "", password: "", displayName: "" });
+const authForm = reactive({
+  username: "",
+  password: "",
+  displayName: "",
+  email: "",
+  code: "",
+  newPassword: "",
+});
 const authBusy = ref(false);
 const authErr = ref("");
 async function doHostAuth() {
@@ -87,6 +100,8 @@ async function doHostAuth() {
   }
   authBusy.value = true;
   try {
+    // 登录前自保:本机主机没跑先拉起、地址漂了先校正(修「无法连接协作主机」)。
+    await collab.ensureLocalHost();
     if (needsBootstrap.value) {
       await collab.bootstrap(u, authForm.password, authForm.displayName.trim() || u, true);
     } else {
@@ -382,7 +397,7 @@ const mineItems = computed<UnifiedCard[]>(() => {
       kind: "disk",
       name: s.name || "远程盘",
       sub: "远程盘 · 127.0.0.1:" + s.port,
-      transport: "p2p", // iroh 打洞直连,如实标 P2P(与拓扑一致)
+      transport: diskTransport(s), // 后端上报的真实链路:打洞直连标 P2P,走中继如实标 relay
       cores: remoteStats.value[s.id]?.cores ?? null,
       stats: remoteStats.value[s.id] ?? null,
       stale: diskStale(s.id),
@@ -393,8 +408,28 @@ const mineItems = computed<UnifiedCard[]>(() => {
   return out;
 });
 
-// ── 账号:登录 / 登出(桌面互联页也能切账号) ──
+// ── 账号:登录 / 注册 / 忘记密码(桌面互联页也能切账号) ──
 const showLogin = ref(false);
+type AuthMode = "login" | "signup" | "reset";
+const authMode = ref<AuthMode>("login");
+/** 邮箱服务状态(主机侧):决定「注册」入口亮不亮、忘记密码能不能自助 */
+const emailInfo = ref<EmailStatus | null>(null);
+async function openLogin() {
+  showLogin.value = true;
+  authMode.value = "login";
+  authErr.value = "";
+  // 先保证本机主机在跑(修「无法连接协作主机」),再探邮箱服务状态。
+  try {
+    await collab.ensureLocalHost();
+  } catch {
+    /* 起不来时登录提交处会给出具体错误 */
+  }
+  try {
+    emailInfo.value = await collabApi.emailStatus();
+  } catch {
+    emailInfo.value = null; // 旧版主机无此端点 → 只显示登录
+  }
+}
 async function doLogout() {
   if (!confirm("登出当前账号?本机主机继续运行,重新登录即可管理。")) return;
   try {
@@ -405,9 +440,175 @@ async function doLogout() {
     toast.error((e as Error).message);
   }
 }
+
+// ── 邮箱验证码:发送(60s 倒计时)/ 注册 / 找回密码 ──
+const codeCooldown = ref(0);
+let codeTimer: ReturnType<typeof setInterval> | null = null;
+async function sendCode() {
+  const email = authForm.email.trim();
+  if (!email) {
+    authErr.value = "请先填写邮箱";
+    return;
+  }
+  if (codeCooldown.value > 0) return;
+  authErr.value = "";
+  try {
+    await collab.ensureLocalHost();
+    await collabApi.sendEmailCode(email, authMode.value === "reset" ? "reset" : "signup");
+    toast.info(`验证码已发往 ${email},10 分钟内有效`);
+    codeCooldown.value = 60;
+    if (codeTimer) clearInterval(codeTimer);
+    codeTimer = setInterval(() => {
+      codeCooldown.value--;
+      if (codeCooldown.value <= 0 && codeTimer) {
+        clearInterval(codeTimer);
+        codeTimer = null;
+      }
+    }, 1000);
+  } catch (e) {
+    authErr.value = (e as Error).message;
+  }
+}
+
+async function doEmailSignup() {
+  authErr.value = "";
+  const u = authForm.username.trim();
+  if (!authForm.email.trim() || !authForm.code.trim()) {
+    authErr.value = "请填写邮箱并获取验证码";
+    return;
+  }
+  if (!u || !authForm.password) {
+    authErr.value = "请填写用户名和密码";
+    return;
+  }
+  authBusy.value = true;
+  try {
+    await collab.ensureLocalHost();
+    await collab.emailSignup({
+      email: authForm.email.trim(),
+      code: authForm.code.trim(),
+      username: u,
+      password: authForm.password,
+      displayName: authForm.displayName.trim() || u,
+    });
+    authForm.password = "";
+    authForm.code = "";
+    toast.info("注册成功,已登录");
+    await refreshAll();
+  } catch (e) {
+    authErr.value = (e as Error).message;
+  } finally {
+    authBusy.value = false;
+  }
+}
+
+async function doEmailReset() {
+  authErr.value = "";
+  if (!authForm.email.trim() || !authForm.code.trim()) {
+    authErr.value = "请填写邮箱并获取验证码";
+    return;
+  }
+  if (!authForm.newPassword) {
+    authErr.value = "请填写新密码(至少 8 位)";
+    return;
+  }
+  authBusy.value = true;
+  try {
+    await collab.ensureLocalHost();
+    const r = await collabApi.emailReset({
+      email: authForm.email.trim(),
+      code: authForm.code.trim(),
+      newPassword: authForm.newPassword,
+    });
+    authForm.code = "";
+    authForm.newPassword = "";
+    if (r.username) authForm.username = r.username;
+    authMode.value = "login";
+    toast.info(`密码已重置${r.username ? `,请用「${r.username}」登录` : ",请重新登录"}`);
+  } catch (e) {
+    authErr.value = (e as Error).message;
+  } finally {
+    authBusy.value = false;
+  }
+}
+
 async function submitLogin() {
-  await doHostAuth();
+  if (authMode.value === "signup") {
+    await doEmailSignup();
+  } else if (authMode.value === "reset") {
+    await doEmailReset();
+    return; // 重置成功后回到登录 tab,让用户用新密码登录
+  } else {
+    await doHostAuth();
+  }
   if (!authErr.value) showLogin.value = false;
+}
+
+// ── owner:邮箱服务设置(SMTP 发信,注册/找回密码的邮件从这里发出) ──
+const showMailCfg = ref(false);
+const mailCfg = reactive({
+  host: "smtp.qq.com",
+  port: 465,
+  user: "",
+  pass: "",
+  from: "",
+  signupOpen: true,
+  passSet: false,
+  testTo: "",
+});
+const mailCfgBusy = ref(false);
+const mailCfgErr = ref("");
+async function openMailCfg() {
+  showMailCfg.value = true;
+  mailCfgErr.value = "";
+  mailCfg.pass = "";
+  try {
+    const c = await collabApi.adminEmailConfig();
+    mailCfg.host = c.host || "smtp.qq.com";
+    mailCfg.port = c.port || 465;
+    mailCfg.user = c.user;
+    mailCfg.from = c.from;
+    mailCfg.signupOpen = c.signupOpen;
+    mailCfg.passSet = c.passSet;
+  } catch (e) {
+    mailCfgErr.value = (e as Error).message;
+  }
+}
+async function saveMailCfg() {
+  mailCfgErr.value = "";
+  if (!mailCfg.user.trim()) {
+    mailCfgErr.value = "请填发信邮箱(如 1799820934@qq.com)";
+    return;
+  }
+  if (!mailCfg.passSet && !mailCfg.pass.trim()) {
+    mailCfgErr.value = "请填 SMTP 授权码(QQ 邮箱 → 设置 → 账号 → 开启SMTP服务领取)";
+    return;
+  }
+  mailCfgBusy.value = true;
+  try {
+    await collabApi.adminEmailConfigSet({
+      host: mailCfg.host.trim() || "smtp.qq.com",
+      port: Number(mailCfg.port) || 465,
+      user: mailCfg.user.trim(),
+      pass: mailCfg.pass,
+      from: mailCfg.from.trim(),
+      signupOpen: mailCfg.signupOpen,
+      testTo: mailCfg.testTo.trim() || undefined,
+    });
+    mailCfg.passSet = true;
+    mailCfg.pass = "";
+    toast.info(
+      mailCfg.testTo.trim()
+        ? "已保存,测试邮件已发出 —— 去收件箱确认"
+        : "邮箱服务已保存,注册/找回密码即刻可用"
+    );
+    showMailCfg.value = false;
+    emailInfo.value = await collabApi.emailStatus().catch(() => emailInfo.value);
+  } catch (e) {
+    mailCfgErr.value = (e as Error).message;
+  } finally {
+    mailCfgBusy.value = false;
+  }
 }
 /** 使用盘:带着目标远程源直接跳文件中心的远程浏览(FileCenter onMounted 接棒)。 */
 function browseDisk(s: RemoteSource) {
@@ -465,6 +666,26 @@ async function pollRemoteStats() {
 /** 盘实况是否过期(>40s 没拉到新帧,多半在隧道重连)。 */
 function diskStale(id: string): boolean {
   return !!remoteStats.value[id] && Date.now() - (remoteStatsAt.value[id] ?? 0) > 40_000;
+}
+
+// ── 隧道真实链路:后端 collab_tunnel_status.tunnels 逐条给出 direct(打洞直连)/relay(中继) ──
+const tunnelByPort = ref<Record<number, { state: string; path: string }>>({});
+async function pollTunnelPaths() {
+  if (!isTauri) return;
+  try {
+    const s = await invoke<{ tunnels?: { port: number; state: string; path: string }[] }>(
+      "collab_tunnel_status"
+    );
+    const map: Record<number, { state: string; path: string }> = {};
+    for (const t of s?.tunnels ?? []) map[t.port] = { state: t.state, path: t.path };
+    tunnelByPort.value = map;
+  } catch {
+    /* 状态拉不到不影响功能,徽标保持上一帧 */
+  }
+}
+/** 远程盘链路徽标:中继兜底如实标 relay,其余(直连/建立中)标 p2p。 */
+function diskTransport(s: RemoteSource): Transport {
+  return tunnelByPort.value[s.port]?.path === "relay" ? "relay" : "p2p";
 }
 
 // ── 正在发生:audit 活动流(接入/上报/吊销/账号事件,主机留痕) ──
@@ -567,14 +788,14 @@ const topoEntities = computed<TopoEntity[]>(() => {
     nodeId: d.node_id || "",
     t: devTransport(d),
   }));
-  // NAS/远程盘走的就是 iroh 打洞直连 → 链路如实标 P2P(蓝),不再单列「远程盘」色。
+  // NAS/远程盘链路按后端上报如实标:打洞直连=P2P(蓝),走中继=relay,不再写死。
   const disks: TopoEntity[] = remotes.value.map((s) => ({
     kind: "disk",
     name: s.name || "远程盘",
     emoji: "🗄",
     revoked: false,
     nodeId: s.nodeId || "",
-    t: "p2p",
+    t: diskTransport(s),
   }));
   return [...devs, ...disks];
 });
@@ -644,8 +865,10 @@ async function connectRemote() {
 }
 function forgetRemote(s: RemoteSource) {
   if (!confirm(`断开并移除「${s.name}」?`)) return;
+  // 真断隧道:不然孤儿隧道在后台对着已移除的主机永远重连(占端口+空耗流量)。
+  if (isTauri) invoke("collab_tunnel_disconnect", { listenPort: s.port }).catch(() => {});
   remotes.value = removeRemoteSource(s.id);
-  toast.info("已移除远程源");
+  toast.info("已断开并移除远程源");
 }
 
 async function refreshAll() {
@@ -676,17 +899,22 @@ onMounted(async () => {
   await autoReconnectRemotes();
   await sampleLocal();
   pollRemoteStats(); // 首屏就拉一次 NAS/远程盘实况(它们在「我的设备」里)
+  pollTunnelPaths(); // 首屏也拉一次隧道链路,星图别先画个写死的 P2P
   // 本机仪表每 4s 跳一帧。盘实况:启动后前 ~40s 每 4s 密集试(iroh 握手要几秒,
   // 首拉大概率没通,别让用户等 12s 才看到数字),之后回落到每 12s 一次。
   let tick = 0;
   let warmup = 10; // 前 10 拍(40s)密集拉
   statTimer = setInterval(() => {
+    // 窗口最小化/切后台时整拍跳过:本机采样+远程 invoke 全省(回前台下一拍即恢复,
+    // 最多迟 4s,仪表盘场景无感)。warmup 拍也不消耗,断网启动的用户回来仍享密集试。
+    if (document.hidden) return;
     sampleLocal();
     tick++;
     const due = warmup > 0 ? true : tick % 3 === 0;
     if (warmup > 0) warmup--;
-    if (due && tab.value === "devices") {
+    if (due && (tab.value === "devices" || tab.value === "topo")) {
       pollRemoteStats(); // 盘实况(任何分区都拉:mine 默认显示它们)
+      pollTunnelPaths(); // 隧道真实链路(直连/中继),卡片与星图共用
       if (tick % 3 === 0) {
         if (devFilter.value === "mine") loadDevices(true);
         else if (devFilter.value === "activity") loadAudit(true); // 停在活动页也持续刷新(codex #7)
@@ -704,6 +932,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   if (statTimer) clearInterval(statTimer);
+  if (codeTimer) clearInterval(codeTimer);
 });
 </script>
 
@@ -866,9 +1095,10 @@ onUnmounted(() => {
           <div class="rail-acct">
             <template v-if="authed">
               <span class="ra-role">{{ owner ? "owner · 全权" : (collab.user?.role || "成员") }}</span>
+              <button v-if="owner" class="ra-btn" title="配置 SMTP,开通邮箱注册/找回密码" @click="openMailCfg"><Mail :size="13" /> 邮箱服务</button>
               <button class="ra-btn" @click="doLogout"><LogOut :size="13" /> 登出</button>
             </template>
-            <button v-else class="ra-btn pri" @click="showLogin = true">登录 / 注册账号</button>
+            <button v-else class="ra-btn pri" @click="openLogin">登录 / 注册账号</button>
           </div>
 
           <nav class="rail-nav">
@@ -1097,25 +1327,120 @@ onUnmounted(() => {
       </template>
     </div>
 
-    <!-- 登录 / 注册账号弹层(桌面互联页切账号) -->
+    <!-- 登录 / 注册 / 忘记密码 弹层(桌面互联页切账号) -->
     <Teleport to="body">
       <div v-if="showLogin" class="login-mask" @click.self="showLogin = false">
         <div class="glass login-box">
           <div class="lb-head">
             <span class="lb-av" v-html="allianceAvatar"></span>
             <div>
-              <div class="lb-title">{{ needsBootstrap ? "创建 owner 账号" : "登录账号" }}</div>
-              <div class="lb-sub">{{ needsBootstrap ? "本机还没账号,建一个 owner" : "登录后管理设备联盟" }}</div>
+              <div class="lb-title">{{ needsBootstrap ? "创建 owner 账号"
+                : authMode === "signup" ? "注册账号"
+                : authMode === "reset" ? "找回密码" : "登录账号" }}</div>
+              <div class="lb-sub">{{ needsBootstrap ? "本机还没账号,建一个 owner"
+                : authMode === "signup" ? "邮箱验证注册,注册即登录"
+                : authMode === "reset" ? "验证码发到绑定邮箱,重设密码" : "登录后管理设备联盟" }}</div>
             </div>
             <button class="icobtn" @click="showLogin = false">✕</button>
           </div>
-          <input v-model="authForm.username" class="af-inp" placeholder="用户名" autocapitalize="off" />
-          <input v-model="authForm.password" type="password" class="af-inp" placeholder="密码" @keydown.enter="submitLogin" />
-          <input v-if="needsBootstrap" v-model="authForm.displayName" class="af-inp" placeholder="昵称(可选)" />
+
+          <!-- 首建 owner:保持原单表单 -->
+          <template v-if="needsBootstrap">
+            <input v-model="authForm.username" class="af-inp" placeholder="用户名" autocapitalize="off" />
+            <input v-model="authForm.password" type="password" class="af-inp" placeholder="密码(至少 8 位)" @keydown.enter="submitLogin" />
+            <input v-model="authForm.displayName" class="af-inp" placeholder="昵称(可选)" />
+          </template>
+
+          <template v-else>
+            <!-- 登录 / 注册 / 忘记密码 三 tab -->
+            <div class="lb-tabs">
+              <button class="lb-tab" :class="{ on: authMode === 'login' }" @click="authMode = 'login'; authErr = ''">登录</button>
+              <button class="lb-tab" :class="{ on: authMode === 'signup' }" @click="authMode = 'signup'; authErr = ''">注册</button>
+              <button class="lb-tab" :class="{ on: authMode === 'reset' }" @click="authMode = 'reset'; authErr = ''">忘记密码</button>
+            </div>
+
+            <template v-if="authMode === 'login'">
+              <input v-model="authForm.username" class="af-inp" placeholder="用户名" autocapitalize="off" />
+              <input v-model="authForm.password" type="password" class="af-inp" placeholder="密码" @keydown.enter="submitLogin" />
+            </template>
+
+            <template v-else-if="authMode === 'signup'">
+              <template v-if="emailInfo?.signupOpen">
+                <div class="lb-code-row">
+                  <input v-model="authForm.email" class="af-inp" placeholder="邮箱(如 xxx@qq.com)" autocapitalize="off" />
+                  <button class="pill code-btn" :disabled="codeCooldown > 0" @click="sendCode">
+                    {{ codeCooldown > 0 ? `${codeCooldown}s` : "发验证码" }}
+                  </button>
+                </div>
+                <input v-model="authForm.code" class="af-inp" placeholder="邮箱验证码(6 位)" inputmode="numeric" />
+                <input v-model="authForm.username" class="af-inp" placeholder="用户名(3-32 位字母数字)" autocapitalize="off" />
+                <input v-model="authForm.password" type="password" class="af-inp" placeholder="密码(至少 8 位)" @keydown.enter="submitLogin" />
+                <input v-model="authForm.displayName" class="af-inp" placeholder="昵称(可选)" />
+              </template>
+              <p v-else class="lb-hint">
+                {{ emailInfo && emailInfo.configured
+                  ? "管理员已关闭邮箱自助注册 —— 请找管理员要一张邀请票据入伙。"
+                  : "主机还没配置邮箱服务:管理员登录后点侧栏「邮箱服务」,填 QQ 邮箱 SMTP 授权码即可开通注册与找回密码。" }}
+              </p>
+            </template>
+
+            <template v-else>
+              <template v-if="emailInfo?.configured">
+                <div class="lb-code-row">
+                  <input v-model="authForm.email" class="af-inp" placeholder="注册时绑定的邮箱" autocapitalize="off" />
+                  <button class="pill code-btn" :disabled="codeCooldown > 0" @click="sendCode">
+                    {{ codeCooldown > 0 ? `${codeCooldown}s` : "发验证码" }}
+                  </button>
+                </div>
+                <input v-model="authForm.code" class="af-inp" placeholder="邮箱验证码(6 位)" inputmode="numeric" />
+                <input v-model="authForm.newPassword" type="password" class="af-inp" placeholder="新密码(至少 8 位)" @keydown.enter="submitLogin" />
+              </template>
+              <p v-else class="lb-hint">主机还没配置邮箱服务,暂不能自助找回 —— 请联系管理员重置密码。</p>
+            </template>
+          </template>
+
           <p v-if="authErr" class="lb-err">{{ authErr }}</p>
-          <button class="cta full" :disabled="authBusy" @click="submitLogin">
+          <button
+            v-if="needsBootstrap || authMode === 'login' || (authMode === 'signup' && emailInfo?.signupOpen) || (authMode === 'reset' && emailInfo?.configured)"
+            class="cta full" :disabled="authBusy" @click="submitLogin">
             <LoaderCircle v-if="authBusy" :size="15" class="spin" />
-            {{ needsBootstrap ? "创建并登录" : "登录" }}
+            {{ needsBootstrap ? "创建并登录"
+              : authMode === "signup" ? "注册并登录"
+              : authMode === "reset" ? "重设密码" : "登录" }}
+          </button>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- owner:邮箱服务设置(SMTP)弹层 -->
+    <Teleport to="body">
+      <div v-if="showMailCfg" class="login-mask" @click.self="showMailCfg = false">
+        <div class="glass login-box mail-box">
+          <div class="lb-head">
+            <Mail :size="22" style="flex:none" />
+            <div>
+              <div class="lb-title">邮箱服务设置</div>
+              <div class="lb-sub">注册 / 找回密码的验证码邮件从这个邮箱发出</div>
+            </div>
+            <button class="icobtn" @click="showMailCfg = false">✕</button>
+          </div>
+          <div class="lb-code-row">
+            <input v-model="mailCfg.host" class="af-inp" placeholder="SMTP 服务器(smtp.qq.com)" />
+            <input v-model.number="mailCfg.port" class="af-inp port-inp" placeholder="465" inputmode="numeric" />
+          </div>
+          <input v-model="mailCfg.user" class="af-inp" placeholder="发信邮箱(如 1799820934@qq.com)" autocapitalize="off" />
+          <input v-model="mailCfg.pass" type="password" class="af-inp"
+            :placeholder="mailCfg.passSet ? 'SMTP 授权码(已配置,留空不改)' : 'SMTP 授权码(QQ邮箱→设置→账号→开启SMTP领取)'" />
+          <input v-model="mailCfg.from" class="af-inp" placeholder="发件人地址(可选,默认同发信邮箱)" autocapitalize="off" />
+          <label class="lb-check">
+            <input v-model="mailCfg.signupOpen" type="checkbox" /> 开放邮箱自助注册(关掉则只能凭邀请票据入伙)
+          </label>
+          <input v-model="mailCfg.testTo" class="af-inp" placeholder="测试收件邮箱(可选,保存时发一封测试信)" autocapitalize="off" />
+          <p class="lb-hint">QQ 邮箱的「授权码」不是 QQ 密码:网页版 QQ 邮箱 → 设置 → 账号 → 「POP3/IMAP/SMTP 服务」开启后按提示短信验证领取。</p>
+          <p v-if="mailCfgErr" class="lb-err">{{ mailCfgErr }}</p>
+          <button class="cta full" :disabled="mailCfgBusy" @click="saveMailCfg">
+            <LoaderCircle v-if="mailCfgBusy" :size="15" class="spin" />
+            保存{{ mailCfg.testTo.trim() ? "并发测试邮件" : "" }}
           </button>
         </div>
       </div>
@@ -1381,6 +1706,17 @@ onUnmounted(() => {
 .lb-head .icobtn { margin-left: auto; }
 .lb-err { color: var(--vermilion); font-size: 12px; margin: 0; }
 .cta.full { width: 100%; }
+/* 登录/注册/忘记密码 三 tab */
+.lb-tabs { display: flex; gap: 4px; padding: 3px; border-radius: 11px; background: color-mix(in srgb, var(--text-1) 6%, transparent); }
+.lb-tab { flex: 1; padding: 7px 0; border: none; border-radius: 9px; background: transparent; color: var(--muted); font-size: 12.5px; font-weight: 600; cursor: pointer; transition: all .15s; }
+.lb-tab.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+.lb-code-row { display: flex; gap: 8px; }
+.lb-code-row .af-inp { flex: 1; min-width: 0; }
+.code-btn { flex: none; white-space: nowrap; align-self: stretch; border-radius: 10px; }
+.lb-hint { font-size: 12px; color: var(--muted); line-height: 1.6; margin: 2px 0; }
+.lb-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); cursor: pointer; user-select: none; }
+.mail-box { width: min(420px, 94vw); }
+.port-inp { flex: none !important; width: 84px; }
 @media (max-width: 720px) {
   .devices-tab { flex-direction: column; }
   .dev-rail { width: 100%; position: static; }

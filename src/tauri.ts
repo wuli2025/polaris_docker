@@ -1005,6 +1005,24 @@ export const chat = {
   send: (args: ChatSendArgs) =>
     invoke<string>("chat_send", { args: args as unknown as Record<string, unknown> }),
   cancel: (reqId: string) => invoke<void>("chat_cancel", { reqId }),
+  /**
+   * 预热常驻 claude 进程(fire-and-forget): 用户打开对话/开始打字时提前 spawn,
+   * 把 CLI ~6.4s 自举挪进打字期间, 首条消息首响 ~10s → ~3s。
+   * 仅 Tauri 桌面(常驻池在本机内核里, web/Docker 壳未登记此命令); 任何失败吞掉 ——
+   * 预热失败不影响真发送(后端有完整重建路径), 不值得打扰用户。
+   */
+  prewarm: (args: {
+    conversationId: string;
+    permissionMode?: PermissionMode;
+    workMode?: string;
+    providerId?: string;
+    dynamicWorkflow?: boolean;
+  }) => {
+    if (!isTauri) return;
+    void invoke<void>("chat_prewarm", {
+      args: args as unknown as Record<string, unknown>,
+    }).catch(() => {});
+  },
   /** 读取分批构建清单 polaris.build.json（分批长任务的断点/进度凭据）。不存在返回 null。 */
   buildManifest: (conversationId: string | undefined) =>
     invoke<BuildManifest | null>("chat_build_manifest", {
@@ -1511,7 +1529,9 @@ export interface ProviderView {
   category: string; // official | cn_official | aggregator | third_party | cloud_provider | custom
   websiteUrl: string;
   color: string;
-  kind: string; // official | key | codex | copilot | custom
+  kind: string; // official | key | codex | openai | copilot | custom
+  /** 上游协议: "" = Anthropic 兼容(直连) | "openai" = OpenAI 协议(经本地路由转发) | "chatgpt" = ChatGPT 订阅(codex) */
+  protocol: string;
   isPreset: boolean;
   hasKey: boolean;
   authToken: string;
@@ -1523,6 +1543,8 @@ export interface ProviderListResult {
   currentId: string;
   /** true = 联动(切换写 ~/.claude/settings.json, 终端 CLI 跟着变); false = 隔离(仅 Polaris 内生效) */
   linkGlobal: boolean;
+  /** 本地路由总开关(cc-switch 式): true = 所有供应商统一经 127.0.0.1 本地路由转发, 改 Key 即刻生效 */
+  routeLocal: boolean;
 }
 export interface ProviderSaveInput {
   id?: string;
@@ -1530,6 +1552,8 @@ export interface ProviderSaveInput {
   note?: string;
   websiteUrl?: string;
   tokenField?: string;
+  /** ""/省略 = Anthropic 兼容(直连); "openai" = OpenAI 协议(经本地路由转发) */
+  protocol?: string;
   /** 完整 settings_config（env 含 base_url + token + 开关） */
   settingsConfig: any;
 }
@@ -1570,6 +1594,7 @@ export interface ProviderBalance {
   /** 控制台 / 官网链接(可空) */
   consoleUrl: string;
 }
+
 // ── 生图供应商坞(独立表, 与上面的聊天供应商无关) ──
 /** 请求/响应形状: minimax 吃 aspect_ratio→data.image_urls[0]; openai 系吃 size→data[0].url|b64_json */
 export type ImageFlavor = "minimax" | "openai";
@@ -1665,6 +1690,9 @@ export const provider = {
   switch: (id: string) => invoke<string>("provider_switch", { id }),
   setLinkMode: (link: boolean) =>
     invoke<boolean>("provider_set_link_mode", { link }),
+  /** 本地路由总开关(cc-switch 式代理模式); 开关立即对当前供应商重新生效 */
+  setRouteMode: (route: boolean) =>
+    invoke<boolean>("provider_set_route_mode", { route }),
   save: (input: ProviderSaveInput) =>
     invoke<string>("provider_save", { input }),
   delete: (id: string) => invoke<void>("provider_delete", { id }),
@@ -1672,7 +1700,9 @@ export const provider = {
   /** 查询某供应商套餐额度 / 实时余额(各家接口不同, 后端逐家适配 + 优雅降级) */
   balance: (id: string) => invoke<ProviderBalance>("provider_balance", { id }),
   codexStatus: () => invoke<CodexStatus>("codex_status"),
-  codexStartLogin: () => invoke<CodexDeviceLogin>("codex_start_login"),
+  // forceDevice=true → 「网站 + 效验码」(device code, 同 cc-switch);false → 桌面回环一键
+  codexStartLogin: (forceDevice = false) =>
+    invoke<CodexDeviceLogin>("codex_start_login", { forceDevice }),
   codexPollLogin: (deviceCode: string, userCode: string) =>
     invoke<CodexPollResult>("codex_poll_login", { deviceCode, userCode }),
   /** 回环一键授权(auto 模式)的进度轮询 / 取消 */
@@ -1689,6 +1719,7 @@ export const provider = {
   claudeLoginPoll: () => invoke<LoginPollResult>("claude_login_poll"),
   claudeLoginCancel: () => invoke<void>("claude_login_cancel"),
 };
+
 /**
  * 生图供应商坞 —— **独立于上面那张聊天表**。
  * 后端是另一张表(provider/image_store.rs), 理由见其文件头: 聊天表的 switch/detect 会把
@@ -2052,7 +2083,9 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
       ];
     case "provider_list": {
       const mk = (id: string, name: string, baseUrl: string, category: string, color: string, kind: string, hasKey: boolean, authToken = "") => ({
-        id, name, note: "", baseUrl, tokenField: "ANTHROPIC_AUTH_TOKEN", category, websiteUrl: baseUrl, color, kind, isPreset: true, hasKey, authToken,
+        id, name, note: "", baseUrl, tokenField: "ANTHROPIC_AUTH_TOKEN", category, websiteUrl: baseUrl, color, kind,
+        protocol: kind === "codex" ? "chatgpt" : kind === "openai" ? "openai" : "",
+        isPreset: true, hasKey, authToken,
         settingsConfig: { env: baseUrl ? { ANTHROPIC_BASE_URL: baseUrl, ...(authToken ? { ANTHROPIC_AUTH_TOKEN: authToken } : {}) } : {} },
       });
       return {
@@ -2069,12 +2102,15 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         ],
         currentId: "kimi",
         linkGlobal: false,
+        routeLocal: false,
       };
     }
     case "provider_switch":
       return String(_args?.id ?? "claude-official");
     case "provider_set_link_mode":
       return Boolean(_args?.link);
+    case "provider_set_route_mode":
+      return Boolean(_args?.route);
     case "provider_save":
       return "custom-stub";
     case "provider_delete":

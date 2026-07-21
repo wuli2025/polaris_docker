@@ -22,7 +22,9 @@ import { useChatStore } from "../stores/chat";
 import { artifacts as artifactsApi, chat as chatApi, skills as skillsApi, type AttachedFile, type Skill } from "../tauri";
 import { useFileDrop } from "../composables/useFileDrop";
 import { groupedThemes, findTheme, type DeckTheme } from "../lib/deckThemes";
-import { specPreviewHtml } from "../lib/slidesSpec";
+import { parseSpecLoose, setSpecText, NATIVE_THEME_META, type SlideSpec } from "../lib/slidesSpec";
+import { resolveSpecImages } from "../lib/specImages";
+import DeckViewer from "./DeckViewer.vue";
 
 // KeepAlive 的 include 按组件 name 匹配 → 显式命名:切去对话看进度再切回来,
 // phase/convId/产物预览都还在,「继续修改」不丢
@@ -56,6 +58,10 @@ const curTheme = computed<DeckTheme>(() => findTheme(selectedTheme.value));
 const slideCount = ref(12);
 const autoSlides = ref(true); // 默认 AI 按篇幅与重点自己决定页数
 const aspect = ref<"16:9" | "4:3">("16:9");
+// 原生引擎的 sldSz 硬编码 16:9(pptx_native.rs CANVAS_W/H)，传统 PPT 给不了 4:3——
+// 之前 UI 照样让选、提示词照样写「画幅:4:3」，模型无从遵守，用户拿到的还是 16:9。
+// 这里让 pptx 模式恒 16:9，4:3 只留给网页模式(模型自己写 HTML，能真兑现)。
+const effAspect = computed(() => (isPpt.value ? "16:9" : aspect.value));
 type Density = "auto" | "low" | "med" | "high";
 const density = ref<Density>("auto");
 const DENSITIES: { id: Density; label: string; hint: string }[] = [
@@ -67,6 +73,11 @@ const DENSITIES: { id: Density; label: string; hint: string }[] = [
 
 // 自定义风格：在所选主题基础上叠加用户的风格描述
 const customStyle = ref("");
+
+// AI 配图(传统 PPT 专属):image-full / image-text 版式 + polaris-forge image 生图。
+// 默认开 —— 课件的「好看」有一大半来自真配图,这也是原生引擎补上的最后一块能力。
+// 网页模式没有 spec、不经引擎,该开关无意义,故只在 isPpt 时呈现。
+const withImages = ref(true);
 
 // 可叠加的「增强技能」——与对话框同源:list_skills 全量技能库,点选后随对话一起注入。
 // polaris-deck-studio 本体恒注入,不在列表里重复展示。
@@ -145,22 +156,29 @@ function densityText(): string {
   return DENSITIES.find((d) => d.id === density.value)?.hint ?? "";
 }
 function buildPrompt(): string {
+  // 传统 PPT 与网页 PPT 的「主题」根本不是一回事:前者是引擎内置的 6 套色板(spec.theme),
+  // 后者才是 themes.css 的 17 套 data-theme。auto 文案必须分开说,否则模型会拿 data-theme
+  // 的 id 去填 spec.theme,引擎认不得 → 静默回退 minimal-white,用户选的主题全白选。
   const themeLine =
     selectedTheme.value === "auto"
-      ? "AI 自由发挥 —— 视觉方向由你根据内容的气质与场景自行决定：从 skill 的 themes.css 全部 " +
-        "`data-theme` 主题里挑最贴合的一个，也可在所选主题之上自行调配色与版式。两条硬要求：" +
-        "①**必须基于 polaris-deck-studio(open-design) 的引擎与主题体系制作**，别脱离 skill 自起炉灶；" +
-        "②观感**必须高级**——讲究的版式层级、克制的配色、超大标题与留白，一眼有设计感，拒绝平庸的默认观感。"
+      ? isPpt.value
+        ? "AI 自由发挥 —— 从 SKILL.md 列出的 **6 套内置色板**里挑气质最贴合内容的一个填进 " +
+          "`spec.theme`（课件默认优先浅色板，教室投影下深色底常糊）。版式混排要讲究：" +
+          "按信息类型选 compare/timeline/stats/two-col，**通篇 bullets 视为失败**。"
+        : "AI 自由发挥 —— 视觉方向由你根据内容的气质与场景自行决定：从 skill 的 themes.css 全部 " +
+          "`data-theme` 主题里挑最贴合的一个，也可在所选主题之上自行调配色与版式。两条硬要求：" +
+          "①**必须基于 polaris-deck-studio 的主题体系制作**，别脱离 skill 自起炉灶；" +
+          "②观感**必须高级**——讲究的版式层级、克制的配色、超大标题与留白，一眼有设计感，拒绝平庸的默认观感。"
       : `${curTheme.value.name}（data-theme id=${selectedTheme.value}）`;
   const lines = [
     "请使用 polaris-deck-studio skill 制作一份演示。",
     "",
     "## 制作配置",
     `- 输出模式：${isPpt.value
-      ? "pptx——传统 PPT（**原生可编辑**）。不写 deck.html，改为产出结构化 spec 文件 polaris.slides.json，再转换成真文本框/真形状、100% 可编辑的 .pptx（spec 路线详见 SKILL.md「传统 PPT」一节）"
+      ? "pptx——传统 PPT（**原生可编辑**）。不写 deck.html，改为产出结构化 spec 文件 polaris.slides.json，再转换成真文本框/真形状、100% 可编辑的 .pptx（spec v1 格式见 SKILL.md「一、spec v1 格式」）"
       : "html（最终交付自包含单文件 .html）"}`,
-    `- 主题：${themeLine}${isPpt.value ? "——传统 PPT 用 spec 内置 6 色板,从中选气质最接近所选主题的一个" : ""}`,
-    `- 画幅比例：${aspect.value}`,
+    `- 主题：${themeLine}${isPpt.value && selectedTheme.value !== "auto" ? "——传统 PPT 走 spec 内置 6 色板(minimal-white/warm-paper/forest/tech-blue/ink-gold/deep-space)，从中选气质最接近所选主题的一个填 spec.theme" : ""}`,
+    `- 画幅比例：${effAspect.value}${isPpt.value ? "（引擎固定，无需也无法调整）" : ""}`,
     autoSlides.value
       ? "- 页数：由你按篇幅与重点自行决定（内容多则多页、少则少页，重点处展开讲透，别硬凑也别硬砍）"
       : `- 页数：约 ${slideCount.value} 页（含封面与结尾，按内容增减）`,
@@ -187,13 +205,17 @@ function buildPrompt(): string {
   lines.push("", "## 要求");
   if (isPpt.value) {
     lines.push(
-      "- 严格按 SKILL.md「传统 PPT(spec 路线)」：把内容编排成 polaris.slides.json（9 种版式：title/section/bullets/two-col/compare/stats/timeline/quote/closing，按信息类型混排别通篇 bullets，标题短、要点凝练，每页可带 notes 口播稿），存到产物目录。",
+      "- 严格按 SKILL.md：把内容编排成 polaris.slides.json（11 种版式：title/section/bullets/two-col/compare/stats/timeline/quote/closing/image-full/image-text，按信息类型混排别通篇 bullets，标题短、要点凝练，每页可带 notes 口播稿），**文件名必须是 polaris.slides.json**，存到产物目录。",
+      "- 字段严格照 SKILL.md 的版式表——引擎只读表里列出的字段，写别的等于没写；compare/stats 最多 4 项、timeline 最多 5 步，超了会被丢弃，要拆页。",
+      `- 配图：${withImages.value
+        ? "**要配图**。顺序按 SKILL.md 2.5：先把完整 spec 写盘（image 字段直接写计划路径，实时预览立刻逐页点亮、缺图显示占位框），再用 `polaris-forge image --prompt=\"…\" --out=<产物目录>/img/xx.png --ratio=16:9` 把图生到那些路径（prompt 必须写「无文字」），最后才转换。宁少勿滥，2–5 张，只给「讲不清楚才需要看」的地方配。生图失败就改用无图版式、末尾说明，别卡住。"
+        : "本次**不配图**，只用文字版式（不要写 image 字段，也不要调生图）。"}`,
       "- 然后用 Polaris 自带 CLI 转换：`polaris-forge spec-pptx --spec=<产物目录>/polaris.slides.json --out=<产物目录>/演示.pptx`（CLI 在 ~/Polaris/bin/，Windows 为 polaris-forge.exe）。",
-      "- 若 CLI 不存在也不用慌：把 spec 按上述文件名存好即可，Polaris 会自动完成转换。",
+      "- 若 CLI 不存在也不用慌：把 spec 按上述文件名存好即可，Polaris 会自动完成转换。**不要**因 CLI 缺失就改去写 HTML 或截图，那会毁掉可编辑性。",
     );
   } else {
     lines.push(
-      "- 严格按 SKILL.md：把 base.css + themes.css 内联进 <style>、runtime.js 内联进 <script>，产出**自包含** deck.html，存到产物目录。",
+      "- 严格按 SKILL.md「五、网页 PPT 模式」：产出**自包含单文件** deck.html（所有 CSS/JS 内联、零外部依赖、双击即开），配色可参考技能目录 assets/themes.css 里的 data-theme 主题，用到哪套就把那套的变量内联进 <style>；翻页交互自己写（键盘左右/点击）。",
       "- 网页模式到此即可，无需导出。",
     );
   }
@@ -251,8 +273,7 @@ async function start() {
     }
     lastAction.value = "create";
     phase.value = "generating";
-    const icon = isPpt.value ? "📊" : "🖥️";
-    const display = `${icon} PPT·${curTheme.value.name}：${preview()}`;
+    const display = `PPT·${curTheme.value.name}：${preview()}`;
     await chat.send(id, buildPrompt(), display, undefined, {
       permissionMode: "auto_current",
       skillIds: skillIds.value,
@@ -289,7 +310,11 @@ function reset() {
   convId.value = null;
   outputs.value = [];
   previewHtml.value = "";
+  previewSpec.value = null;
+  previewKey.value = "";
   reviseText.value = "";
+  specPages.value = 0;
+  specTheme.value = "";
 }
 
 // ───────── 产物 + 实时预览 ─────────
@@ -304,8 +329,15 @@ const lastToolHint = computed(() => {
 });
 const outputs = ref<{ path: string; name: string; modified: number }[]>([]);
 const hasResult = computed(() => outputs.value.length > 0);
+// 网页模式:自包含 html 喂 iframe。传统PPT模式:解析+内联图后的 spec 对象喂 DeckViewer。
 const previewHtml = ref<string>("");
+const previewSpec = ref<SlideSpec | null>(null);
 const previewPath = ref<string>("");
+// 内容防抖键:spec 文本没变就不重新 解析/内联图(几百KB的图重读一遍不便宜)
+const previewKey = ref<string>("");
+// 宽容解析出的页数(生成中逐页点亮的进度数字) + 当前 spec 主题(换肤高亮用)
+const specPages = ref(0);
+const specTheme = ref<string>("");
 const outRe = computed(() =>
   isPpt.value ? /\.pptx$|polaris\.slides\.json$|\.html?$/i : /\.html?$/i
 );
@@ -339,26 +371,43 @@ async function loadPreview() {
       if (p?.text && (p.text !== previewHtml.value || htmlOut.path !== previewPath.value)) {
         previewHtml.value = p.text;
         previewPath.value = htmlOut.path;
+        previewKey.value = htmlOut.path;
       }
     } catch {
       /* ignore */
     }
     return;
   }
-  // 传统PPT(spec 路线):spec → 预览 HTML,与导出引擎同构(预览即导出)。
+  // 传统PPT(spec 路线):spec → DeckViewer 组件,与导出引擎同构(预览即导出)。
+  // 生成中用宽容解析:模型边写边存的「半个 JSON」也能先亮出已完整的页(豆包式逐页点亮),
+  // 不必等整份 spec 合法。翻页状态在 DeckViewer 里,这里只管喂最新的 spec 对象。
   const specOut = outputs.value.find((o) => /polaris\.slides\.json$/i.test(o.name));
   if (specOut && isPpt.value) {
     try {
       const p = await artifactsApi.read(specOut.path);
-      const html = p?.text ? specPreviewHtml(p.text) : null;
-      if (html && (html !== previewHtml.value || specOut.path !== previewPath.value)) {
-        previewHtml.value = html;
-        previewPath.value = specOut.path;
-      }
+      if (!p?.text) return;
+      const key = `${specOut.path}|${p.text}`;
+      if (key === previewKey.value) return; // 内容没变:不重复解析/内联图
+      const { spec } = parseSpecLoose(p.text);
+      if (!spec || !Array.isArray(spec.slides) || !spec.slides.length) return;
+      specPages.value = spec.slides.length;
+      specTheme.value = String(spec.theme ?? "");
+      await resolveSpecImages(spec);
+      previewSpec.value = spec;
+      previewPath.value = specOut.path;
+      previewKey.value = key;
     } catch {
       /* ignore */
     }
   }
+}
+
+// 导出/转换目标 = 同目录**已有的那份 pptx**(模型做的、聊天里列为交付物的那个)。
+// 绝不能写死成「演示.pptx」—— 那会新建一个重复文件,而用户认识的那份纹丝不动,
+// 看起来就是「导出没保存」(真踩过)。没有已存在的 pptx 时才用兜底名。
+function pptxTarget(specPath: string): string {
+  const hit = outputs.value.find((o) => /\.pptx$/i.test(o.name));
+  return hit ? hit.path : specPath.replace(/polaris\.slides\.json$/i, "课件.pptx");
 }
 
 // 兜底转换:模型只写了 spec(CLI 不在/没跑成)→ 桌面端自己调原生引擎出 .pptx。
@@ -371,8 +420,7 @@ async function ensureSpecConverted() {
   const pptx = outputs.value.find((o) => /\.pptx$/i.test(o.name));
   if (pptx && pptx.modified >= spec.modified) return;
   try {
-    const out = spec.path.replace(/polaris\.slides\.json$/i, "演示.pptx");
-    await artifactsApi.specToPptx(spec.path, out);
+    await artifactsApi.specToPptx(spec.path, pptxTarget(spec.path));
     await loadOutputs();
   } catch (e: any) {
     error.value = `spec → PPT 转换失败：${e?.message ?? e}`;
@@ -383,11 +431,82 @@ watch(sending, async (now, before) => {
   if (before && !now && phase.value === "generating") {
     await loadOutputs();
     await ensureSpecConverted();
-    phase.value = "done";
+    phase.value = "done"; // DeckViewer 的 generating prop 随之落下:撤占位、回封面
   }
 });
-// 共享轮询:页面隐藏自动暂停、回前台立即补拉、卸载自动清理
-const poller = usePolling(loadOutputs, 4000);
+
+// ───────── 完成态动作:导出 / 换肤 ─────────
+const specOut = computed(() => outputs.value.find((o) => /polaris\.slides\.json$/i.test(o.name)));
+const exporting = ref(false);
+const exported = ref<string | null>(null); // 刚导出的文件名(回执,明说存到哪)
+// 用户主动点「导出」= 无条件重转(mtime 短路只给轮询兜底用,主动导出必须拿到最新内容),
+// **覆盖用户认识的那份 pptx** 并在资源管理器里选中它 —— 让「导出」这个词兑现。
+async function exportPptx() {
+  const spec = specOut.value;
+  if (!spec || exporting.value) return;
+  exporting.value = true;
+  error.value = null;
+  exported.value = null;
+  try {
+    const out = pptxTarget(spec.path);
+    await artifactsApi.specToPptx(spec.path, out);
+    await loadOutputs();
+    exported.value = out.replace(/\\/g, "/").split("/").pop() ?? "";
+    await artifactsApi.reveal(out); // 在资源管理器里定位成品
+  } catch (e: any) {
+    error.value = `导出 PPTX 失败：${e?.message ?? e}`;
+  } finally {
+    exporting.value = false;
+  }
+}
+// 点字直改:只改文字不动版式 → 写回 spec 盘 + 同步重转 pptx(否则导出还是旧字)。
+// autofit 会按新内容重算字号,所以用户改不坏排版。
+async function onDeckEdit(slideIdx: number, path: string, value: string) {
+  const spec = specOut.value;
+  if (!spec || !previewSpec.value) return;
+  error.value = null;
+  try {
+    // 从盘上重读再改:预览里的 spec 已把图换成 dataURL,直接回写会把几百KB base64 写进文件
+    const p = await artifactsApi.read(spec.path);
+    const obj = JSON.parse(p?.text ?? "");
+    if (!obj?.slides?.[slideIdx]) throw new Error("spec 结构不符");
+    if (!setSpecText(obj.slides[slideIdx], path, value)) return; // 没改动/路径不符:静默跳过
+    await artifactsApi.write(spec.path, JSON.stringify(obj, null, 2));
+    await loadOutputs(); // spec 文本变了 → previewKey 失配 → 播放器按新字重排
+    await artifactsApi.specToPptx(spec.path, pptxTarget(spec.path)); // 导出物跟着走
+    await loadOutputs();
+  } catch (e: any) {
+    error.value = `保存修改失败：${e?.message ?? e}`;
+  }
+}
+
+// 换肤不重新生成:spec.theme 是引擎/预览共用的色板 id,本地改字段→预览秒变→后台重转 pptx。
+// 内容一字不动 —— 这正是「版式态」的红利(豆包没有重排引擎,我们有)。
+const skinning = ref<string | null>(null);
+async function applyTheme(id: string) {
+  const spec = specOut.value;
+  if (!spec || skinning.value || phase.value === "generating") return;
+  skinning.value = id;
+  error.value = null;
+  try {
+    const p = await artifactsApi.read(spec.path);
+    const obj = JSON.parse(p?.text ?? "");
+    if (!obj || !Array.isArray(obj.slides)) throw new Error("spec 尚未就绪");
+    obj.theme = id;
+    await artifactsApi.write(spec.path, JSON.stringify(obj, null, 2));
+    await loadOutputs(); // spec 文本变了 → previewKey 失配 → 播放器即时换色
+    // 后台同步重转(覆盖同一份 pptx),导出物与预览不脱节
+    await artifactsApi.specToPptx(spec.path, pptxTarget(spec.path));
+    await loadOutputs();
+  } catch (e: any) {
+    error.value = `换肤失败：${e?.message ?? e}`;
+  } finally {
+    skinning.value = null;
+  }
+}
+
+// 共享轮询:页面隐藏自动暂停、回前台立即补拉、卸载自动清理。3s——逐页点亮的跟手感。
+const poller = usePolling(loadOutputs, 3000);
 watch(phase, (p) => {
   if (p === "generating") poller.start();
   else poller.stop();
@@ -464,14 +583,31 @@ function fillDemo() {
           <input type="range" min="4" max="30" step="1" v-model.number="slideCount" class="dk-range" :disabled="autoSlides" />
           <label class="dk-lab">画幅</label>
           <div class="dk-seg">
-            <button :class="{ on: aspect === '16:9' }" @click="aspect = '16:9'">16:9</button>
-            <button :class="{ on: aspect === '4:3' }" @click="aspect = '4:3'">4:3</button>
+            <button :class="{ on: effAspect === '16:9' }" @click="aspect = '16:9'">16:9</button>
+            <button
+              :class="{ on: effAspect === '4:3' }"
+              :disabled="isPpt"
+              :title="isPpt ? '传统 PPT 由原生引擎渲染，固定 16:9；需要 4:3 请用网页 PPT 模式' : ''"
+              @click="aspect = '4:3'"
+            >
+              4:3
+            </button>
           </div>
+          <span v-if="isPpt" class="dk-note">传统 PPT 固定 16:9（引擎画幅）。</span>
           <label class="dk-lab">信息密度</label>
           <div class="dk-seg">
             <button v-for="d in DENSITIES" :key="d.id" :class="{ on: density === d.id }" @click="density = d.id">{{ d.label }}</button>
           </div>
           <span class="dk-note">{{ densityText() }}</span>
+          <template v-if="isPpt">
+            <label class="dk-lab-row" style="margin-top: 8px">
+              <span class="dk-lab" style="margin: 0">AI 配图</span>
+              <label class="dk-check"><input type="checkbox" v-model="withImages" /> 开启</label>
+            </label>
+            <span class="dk-note">
+              为封面与关键讲解页生成真插图（MiniMax），嵌进 PPT 后仍可选中/换图。关掉则纯文字，出片更快。
+            </span>
+          </template>
         </div>
 
         <div class="dk-side-sec">
@@ -524,7 +660,7 @@ function fillDemo() {
       <main class="dk-main">
         <div class="dk-canvas" :class="{ drop: dropOver }">
           <!-- 无产物：内容输入 -->
-          <div v-if="!hasResult" class="dk-input">
+          <div v-if="!hasResult && phase !== 'generating'" class="dk-input">
             <h3 class="dk-input-title"><FileText :size="16" :stroke-width="1.7" /> 演示内容</h3>
             <textarea
               v-model="contentText"
@@ -550,28 +686,69 @@ function fillDemo() {
             </div>
           </div>
 
-          <!-- 有产物：实时预览 -->
+          <!-- 生成中、第一页还没落地：轻量等待面板（不再全屏遮罩） -->
+          <div v-else-if="phase === 'generating' && !previewHtml && !previewSpec" class="dk-wait">
+            <Loader :size="30" class="spin" />
+            <span class="dk-wait-t">{{ lastAction === 'revise' ? '正在按修改重做…' : '正在构思大纲与页面…' }}</span>
+            <span v-if="lastToolHint" class="dk-tool-hint">{{ lastToolHint }}</span>
+            <button class="dk-ghost" @click="openConv">在对话里看进度 →</button>
+          </div>
+
+          <!-- 有页可看：播放器。生成中就开始逐页点亮，完成后变成 导出/换肤 工具栏 -->
           <div v-else class="dk-preview">
-            <!-- 安全: 只给 allow-scripts(deck runtime 需要), 绝不加 allow-same-origin ——
-                 二者并存会让 srcdoc 内 AI 生成的脚本自拆沙箱、同源访问 __TAURI_INTERNALS__ 调后端。
-                 deck 在不透明源里照常翻页/动画(只操作自身 document)。 -->
-            <iframe v-if="previewHtml" class="dk-frame" :srcdoc="previewHtml" sandbox="allow-scripts"></iframe>
+            <div v-if="phase === 'generating'" class="dk-strip">
+              <Loader :size="13" class="spin" />
+              <b>{{ lastAction === 'revise' ? '正在按修改重做' : '正在生成' }} · 已出 {{ specPages }} 页</b>
+              <span v-if="lastToolHint" class="dk-tool-hint">{{ lastToolHint }}</span>
+              <button class="dk-ghost xs" @click="openConv">看进度</button>
+            </div>
+            <div v-else-if="isPpt && specOut" class="dk-toolbar">
+              <button class="dk-primary sm" :disabled="exporting" @click="exportPptx">
+                <Loader v-if="exporting" :size="14" class="spin" /><FileType2 v-else :size="14" />
+                {{ exporting ? "导出中…" : "导出 PPTX" }}
+              </button>
+              <!-- 导出回执:明说存成了哪个文件 —— 否则用户以为「没保存」(真踩过) -->
+              <span v-if="exported" class="dk-exported">已保存到 {{ exported }}</span>
+              <button class="dk-ghost" @click="openDir"><FolderOpen :size="12" /> 目录</button>
+              <div class="dk-skin">
+                <span class="dk-skin-lab">换肤</span>
+                <button
+                  v-for="t in NATIVE_THEME_META"
+                  :key="t.id"
+                  class="dk-skin-sw"
+                  :class="{ on: specTheme === t.id, busy: skinning === t.id }"
+                  :title="`${t.name}（内容不变，预览与导出同步换色）`"
+                  :disabled="!!skinning"
+                  :style="{ background: t.bg }"
+                  @click="applyTheme(t.id)"
+                >
+                  <span class="dk-skin-acc" :style="{ background: t.accent }"></span>
+                </button>
+                <Loader v-if="skinning" :size="12" class="spin" />
+              </div>
+            </div>
+            <!-- 传统PPT:组件播放器(缩略图+舞台+翻页,与导出同构;不走 iframe——
+                 Tauri CSP 会拦 srcdoc 内联脚本,组件方案由 Vue 管状态,天然免疫) -->
+            <DeckViewer
+              v-if="isPpt && previewSpec"
+              class="dk-viewer"
+              :spec="previewSpec"
+              :generating="phase === 'generating'"
+              :editable="phase === 'done'"
+              @edit="onDeckEdit"
+            />
+            <!-- 网页PPT:自包含 html 喂 iframe。安全: 只给 allow-scripts,绝不加
+                 allow-same-origin —— 二者并存会让 srcdoc 内 AI 生成的脚本自拆沙箱、
+                 同源访问 __TAURI_INTERNALS__ 调后端。 -->
+            <iframe v-else-if="previewHtml" class="dk-frame" :srcdoc="previewHtml" sandbox="allow-scripts"></iframe>
             <div v-else class="dk-frame-empty">
               <Monitor :size="30" />
               <span>{{ phase === 'generating' ? '预览加载中…可在对话或目录查看' : '预览没有加载出来' }}</span>
               <button v-if="phase !== 'generating'" class="dk-ghost" @click="loadOutputs">重新加载预览</button>
             </div>
-            <div v-if="isPpt && pptxOut" class="dk-preview-tip">
-              最终 <b>.pptx</b> 已生成（原生可编辑：可改字/换色/挪位置），点左侧产物打开。
+            <div v-if="isPpt && pptxOut && phase === 'done'" class="dk-preview-tip">
+              最终 <b>.pptx</b> 已生成（原生可编辑：可改字/换色/挪位置）——点「导出 PPTX」重转并定位文件。
             </div>
-          </div>
-
-          <!-- 生成中遮罩 -->
-          <div v-if="phase === 'generating'" class="dk-overlay">
-            <Loader :size="30" class="spin" />
-            <span>{{ lastAction === 'revise' ? '正在按修改重做…' : '正在制作 PPT…' }}</span>
-            <span v-if="lastToolHint" class="dk-tool-hint">{{ lastToolHint }}</span>
-            <button class="dk-ghost" @click="openConv">在对话里看进度 →</button>
           </div>
         </div>
 
@@ -636,6 +813,7 @@ function fillDemo() {
 .dk-seg { display: flex; gap: 4px; }
 .dk-seg button { flex: 1; padding: 6px 4px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text-2); font-size: 11.5px; cursor: pointer; }
 .dk-seg button.on { border-color: var(--primary); background: var(--primary-soft); color: var(--primary-deep); font-weight: 600; }
+.dk-seg button:disabled { opacity: .45; cursor: default; }
 .dk-note { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
 .dk-lab-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .dk-check { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); cursor: pointer; user-select: none; }
@@ -680,13 +858,33 @@ function fillDemo() {
 
 /* 预览态 */
 .dk-preview { flex: 1; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.dk-viewer { flex: 1; min-height: 0; border: 1px solid var(--border); box-shadow: var(--shadow, 0 6px 24px rgba(0,0,0,.08)); }
 .dk-frame { flex: 1; width: 100%; border: 1px solid var(--border); border-radius: 10px; background: #fff; box-shadow: var(--shadow, 0 6px 24px rgba(0,0,0,.08)); }
 .dk-frame-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted); border: 1px dashed var(--border); border-radius: 10px; }
 .dk-preview-tip { font-size: 12px; color: var(--muted); text-align: center; }
 
-/* 生成遮罩 */
-.dk-overlay { position: absolute; inset: 18px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: color-mix(in srgb, var(--bg) 78%, transparent); backdrop-filter: blur(2px); border-radius: 10px; color: var(--text); font-size: 14px; font-weight: 600; }
+/* 生成前等待面板(第一页出现即让位给播放器) */
+.dk-wait { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text); font-size: 14px; font-weight: 600; }
+.dk-wait-t { font-weight: 600; }
 .dk-tool-hint { max-width: 80%; font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 生成中细进度条(播放器顶部,不遮内容) */
+.dk-strip { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--panel); font-size: 12.5px; color: var(--text); }
+.dk-strip b { color: var(--primary-deep); font-weight: 650; white-space: nowrap; }
+.dk-strip .dk-tool-hint { flex: 1; }
+.dk-ghost.xs { padding: 4px 8px; font-size: 11px; flex-shrink: 0; }
+
+/* 完成态工具栏:导出 + 换肤 */
+.dk-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dk-exported { font-size: 11.5px; font-weight: 600; color: var(--ok, #2f7a4f); }
+.dk-skin { margin-left: auto; display: flex; align-items: center; gap: 5px; }
+.dk-skin-lab { font-size: 11.5px; color: var(--muted); margin-right: 2px; }
+.dk-skin-sw { position: relative; width: 24px; height: 24px; border-radius: 6px; border: 1.5px solid var(--border); cursor: pointer; overflow: hidden; padding: 0; }
+.dk-skin-sw:hover:not(:disabled) { border-color: var(--primary); }
+.dk-skin-sw.on { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.dk-skin-sw.busy { animation: dk-spin 1s linear infinite; }
+.dk-skin-sw:disabled { cursor: default; opacity: .7; }
+.dk-skin-acc { position: absolute; left: 0; right: 0; bottom: 0; height: 34%; display: block; }
 
 /* 底部 composer */
 .dk-composer { border-top: 1px solid var(--border-soft); background: var(--panel); padding: 12px 18px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

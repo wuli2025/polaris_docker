@@ -111,7 +111,8 @@ pub(crate) fn resolve_app_auth_token(
     })
 }
 
-/// 从请求头(Bearer)解析基础面身份。server.rs 壳专属端点复用,故 pub(crate)。
+/// 从请求头(Bearer)解析基础面身份。server.rs 壳专属端点复用,故 pub(crate)+同门控。
+#[cfg(feature = "server")]
 pub(crate) fn app_ctx_headers(auth_token: &Option<String>, headers: &HeaderMap) -> Option<AuthCtx> {
     resolve_app_auth_token(auth_token, bearer_of(headers).as_deref())
 }
@@ -366,6 +367,25 @@ async fn dispatch_desktop(cmd: &str, a: &Args, _app: AppHandle) -> Result<Value,
         // 设备联盟遥测:本机资源实况(远端设备经中继/隧道取用)。
         "sys_stats" => ok(crate::sysstat::sample()),
 
+        // ── 输入区选择器(手机豆包式输入条:模型/技能;只读) ──
+        // 桌面版 provider_list 原样含 auth_token 真 key(仅桌面本机 UI 可见);
+        // 手机数据面必须脱敏 —— 只给选择器要用的字段,绝不下发密钥与 settings_config。
+        "provider_list" => {
+            let r = provider::provider_list()?;
+            ok(json!({
+                "providers": r.providers.iter().map(|p| json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "category": p.category,
+                    "protocol": p.protocol,
+                    "color": p.color,
+                    "hasKey": p.has_key,
+                })).collect::<Vec<Value>>(),
+                "currentId": r.current_id,
+            }))
+        }
+        "list_skills" => ok(skills::list_skills().await),
+
         _ => Err(format!(
             "命令 {cmd} 在桌面主机模式暂不支持(手机远程仅开放文件/对话数据面;全部命令请用 Docker/NAS server 版)"
         )),
@@ -391,15 +411,20 @@ fn opt_str(a: &Args, k: &str) -> Option<String> {
 fn opt_usize(a: &Args, k: &str) -> Option<usize> {
     a.get(k).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
+// 下列取参 helper 只被 dispatch_sync 用,与它同门控,否则 desktop 编译时报 dead_code。
+#[cfg(not(feature = "desktop"))]
 fn opt_bool(a: &Args, k: &str) -> Option<bool> {
     a.get(k).and_then(|v| v.as_bool())
 }
+#[cfg(not(feature = "desktop"))]
 fn opt_f64(a: &Args, k: &str) -> Option<f64> {
     a.get(k).and_then(|v| v.as_f64())
 }
+#[cfg(not(feature = "desktop"))]
 fn opt_u8(a: &Args, k: &str) -> Option<u8> {
     a.get(k).and_then(|v| v.as_u64()).map(|n| n.min(255) as u8)
 }
+#[cfg(not(feature = "desktop"))]
 fn bool_def(a: &Args, k: &str, d: bool) -> bool {
     a.get(k).and_then(|v| v.as_bool()).unwrap_or(d)
 }
@@ -414,6 +439,7 @@ fn vec_str(a: &Args, k: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 /// 必填字符串数组:缺失/非数组/元素非字符串都报 400,避免参数错被伪装成「空结果」
+#[cfg(not(feature = "desktop"))]
 fn req_vec_str(a: &Args, k: &str) -> Result<Vec<String>, String> {
     let arr = a
         .get(k)
@@ -810,6 +836,9 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
         "provider_set_link_mode" => ok(provider::provider_set_link_mode(bool_def(
             a, "link", false,
         ))?),
+        "provider_set_route_mode" => ok(provider::provider_set_route_mode(bool_def(
+            a, "route", false,
+        ))?),
         "provider_save" => {
             let input: provider::ProviderInput =
                 serde_json::from_value(a.get("input").cloned().unwrap_or(Value::Null))
@@ -817,6 +846,8 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
             ok(provider::provider_save(input)?)
         }
         "provider_delete" => ok(provider::provider_delete(req_str(a, "id")?)?),
+        "usage_summary" => ok(provider::usage_summary()?),
+        "provider_balance" => ok(provider::provider_balance(req_str(a, "id")?)?),
         // ── 生图供应商坞(独立表)+ 生图 ──
         "image_provider_list" => ok(provider::image_provider_list()?),
         "image_provider_save" => {
@@ -833,10 +864,12 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
             req_str(a, "out")?,
             opt_str(a, "ratio"),
         )?),
-        "usage_summary" => ok(provider::usage_summary()?),
-        "provider_balance" => ok(provider::provider_balance(req_str(a, "id")?)?),
         "codex_status" => ok(provider::codex_status()?),
-        "codex_start_login" => ok(provider::codex_start_login()?),
+        "codex_start_login" => ok(provider::codex_start_login(Some(bool_def(
+            a,
+            "forceDevice",
+            false,
+        )))?),
         "codex_poll_login" => ok(provider::codex_poll_login(
             req_str(a, "deviceCode")?,
             req_str(a, "userCode")?,

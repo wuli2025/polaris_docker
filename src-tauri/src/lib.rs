@@ -192,6 +192,7 @@ pub fn run() {
             collab::commands::collab_scope_status,
             collab::commands::collab_device_node_id,
             collab::commands::collab_tunnel_connect,
+            collab::commands::collab_tunnel_disconnect,
             collab::commands::collab_tunnel_status,
             // 云机中继网关:桌面主机挂牌/断开(真·中继完整形态)
             collab::commands::collab_gateway_attach,
@@ -301,6 +302,7 @@ pub fn run() {
             integrations::nas::nas_disconnect,
             // Chat
             chat::chat_send,
+            chat::chat_prewarm, // 打字期预热常驻 claude 进程(best-effort)
             chat::chat_cancel,
             chat::chat_attach_files,
             chat::chat_attach_image,
@@ -333,11 +335,12 @@ pub fn run() {
             provider::provider_list,
             provider::provider_switch,
             provider::provider_set_link_mode,
+            provider::provider_set_route_mode,
             provider::provider_save,
             provider::provider_delete,
             provider::usage_summary,
             provider::provider_balance,
-            // 生图供应商坞(独立于聊天表 —— 理由见 provider/image_store.rs 文件头)
+            // 生图供应商坞(独立于上面那张聊天表 —— 理由见 provider/image_store.rs 文件头)
             provider::image_provider_list,
             provider::image_provider_save,
             provider::image_provider_delete,
@@ -473,6 +476,9 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 runtime::procs::CHILDREN.kill_all();
+                // 常驻 claude agent 进程池(session_pool)不在 CHILDREN 里(按 conv 而非
+                // req 管理), 单独收割 —— 否则退出后每个会话遗留一个 ~数百 MB 的孤儿 claude。
+                chat::session_pool::kill_all();
                 // 对话状态强制落盘:append_message 走「脏标记 + 500ms 合并落盘」,
                 // 退出瞬间可能还有最近半秒的消息只在内存里 —— 这里补一刀(不脏则零开销)。
                 conv::flush();
