@@ -472,13 +472,19 @@ pub fn ontology_extract(app: AppHandle, schema_id: String) -> Result<String, Str
             &app,
             json!({ "kind": "phase", "text": "在框内读资料、抽关系三元组…" }),
         );
-        let collected = match crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _t| {
-            if kind == "delta" {
-                emit_onto(&app, json!({ "kind": "tick" }));
-            } else if kind == "tool" {
-                emit_onto(&app, json!({ "kind": "phase", "text": "正在浏览资料…" }));
-            }
-        }) {
+        // 墙钟超时:子进程挂死会把 EXTRACTING 闸永久钉死(构建知识体系此后一直拒绝)。
+        let collected = match crate::kb::run_claude_readonly_timeout(
+            &cwd,
+            &prompt,
+            |kind, _t| {
+                if kind == "delta" {
+                    emit_onto(&app, json!({ "kind": "tick" }));
+                } else if kind == "tool" {
+                    emit_onto(&app, json!({ "kind": "phase", "text": "正在浏览资料…" }));
+                }
+            },
+            std::time::Duration::from_secs(1200),
+        ) {
             Ok(t) => t,
             Err(e) => {
                 emit_onto(&app, json!({ "kind": "error", "message": e }));

@@ -183,17 +183,33 @@ pub(crate) fn cluster_build_on(
         mode = "lexical";
         load_lexical_files(&conn, &filter)?
     } else {
-        // 均值池化:流式累加每个文件的 chunk 向量
+        // 均值池化:流式累加每个文件的 chunk 向量。
+        // 只取**主力车道**(chunk 数最多的 model):换过嵌入模型的混库里,不同维度的向量
+        // 掺进同一次 k-means 会让余弦全错(dot 的 zip 静默截断,不 panic、只算错)。
+        // 单模型库 lane 就是唯一那一个,行为不变。
+        let lane: Option<String> = conn
+            .query_row(
+                "SELECT model FROM chunks GROUP BY model ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
         let mut acc: HashMap<i64, (Vec<f32>, u32, i64, String, String)> = HashMap::new();
         {
             let sql = format!(
                 "SELECT c.file_id, c.vec, f.root_id, f.relpath, f.name
                  FROM chunks c JOIN files f ON f.id=c.file_id
-                 WHERE f.kind='text'{filter}"
+                 WHERE f.kind='text' AND c.model=?1{filter}"
             );
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-            let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+            let lane_s = lane.unwrap_or_default();
+            let mut rows = stmt.query([&lane_s]).map_err(|e| e.to_string())?;
+            let mut seen_rows = 0u64;
             while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                seen_rows += 1;
+                if seen_rows % 4096 == 0 && cluster_cancelled() {
+                    return Err("已取消".into());
+                }
                 let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
                 let blob: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
                 let v = crate::fable::index::blob_to_vec(&blob);
@@ -250,6 +266,9 @@ pub(crate) fn cluster_build_on(
     }
     // 稳定顺序(file_id 升序),让确定性初始化可复现
     files.sort_by_key(|f| f.file_id);
+    if cluster_cancelled() {
+        return Err("已取消".into()); // 尚未动库,旧归类原样保留
+    }
 
     let n = files.len();
     let file_vecs: Vec<Vec<f32>> = files.iter().map(|f| f.vec.clone()).collect();
@@ -258,6 +277,9 @@ pub(crate) fn cluster_build_on(
         .clamp(4, 32)
         .min(n);
     let (assign, leaf_centroids) = spherical_kmeans(&file_vecs, k);
+    if cluster_cancelled() {
+        return Err("已取消".into()); // k-means 被取消提前退出 → 别拿半成品换掉旧归类
+    }
 
     // 叶簇成员(剔空簇)
     let mut members_all: Vec<Vec<usize>> = vec![Vec::new(); leaf_centroids.len()];
@@ -408,7 +430,13 @@ pub(crate) fn cluster_build_on(
         {
             let mut sel = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let mut rows = sel.query([]).map_err(|e| e.to_string())?;
+            let mut seen_rows = 0u64;
             while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                seen_rows += 1;
+                if seen_rows % 4096 == 0 && cluster_cancelled() {
+                    // 簇本体已提交;停在指派阶段最坏是部分文件暂留 cluster_id=0,下轮归类可续。
+                    return Err("已取消".into());
+                }
                 let id: i64 = row.get(0).map_err(|e| e.to_string())?;
                 let relpath: String = row.get(1).map_err(|e| e.to_string())?;
                 let name: String = row.get(2).map_err(|e| e.to_string())?;
@@ -433,6 +461,9 @@ pub(crate) fn cluster_build_on(
         //    (已提交的批仍有效,未写到的文件保持 cluster_id=0,下轮归类可续)。
         const ASSIGN_BATCH: usize = 8000;
         for chunk in pairs.chunks(ASSIGN_BATCH) {
+            if cluster_cancelled() {
+                return Err("已取消".into()); // 已提交的批有效,余下保持 0 待下轮
+            }
             conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
             let step: Result<(), String> = (|| {
                 let mut up = conn
@@ -500,6 +531,9 @@ pub(crate) fn spherical_kmeans(vecs: &[Vec<f32>], k: usize) -> (Vec<usize>, Vec<
     let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
     centroids.push(vecs[0].clone());
     while centroids.len() < k {
+        if cluster_cancelled() {
+            break; // 提前退出给个残缺但合法的结果;调用方随后检查取消并放弃写库
+        }
         let mut best_i = 0usize;
         let mut best_d = f32::MIN;
         for (i, v) in vecs.iter().enumerate() {
@@ -515,6 +549,9 @@ pub(crate) fn spherical_kmeans(vecs: &[Vec<f32>], k: usize) -> (Vec<usize>, Vec<
     // Lloyd 迭代(球面)
     let mut assign = vec![0usize; n];
     for _ in 0..16 {
+        if cluster_cancelled() {
+            break; // 全库 47 万 × 上千维时一轮就是几秒:响应「停止」,别把 16 轮跑满
+        }
         let mut changed = false;
         for (i, v) in vecs.iter().enumerate() {
             let mut best = 0usize;

@@ -363,6 +363,18 @@ export const useAppStore = defineStore("app", () => {
     await convApi.openProjectDir(projectId);
   }
 
+  /** 设置(或清除)项目的工作目录：本项目下所有对话以此为 claude cwd（终端 cd 进 repo 同款）。
+   *  workDir 传 null/空 = 解绑回落默认。成功后就地更新本地项目的 workDir。 */
+  async function setProjectWorkDir(projectId: string, workDir: string | null) {
+    await convApi.setWorkDir(projectId, workDir);
+    const i = projects.value.findIndex((x) => x.id === projectId);
+    if (i >= 0) {
+      const next = [...projects.value];
+      next[i] = { ...next[i], workDir: workDir && workDir.trim() ? workDir : null };
+      projects.value = next;
+    }
+  }
+
   /**
    * @param navigate 是否切到 chat 视图。默认 true(侧栏/对话面板新建即跳进对话)。
    *   工坊类组件(Deck/Web 等)自己管理视图、就地展示预览, 必须传 false ——
@@ -498,6 +510,7 @@ export const useAppStore = defineStore("app", () => {
     projectByCollabId,
     archiveProject,
     openProjectDir,
+    setProjectWorkDir,
     createConversation,
     deleteConversation,
     archiveConversation,

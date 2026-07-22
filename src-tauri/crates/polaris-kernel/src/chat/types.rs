@@ -19,8 +19,10 @@ impl PermissionMode {
         match self {
             PermissionMode::Manual => "default",
             PermissionMode::AutoCurrent => "acceptEdits",
-            // AutoAll 不再 bypass permissions，与 AutoCurrent 一致
-            PermissionMode::AutoAll => "acceptEdits",
+            // AutoAll = 终端裸跑 claude --dangerously-skip-permissions 的同款体验:
+            // 全工具免确认(headless 下 acceptEdits 只批文件编辑, 白名单外的工具
+            // 一律被拒 → 与 CLI 体验割裂)。用户显式选这一档即知情放行。
+            PermissionMode::AutoAll => "bypassPermissions",
             PermissionMode::Deny => "plan",
         }
     }

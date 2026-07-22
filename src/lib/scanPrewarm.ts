@@ -57,11 +57,19 @@ export function prewarmScan(): void {
 export function takeScan(): Promise<FolderScan> {
   const now = Date.now();
   if (scanPromise && now - scanAt < TTL_MS) return scanPromise;
-  scanAt = now;
-  scanPromise = fc.scanFolders(null).catch((e) => {
-    scanPromise = null; // 失败不缓存,下次重试
-    throw e;
-  });
+  scanAt = now; // 先占位防并发重复发起;完成后再刷成完成时刻
+  scanPromise = fc
+    .scanFolders(null)
+    .then((r) => {
+      // TTL 从**完成时刻**起算:慢盘上 scanFolders 本身要几十秒,若从发起时刻计,
+      // 解析完剩余有效期近 0,下一次 takeScan 立即判过期重拉,预热形同虚设。
+      scanAt = Date.now();
+      return r;
+    })
+    .catch((e) => {
+      scanPromise = null; // 失败不缓存,下次重试
+      throw e;
+    });
   return scanPromise;
 }
 

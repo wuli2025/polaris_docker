@@ -26,7 +26,7 @@ pub mod thumbs;
 
 // 共享依赖统一在此升为 pub(crate) 供子模块 `use super::*` 取用(与原单文件同一作用域语义)。
 
-pub(crate) use super::{open_db, worker_count, FlagGuard};
+pub(crate) use super::{cluster_cancelled, open_db, worker_count, FlagGuard, CANCEL_CLUSTER};
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
 pub(crate) use std::collections::HashMap;

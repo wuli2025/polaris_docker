@@ -37,6 +37,12 @@ pub struct Project {
     /// 绑定时的协作主机 base(空=同源/未绑;换主机时据此识别失配)。
     #[serde(default)]
     pub collab_host: String,
+    /// 本项目在磁盘上的**工作目录**(用户选定的真实文件夹, 绝对路径)。设了之后, 本项目下
+    /// 所有对话调起 claude CLI 时以它为 cwd —— 等同终端 `cd <dir> && claude`, 让 AI 直接在
+    /// 用户自己的大项目仓库里读写。None/空=沿用默认(应用数据根/仓库根), 与旧行为一致。
+    /// 老 state.json 无此字段 → serde 默认 None, 向后兼容。
+    #[serde(default)]
+    pub work_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +127,7 @@ pub fn init(_app: &AppHandle) -> Result<()> {
             kb_scope: None,
             collab_project_id: None,
             collab_host: String::new(),
+            work_dir: None,
         });
     }
 
@@ -156,6 +163,7 @@ pub fn ensure_mao_project() {
                         kb_scope: Some("raw/毛主席".into()),
                         collab_project_id: None,
                         collab_host: String::new(),
+                        work_dir: None,
                     },
                 );
                 pid
@@ -552,6 +560,7 @@ pub fn conv_create_project(name: String) -> Result<Project, String> {
         kb_scope: None,
         collab_project_id: None,
         collab_host: String::new(),
+        work_dir: None,
     };
     STATE.write().projects.push(p.clone());
     persist();
@@ -598,6 +607,49 @@ pub fn conv_set_project_kb_scope(
         kb_scope.filter(|s| !s.trim().is_empty()),
     );
     Ok(())
+}
+
+/// 手动设置(或清除)项目的**工作目录**。传入的路径必须是磁盘上真实存在的目录;
+/// 传 None/空串 = 解绑, 回落默认 cwd。设定后立即落盘, 下一轮对话即以此为 cwd。
+///
+/// 不做路径白名单限制(工作目录本就要指向用户任意大项目仓库), 但要求「存在且是目录」——
+/// 挡掉误传文件/打错路径导致 claude spawn 时 cwd 无效而整轮失败。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn conv_set_project_work_dir(
+    project_id: String,
+    work_dir: Option<String>,
+) -> Result<(), String> {
+    let cleaned: Option<String> = match work_dir.map(|s| s.trim().to_string()) {
+        Some(s) if !s.is_empty() => {
+            let p = std::path::Path::new(&s);
+            if !p.is_dir() {
+                return Err(format!("工作目录不存在或不是文件夹: {s}"));
+            }
+            Some(s)
+        }
+        _ => None,
+    };
+    {
+        let mut st = STATE.write();
+        let Some(p) = st.projects.iter_mut().find(|p| p.id == project_id) else {
+            return Err("项目不存在".into());
+        };
+        p.work_dir = cleaned;
+    }
+    persist();
+    Ok(())
+}
+
+/// 读取某项目绑定的工作目录(chat::send 解析 cwd 时用)。返回真实存在的绝对路径, 否则 None。
+/// 目录被用户在应用外删掉/改名时也返回 None —— 让 spawn 安全回落默认 cwd 而非拿无效路径失败。
+pub fn project_work_dir(project_id: &str) -> Option<String> {
+    STATE
+        .read()
+        .projects
+        .iter()
+        .find(|p| p.id == project_id)
+        .and_then(|p| p.work_dir.clone())
+        .filter(|s| !s.trim().is_empty() && std::path::Path::new(s).is_dir())
 }
 
 /// project_id 直接拼进文件系统路径, 必须挡掉 `..` / 路径分隔符 / 盘符,

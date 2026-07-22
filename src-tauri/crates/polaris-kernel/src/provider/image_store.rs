@@ -145,6 +145,17 @@ pub struct ImageProviderListResult {
     pub current_id: String,
     /// 预设模板(前端「新建」时给候选, 免手输)
     pub presets: Vec<ImagePresetView>,
+    /// 可借用的聊天坞 MiniMax(Coding Plan)key 档;None = 无可借。
+    /// active=true 表示它就是当前生效档(生图坞没配任何可用条目)。
+    pub borrowed: Option<BorrowedImageView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BorrowedImageView {
+    pub name: String,
+    pub model: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,9 +196,8 @@ pub struct ImageGenConfig {
     pub name: String,
 }
 
-/// 当前启用的生图配置。无配置 / 无 key → None(= 生图能力关闭)。
-/// 这是壳(lib.rs 的 forge_image / apihub / polaris-cli)取配置的**唯一入口**。
-pub fn current_image_config() -> Option<ImageGenConfig> {
+/// 生图坞里当前启用条目的配置(不含借用回落)。配了但缺 key/地址/模型 → None。
+fn stored_image_config() -> Option<ImageGenConfig> {
     let st = load_store();
     let it = st.items.iter().find(|x| x.id == st.current_id)?;
     let key = it.api_key.trim();
@@ -203,12 +213,46 @@ pub fn current_image_config() -> Option<ImageGenConfig> {
     })
 }
 
+/// 借用聊天坞 MiniMax(Coding Plan)key 的生图配置。国际站/国内站按 key 来源选主站
+/// (打错会 401)。无可借 → None。
+fn minimax_image_endpoint(intl: bool) -> &'static str {
+    if intl {
+        "https://api.minimax.io/v1/image_generation"
+    } else {
+        "https://api.minimaxi.com/v1/image_generation"
+    }
+}
+fn borrowed_image_config() -> Option<ImageGenConfig> {
+    let (key, intl) = minimax_borrow_key_for_image()?;
+    Some(ImageGenConfig {
+        endpoint: minimax_image_endpoint(intl).to_string(),
+        model: "image-01".to_string(),
+        api_key: key,
+        flavor: ImageFlavor::Minimax,
+        name: "MiniMax(借用 Coding Plan Key)".to_string(),
+    })
+}
+
+/// 当前生效的生图配置。这是壳(lib.rs 的 forge_image / apihub / polaris-cli)取配置的**唯一入口**。
+/// 优先级: 生图坞里显式配的那家 → 借用聊天坞的 MiniMax(Coding Plan)key 开箱即用
+/// (实测 `sk-cp-` key 可直接调 image_generation) → None(= 生图能力关闭)。
+/// 显式配置永远压过借用 —— 用户配了别家就是不想用 MiniMax, 别自作聪明换回去。
+pub fn current_image_config() -> Option<ImageGenConfig> {
+    stored_image_config().or_else(borrowed_image_config)
+}
+
 // ───────────────────────── 命令 ─────────────────────────
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn image_provider_list() -> Result<ImageProviderListResult, String> {
     let st = load_store();
+    let borrowed = borrowed_image_config().map(|c| BorrowedImageView {
+        name: c.name,
+        model: c.model,
+        active: stored_image_config().is_none(),
+    });
     Ok(ImageProviderListResult {
+        borrowed,
         items: st
             .items
             .iter()
@@ -355,6 +399,19 @@ mod tests {
         let o: ImageStore = serde_json::from_str(old).unwrap();
         assert_eq!(o.items[0].flavor, ImageFlavor::Minimax); // default
         assert!(o.items[0].api_key.is_empty());
+    }
+
+    #[test]
+    fn borrow_endpoint_matches_key_origin() {
+        // 国际站 key 打 minimaxi.com 会 401(反之亦然), 主站映射错了就是全员生图挂
+        assert_eq!(
+            minimax_image_endpoint(false),
+            "https://api.minimaxi.com/v1/image_generation"
+        );
+        assert_eq!(
+            minimax_image_endpoint(true),
+            "https://api.minimax.io/v1/image_generation"
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ import {
   PencilLine,
   Copy,
   RotateCcw,
+  Eye,
 } from "@lucide/vue";
 import {
   fileName,
@@ -24,8 +25,10 @@ import {
   toolLabel,
   fmtTime,
   renderMd,
+  isImageArtifact,
   type Turn,
 } from "./shared";
+import ImageStrip from "./ImageStrip.vue";
 import { useArtifactsStore } from "../../stores/artifacts";
 
 const props = defineProps<{
@@ -44,6 +47,7 @@ const emit = defineEmits<{
   (e: "toggle-tool", turnKey: number, idx: number): void;
   (e: "toggle-files", turnKey: number): void;
   (e: "open-artifact", path: string): void;
+  (e: "open-folder", path: string): void;
   (e: "edit", t: Turn): void;
   (e: "copy", t: Turn): void;
   (e: "regenerate", t: Turn): void;
@@ -59,6 +63,35 @@ const artifactsStore = useArtifactsStore();
 // 内部读 mdVersion,异步高亮完成后父级重建前缀 → 新 turn.html 自动刷进来。
 const html = computed(() =>
   props.turn.html ?? renderMd(props.turn.text, !props.pending)
+);
+
+// Kimi 式产物区:主预览件单独成卡,其余文件收进「文件夹」入口。
+// 展开时也只内联渲染前 MAX_INLINE 行,溢出的引导去文件管理器看,永不铺满对话框卡死。
+const MAX_INLINE = 8;
+// 文件夹入口里要列的文件 = 本轮全部产物里排除文件夹产物本身(仍含主预览件,方便一处看全)
+const folderFiles = computed(() =>
+  props.turn.artifacts.filter((a) => !a.endsWith("/"))
+);
+// 生成图片单拎出来走横排缩略图画廊(LUMI 式),不再混进文件行当图标
+const imageFiles = computed(() => folderFiles.value.filter(isImageArtifact));
+const docFiles = computed(
+  () => folderFiles.value.filter((a) => !isImageArtifact(a))
+);
+// 主预览大卡只留非图片主件 —— 图片已在画廊里以真缩略图呈现,再出一张大卡就重复了
+const docPreview = computed(() =>
+  props.turn.preview && !isImageArtifact(props.turn.preview)
+    ? props.turn.preview
+    : undefined
+);
+// 文件夹入口:有非图片产物才出现;唯一一个且已被预览大卡呈现时省掉(预览卡已够)
+const showFolderCard = computed(
+  () =>
+    docFiles.value.length > 0 &&
+    !(docFiles.value.length === 1 && docFiles.value[0] === docPreview.value)
+);
+const inlineFiles = computed(() => docFiles.value.slice(0, MAX_INLINE));
+const overflowCount = computed(() =>
+  Math.max(0, docFiles.value.length - MAX_INLINE)
 );
 </script>
 
@@ -160,23 +193,80 @@ const html = computed(() =>
         {{ e }}
       </div>
 
-      <!-- 生成的文件：文件夹卡片统一收在回答末尾, 点文件行在右侧抽屉预览 -->
+      <!-- 生成的文件(Kimi 式：一文件一预览)——
+           ① 主预览大卡：本轮最该「打开看」的那个件(html/演示/pdf…)，点开右抽屉联动。
+           ② 文件夹入口：其余产物统一收进一行，点开在文件管理器看，绝不把小文件铺满对话框。 -->
       <div v-if="turn.artifacts.length" class="files">
-        <div class="folder-card">
-          <button class="folder-head" @click="emit('toggle-files', turn.key)">
-            <FolderOpen :size="15" :stroke-width="1.7" class="folder-ico" />
-            <span class="folder-title">本轮产物</span>
-            <span class="folder-count">{{ turn.artifacts.length }}</span>
-            <ChevronDown
-              :size="14"
-              :stroke-width="2"
-              class="folder-chev"
-              :class="{ closed: filesCollapsed }"
+        <!-- ⓪ 生成图片：横排缩略图画廊(LUMI 式一排),点开右抽屉预览 -->
+        <ImageStrip
+          v-if="imageFiles.length"
+          :paths="imageFiles"
+          :folder="turn.folder"
+          @open="emit('open-artifact', $event)"
+          @open-folder="emit('open-folder', $event)"
+        />
+
+        <!-- ① 主预览大卡(非图片主件;图片已在画廊里) -->
+        <button
+          v-if="docPreview"
+          class="preview-card"
+          :class="{ active: artifactsStore.current?.path === docPreview }"
+          :title="docPreview"
+          @click="emit('open-artifact', docPreview)"
+        >
+          <div class="pv-ico">
+            <component
+              :is="artifactIcon(docPreview)"
+              :size="22"
+              :stroke-width="1.6"
             />
-          </button>
+          </div>
+          <div class="pv-meta">
+            <span class="pv-name">{{ fileName(docPreview) }}</span>
+            <span class="pv-sub">
+              <span v-if="fileExt(docPreview)" class="pv-ext">{{
+                fileExt(docPreview)
+              }}</span>
+              点击预览
+            </span>
+          </div>
+          <span class="pv-open">
+            <Eye :size="15" :stroke-width="1.8" />
+            {{ artifactsStore.current?.path === docPreview ? "预览中" : "预览" }}
+          </span>
+        </button>
+
+        <!-- ② 文件夹入口：折叠态只显示一行摘要 + 打开文件夹；展开也封顶,不铺满。
+             图片走上面的画廊,这里只收非图片产物;唯一一个且已被预览大卡呈现时省掉。 -->
+        <div v-if="showFolderCard" class="folder-card">
+          <div class="folder-head">
+            <button
+              class="folder-title-btn"
+              @click="emit('toggle-files', turn.key)"
+            >
+              <FolderOpen :size="15" :stroke-width="1.7" class="folder-ico" />
+              <span class="folder-title">本轮产物</span>
+              <span class="folder-count">{{ docFiles.length }}</span>
+              <ChevronDown
+                :size="14"
+                :stroke-width="2"
+                class="folder-chev"
+                :class="{ closed: filesCollapsed }"
+              />
+            </button>
+            <button
+              v-if="turn.folder"
+              class="folder-open-btn"
+              title="在文件管理器中打开文件夹"
+              @click="emit('open-folder', turn.folder)"
+            >
+              <ExternalLink :size="13" :stroke-width="1.8" />
+              打开文件夹
+            </button>
+          </div>
           <div v-if="!filesCollapsed" class="folder-body">
             <button
-              v-for="a in turn.artifacts"
+              v-for="a in inlineFiles"
               :key="a"
               class="file-row"
               :class="{ active: artifactsStore.current?.path === a }"
@@ -191,6 +281,15 @@ const html = computed(() =>
               />
               <span class="fr-name">{{ fileName(a) }}</span>
               <span v-if="fileExt(a)" class="fr-ext">{{ fileExt(a) }}</span>
+              <ExternalLink :size="12" :stroke-width="1.8" class="fr-open" />
+            </button>
+            <button
+              v-if="overflowCount > 0 && turn.folder"
+              class="file-row overflow"
+              @click="emit('open-folder', turn.folder)"
+            >
+              <FolderOpen :size="15" :stroke-width="1.7" class="fr-ico" />
+              <span class="fr-name">还有 {{ overflowCount }} 个文件 · 打开文件夹查看全部</span>
               <ExternalLink :size="12" :stroke-width="1.8" class="fr-open" />
             </button>
           </div>
@@ -470,8 +569,25 @@ const html = computed(() =>
 .md :deep(h4) {
   font-family: var(--serif);
   line-height: 1.35;
-  margin: 1.1em 0 0.5em;
+  margin: 1.15em 0 0.5em;
   color: var(--ink);
+}
+/* 结构化小节标题:左侧渐变光条,信息层级一眼可辨 */
+.md :deep(h2),
+.md :deep(h3) {
+  position: relative;
+  padding-left: 13px;
+}
+.md :deep(h2)::before,
+.md :deep(h3)::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.16em;
+  bottom: 0.16em;
+  width: 3.5px;
+  border-radius: 4px;
+  background: linear-gradient(180deg, var(--primary), var(--primary-soft));
 }
 .md :deep(h1) {
   font-size: 1.5em;
@@ -497,7 +613,7 @@ const html = computed(() =>
   margin: 0.25em 0;
 }
 .md :deep(li::marker) {
-  color: var(--muted);
+  color: var(--primary);
 }
 .md :deep(a) {
   color: var(--primary);
@@ -576,9 +692,12 @@ const html = computed(() =>
   font-weight: 600;
   color: var(--text);
 }
+/* 正文内嵌图:卡片化(圆角 + 细边 + 浅影),与画廊缩略图同一气质 */
 .md :deep(img) {
   max-width: 100%;
-  border-radius: 6px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  box-shadow: var(--shadow-sm);
 }
 
 /* 成品文件 chips —— 回答末尾的可点击文件 */
@@ -611,21 +730,139 @@ const html = computed(() =>
 html[data-theme="dark"] .folder-card {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), var(--shadow-sm);
 }
+/* ── 主预览大卡(Kimi 式)：本轮最该「打开看」的那个件, 单独醒目呈现 ── */
+.preview-card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  max-width: 420px;
+  width: 100%;
+  margin-bottom: 9px;
+  padding: 11px 13px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: linear-gradient(
+    135deg,
+    var(--primary-soft) 0%,
+    var(--panel) 60%
+  );
+  cursor: pointer;
+  text-align: left;
+  animation: card-rise 0.35s var(--ease-out) both;
+  transition: border-color 0.2s, box-shadow 0.22s var(--ease-out),
+    transform 0.22s var(--ease-spring);
+}
+.preview-card:hover,
+.preview-card.active {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+}
+.pv-ico {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  color: var(--primary);
+}
+.pv-meta {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.pv-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.pv-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.pv-ext {
+  padding: 0 5px;
+  border-radius: 5px;
+  background: var(--bg-soft);
+  color: var(--muted);
+  line-height: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.pv-open {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: var(--primary);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
 .folder-head {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 4px;
   width: 100%;
-  padding: 8px 11px;
+  padding: 3px 5px 3px 6px;
   font-size: 12px;
   color: var(--text);
-  cursor: pointer;
-  background: transparent;
+}
+.folder-title-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  padding: 5px 6px;
   border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
   text-align: left;
 }
-.folder-head:hover {
+.folder-title-btn:hover {
   background: var(--bg-soft);
+}
+.folder-open-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.folder-open-btn:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+.file-row.overflow .fr-name {
+  color: var(--muted);
+  font-weight: 500;
 }
 .folder-ico {
   color: var(--primary);

@@ -8,7 +8,7 @@
  * 聊天整条链路搞挂)。前端跟着分开, 两边的状态/方法物理隔离, 不会有人手滑串用。
  */
 import { computed, onMounted, reactive, ref } from "vue";
-import { Eye, EyeOff, Pencil, Plus, Trash2 } from "@lucide/vue";
+import { Eye, EyeOff, Pencil, Plus, Trash2, Zap } from "@lucide/vue";
 import {
   imageProvider,
   isTauri,
@@ -39,8 +39,11 @@ const form = reactive({
 const items = computed<ImageProviderView[]>(() => data.value?.items ?? []);
 const presets = computed<ImagePresetView[]>(() => data.value?.presets ?? []);
 const currentId = computed(() => data.value?.currentId ?? "");
-/** 一家都没配 = 生图能力关闭(与后端 current_image_config() 回 None 同口径) */
 const empty = computed(() => items.value.length === 0);
+/** 借用档:生图坞没配可用条目时, 自动借聊天坞的 MiniMax(Coding Plan)key 开箱即用 */
+const borrowed = computed(() => data.value?.borrowed ?? null);
+/** 生图当前是否可用(显式配置 或 借用生效) —— 决定测试按钮是否出现 */
+const usable = computed(() => !!currentId.value || !!borrowed.value?.active);
 
 async function refresh() {
   loading.value = true;
@@ -122,7 +125,7 @@ async function use(it: ImageProviderView) {
 
 /** 真打一次上游 —— 配错地址/Key/模型名是最常见的坑, 让用户当场知道而不是等生图时才炸 */
 async function testCurrent() {
-  if (testing.value || !currentId.value) return;
+  if (testing.value || !usable.value) return;
   testing.value = true;
   err.value = null;
   ok.value = null;
@@ -155,7 +158,18 @@ const flavorHint = computed(() =>
 
     <!-- 空态：直接把预设摆出来，点一下就带出表单（免手输地址/模型名） -->
     <template v-else-if="empty && !editing">
-      <div class="empty">
+      <!-- 有可借的 Coding Plan key = 开箱即用，明确告知而不是让用户以为还得配 -->
+      <div v-if="borrowed?.active" class="borrow-banner">
+        <Zap :size="14" :stroke-width="2" class="bb-ico" />
+        <div class="bb-body">
+          <div class="bb-t">生图已就绪 · {{ borrowed.name }}</div>
+          <div class="bb-s">
+            自动借用你聊天供应商里的 MiniMax Key（模型 {{ borrowed.model }}），
+            对话里直接说「画一张…」就出真图。想换别家或单独的 Key，从下面添加即可。
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">
         还没配生图模型。配好后，对话里说「画一张…」就会出真图，而不是 HTML 模拟。
       </div>
       <div class="preset-row">
@@ -163,6 +177,15 @@ const flavorHint = computed(() =>
           <Plus :size="12" :stroke-width="2.2" /> {{ p.name }}
         </button>
         <button class="preset ghost" @click="startNew()">自定义…</button>
+        <button
+          v-if="borrowed?.active && isTauri"
+          class="preset test"
+          :disabled="testing"
+          title="用借用的 Coding Plan Key 真打一次生图接口"
+          @click="testCurrent"
+        >
+          {{ testing ? "测试中…（生图慢，20–60s）" : "测试连通" }}
+        </button>
       </div>
     </template>
 
@@ -262,6 +285,12 @@ const flavorHint = computed(() =>
 .sec-head .sub { font-size: 10.5px; color: var(--dim); }
 .muted { font-size: 11.5px; color: var(--muted); padding: 6px 0; }
 .empty { font-size: 11.5px; color: var(--muted); line-height: 1.7; margin-bottom: 8px; }
+
+/* 借用 Coding Plan key 的「开箱即用」横幅 */
+.borrow-banner { display: flex; gap: 9px; align-items: flex-start; padding: 9px 11px; margin-bottom: 8px; border-radius: 8px; border: 1px solid var(--primary-soft); background: linear-gradient(135deg, var(--primary-soft) 0%, transparent 70%); }
+.bb-ico { color: var(--primary); flex-shrink: 0; margin-top: 2px; }
+.bb-t { font-size: 12px; font-weight: 600; color: var(--ink); }
+.bb-s { font-size: 10.5px; color: var(--muted); line-height: 1.7; margin-top: 2px; }
 
 .row { display: flex; align-items: center; gap: 9px; padding: 7px 6px; border-radius: 4px; }
 .row.cur { background: var(--selection-bg); }

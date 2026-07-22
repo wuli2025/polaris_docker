@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "2.3.1"
+version = "2.4.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -34,6 +34,9 @@ tauri-plugin-shell = { version = "2.0", optional = true }
 # 自动更新（GitHub Releases 托管）+ 重启（更新后自重启生效）
 tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
+# 静默驻留(Tailscale 式):关窗=藏进托盘继续跑;再点桌面图标须唤起已有实例而非
+# 起第二个进程(两实例会互抢 8484/网关端口、双份 claude 池)。
+tauri-plugin-single-instance = { version = "2", optional = true }
 # ── Docker(server) 外壳依赖：仅在 `server` feature 下编译 ──
 axum = { version = "0.7", features = ["ws", "multipart"], optional = true }
 tower = { version = "0.5", optional = true }
@@ -155,6 +158,8 @@ desktop = [
     "dep:tauri-plugin-shell",
     "dep:tauri-plugin-updater",
     "dep:tauri-plugin-process",
+    "dep:tauri-plugin-single-instance",
+    "tauri?/tray-icon",       # 系统托盘:关窗静默驻留(见 lib.rs 托盘装配)
     "dep:polaris-sandbox",
     "polaris-kernel/desktop", # 内核的桌面形态(tauri 事件 + 沙箱档位)
     "polaris-forge/desktop", # forge 引擎的桌面形态(tauri 事件 + headless_chrome 兜底)

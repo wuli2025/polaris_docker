@@ -196,6 +196,15 @@ const scanning = computed(() => tasks.running.inventory);
 const scanMsg = computed(() => tasks.detail.inventory);
 // 即时操作(检索/打开/定位/撤销)的轻提示位,独立于上面的任务进度文案。
 const opMsg = ref("");
+// 操作轻提示统一走 flashOp:9s 自动消隐。opMsg 若常驻,要么被常驻的任务文案永久遮蔽
+// (旧模板 buildMsg||scanMsg||opMsg,盘点跑过一次 scanMsg 恒非空,打开失败/检索失败全看不见),
+// 要么反过来永久遮蔽任务进度 —— 只有「短暂置顶」才两全。
+let opMsgTimer: ReturnType<typeof setTimeout> | null = null;
+function flashOp(msg: string) {
+  opMsg.value = msg;
+  if (opMsgTimer) clearTimeout(opMsgTimer);
+  opMsgTimer = setTimeout(() => (opMsg.value = ""), 9000);
+}
 // 盘点完成但有根「连不上、已跳过」时,这里存这些路径 → 弹温和提示框(见模板 .fc-alert)。
 const unreachableNotice = ref<string[]>([]);
 function dismissUnreachable() {
@@ -230,8 +239,16 @@ const building = computed(() => tasks.running.index);
 const buildMsg = computed(() => tasks.detail.index);
 const llmClustering = computed(() => tasks.running.clusterLlm);
 const llmMsg = computed(() => tasks.detail.clusterLlm);
-// 星图重挂载键:归类每完成一档,doneTick 自增 → key 变 → KnowledgeGraph 重载新数据,星图原地升级。
-const graphRefreshKey = computed(() => tasks.doneTick.cluster + tasks.doneTick.clusterLlm);
+// 星图重挂载键:归类收尾后 key 变 → KnowledgeGraph 重载新数据,星图原地升级。
+// **归类进行中不推进**:tier 一档一跳,每跳都整图销毁重拉重排(大图秒级 fcose),
+// 星图开着会反复闪烁抖动;等 done(clustering=false)后一次性升级。
+const graphRefreshKey = ref(0);
+watch(
+  () => tasks.doneTick.cluster + tasks.doneTick.clusterLlm,
+  () => {
+    if (!tasks.clustering) graphRefreshKey.value++;
+  },
+);
 
 // 语义文件夹下钻路径(目前两级:[] = 顶层主题;[topId] = 某主题内看子主题)
 const folderPath = ref<number[]>([]);
@@ -350,7 +367,17 @@ watch(() => tasks.doneTick.inventory, () => {
 watch(() => tasks.doneTick.index, () => { loadOverview(); });
 watch(
   () => tasks.doneTick.cluster + tasks.doneTick.clusterLlm,
-  () => { folderPath.value = []; activeCluster.value = null; loadOverview(); loadGrid(true); },
+  () => {
+    // v3 智能归类每完成一档(骨架/AI/语义)都 tier→tick 自增:任务**还在跑**时只刷
+    // 侧栏总览,既不清导航、也不 loadGrid(true) —— 后者会清空画廊并把虚拟滚动拽回顶部,
+    // 归类期间用户正翻着的画廊每档被拽回第一屏。收尾那次才全量重载。
+    if (!tasks.clustering) {
+      folderPath.value = [];
+      activeCluster.value = null;
+      loadGrid(true);
+    }
+    loadOverview();
+  },
 );
 watch(() => tasks.doneTick.titles, () => { loadGrid(true); });
 
@@ -526,15 +553,16 @@ async function resetTitles() {
   try {
     await fc.titlesClear();
     titlesReverted.value = true;
-    opMsg.value = "已撤销 AI 名称,回落到本地清洗名";
+    flashOp("已撤销 AI 名称,回落到本地清洗名");
     loadGrid(true);
   } catch (e: any) {
-    opMsg.value = `撤销失败:${e?.message ?? e}`;
+    flashOp(`撤销失败:${e?.message ?? e}`);
   }
 }
 
 // ───────────────────────── 语义检索 ─────────────────────────
 async function runSemantic() {
+  if (semBusy.value) return; // 防并发:快速连按会让先发的慢响应后到、覆盖新词的结果
   const q = searchText.value.trim();
   if (!q) {
     semActive.value = false;
@@ -562,7 +590,7 @@ async function runSemantic() {
     semHits.value = Array.from(byPath.values()).slice(0, 16);
   } catch (e: any) {
     semHits.value = [];
-    opMsg.value = `检索失败:${e?.message ?? e}`;
+    flashOp(`检索失败:${e?.message ?? e}`);
   } finally {
     semBusy.value = false;
   }
@@ -610,7 +638,7 @@ async function openPath(abspath: string) {
   try {
     await artifactsApi.openExternal(abspath);
   } catch (e: any) {
-    opMsg.value = `打开失败:${e?.message ?? e}`;
+    flashOp(`打开失败:${e?.message ?? e}`);
   }
 }
 
@@ -645,6 +673,7 @@ onBeforeUnmount(() => {
   // 任务事件监听已托管给全局 fileTasks store(App 级注册一次,永不在此退订)——
   // 这正是「切走文件中心,盘点/建索引/归类仍在后台跑、进度不丢」的关键。
   if (tipTimer) clearTimeout(tipTimer);
+  if (opMsgTimer) clearTimeout(opMsgTimer);
   // 内存治理:切走文件中心即主动清空缩略图缓存(几百条 base64 data URL,可达几十 MB),
   // 让 WebView 立刻能回收,而不是等组件实例被 GC 才释放(Mac WKWebView 回收偏懒)。
   // 回到文件中心时视口内缩略图会按需重取(服务端已落盘 jpg,极快)。
@@ -747,7 +776,8 @@ onBeforeUnmount(() => {
       </div>
     </transition>
 
-    <div v-if="(scanMsg || buildMsg || opMsg) && view !== 'core'" class="fc-note">{{ buildMsg || scanMsg || opMsg }}</div>
+    <!-- 即时操作提示(9s 自动消隐)短暂置顶;平时显示任务进度文案 -->
+    <div v-if="(scanMsg || buildMsg || opMsg) && view !== 'core'" class="fc-note">{{ opMsg || buildMsg || scanMsg }}</div>
 
     <!-- 筛选面板:语义文件夹(两级下钻)+ 按类型 + 按语言 -->
     <FilterPanel

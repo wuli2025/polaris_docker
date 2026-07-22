@@ -94,7 +94,7 @@ impl<T> WorkQueue<T> {
     pub fn pop(&self) -> Option<Job<T>> {
         let mut g = self.inner.lock().unwrap();
         loop {
-            if g.closed || crate::fable::cancelled() {
+            if g.closed || crate::fable::scan_cancelled() {
                 return None;
             }
             if let Some(job) = g.q.pop_back() {
@@ -150,7 +150,7 @@ impl<T> WorkQueue<T> {
     /// 协调线程在此挂起,直到全部了结或被取消。**零忙等**(Condvar + 500ms 兜底复查)。
     pub fn wait_until_done(&self) {
         let mut g = self.inner.lock().unwrap();
-        while !g.closed && !crate::fable::cancelled() && !Self::is_done(&g) {
+        while !g.closed && !crate::fable::scan_cancelled() && !Self::is_done(&g) {
             let (ng, _) = self
                 .cond
                 .wait_timeout(g, Duration::from_millis(500))
@@ -163,11 +163,11 @@ impl<T> WorkQueue<T> {
     /// (等一小段→报一次进度→再等),既不忙等又能让进度条平滑推进。
     pub fn wait_until_done_for(&self, dur: Duration) -> bool {
         let g = self.inner.lock().unwrap();
-        if g.closed || crate::fable::cancelled() || Self::is_done(&g) {
+        if g.closed || crate::fable::scan_cancelled() || Self::is_done(&g) {
             return true;
         }
         let (g, _) = self.cond.wait_timeout(g, dur).unwrap();
-        g.closed || crate::fable::cancelled() || Self::is_done(&g)
+        g.closed || crate::fable::scan_cancelled() || Self::is_done(&g)
     }
 
     /// 取走队列里剩余未处理的工作单元(扫完后:正常路径返回空;若因挂载掉线令所有 worker
@@ -188,6 +188,40 @@ impl<T> WorkQueue<T> {
     pub fn stats(&self) -> (usize, usize, usize) {
         let g = self.inner.lock().unwrap();
         (g.in_flight, g.q.len(), g.live_workers)
+    }
+}
+
+// ───────────────────────── 后台线程降级(长任务不拖垮整机)─────────────────────────
+
+/// 把**当前线程**降为后台优先级:索引构建/词法专扫/智能归类这类长任务不与
+/// UI·对话·claude 子进程抢 CPU 和磁盘带宽(「建索引把整个应用拖卡」的资源面根因)。
+/// 只准用在**专属线程**(任务结束线程即退出)上:优先级是线程级状态且本函数不做恢复,
+/// 池化线程(spawn_blocking/rayon)调它会把降级永久带给池里后续不相干的任务。
+/// - Windows: THREAD_MODE_BACKGROUND_BEGIN —— CPU、IO、内存优先级一起降(系统给
+///   「后台长任务」的正解,索引狂读盘也抢不过前台 IO);老系统/失败时退
+///   THREAD_PRIORITY_BELOW_NORMAL 至少降 CPU。
+/// - Linux(容器): 线程粒度 nice +10(gettid 而非 getpid,绝不动整个进程)。
+/// - macOS: QoS 降到 Utility 档(调度/IO 据此让路;不用 Background 档 —— 会被系统
+///   限到龟速,NAS 大库一轮索引跑不完)。
+pub fn demote_current_thread_to_background() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+            THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        if SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) == 0 {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let _ = libc::pthread_set_qos_class_self_np(libc::QOS_CLASS_UTILITY, 0);
     }
 }
 
@@ -215,6 +249,21 @@ where
     rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
 }
 
+/// [`with_deadline`] 的后台档变体:旁路线程先降后台优先级再干活。索引构建/词法专扫的
+/// 批量读盘用这个 —— 读发生在旁路线程上,而线程优先级**不继承**,只降构建线程等于
+/// IO 降级被绕过;旁路线程是专属线程(干完即退),降级安全。交互请求路径(文件夹选择器
+/// 探挂载点等)仍用 with_deadline,不能让用户等一个被降速的读。
+pub fn with_deadline_bg<T, F>(secs: u64, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    with_deadline(secs, move || {
+        demote_current_thread_to_background();
+        f()
+    })
+}
+
 /// 有界 `is_dir`:对挂载点探测可达性,挂载掉线最多卡 `secs` 秒即判不可达(返回 false),
 /// 而非让 `Path::is_dir()` 在死 NAS 上 stat 几十秒吊死请求。
 pub fn dir_reachable(path: &std::path::Path, secs: u64) -> bool {
@@ -227,6 +276,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// 后台降级在专属线程上安全:调用后线程照常干活、正常退出(全平台冒烟;
+    /// 优先级真降没降由系统决定,这里只保证不 panic、不影响执行)。
+    #[test]
+    fn demote_current_thread_is_safe() {
+        let v = std::thread::spawn(|| {
+            demote_current_thread_to_background();
+            21 * 2
+        })
+        .join()
+        .unwrap();
+        assert_eq!(v, 42);
+    }
 
     /// 旁路死线:可能阻塞的活儿(这里 sleep 5s 模拟死 NAS 的 read_dir)在死线内返回 None,
     /// 请求线程绝不被吊死;正常快活儿则照常拿到结果。

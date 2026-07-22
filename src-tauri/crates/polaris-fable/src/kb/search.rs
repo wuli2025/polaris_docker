@@ -217,7 +217,9 @@ pub fn render_kb_context(query: &str, top_k: usize) -> String {
     let root = KB_ROOT.read().clone();
     for (i, h) in hits.iter().enumerate() {
         let full = root.join(&h.path);
-        let body = fs::read_to_string(&full).unwrap_or_default();
+        // 有界读(≤8MiB,见 read_text_capped):只留 4000 字却整读全文,库里混进一个
+        // 超大 markdown(如转出来的巨型日志)会在每次聊天召回时整份进内存。
+        let body = super::scan::read_text_capped(&full).unwrap_or_default();
         let trimmed: String = body.chars().take(4000).collect();
         out.push_str(&format!(
             "### [{}] {}\n来源: `{}`\n\n{}\n\n---\n\n",

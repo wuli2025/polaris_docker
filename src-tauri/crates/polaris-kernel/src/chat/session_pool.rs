@@ -139,6 +139,9 @@ pub(super) struct Fingerprint {
     pub model: String,
     pub add_dirs: Vec<String>,
     pub creative: bool,
+    /// 本项目绑定的工作目录(claude cwd)。cwd 是 spawn 时钉死、进程中途改不了的, 故必须入
+    /// 指纹: 用户切换项目工作目录后, 旧常驻进程还在老 cwd 里跑, 判变才会杀旧重建。空=默认 cwd。
+    pub cwd: String,
 }
 
 // ───────────────────────── PoolCore (纯记账, 可测) ─────────────────────────
@@ -146,6 +149,7 @@ pub(super) struct Fingerprint {
 /// LRU 上限: 每个常驻 claude ~200-400MB, 2 个封顶 → 最多 ~800MB, 桌面可接受。
 const MAX_SESSIONS: usize = 2;
 /// 空闲 TTL: 10 分钟没消息就收割(惰性检查, 在每次发消息时扫)。
+/// 注意: 「正在跑轮次」的会话不论多久都豁免(见 sweep_expired 的 busy 谓词)。
 const IDLE_TTL_MS: u64 = 10 * 60 * 1000;
 
 struct Entry<T> {
@@ -169,11 +173,16 @@ impl<T> PoolCore<T> {
     }
 
     /// TTL 收割: 摘出所有空闲超时条目(杀进程由调用方在锁外做)。
-    fn sweep_expired(&mut self, now: u64) -> Vec<T> {
+    /// busy 谓词豁免「正在跑轮次」的会话: last_used 只在轮次**开始**时刷新, 一轮跑得
+    /// 比 TTL 久的长任务(几十分钟编译/整夜脚本)绝不能被当闲置误杀 —— 否则任何其它
+    /// 对话一发消息/预热, 这里的惰性清扫就会把进行中的长任务整树杀掉且静默收尾。
+    fn sweep_expired(&mut self, now: u64, busy: impl Fn(&T) -> bool) -> Vec<T> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.entries.len() {
-            if now.saturating_sub(self.entries[i].last_used) >= IDLE_TTL_MS {
+            if now.saturating_sub(self.entries[i].last_used) >= IDLE_TTL_MS
+                && !busy(&self.entries[i].payload)
+            {
                 out.push(self.entries.remove(i).payload);
             } else {
                 i += 1;
@@ -202,7 +211,16 @@ impl<T> PoolCore<T> {
     }
 
     /// 插入新会话; 超过 LRU 上限时摘出最久未用的旧会话返回给调用方收割。
-    fn insert(&mut self, conv: String, fp: Fingerprint, payload: T, now: u64) -> Vec<T> {
+    /// busy 谓词与 sweep_expired 同义: 逐出只在**非忙碌**条目里挑, 全员在跑轮次时
+    /// 宁可临时超上限(多占一个进程的内存, 轮次结束后由 TTL 收回), 也不杀进行中的任务。
+    fn insert(
+        &mut self,
+        conv: String,
+        fp: Fingerprint,
+        payload: T,
+        now: u64,
+        busy: impl Fn(&T) -> bool,
+    ) -> Vec<T> {
         // 同 conv 旧条目先摘(调用方应已处理, 这里兜底防泄漏)
         let mut evicted: Vec<T> = self.remove(&conv).into_iter().collect();
         self.entries.push(Entry {
@@ -212,13 +230,20 @@ impl<T> PoolCore<T> {
             payload,
         });
         while self.entries.len() > MAX_SESSIONS {
-            let (idx, _) = self
+            // 新插入者恒在末位(只会移除它前面的条目), 不列为逐出候选 —— 否则「其余
+            // 全员忙碌」时会把刚建好的会话自己逐出去, 新对话的消息就发不出去了。
+            let new_idx = self.entries.len() - 1;
+            let candidate = self
                 .entries
                 .iter()
                 .enumerate()
+                .filter(|(i, e)| *i != new_idx && !busy(&e.payload))
                 .min_by_key(|(_, e)| e.last_used)
-                .expect("len > MAX >= 1");
-            evicted.push(self.entries.remove(idx).payload);
+                .map(|(i, _)| i);
+            match candidate {
+                Some(idx) => evicted.push(self.entries.remove(idx).payload),
+                None => break, // 其余全员忙碌: 不杀活轮, 容忍暂时超上限
+            }
         }
         evicted
     }
@@ -277,6 +302,12 @@ fn now_ms() -> u64 {
 
 /// 收割一个会话进程(池锁外调用): 标记死亡→杀整树→reap。
 /// reported=true 表示"死因已由调用方告知前端"(取消/看门狗/退出), reader 不再补报 error。
+/// 「正在跑轮次」判定(TTL 清扫/LRU 逐出的豁免谓词): 进程活着且本轮 active_req 未被
+/// reader 清空。进程死了(alive=false)即便 active_req 残留也不算忙 —— 死条目必须可清。
+fn session_busy(sp: &SessionProc) -> bool {
+    sp.shared.alive.load(Ordering::SeqCst) && sp.shared.active_req.lock().is_some()
+}
+
 fn reap(mut s: SessionProc, reported: bool) {
     if reported {
         s.shared.kill_reported.store(true, Ordering::SeqCst);
@@ -357,11 +388,16 @@ pub(super) struct TurnParams {
     pub work_full: bool,
     pub provider_id: Option<String>,
     pub creative: bool,
+    /// 本项目绑定的工作目录(用户选的真实仓库), None=用默认 cwd。透传给 spawn_on_host + 进指纹。
+    pub work_dir: Option<String>,
 }
 
 /// 由本轮参数算配置指纹 —— run_persistent_turn 与 prewarm 必须用**同一个**算法,
 /// 否则预热起的进程会因指纹算法差异被真发送误判「不符」而白白杀掉重建。
 fn fingerprint_of(p: &TurnParams) -> Fingerprint {
+    // cwd 与 add_dirs 必须用**同一个** effective_cwd 口径算(add_dirs 靠它判 KB/产物在不在
+    // cwd 子树), 且这里算出的 cwd 必须与 spawn_session→spawn_on_host 真用的 cwd 完全一致。
+    let cwd = pipeline::effective_cwd(p.work_dir.as_deref().map(std::path::Path::new));
     Fingerprint {
         perm: p.perm.clone(),
         // None/"auto"/"" 都是「跟随全局当前供应商」同一档, 归一化后指纹才稳定。
@@ -372,8 +408,9 @@ fn fingerprint_of(p: &TurnParams) -> Fingerprint {
         work_full: p.work_full,
         with_task: p.with_task,
         model: pipeline::model_for_mode(p.work_full).unwrap_or_default(),
-        add_dirs: pipeline::extra_claude_dirs(&p.art_dir),
+        add_dirs: pipeline::extra_claude_dirs(&cwd, &p.art_dir),
         creative: p.creative,
+        cwd: cwd.to_string_lossy().to_string(),
     }
 }
 
@@ -404,6 +441,10 @@ pub fn prewarm(
     // add_dirs, 取值路径必须一致, 否则预热指纹永远对不上。
     let art_dir = super::artifacts::artifacts_dir(Some(&conv_id));
     let _ = std::fs::create_dir_all(&art_dir);
+    // 工作目录从 conv → project 反查(与真发送 chat_send_pipeline 同源), 必须一致否则预热指纹
+    // 永远对不上、白起进程。这里内部解析而不改 prewarm 签名, 免动 chat_prewarm 调用方。
+    let work_dir = crate::conv::project_id_of_conversation(&conv_id)
+        .and_then(|pid| crate::conv::project_work_dir(&pid));
     let p = TurnParams {
         app,
         req_id: String::new(), // 预热没有"轮", 不发消息 → 无 req_id/plan/快照
@@ -417,6 +458,7 @@ pub fn prewarm(
         work_full,
         provider_id,
         creative: false,
+        work_dir,
     };
     let fp = fingerprint_of(&p);
 
@@ -424,7 +466,7 @@ pub fn prewarm(
     let mut to_reap: Vec<SessionProc> = Vec::new();
     let hit = {
         let mut g = POOL.lock();
-        to_reap.extend(g.sweep_expired(now_ms()));
+        to_reap.extend(g.sweep_expired(now_ms(), session_busy));
         match g.get_mut(&conv_id) {
             Some((cur_fp, sp)) if *cur_fp == fp && sp.shared.alive.load(Ordering::SeqCst) => true,
             Some(_) => {
@@ -460,7 +502,7 @@ pub fn prewarm(
         if occupied {
             (Some(proc), Vec::new())
         } else {
-            (None, g.insert(conv_id.clone(), fp, proc, now_ms()))
+            (None, g.insert(conv_id.clone(), fp, proc, now_ms(), session_busy))
         }
     };
     if let Some(s) = discard {
@@ -483,7 +525,7 @@ pub(super) fn run_persistent_turn(p: TurnParams) -> Result<(), String> {
         let mut reusable = false;
         {
             let mut g = POOL.lock();
-            to_reap.extend(g.sweep_expired(now_ms()));
+            to_reap.extend(g.sweep_expired(now_ms(), session_busy));
             if let Some((cur_fp, sp)) = g.get_mut(&p.conv_id) {
                 if *cur_fp == fp && sp.shared.alive.load(Ordering::SeqCst) {
                     reusable = true;
@@ -506,9 +548,9 @@ pub(super) fn run_persistent_turn(p: TurnParams) -> Result<(), String> {
                     continue;
                 }
             };
-            let evicted = POOL
-                .lock()
-                .insert(p.conv_id.clone(), fp.clone(), proc, now_ms());
+            let evicted =
+                POOL.lock()
+                    .insert(p.conv_id.clone(), fp.clone(), proc, now_ms(), session_busy);
             for s in evicted {
                 reap(s, true);
             }
@@ -630,6 +672,7 @@ fn spawn_session(p: &TurnParams) -> Result<SessionProc, String> {
         p.work_full,
         p.provider_id.as_deref(),
         true, // persistent: 加 --input-format stream-json
+        p.work_dir.as_deref().map(std::path::Path::new),
     )?;
     let stdin = child
         .stdin
@@ -882,6 +925,7 @@ mod tests {
             model: model.into(),
             add_dirs: vec!["/kb".into()],
             creative: false,
+            cwd: String::new(),
         }
     }
 
@@ -898,17 +942,25 @@ mod tests {
         let mut c = fp("acceptEdits", "");
         c.creative = true;
         assert_ne!(a, c, "创作模式翻转必须判不等(前置指令取向不同)");
+        let mut d = fp("acceptEdits", "");
+        d.cwd = "/home/me/big-project".into();
+        assert_ne!(a, d, "项目工作目录(cwd)变化必须判不等(cwd 进程中途改不了, 须杀旧重建)");
+    }
+
+    /// 无忙碌者的默认谓词(旧行为)。
+    fn idle_only(_: &u32) -> bool {
+        false
     }
 
     /// LRU 上限 2: 第 3 个会话插入时, 最久未用的被逐出; touch 能续命。
     #[test]
     fn lru_evicts_least_recently_used() {
         let mut core: PoolCore<u32> = PoolCore::new();
-        assert!(core.insert("a".into(), fp("p", ""), 1, 0).is_empty());
-        assert!(core.insert("b".into(), fp("p", ""), 2, 100).is_empty());
+        assert!(core.insert("a".into(), fp("p", ""), 1, 0, idle_only).is_empty());
+        assert!(core.insert("b".into(), fp("p", ""), 2, 100, idle_only).is_empty());
         // touch a → b 变成最久未用
         core.touch("a", 200);
-        let evicted = core.insert("c".into(), fp("p", ""), 3, 300);
+        let evicted = core.insert("c".into(), fp("p", ""), 3, 300, idle_only);
         assert_eq!(evicted, vec![2], "应逐出最久未用的 b(payload=2)");
         assert!(core.get_mut("a").is_some());
         assert!(core.get_mut("b").is_none());
@@ -919,8 +971,8 @@ mod tests {
     #[test]
     fn reinsert_same_conv_replaces() {
         let mut core: PoolCore<u32> = PoolCore::new();
-        core.insert("a".into(), fp("p", ""), 1, 0);
-        let evicted = core.insert("a".into(), fp("q", ""), 9, 10);
+        core.insert("a".into(), fp("p", ""), 1, 0, idle_only);
+        let evicted = core.insert("a".into(), fp("q", ""), 9, 10, idle_only);
         assert_eq!(evicted, vec![1]);
         let (f, v) = core.get_mut("a").unwrap();
         assert_eq!((f.perm.as_str(), *v), ("q", 9));
@@ -930,15 +982,46 @@ mod tests {
     #[test]
     fn ttl_sweep_reaps_idle_sessions() {
         let mut core: PoolCore<u32> = PoolCore::new();
-        core.insert("old".into(), fp("p", ""), 1, 0);
-        core.insert("new".into(), fp("p", ""), 2, 5 * 60 * 1000);
-        let reaped = core.sweep_expired(10 * 60 * 1000); // old 恰满 10min, new 才 5min
+        core.insert("old".into(), fp("p", ""), 1, 0, idle_only);
+        core.insert("new".into(), fp("p", ""), 2, 5 * 60 * 1000, idle_only);
+        let reaped = core.sweep_expired(10 * 60 * 1000, idle_only); // old 恰满 10min, new 才 5min
         assert_eq!(reaped, vec![1]);
         assert!(core.get_mut("old").is_none());
         assert!(core.get_mut("new").is_some());
         // touch 后不再过期
         core.touch("new", 14 * 60 * 1000);
-        assert!(core.sweep_expired(20 * 60 * 1000).is_empty());
+        assert!(core.sweep_expired(20 * 60 * 1000, idle_only).is_empty());
+    }
+
+    /// 长任务保命核心: 正在跑轮次(busy)的会话, TTL 到点也**绝不**被清扫;
+    /// 轮次结束(不再 busy)后才可回收。
+    #[test]
+    fn ttl_sweep_never_reaps_busy_session() {
+        let mut core: PoolCore<u32> = PoolCore::new();
+        core.insert("longtask".into(), fp("p", ""), 1, 0, idle_only);
+        // 轮次开跑 7 小时后别的对话触发清扫: busy 豁免, 条目必须还在
+        let reaped = core.sweep_expired(7 * 3600 * 1000, |v| *v == 1);
+        assert!(reaped.is_empty(), "进行中的长任务绝不能被 TTL 误杀");
+        assert!(core.get_mut("longtask").is_some());
+        // 轮次结束后同一时刻再扫: 正常回收
+        let reaped = core.sweep_expired(7 * 3600 * 1000, idle_only);
+        assert_eq!(reaped, vec![1]);
+    }
+
+    /// 长任务保命之二: LRU 逐出只挑非忙碌者; 全员忙碌时容忍超上限, 不杀活轮。
+    #[test]
+    fn lru_never_evicts_busy_session() {
+        let mut core: PoolCore<u32> = PoolCore::new();
+        core.insert("a".into(), fp("p", ""), 1, 0, idle_only);
+        core.insert("b".into(), fp("p", ""), 2, 100, idle_only);
+        // a 最久未用但正在跑轮次 → 逐出的必须是 b
+        let evicted = core.insert("c".into(), fp("p", ""), 3, 200, |v| *v == 1);
+        assert_eq!(evicted, vec![2], "忙碌的 a 不可逐出, 应逐出空闲的 b");
+        // a、c 都忙 → 第 4 个插入不逐出任何人(包括 d 自己), 暂时超上限
+        let evicted = core.insert("d".into(), fp("p", ""), 4, 300, |v| *v == 1 || *v == 3);
+        assert!(evicted.is_empty(), "其余全员忙碌时宁可超上限也不杀活轮");
+        assert!(core.get_mut("a").is_some() && core.get_mut("c").is_some());
+        assert!(core.get_mut("d").is_some(), "新插入者不可被自己逐出");
     }
 
     /// PromptPlan 首条/续轮拆分: 续轮剔除 Session 段与已发过的 Keyed 段, 保留 Turn 段。

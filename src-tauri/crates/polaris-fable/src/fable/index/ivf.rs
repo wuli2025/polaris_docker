@@ -36,9 +36,11 @@ fn majority_bits(members: &[&[u8]], nbytes: usize) -> Vec<u8> {
     out
 }
 
-/// 返回 `bits` 在 `centroids` 里汉明最近的下标(centroids 非空;等长项才参与)。
-fn nearest_centroid(bits: &[u8], centroids: &[Vec<u8>]) -> usize {
-    let mut best = 0usize;
+/// 返回 `bits` 在 `centroids` 里汉明最近的下标(等长项才参与)。
+/// **没有任何等长质心时返回 `None`**:旧版默认返回 0,长度不匹配的脏 blob 会被静默塞进
+/// cell 0(错桶),该 chunk 的 ANN 召回从此悄悄劣化 —— 调用方应跳过而不是错放。
+fn nearest_centroid(bits: &[u8], centroids: &[Vec<u8>]) -> Option<usize> {
+    let mut best: Option<usize> = None;
     let mut bestd = u32::MAX;
     for (i, c) in centroids.iter().enumerate() {
         if c.len() != bits.len() {
@@ -47,7 +49,7 @@ fn nearest_centroid(bits: &[u8], centroids: &[Vec<u8>]) -> usize {
         let d = hamming(bits, c);
         if d < bestd {
             bestd = d;
-            best = i;
+            best = Some(i);
         }
     }
     best
@@ -68,7 +70,9 @@ fn train_binary_centroids(sample: &[Vec<u8>], k: usize, iters: usize) -> Vec<Vec
     for _ in 0..iters {
         let mut buckets: Vec<Vec<&[u8]>> = vec![Vec::new(); centroids.len()];
         for s in sample {
-            let c = nearest_centroid(s, &centroids);
+            let Some(c) = nearest_centroid(s, &centroids) else {
+                continue;
+            };
             buckets[c].push(s.as_slice());
         }
         for (ci, bucket) in buckets.iter().enumerate() {
@@ -210,7 +214,10 @@ pub fn optimize_vectors() -> Result<OptimizeSummary, String> {
                 .prepare_cached("UPDATE chunks SET cell=?2 WHERE id=?1")
                 .map_err(|e| e.to_string())?;
             for (id, bits) in &batch {
-                let ci = nearest_centroid(bits, &centroids);
+                // 长度不匹配的脏 blob:跳过(保持未分配),别错塞 cell 0 劣化召回。
+                let Some(ci) = nearest_centroid(bits, &centroids) else {
+                    continue;
+                };
                 up.execute(rusqlite::params![id, cell_ids[ci]])
                     .map_err(|e| e.to_string())?;
             }
@@ -373,7 +380,10 @@ pub fn repair_vectors() -> Result<RepairSummary, String> {
                     .prepare_cached("UPDATE chunks SET cell=?2 WHERE id=?1")
                     .map_err(|e| e.to_string())?;
                 for (id, bits) in &batch {
-                    let ci = nearest_centroid(bits, &centroids);
+                    // 同 optimize:不匹配即跳过,不错桶。
+                    let Some(ci) = nearest_centroid(bits, &centroids) else {
+                        continue;
+                    };
                     up.execute(rusqlite::params![id, cell_ids[ci]])
                         .map_err(|e| e.to_string())?;
                 }
@@ -463,8 +473,10 @@ mod tests {
         assert_eq!(maj[0], 0b0000_0011); // bit0(a,b)、bit1(b,c)各 2/3 > 半数
                                          // 汉明最近质心。
         let cents = vec![vec![0b0000_0000u8], vec![0b1111_1111u8]];
-        assert_eq!(nearest_centroid(&[0b0000_0001u8], &cents), 0);
-        assert_eq!(nearest_centroid(&[0b1111_1110u8], &cents), 1);
+        assert_eq!(nearest_centroid(&[0b0000_0001u8], &cents), Some(0));
+        assert_eq!(nearest_centroid(&[0b1111_1110u8], &cents), Some(1));
+        // 长度全不匹配 → None(而非错塞 0 号桶)。
+        assert_eq!(nearest_centroid(&[0u8, 0u8], &cents), None);
     }
 
     #[test]

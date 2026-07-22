@@ -899,9 +899,12 @@ export const files = {
   searchAi: (query: string, topK = 24, scope?: string) =>
     invoke<FableSearchResult>("fable_search_ai", { query, topK, scope }),
   /** 取消当前盘点/索引任务(协作式:循环轮询 CANCEL,几百毫秒内优雅停;索引可再点继续续建) */
-  fableCancel: () => invoke<void>("fable_cancel"),
+  /** 协作式取消。task:"inventory"=只停盘点、"index"=只停索引、"cluster"=停归类(连带其 T2 向量化);缺省=全停(旧行为)。 */
+  fableCancel: (task?: "inventory" | "index" | "cluster") => invoke<void>("fable_cancel", { task: task ?? null }),
 };
 
+// 注意:后端 FableHit/FableSearchResult **没有** serde camelCase 改名(库里少数派),
+// 载荷就是 snake_case —— 类型必须照实写,否则读 grepHits 之类恒 undefined。
 export interface FableHit {
   path: string;
   abspath: string;
@@ -909,15 +912,17 @@ export interface FableHit {
   snippet: string;
   score: number;
   lanes: string[];
+  /** 被同目录同名新版本压制时给出新版本相对路径(前端标「有新版本」);无则缺省。 */
+  superseded_by_path?: string;
 }
 export interface FableSearchResult {
   query: string;
   mode: string;
   hits: FableHit[];
-  grepHits: number;
-  vectorHits: number;
+  grep_hits: number;
+  vector_hits: number;
   reranked: boolean;
-  grepTruncated: boolean;
+  grep_truncated: boolean;
   ms: number;
 }
 
@@ -1245,6 +1250,8 @@ export interface Project {
   collabProjectId?: number | null;
   /** 绑定时的协作主机 base(空=未绑) */
   collabHost?: string;
+  /** 本项目绑定的工作目录(用户选的真实仓库绝对路径)；该项目下所有对话以它为 claude cwd。null/空=默认 */
+  workDir?: string | null;
 }
 
 export interface Conversation {
@@ -1273,6 +1280,7 @@ type RawProject = {
   kb_scope?: string | null;
   collab_project_id?: number | null;
   collab_host?: string;
+  work_dir?: string | null;
 };
 type RawConv = {
   id: string;
@@ -1298,6 +1306,7 @@ const p = (r: RawProject): Project => ({
   kbScope: r.kb_scope ?? null,
   collabProjectId: r.collab_project_id ?? null,
   collabHost: r.collab_host ?? "",
+  workDir: r.work_dir ?? null,
 });
 const c = (r: RawConv): Conversation => ({
   id: r.id,
@@ -1358,6 +1367,10 @@ export const convApi = {
   /** 板块⑫: 设置项目的知识库 scope（人格工坊下拉） */
   setKbScope: (projectId: string, kbScope: string | null) =>
     invoke<void>("conv_set_project_kb_scope", { projectId, kbScope }),
+  /** 设置(或清除)项目的工作目录：本项目下所有对话以此为 claude cwd（终端 cd 进 repo 同款）。
+   *  传 null/空 = 解绑回落默认。传入不存在的目录后端会报错(可直接展示)。 */
+  setWorkDir: (projectId: string, workDir: string | null) =>
+    invoke<void>("conv_set_project_work_dir", { projectId, workDir }),
 };
 
 // ──────────────────────────────────────────────────────────────
@@ -1622,6 +1635,8 @@ export interface ImageProviderListResult {
   currentId: string;
   /** 预设模板, 只为免手输; 用户仍需自己填 Key */
   presets: ImagePresetView[];
+  /** 可借用的聊天坞 MiniMax(Coding Plan)key 档; active=true 即当前生效(坞里没配可用条目) */
+  borrowed?: { name: string; model: string; active: boolean } | null;
 }
 export interface ImageProviderSaveInput {
   /** 空 = 新建 */

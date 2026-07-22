@@ -49,11 +49,24 @@ use std::sync::Mutex;
 pub(crate) static SCANNING: AtomicBool = AtomicBool::new(false);
 /// 索引构建进行中(防双发)
 pub(crate) static INDEXING: AtomicBool = AtomicBool::new(false);
-/// 协作式取消:盘点与索引循环里轮询
-pub(crate) static CANCEL: AtomicBool = AtomicBool::new(false);
+/// 协作式取消 —— **按任务族分立**。SCANNING 与 INDEXING 是两把独立的闸,盘点和索引
+/// 完全可以同时在跑;旧实现只有一个全局 CANCEL,后果:①停索引会把正在跑的盘点一起打死;
+/// ②起盘点时 `store(false)` 会把「用户刚点的停索引」静默洗掉,索引「关不掉」。
+/// 盘点族(inventory + audit + sched 队列)轮询 `CANCEL_SCAN`;
+/// 索引族(build/lexical/ivf/dedupe)轮询 `CANCEL_INDEX`;
+/// 归类族(cluster_build / smart_cluster 各阶段)轮询 `CANCEL_CLUSTER`。
+pub(crate) static CANCEL_SCAN: AtomicBool = AtomicBool::new(false);
+pub(crate) static CANCEL_INDEX: AtomicBool = AtomicBool::new(false);
+pub(crate) static CANCEL_CLUSTER: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn cancelled() -> bool {
-    CANCEL.load(Ordering::Relaxed)
+pub(crate) fn scan_cancelled() -> bool {
+    CANCEL_SCAN.load(Ordering::Relaxed)
+}
+pub(crate) fn index_cancelled() -> bool {
+    CANCEL_INDEX.load(Ordering::Relaxed)
+}
+pub(crate) fn cluster_cancelled() -> bool {
+    CANCEL_CLUSTER.load(Ordering::Relaxed)
 }
 
 /// 任务闸 RAII 守卫:`acquire` 成功后,持有它即代表「已上闸」;drop 时(含工作线程 panic
@@ -792,10 +805,25 @@ pub fn fable_status() -> Result<FableStatus, String> {
     status()
 }
 
-/// 取消当前盘点/索引任务(协作式,几百毫秒内停)。
+/// 取消盘点/索引/归类任务(协作式,几百毫秒内停)。
+/// `task`:`"inventory"` 只停盘点、`"index"` 只停索引、`"cluster"` 停归类
+/// (归类的 T2 阶段内嵌全量向量化、持 INDEXING 闸,故连带置 CANCEL_INDEX 才断得开);
+/// 缺省/其它 = 全部都停(兼容旧调用)。
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn fable_cancel() {
-    CANCEL.store(true, Ordering::SeqCst);
+pub fn fable_cancel(task: Option<String>) {
+    match task.as_deref() {
+        Some("inventory") => CANCEL_SCAN.store(true, Ordering::SeqCst),
+        Some("index") => CANCEL_INDEX.store(true, Ordering::SeqCst),
+        Some("cluster") => {
+            CANCEL_CLUSTER.store(true, Ordering::SeqCst);
+            CANCEL_INDEX.store(true, Ordering::SeqCst);
+        }
+        _ => {
+            CANCEL_SCAN.store(true, Ordering::SeqCst);
+            CANCEL_INDEX.store(true, Ordering::SeqCst);
+            CANCEL_CLUSTER.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]

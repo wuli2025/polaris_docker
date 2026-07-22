@@ -258,11 +258,17 @@ pub(crate) fn cluster_llm_run(
         } else {
             std::env::temp_dir()
         };
-        crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _text| {
-            if kind == "delta" {
-                emit_llm(app, json!({ "kind": "tick" })); // 心跳,不外泄正文
-            }
-        })?
+        // 墙钟超时:无超时版挂死会把 CLUSTERS_TABLE_WRITE 一类一次性闸永久钉死(归类此后一直拒绝)。
+        crate::kb::run_claude_readonly_timeout(
+            &cwd,
+            &prompt,
+            |kind, _text| {
+                if kind == "delta" {
+                    emit_llm(app, json!({ "kind": "tick" })); // 心跳,不外泄正文
+                }
+            },
+            std::time::Duration::from_secs(600),
+        )?
     };
     let raw = crate::kb::extract_balanced_json(&collected)
         .ok_or("大模型没有返回可解析的 JSON(可换更强的模型,或稍后重试)")?;
@@ -881,11 +887,17 @@ pub(crate) fn cluster_rename_llm(
         } else {
             std::env::temp_dir()
         };
-        crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _t| {
-            if kind == "delta" {
-                emit_cluster(app, json!({ "kind": "tick", "tier": tier }));
-            }
-        })?
+        // 墙钟超时同上:命名卡死不能钉死后续归类。
+        crate::kb::run_claude_readonly_timeout(
+            &cwd,
+            &prompt,
+            |kind, _t| {
+                if kind == "delta" {
+                    emit_cluster(app, json!({ "kind": "tick", "tier": tier }));
+                }
+            },
+            std::time::Duration::from_secs(600),
+        )?
     };
     let raw = crate::kb::extract_balanced_json(&collected)
         .ok_or("大模型没有返回可解析的 JSON(可换更强的模型,或稍后重试)")?;
@@ -981,11 +993,17 @@ pub(crate) fn titles_llm_run(app: &AppHandle, root: Option<String>) -> Result<us
         } else {
             std::env::temp_dir()
         };
-        crate::kb::run_claude_readonly(&cwd, &prompt, |kind, _text| {
-            if kind == "delta" {
-                emit_title(app, json!({ "kind": "tick" }));
-            }
-        })?
+        // 墙钟超时同上。
+        crate::kb::run_claude_readonly_timeout(
+            &cwd,
+            &prompt,
+            |kind, _text| {
+                if kind == "delta" {
+                    emit_title(app, json!({ "kind": "tick" }));
+                }
+            },
+            std::time::Duration::from_secs(600),
+        )?
     };
     let raw = crate::kb::extract_balanced_json(&collected)
         .ok_or("大模型没有返回可解析的 JSON(可换更强的模型,或稍后重试)")?;

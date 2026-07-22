@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { reactive, computed, ref } from "vue";
 import { files as fc, listen, invoke } from "../tauri";
+import { invalidateScanPrewarm } from "../lib/scanPrewarm";
 
 // 文件中心长任务的全局状态枢纽。
 //
@@ -57,6 +58,10 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
     running[id] = false;
     failed[id] = true;
     detail[id] = msg;
+    // 失败也自增 doneTick —— 它的语义是「任务结束了(需要刷新)」。SenseApi 等页面靠
+    // watch(doneTick) 复位乐观置位的「盘点中/构建中」按钮态,fail 不自增会让真失败后
+    // 按钮永久禁用直到换页重进;FileCenter 的数据刷新 watcher 多刷一次无害。
+    doneTick[id]++;
   }
 
   let wired = false;
@@ -77,8 +82,15 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
             detail.inventory = p.text ?? detail.inventory;
           } else if (p.kind === "done") {
             lastUnreachable.value = p.unreachable ?? [];
+            // 预热缓存失效必须在**全局 store**里做:以前只挂在 FileCenter 的 watcher 上,
+            // 而 FileCenter 不在 KeepAlive 里、切走即卸载 —— 从向导/别的视图完成盘点后,
+            // 盘点选择器会继续吐 60s 内的旧目录树与旧体积。
+            invalidateScanPrewarm();
             finish("inventory", `盘点完成 · ${p.files ?? 0} 个文件`);
           } else if (p.kind === "error") {
+            // 失败/取消时清掉上一轮攒下的「连不上」列表:fail 现在也会触发刷新 watcher,
+            // 别让旧列表在失败后再弹一次「这些根没扫到」的提示框误导用户。
+            lastUnreachable.value = [];
             // 用户主动取消时后端发的也是 error{message:"已取消"};这是「停止」不是「失败」,
             // 按 done 口径优雅收尾(否则任务中心红字报「盘点失败」,误导)。
             if ((p.message ?? "").includes("已取消")) finish("inventory", "盘点已停止");
@@ -115,7 +127,11 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
           doneTick.cluster++;
         } else if (p.kind === "done") {
           finish("cluster", p.note || "归类完成");
-        } else if (p.kind === "error") fail("cluster", `归类失败:${p.message ?? ""}`);
+        } else if (p.kind === "error") {
+          // 用户主动停止时后端发 error{message:"已取消"}:按「停止」而非「失败」收尾(同盘点口径)。
+          if ((p.message ?? "").includes("已取消")) finish("cluster", "归类已停止");
+          else fail("cluster", `归类失败:${p.message ?? ""}`);
+        }
       }),
     );
     unlisteners.push(
@@ -201,12 +217,13 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
   // T2 全量向量化后语义重聚再命名,全程后台、进度走 file:cluster 事件(tier 分档)。
   // 配不配嵌入 key 都点得动:没配则止于结构骨架 + AI 命名;配了自动接 T2 精修。
   // (hasEmbedProvider 参数保留兼容旧调用,实际由后端按服务商在不在自行决定是否做 T2。)
-  async function startSmartCluster(_hasEmbedProvider?: boolean) {
+  // quick=true 跳过耗时的 T2 全量向量化(向导用:收尾自己会后台建索引)。
+  async function startSmartCluster(_hasEmbedProvider?: boolean, quick?: boolean) {
     if (running.cluster || running.clusterLlm) return;
     await ensureListeners();
     begin("cluster", "正在启动智能归类…");
     try {
-      await fc.smartCluster(null);
+      await fc.smartCluster(null, quick);
     } catch (e: any) {
       fail("cluster", `归类失败:${e?.message ?? e}`);
     }
@@ -247,7 +264,15 @@ export const useFileTasksStore = defineStore("fileTasks", () => {
       try { localStorage.setItem("polaris.indexAutoPaused", "1"); } catch { /* ignore */ }
     }
     try {
-      await fc.fableCancel();
+      // 精准停某一族:停索引不再把正在跑的盘点一起打死(反之亦然);
+      // 归类走 "cluster"(后端会连带停它 T2 内嵌的向量化)。
+      // clusterLlm/titles/ontology 后端不轮询任何取消标志 —— 对它们调 fable_cancel
+      // 唯一的效果是误伤别的正在跑的盘点/索引/归类,所以干脆不调,只做乐观收起。
+      const target =
+        id === "inventory" || id === "index" ? id
+        : id === "cluster" ? ("cluster" as const)
+        : null;
+      if (target) await fc.fableCancel(target);
     } catch {
       /* 取消是尽力而为,失败也不抛给用户 */
     }

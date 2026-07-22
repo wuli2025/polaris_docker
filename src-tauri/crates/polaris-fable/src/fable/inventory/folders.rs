@@ -76,11 +76,35 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
         .into_iter()
         .map(|r| (r.path, r.label))
         .collect();
+    // ── 可达性并行预探测(默认根 + 盘符/卷两组一起):每根一个有界旁路**同时**起跑,
+    // 总等待 ≈ 一个 probe_secs。旧串行版逐根 dir_reachable,多个 NAS/外置盘同时掉线时
+    // 打开盘点选择器要 N×10s 才出来,观感就是「又卡死了」(与 fable_inventory_start 同款修法)。
+    let default_roots = inventory_roots(None);
+    let vol_roots = crate::scan::scan_roots();
+    let reachable: HashSet<String> = {
+        let mut uniq: HashSet<String> = HashSet::new();
+        let probes: Vec<(String, std::thread::JoinHandle<bool>)> = default_roots
+            .iter()
+            .cloned()
+            .chain(vol_roots.iter().map(|s| s.path.clone()))
+            .filter(|p| uniq.insert(p.clone()))
+            .map(|p| {
+                let q = p.clone();
+                let h = std::thread::spawn(move || {
+                    super::sched::dir_reachable(Path::new(&q), probe_secs())
+                });
+                (p, h)
+            })
+            .collect();
+        probes
+            .into_iter()
+            .filter_map(|(p, h)| h.join().unwrap_or(false).then_some(p))
+            .collect()
+    };
     // 默认勾:知识库根 + NAS 挂载点 + App 数据下载目录(沿用盘点默认根集合)。
-    for r in inventory_roots(None) {
-        // 有界探测:NAS 挂载点掉线时 is_dir 会 stat 几十秒吊死选择器 → 超死线判不可达即跳过
-        // (死线见 [`probe_secs`],放宽到 12s 容忍冷连接 NAS 的首次慢响应)。
-        if !super::sched::dir_reachable(Path::new(&r), probe_secs()) || !seen.insert(r.clone()) {
+    for r in default_roots {
+        // 掉线挂载点已在上面的并行预探测里出局(死线见 [`probe_secs`],默认 10s)。
+        if !reachable.contains(&r) || !seen.insert(r.clone()) {
             continue;
         }
         let label = if r == kb {
@@ -102,11 +126,9 @@ fn scan_root_candidates(explicit: Option<String>) -> Vec<ScanRootInfo> {
     // 本机盘符 / 桌面 / 外置卷 / 挂载点(复用全盘资源归集的跨平台根)。
     // default_on 直接沿用 scan_roots 的判断(现在「一个不落」——所有真实存在的盘符/卷默认都勾),
     // 这样首次盘点就能把整机所有可达的盘都纳入,用户想缩小范围再手动取消。
-    for sr in crate::scan::scan_roots() {
-        // 同上:挂载点/网络卷可能僵死,有界探测(死线见 [`probe_secs`]),不可达就不进选择器。
-        if !super::sched::dir_reachable(Path::new(&sr.path), probe_secs())
-            || !seen.insert(sr.path.clone())
-        {
+    for sr in vol_roots {
+        // 同上:僵死挂载点/网络卷已在并行预探测里出局,不进选择器。
+        if !reachable.contains(&sr.path) || !seen.insert(sr.path.clone()) {
             continue;
         }
         out.push(ScanRootInfo {
@@ -232,7 +254,7 @@ pub fn fable_scan_folders(root: Option<String>) -> Result<FolderScan, String> {
 
 /// 懒加载:点开某个文件夹时才扫它的直属子文件夹(支持一层层往下钻到任意深度)。
 /// `(async)`:`with_deadline` 内部已开旁路线程,但调用线程仍要 `recv_timeout` 等满死线
-/// (NAS 上≈12s)→ 主线程跑会冻 UI(每展开一个文件夹冻一次)。派到工作线程即解。
+/// (NAS 上≈10s)→ 主线程跑会冻 UI(每展开一个文件夹冻一次)。派到工作线程即解。
 #[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn fable_scan_folder_children(root: String, path: String) -> Result<Vec<FolderNode>, String> {
     // 展开子目录:is_dir + read_dir 都可能卡死 NAS → 整体加死线(见 [`probe_secs`]),超时返回空

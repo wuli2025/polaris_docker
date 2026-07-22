@@ -331,6 +331,43 @@ pub fn minimax_borrow_key() -> String {
     gift_minimax_key()
 }
 
+/// **生图**专用借 key:只借用户自己在坞里存的 minimax / minimax-en(Coding Plan)key,
+/// **不**回落粉丝福利 key —— 生图按张烧额度, 共享福利 key 扛不住, 只留给语音整形这类小调用。
+/// 实测(2026-07-21): `sk-cp-` 前缀的 Coding Plan key 可直接调 `/v1/image_generation`。
+/// 回 (key, 是否国际站) —— 国际站 key 须打 api.minimax.io, 国内站打 api.minimaxi.com,
+/// 打错主站会 401, 由调用方按此选 endpoint。
+pub fn minimax_borrow_key_for_image() -> Option<(String, bool)> {
+    fn pick(st: &Store) -> Option<(String, bool)> {
+        for id in ["minimax", "minimax-en"] {
+            if let Some(it) = st.items.iter().find(|i| i.id == id) {
+                for field in [DEFAULT_TOKEN_FIELD, API_KEY_FIELD] {
+                    let tok = cfg_env_str(&it.settings_config, field);
+                    if !tok.trim().is_empty() {
+                        return Some((tok.trim().to_string(), id == "minimax-en"));
+                    }
+                }
+            }
+        }
+        None
+    }
+    // 壳内(Tauri/server)STORE 由 init() 装载, 直接读内存。但对话里的生图跑在
+    // `polaris-forge image` **子进程**里 —— 没有 AppHandle 不走 init, STORE 恒空;
+    // 以 STORE_PATH 是否已设判「未初始化」, 是则从磁盘只读解析 providers.json,
+    // 否则聊天出图的借用链路在子进程里永远断(实测就是这么断的)。
+    if !STORE_PATH.read().as_os_str().is_empty() {
+        return pick(&STORE.read());
+    }
+    let user = UserDirs::new()?;
+    let path = user
+        .home_dir()
+        .join("Polaris")
+        .join("data")
+        .join("providers.json");
+    let txt = fs::read_to_string(path).ok()?;
+    let st: Store = serde_json::from_str(&txt).ok()?;
+    pick(&st)
+}
+
 /// 还原构建期注入的「免费额度赠送」Kimi For Coding token(XOR 混淆, 见 build.rs)。
 /// 与 MiniMax 同 —— 仅从环境变量注入(CI secret POLARIS_GIFT_KIMI_KEY);未注入
 /// (本地 dev / 无 secret 构建)时返回空串, seed_gift_kimi 见空即跳过, 不种子。

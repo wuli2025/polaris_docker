@@ -36,11 +36,16 @@ fn scan_and_score(
     let hits = Mutex::new(Vec::<GrepHit>::new());
     let spent = AtomicU64::new(0);
     let truncated = std::sync::atomic::AtomicBool::new(false);
+    // 已判僵死的远程根(全池共享):候选文件散在 NAS 上时,一个僵死挂载会让 worker 卡在
+    // read 上永不返回 → thread::scope join 不了 → 整个同步 search() 冻死。远程根的读走
+    // 有界旁路,超时即整根拉黑;本地盘照旧直读(零额外开销)。
+    let dead_roots = Mutex::new(std::collections::HashSet::<String>::new());
 
     std::thread::scope(|s| {
         for _ in 0..worker_count() {
             let (stack, hits, spent, truncated) = (&stack, &hits, &spent, &truncated);
             let (q_full, tokens) = (&q_full, &tokens);
+            let dead_roots = &dead_roots;
             s.spawn(move || loop {
                 let item = { stack.lock().unwrap().pop() };
                 let Some((root, rel, size)) = item else { break };
@@ -59,8 +64,24 @@ fn scan_and_score(
                     .to_string_lossy()
                     .into_owned();
                 let abs = crate::fable::reencode_fs_path(&abs_display);
-                let Ok(bytes) = std::fs::read(&abs) else {
-                    continue;
+                let bytes = if crate::fable::inventory::is_remote_root(&root) {
+                    if dead_roots.lock().unwrap().contains(&root) {
+                        continue; // 该根已判僵死:零 IO 跳过
+                    }
+                    let p = abs.clone();
+                    match crate::fable::sched::with_deadline(8, move || std::fs::read(&p).ok()) {
+                        None => {
+                            dead_roots.lock().unwrap().insert(root.clone());
+                            continue; // 读超时:整根拉黑,搜索绝不因死 NAS 冻死
+                        }
+                        Some(None) => continue,
+                        Some(Some(b)) => b,
+                    }
+                } else {
+                    match std::fs::read(&abs) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    }
                 };
                 if bytes.iter().take(4096).any(|&b| b == 0) {
                     continue; // 二进制伪文本

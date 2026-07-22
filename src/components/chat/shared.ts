@@ -10,7 +10,12 @@ import {
   File as FileIcon,
 } from "@lucide/vue";
 import { renderMarkdown, mdVersion } from "../../lib/markdown";
-import type { PermissionMode } from "../../tauri";
+import {
+  artifacts as artifactsApi,
+  isTauri,
+  backendFileUrl,
+  type PermissionMode,
+} from "../../tauri";
 import type { Bubble } from "../../stores/chat";
 
 export function fileName(path: string): string {
@@ -26,6 +31,114 @@ export function fileExt(path: string): string {
 /** 尾随 `/` = 后端归并上报的「应用文件夹」产物（整个应用一个 chip） */
 export function isFolderArtifact(path: string): boolean {
   return path.endsWith("/");
+}
+
+// ── Kimi 式「一文件一预览」：本轮产物里挑一个「主可打开件」当预览，其余收进文件夹入口 ──
+// 预览优先级(数字小=更该当主预览):能在右抽屉里「打开看」的排前面,零碎数据文件垫底。
+// html/htm 最优(前后端联动或纯前端页面),其次演示 spec / pdf / 图片 / 视频 / office / 文档。
+const PREVIEW_RANK: Record<string, number> = {
+  html: 0,
+  htm: 0,
+  svg: 2,
+  pdf: 3,
+  png: 4,
+  jpg: 4,
+  jpeg: 4,
+  gif: 4,
+  webp: 4,
+  avif: 4,
+  mp4: 5,
+  mov: 5,
+  webm: 5,
+  pptx: 6,
+  docx: 6,
+  xlsx: 6,
+  md: 7,
+  markdown: 7,
+  txt: 8,
+  csv: 8,
+};
+/** 从本轮产物里选出「主预览件」:排除文件夹产物,按 PREVIEW_RANK 取最优;
+ *  演示 spec(polaris.slides.json)当作最高优先——它就是要在右抽屉自动播放的那个。 */
+export function pickPreview(arts: string[]): string | undefined {
+  let best: string | undefined;
+  let bestRank = Infinity;
+  for (const a of arts) {
+    if (isFolderArtifact(a)) continue;
+    const rank = /polaris\.slides\.json$/i.test(a)
+      ? -1
+      : PREVIEW_RANK[fileExt(a)] ?? 50;
+    if (rank < bestRank) {
+      bestRank = rank;
+      best = a;
+    }
+  }
+  return best;
+}
+/** 本轮产物的「打开文件夹」目标:有后端归并的文件夹产物就用它,否则取所有文件的最长公共目录。
+ *  返回不带尾随 `/` 的目录路径;取不到则 undefined(不显示文件夹入口)。 */
+export function commonFolder(arts: string[]): string | undefined {
+  const folder = arts.find(isFolderArtifact);
+  if (folder) return folder.replace(/\/+$/, "");
+  const files = arts
+    .filter((a) => !isFolderArtifact(a))
+    .map((a) => a.replace(/\\/g, "/"));
+  if (!files.length) return undefined;
+  const dirs = files.map((f) => {
+    const i = f.lastIndexOf("/");
+    return i >= 0 ? f.slice(0, i) : "";
+  });
+  // 按路径段求最长公共前缀
+  let prefix = dirs[0].split("/");
+  for (let i = 1; i < dirs.length; i++) {
+    const segs = dirs[i].split("/");
+    let j = 0;
+    while (j < prefix.length && j < segs.length && prefix[j] === segs[j]) j++;
+    prefix = prefix.slice(0, j);
+  }
+  const dir = prefix.join("/");
+  return dir || undefined;
+}
+
+// ── 对话内横排图片画廊(LUMI 式一排缩略图) ──
+// 只认位图:svg 桌面端 artifact_read 走文本通道不出 dataUrl,继续按普通文件走卡片。
+const STRIP_IMAGE_EXTS = new Set([
+  "png",
+  "apng",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "avif",
+]);
+export function isImageArtifact(path: string): boolean {
+  return !isFolderArtifact(path) && STRIP_IMAGE_EXTS.has(fileExt(path));
+}
+
+// 缩略图数据面:桌面版走 artifact_read 的 dataUrl(≤25MB),网页版直接用带 token 的
+// 后端文件 URL(浏览器自己缓存)。模块级缓存按路径去重 —— 同图重渲染/多回合只读一次盘;
+// 上限淘最旧,防大图 base64 无限常驻内存。
+const THUMB_CACHE = new Map<string, Promise<string | null>>();
+const THUMB_CACHE_MAX = 24;
+export function loadImageThumb(path: string): Promise<string | null> {
+  let p = THUMB_CACHE.get(path);
+  if (!p) {
+    p = (async () => {
+      try {
+        if (!isTauri) return backendFileUrl(path);
+        return (await artifactsApi.read(path)).dataUrl ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    if (THUMB_CACHE.size >= THUMB_CACHE_MAX) {
+      const oldest = THUMB_CACHE.keys().next().value;
+      if (oldest !== undefined) THUMB_CACHE.delete(oldest);
+    }
+    THUMB_CACHE.set(path, p);
+  }
+  return p;
 }
 
 export function artifactIcon(path: string) {
@@ -134,6 +247,12 @@ export interface Turn {
    *  此前是模板里内联函数 refFiles(t):流式每帧(~40ms)每回合被调 3 次
    *  (v-if / .length / v-for 各一次),每次都重建 Set 全量扫工具,纯属浪费。 */
   refs: string[];
+  /** Kimi 式「主预览件」:本轮产物里挑一个最该「打开看」的(html/spec/pdf…),
+   *  渲染成置顶预览大卡,点开走右抽屉。无可预览件则 undefined。 */
+  preview?: string;
+  /** Kimi 式「文件夹」入口目标:本轮产物的公共目录(不带尾随 /)。点它在文件管理器打开,
+   *  不再把一堆小文件铺满对话框。无产物则 undefined。 */
+  folder?: string;
   /** 定稿回合预渲染好的正文 html(ChatPanel renderTurns 里挂上,随前缀缓存复用;
    *  活跃末回合缺省 → 由 TurnItem 现场 renderMd,流式中逐帧更新)。 */
   html?: string;
@@ -226,7 +345,13 @@ export function buildTurnsSlice(list: Bubble[], startKey: number): Turn[] {
   }
   // 参考文件在回合构建完成后一次算好(tools/artifacts 已齐);流式中活跃回合每帧
   // 重建时也只算这一次,而不是模板每帧内联调 3 次。
-  for (const t of out) t.refs = buildRefFiles(t);
+  for (const t of out) {
+    t.refs = buildRefFiles(t);
+    if (t.artifacts.length) {
+      t.preview = pickPreview(t.artifacts);
+      t.folder = commonFolder(t.artifacts);
+    }
+  }
   return out;
 }
 

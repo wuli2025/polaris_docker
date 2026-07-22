@@ -41,6 +41,11 @@ function openArtifact(path: string) {
   artifactsStore.open(path);
 }
 
+/** 「打开文件夹」入口 → 直接在系统文件管理器里打开本轮产物所在目录(不进右抽屉预览)。 */
+function openFolderCard(path: string) {
+  artifactsStore.openFolder(path);
+}
+
 // 豆包化:对话里模型一落出演示 spec(polaris.slides.json),右抽屉立刻自动打开成播放器
 // —— 配合抽屉的宽容解析轮询,页面逐页点亮,用户不必等生成结束、也不必自己去点产物 chip。
 // 只在「抽屉没在看别的东西」时抢焦点;同一个路径一个会话只自动开一次。
@@ -73,10 +78,11 @@ watch(
 // 豆包式「参考文件」已在 buildTurnsSlice 里一次算好挂在 turn.refs 上(见 chat/shared.ts),
 // 点开预览走 openArtifact 同一条右侧抽屉链路;这里不再保留每帧内联重算的函数版。
 
-// 产物文件夹卡片的折叠态(按回合 key, 默认展开; 只在会话内存活, 不持久化)
-const filesCollapsed = ref<Record<number, boolean>>({});
+// 产物文件夹入口的展开态(按回合 key, 默认折叠 —— Kimi 式默认只露主预览卡 + 文件夹一行摘要,
+// 不再把一堆小文件铺满对话框; 只在会话内存活, 不持久化)
+const filesExpanded = ref<Record<number, boolean>>({});
 function toggleFiles(k: number) {
-  filesCollapsed.value = { ...filesCollapsed.value, [k]: !filesCollapsed.value[k] };
+  filesExpanded.value = { ...filesExpanded.value, [k]: !filesExpanded.value[k] };
 }
 
 // 多开：当前对话的气泡 / 运行态来自 chat store（按对话 id 维护，切走不丢、后台续流）
@@ -423,10 +429,11 @@ onMounted(async () => {
         :pending="isPending(t)"
         :sending="sending"
         :expanded-tool="expandedTool"
-        :files-collapsed="!!filesCollapsed[t.key]"
+        :files-collapsed="!filesExpanded[t.key]"
         @toggle-tool="toggleTool"
         @toggle-files="toggleFiles"
         @open-artifact="openArtifact"
+        @open-folder="openFolderCard"
         @edit="editTurn"
         @copy="copyTurn"
         @regenerate="regenerate"

@@ -198,12 +198,10 @@ async function startScan() {
       unScan = await listen<{ kind: string; files?: number; dirs?: number; text?: string; message?: string }>(
         "fable:inventory",
         (p) => {
-          // 已离开 scan 步(转后台 / 已往下走)就不再让迟到的事件改动这屏 UI;
-          // 但若后台真扫完了,仍把流程推进下去。
-          if (step.value !== "scan") {
-            if (p.kind === "done") void afterScan();
-            return;
-          }
+          // 只有向导确实停在 scan 步才响应(「转入后台」不改 step,回来照常推进)。
+          // 以前这里对「step 已不在 scan」的 done 也会 afterScan():用户日后在文件中心
+          // 手动盘点时,迟到的 done 会把(隐藏中的)向导从 intro/finish 强行跳到 model 步。
+          if (step.value !== "scan") return;
           if (p.kind === "progress") {
             scanFailed.value = false;
             scanFiles.value = p.files ?? 0;
@@ -334,6 +332,9 @@ function openKeyUrl() {
 // ── 归类 ──
 const organizing = ref(false);
 const organizeMsg = ref("");
+// 归类/构建失败的恢复态(对齐 scan 步的 scanFailed):置位后停掉转圈、亮出「重试 / 返回」,
+// 否则向导会永远卡在 organize 这一步(唯一出口只有「转入后台」,像卡死)。
+const organizeFailed = ref(false);
 let unCluster: (() => void) | null = null;
 // 归类(智能 smartCluster / 离线词法 clusterBuild)进度与完成都走 file:cluster 事件
 // (phase/tier/done/error)。必须等 done 再进图谱,否则聚类还没落库、星图会是空的。
@@ -346,19 +347,25 @@ async function ensureClusterListener() {
       if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
       else if (p.kind === "tier") organizeMsg.value = p.note ?? organizeMsg.value;
       else if (p.kind === "done") {
+        // 只有向导确实停在 organize 步才推进:监听器常驻,用户日后在文件中心手动归类时,
+        // 迟到的 done 不能把(隐藏中的)向导强行跳步、重复 finishUp。
+        if (step.value !== "organize") return;
         organizeMsg.value = p.note ?? "归类完成";
         void afterOrganize();
       } else if (p.kind === "error") {
+        if (step.value !== "organize") return;
         organizeMsg.value = `归类失败:${p.message ?? ""}`;
         organizing.value = false;
+        organizeFailed.value = true;
       }
     },
   );
 }
-// 离线词法归类:file_cluster_build 现为后台事件式(fire-and-forget)。
+// 离线词法归类:走全局任务 store(全局任务中心可见,「转入后台」后仍有运行指示);
+// 向导自身的 file:cluster 监听照旧负责推进步骤。
 async function runOfflineCluster() {
   await ensureClusterListener();
-  await fc.clusterBuild(null);
+  await tasks.startCluster();
 }
 // 企业路径(D 方案):Schema-Guided 在框内抽三元组,事件走 fable:ontology。
 const ontoKept = ref(0);
@@ -371,12 +378,15 @@ async function runSchemaExtract() {
         if (p.kind === "phase") organizeMsg.value = p.text ?? organizeMsg.value;
         else if (p.kind === "tick") organizeMsg.value = "模型正在框内抽取关系…";
         else if (p.kind === "done") {
+          if (step.value !== "organize") return; // 同 unCluster:迟到事件不跳步
           ontoKept.value = p.kept ?? 0;
           organizeMsg.value = p.note ?? "知识体系构建完成";
           void afterOrganize();
         } else if (p.kind === "error") {
+          if (step.value !== "organize") return;
           organizeMsg.value = `构建失败:${p.message ?? ""}`;
           organizing.value = false;
+          organizeFailed.value = true;
         }
       },
     );
@@ -387,6 +397,7 @@ async function runSchemaExtract() {
 async function startOrganize() {
   step.value = "organize";
   organizing.value = true;
+  organizeFailed.value = false;
   // 归类要跑几秒,趁这空当把星河图谱(cytoscape ~562KB)的 chunk 预下载好 →
   // 归类一完成切到「知识图谱」步时,图谱「啪」地直接渲染,不再等大包下载的白屏。
   void import("./KnowledgeGraph.vue").catch(() => {});
@@ -398,6 +409,7 @@ async function startOrganize() {
     } catch (e: any) {
       organizeMsg.value = `构建失败:${e?.message ?? e}`;
       organizing.value = false;
+      organizeFailed.value = true;
     }
     return;
   }
@@ -408,6 +420,7 @@ async function startOrganize() {
     } catch (e: any) {
       organizeMsg.value = `归类失败:${e?.message ?? e}`;
       organizing.value = false;
+      organizeFailed.value = true;
     }
     return;
   }
@@ -418,11 +431,20 @@ async function startOrganize() {
   organizeMsg.value = "正在快速归类你的全部文件、再请 AI 读懂起名…";
   try {
     await ensureClusterListener();
-    await fc.smartCluster(null, true);
+    // 走全局任务 store(quick=true 跳过 T2):归类因此出现在后台任务浮球里,
+    // 「转入后台·去逛别处」之后仍看得到它在跑;向导监听照旧推进步骤。
+    await tasks.startSmartCluster(undefined, true);
   } catch (e: any) {
     organizeMsg.value = `归类失败:${e?.message ?? e}`;
     organizing.value = false;
+    organizeFailed.value = true;
   }
+}
+// 失败后「返回上一步」重选归类方式/模型。
+function backToModel() {
+  organizeFailed.value = false;
+  organizing.value = false;
+  step.value = "model";
 }
 async function afterOrganize() {
   await loadOverview();
@@ -440,6 +462,7 @@ const finishing = ref(false);
 const profilePath = ref("");
 const indexKicked = ref(false);
 async function finishUp() {
+  if (finishing.value) return; // 图谱步双击「继续」防重入(否则画像生成会跑两遍)
   step.value = "finish";
   finishing.value = true;
   // 1) 后台建向量索引,托管全局任务 store(全局任务中心可见 + 关掉向导/切界面照常后台跑)。
@@ -817,12 +840,24 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 4 · 归类中 / 构建中 -->
+        <!-- 4 · 归类中 / 构建中 / 失败 -->
         <div v-else-if="step === 'organize'" class="wiz-body center">
-          <div class="scan-orb"><component :is="wiz.method === 'schema' ? Network : Wand2" :size="28" :stroke-width="1.3" /><div class="scan-ring" /></div>
-          <div class="scan-lab big">{{ organizeMsg }}</div>
-          <div class="scan-fine">{{ wiz.method === 'schema' ? '模型正在行业框内抽实体与关系,只抽资料里写明的、可溯源的,稍候…' : 'AI 正在读你的文件清单分主题,稍候…' }}</div>
-          <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
+          <!-- 失败:停掉转圈,给「重试 / 返回」出口,不再让向导卡死在这屏(对齐 scan 步) -->
+          <template v-if="organizeFailed">
+            <div class="scan-orb stopped"><X :size="28" :stroke-width="1.4" /></div>
+            <div class="scan-lab big">{{ organizeMsg }}</div>
+            <div class="scan-fine">这一步中断了。可以重试,或返回上一步换个方式。</div>
+            <div class="scan-actions">
+              <button class="wiz-go ghost" @click="backToModel"><ChevronRight :size="14" :stroke-width="1.8" class="flip" /> 返回上一步</button>
+              <button class="wiz-go" @click="startOrganize"><component :is="wiz.method === 'schema' ? Network : Wand2" :size="15" :stroke-width="1.8" /> 重试</button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="scan-orb"><component :is="wiz.method === 'schema' ? Network : Wand2" :size="28" :stroke-width="1.3" /><div class="scan-ring" /></div>
+            <div class="scan-lab big">{{ organizeMsg }}</div>
+            <div class="scan-fine">{{ wiz.method === 'schema' ? '模型正在行业框内抽实体与关系,只抽资料里写明的、可溯源的,稍候…' : 'AI 正在读你的文件清单分主题,稍候…' }}</div>
+            <button class="wiz-go ghost bg" @click="close"><Layers :size="14" :stroke-width="1.8" /> 转入后台 · 去逛别处</button>
+          </template>
         </div>
 
         <!-- 5 · 知识图谱 -->

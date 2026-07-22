@@ -36,11 +36,14 @@ const DEFAULT_WEB_TOOLS: &str = "WebSearch,WebFetch";
 /// (实测 permission_denials 五连拒, 工具名是 Windows 的 `PowerShell`)。
 /// 这里显式放行本地读写 + 执行 (Windows shell 工具叫 `PowerShell`, 跨平台再带上 `Bash`),
 /// 让成品能真正落地。危险兜底仍由「拒绝授权(plan, 只读)」档位提供。
-const LOCAL_WORK_TOOLS: &str = "Read,Write,Edit,Glob,Grep,Bash,PowerShell";
+/// NotebookEdit 也入列: 工作模式(纯 Claude Code)本就放开全套工具, headless 下不在
+/// allowedTools 里等于被拒 —— 快速模式仍经 disallowedTools 砍掉(其优先级更高)。
+const LOCAL_WORK_TOOLS: &str = "Read,Write,Edit,Glob,Grep,Bash,PowerShell,NotebookEdit";
 
-/// 按权限档位 (cli_value: default | acceptEdits | plan) 组装 `--allowedTools`。
+/// 按权限档位 (cli_value: default | acceptEdits | bypassPermissions | plan) 组装 `--allowedTools`。
 /// - plan (拒绝授权 / 只读): 仅联网工具, 不放行任何本地执行;
-/// - default / acceptEdits (手动 / 自动): 联网 + 本地读写执行, 成品能真正产出。
+/// - default / acceptEdits (手动 / 自动): 联网 + 本地读写执行, 成品能真正产出;
+/// - bypassPermissions (完全放行): 模式本身已免确认, allowedTools 仅是冗余声明。
 /// - with_task=true (动态编排): 额外放行 `Task` —— 否则 headless(stdin=null)下编排器
 ///   想扇出子代理会卡在权限确认上, 多智能体并行就跑不起来。
 fn allowed_tools_for(perm: &str, with_task: bool) -> String {
@@ -238,6 +241,12 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         .conversation_id
         .as_deref()
         .and_then(conv::project_id_of_conversation);
+    // 项目绑定的工作目录(用户在侧栏「选择工作文件夹」设的真实仓库): 本项目下所有对话都以它
+    // 为 claude CLI 的 cwd —— 等同终端 `cd <repo> && claude`, 让 AI 直接在用户自己的大项目里干活。
+    // 未绑 / 目录已被应用外删除 → None, spawn 回落默认 cwd(与旧行为一致)。
+    let project_work_dir = current_project_id
+        .as_deref()
+        .and_then(conv::project_work_dir);
     let cm_ctx =
         claude_md::render_for_project(current_project_id.as_deref(), &args.prompt, args.use_kb);
 
@@ -638,6 +647,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
                 work_full,
                 provider_id: args.provider_id.clone(),
                 creative,
+                work_dir: project_work_dir.clone(),
             });
         }
     }
@@ -655,6 +665,7 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
         work_full,
         args.provider_id.as_deref(),
         false, // 一次性进程: stdin 只当 prompt 通道, 不进 stream-json 输入模式
+        project_work_dir.as_deref().map(Path::new),
     )?;
 
     // prompt 经 stdin 喂给 claude (而非命令行参数): 大 prompt 不会撞 Windows 命令行
@@ -687,8 +698,8 @@ fn chat_send_pipeline(app: &AppHandle, req_id: &str, args: ChatSendArgs) -> Resu
     // ① **计时判定核**已抽到 polaris-watchdog crate(空闲 idle + 绝对硬顶 hard cap,
     //    纯逻辑可独立测试): stdout/stderr 每产出一行就 touch → 持续有输出的长任务
     //    (批量 PPT/长脚本)idle 永不触发; 阈值仍由原有 env 控制(与旧行为完全融合,
-    //    不叠两套): POLARIS_CHAT_TIMEOUT_SECS 桌面 600s / 容器 180s, 0=关;
-    //    POLARIS_CHAT_HARD_CAP_SECS 桌面 0=不设(用户看得见, 有停止按钮) / 容器 3600s。
+    //    不叠两套): POLARIS_CHAT_TIMEOUT_SECS 桌面 1800s / 容器 900s, 0=关;
+    //    POLARIS_CHAT_HARD_CAP_SECS 默认 86400s(24h, 只兜真失控, 7h 级长任务不受扰)。
     // ② idle 判定后 kernel 保留**深检进程树的否决权**: 还有活的子孙进程(claude 正在跑
     //    Bash 工具里的构建/ffmpeg/下载等, 工具执行期整段零输出是常态), 或整树 CPU 时间
     //    仍在推进(claude 本体在算) —— 都算「静默但在干活」, 不杀, 转入 30s 低频复查;
@@ -1677,13 +1688,25 @@ fn spawn_in_sandbox(prompt: &str, perm: &str) -> Result<Child, String> {
     Ok(child)
 }
 
+/// 本轮 claude CLI 的实际工作目录(cwd)。优先用项目绑定的工作目录(用户选定的真实文件夹,
+/// 等同终端 `cd <dir> && claude`), 否则回落编译期仓库根(开发)/进程当前目录(装机)。
+/// 抽出来让 spawn、extra_claude_dirs、常驻会话指纹三处对 cwd 的口径**完全一致** —— 否则
+/// 指纹里算出的 add_dirs(相对 cwd 判「在不在子树」)会与真 spawn 的 cwd 不符。
+/// work_dir 传进来时若已不是有效目录(用户在应用外删了)则忽略, 回落默认, spawn 不会拿无效 cwd 失败。
+pub(super) fn effective_cwd(work_dir: Option<&Path>) -> std::path::PathBuf {
+    work_dir
+        .filter(|p| p.is_dir())
+        .map(Path::to_path_buf)
+        .or_else(claude_md::project_root)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+}
+
 /// 需要 --add-dir 显式放行的目录(KB 根/产物目录, 均可能不在 cwd 子树)。
 /// 抽成独立函数: spawn 与常驻会话的「配置指纹」共用同一来源 —— 目录集合变了
-/// (用户移动 KB / 换对话产物目录)意味着旧进程的可访问面已不对, 指纹判变触发重建。
-pub(super) fn extra_claude_dirs(art_dir: &Path) -> Vec<String> {
-    let cwd = claude_md::project_root().unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    });
+/// (用户移动 KB / 换对话产物目录 / 换项目工作目录)意味着旧进程的可访问面已不对, 指纹判变触发重建。
+/// cwd 由调用方传入(= effective_cwd 的结果): 项目绑了工作目录后 cwd 是用户项目仓库,
+/// KB 根/产物目录几乎必然不在其子树 → 照常经 --add-dir 放行, claude 才读得到。
+pub(super) fn extra_claude_dirs(cwd: &Path, art_dir: &Path) -> Vec<String> {
     // 如果 KB root 不在 cwd 子树下(用户可能把 KB 移到别处), 用 --add-dir 显式放行
     let kb_root = std::path::PathBuf::from(
         super::bridges::kb_bridge()
@@ -1691,11 +1714,11 @@ pub(super) fn extra_claude_dirs(art_dir: &Path) -> Vec<String> {
             .unwrap_or_default(),
     );
     let mut dirs: Vec<String> = Vec::new();
-    if !kb_root.as_os_str().is_empty() && kb_root.exists() && !kb_root.starts_with(&cwd) {
+    if !kb_root.as_os_str().is_empty() && kb_root.exists() && !kb_root.starts_with(cwd) {
         dirs.push(kb_root.to_string_lossy().to_string());
     }
     // 产物目录在 ~/Polaris 下, 不在 cwd 子树, 显式放行 claude 可写入
-    if art_dir.exists() && !art_dir.starts_with(&cwd) {
+    if art_dir.exists() && !art_dir.starts_with(cwd) {
         dirs.push(art_dir.to_string_lossy().to_string());
     }
     dirs
@@ -1719,14 +1742,24 @@ pub(super) fn model_for_mode(work_full: bool) -> Option<String> {
 /// 看门狗阈值 (idle_secs, hard_cap_secs): env 覆写语义与默认值不变(详注见
 /// chat_send_pipeline 内看门狗一节); 抽出来让常驻路径每轮的看门狗吃同一套配置。
 pub(super) fn watchdog_config() -> (u64, u64) {
+    // idle 判死是「疑似挂死」的入口, 真正杀不杀还要过进程树深检(有子孙/CPU 推进就豁免)。
+    // 但深检盖不住一类**正常**静默: claude 本体在等上游(限流退避/慢 API/长响应首包)时
+    // 零输出、零子孙、CPU 也几乎不动 —— 600s 阈值会把 7h 级长任务在等待窗口里误杀。
+    // 放宽到 1800s(30min): 真挂死(网络吊死/无界扫描)迟早静止照样回收, 长等待不再中断。
     let idle = std::env::var("POLARIS_CHAT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(if cfg!(feature = "desktop") { 600 } else { 180 });
+        .unwrap_or(if cfg!(feature = "desktop") { 1800 } else { 900 });
+    // 硬顶 = 单轮总时长的**绝对**上限, 不受 idle 深检的「CPU 在推进」豁免影响
+    // (HardTimeout 判据独立于 IdleKilled 分支)。此前桌面 7200s(2h)/容器 3600s(1h) ——
+    // 一个持续产出的 7 小时长任务(批量创作/大编译/整夜跑脚本)到点被**无条件**杀掉,
+    // 这是「长任务必中断」的根因。改为 86400s(24h): 正常长任务(含 7h 级)绝不会撞线,
+    // 「假死但 CPU 空转」仍有必然终止的天花板, 不会永久霸占资源。
+    // POLARIS_CHAT_HARD_CAP_SECS 仍可覆写(0=显式关掉)。
     let cap = std::env::var("POLARIS_CHAT_HARD_CAP_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(if cfg!(feature = "desktop") { 0 } else { 3600 });
+        .unwrap_or(86400);
     (idle, cap)
 }
 
@@ -1738,13 +1771,12 @@ pub(super) fn spawn_on_host(
     work_full: bool,
     provider_id: Option<&str>,
     persistent: bool,
+    work_dir: Option<&Path>,
 ) -> Result<Child, String> {
     let perm_flag = format!("--permission-mode={}", perm);
-    // cwd = polaris-app 根 (env!("CARGO_MANIFEST_DIR") 的父级),
-    // 这样 claude CLI 自动信任整棵 polaris-app/ 子树, 包括 PolarisKB/
-    let cwd = claude_md::project_root().unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    });
+    // cwd = 项目绑定的工作目录(用户选的真实仓库, 等同终端 `cd <dir> && claude`), 未绑则回落
+    // 编译期 polaris-app 根 / 进程当前目录。claude CLI 自动信任整棵 cwd 子树。
+    let cwd = effective_cwd(work_dir);
 
     // KB 根写一份 .ignore(幂等), 让 ripgrep(Grep 工具/rg)自动跳 output/二进制/大素材 → 检索更快
     ensure_kb_search_ignore();
@@ -1767,7 +1799,7 @@ pub(super) fn spawn_on_host(
     if partial_stream_enabled() {
         args.push("--include-partial-messages".into());
     }
-    for d in extra_claude_dirs(art_dir) {
+    for d in extra_claude_dirs(&cwd, art_dir) {
         args.push("--add-dir".into());
         args.push(d);
     }

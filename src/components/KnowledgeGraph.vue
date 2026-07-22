@@ -458,8 +458,19 @@ function runSearch() {
   });
 }
 
+let readyFallback: ReturnType<typeof setTimeout> | null = null;
 onMounted(async () => {
-  graphData = isFiles ? await filesApi.graph() : await kb.graph();
+  try {
+    graphData = isFiles ? await filesApi.graph() : await kb.graph();
+  } catch {
+    // 拉图失败必须照常 emit ready 并按空图收场:这里一抛,后面的 ready/兜底定时器全被
+    // 跳过,而 App 端加载条只等 ready、KeepAlive 又缓存失败实例(切走切回不重挂重试)
+    // → 加载指示永久悬挂。失败按「空图」显示,用户至少还有界面。
+    graphData = { nodes: [], edges: [] };
+    empty.value = true;
+    emit("ready");
+    return;
+  }
   empty.value = graphData.nodes.length === 0;
   stats.value = {
     docs: graphData.nodes.filter((n) => n.kind === "doc").length,
@@ -473,8 +484,8 @@ onMounted(async () => {
   }
   await nextTick();
   render(); // render 内 layoutstop 时 emit('ready')，App 据此收起加载条
-  // 兜底：极端情况下 layoutstop 未触发，也不让加载条一直卡住
-  setTimeout(() => emit("ready"), 3500);
+  // 兜底：极端情况下 layoutstop 未触发，也不让加载条一直卡住(句柄存下,卸载时清)
+  readyFallback = setTimeout(() => emit("ready"), 3500);
 });
 
 // KeepAlive：切回本视图时恢复自转；切走时暂停自转 raf + 星场 CSS 动画
@@ -493,6 +504,8 @@ onDeactivated(() => {
 
 onUnmounted(() => {
   cancelAnimationFrame(rafId);
+  // 星图按 tier 重挂时不清会累积一堆待触发定时器,在已卸载实例上回调。
+  if (readyFallback) clearTimeout(readyFallback);
   if (cy) {
     cy.destroy();
     cy = null;

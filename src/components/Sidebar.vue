@@ -40,6 +40,7 @@ import {
   type PersonaPreset,
 } from "../tauri";
 import { toast } from "../composables/useToast";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 const app = useAppStore();
 const chat = useChatStore();
@@ -174,6 +175,33 @@ async function revealProject(pid: string) {
     console.error("打开项目目录失败", e);
   }
 }
+// 选择工作文件夹：本项目下所有对话都以这个真实目录为 claude cwd（等同终端 cd 进 repo，方便做大项目）
+async function pickWorkDir(pid: string) {
+  closeProjMenu();
+  try {
+    const picked = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "选择本项目的工作文件夹（AI 将直接在此目录读写）",
+    });
+    if (typeof picked !== "string" || !picked) return;
+    await app.setProjectWorkDir(pid, picked);
+    toast.success(`已绑定工作目录：${picked}\n本项目下的对话会直接在这个文件夹里干活`);
+  } catch (e) {
+    toast.error(`绑定工作目录失败：${e}`);
+  }
+}
+// 解绑：回落默认工作目录
+async function clearWorkDir(pid: string) {
+  closeProjMenu();
+  try {
+    await app.setProjectWorkDir(pid, null);
+    toast.info("已解绑工作目录，回落默认");
+  } catch (e) {
+    toast.error(`解绑失败：${e}`);
+  }
+}
+
 async function archiveProj(proj: { id: string; name: string }) {
   closeProjMenu();
   if (
@@ -488,6 +516,19 @@ const sortedProjects = computed(() => {
               <Users :size="14" :stroke-width="1.7" />
               <span>入驻专家 / 专家团</span>
             </button>
+            <div class="pm-sep"></div>
+            <button class="pm-item" @click="pickWorkDir(proj.id)">
+              <Folder :size="14" :stroke-width="1.7" />
+              <span>{{ proj.workDir ? "更换工作文件夹" : "选择工作文件夹（做大项目）" }}</span>
+            </button>
+            <div v-if="proj.workDir" class="pm-workdir" :title="proj.workDir">
+              当前：{{ proj.workDir }}
+            </div>
+            <button v-if="proj.workDir" class="pm-item" @click="clearWorkDir(proj.id)">
+              <FolderOpen :size="14" :stroke-width="1.7" />
+              <span>解绑工作文件夹（回落默认）</span>
+            </button>
+            <div class="pm-sep"></div>
             <button class="pm-item" @click="revealProject(proj.id)">
               <FolderOpen :size="14" :stroke-width="1.7" />
               <span>在资源管理器中打开</span>
@@ -1032,6 +1073,13 @@ const sortedProjects = computed(() => {
 }
 .pm-item.danger:hover svg {
   color: var(--vermilion);
+}
+.pm-workdir {
+  padding: 2px 9px 6px 30px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--muted);
+  word-break: break-all;
 }
 .pm-sep {
   height: 1px;

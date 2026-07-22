@@ -534,6 +534,17 @@ fn readiness_check(state: &ReadinessState, web_dir: &Path) -> bool {
 
 async fn spa_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let rel = uri.path().trim_start_matches('/');
+    // 未匹配的 /api/* 路径绝不回退到 index.html: 否则手机/中继端请求到拼错或版本不符
+    // 的接口会拿到 200 + 整页 HTML, JSON 解析炸掉且无从判断"接口不存在 vs 网络故障"。
+    // 明确回 404 JSON, 让客户端能干净地报"未知接口"。
+    if rel == "api" || rel.starts_with("api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            format!("{{\"error\":\"未知接口: /{rel}\"}}"),
+        )
+            .into_response();
+    }
     // 安全闸: rel 取自原始 URL, 裸 socket 客户端能塞 `../../etc/passwd`(hyper 不规范化
     // `..` 段)。任一段为 `..` 或绝对/盘符前缀 → 当 SPA 路由回 index.html, 绝不拼出 web_dir。
     let traversal = rel.split(['/', '\\']).any(|seg| seg == "..")

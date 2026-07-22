@@ -20,7 +20,10 @@ mod tests;
 
 // 共享依赖统一在此升为 pub(crate) 供子模块 `use super::*` 取用(与原单文件同一作用域语义)。
 pub(crate) use super::sched::WorkQueue;
-pub(crate) use super::{cancelled, open_db, worker_count, FlagGuard, CANCEL, SCANNING};
+// 盘点族的取消走 CANCEL_SCAN(与索引族分立);别名保持模块内 `cancelled()`/`CANCEL` 旧写法零改动。
+pub(crate) use super::{
+    open_db, scan_cancelled as cancelled, worker_count, FlagGuard, CANCEL_SCAN as CANCEL, SCANNING,
+};
 pub(crate) use super::{decode_fs, lex_available, reencode_fs_path};
 pub(crate) use super::{index, sched};
 pub(crate) use serde::Serialize;

@@ -49,6 +49,31 @@ function isDisplayableArtifact(path: string): boolean {
   return i >= 0 && DISPLAY_EXTS.has(name.slice(i + 1).toLowerCase());
 }
 
+// 「强成品」= 本轮结束后值得自动弹进右抽屉预览的可打开件(Kimi 式:生成完直接看到成品)。
+// 只认网页 / 演示 spec / pdf 这类「一眼即成品」的东西;零碎数据文件(json/csv/txt…)不自动弹,
+// 免得打扰。优先级:演示 spec > 网页 > pdf(与 shared.ts 的预览排序同源,这里只取会弹的子集)。
+function pickDeliverable(arts: string[]): string | undefined {
+  const files = arts.filter((a) => !a.endsWith("/"));
+  const rank = (p: string): number => {
+    if (/polaris\.slides\.json$/i.test(p)) return 0;
+    const n = p.split(/[\\/]/).pop() || p;
+    const ext = n.slice(n.lastIndexOf(".") + 1).toLowerCase();
+    if (ext === "html" || ext === "htm") return 1;
+    if (ext === "pdf") return 2;
+    return 99; // 其余不自动弹
+  };
+  let best: string | undefined;
+  let bestRank = 99;
+  for (const p of files) {
+    const r = rank(p);
+    if (r < bestRank) {
+      bestRank = r;
+      best = p;
+    }
+  }
+  return bestRank < 99 ? best : undefined;
+}
+
 /** 解析正文里夹带的产物清单 marker，返回剥离 marker 后的纯文本 + 路径数组 */
 export function parseArtifacts(content: string): {
   text: string;
@@ -278,7 +303,12 @@ export const useChatStore = defineStore("chatRuntime", () => {
   const prewarmAt: Record<string, number> = {};
   function prewarm(
     convId: string | null | undefined,
-    opts?: { permissionMode?: PermissionMode; workMode?: string; providerId?: string }
+    opts?: {
+      permissionMode?: PermissionMode;
+      workMode?: string;
+      providerId?: string;
+      dynamicWorkflow?: boolean;
+    }
   ) {
     if (!convId) return;
     const now = Date.now();
@@ -303,6 +333,7 @@ export const useChatStore = defineStore("chatRuntime", () => {
       permissionMode: opts?.permissionMode,
       workMode,
       providerId,
+      dynamicWorkflow: opts?.dynamicWorkflow,
     });
   }
 
@@ -516,6 +547,39 @@ export const useChatStore = defineStore("chatRuntime", () => {
         const sessions = useSessionsStore();
         sessions.finish(cid);
         app.markUnread(cid);
+        // Kimi 式:本轮结束,把「主成品」(网页/演示/pdf)自动弹进右抽屉预览 —— 用户不必
+        // 生成完还得自己去点产物 chip。沿用演示 spec 那套抢焦点分寸:①必须是用户正看的这条
+        // 对话;②抽屉空着、或停在别条对话的旧产物上(陈旧,让位)才弹;③同对话内用户特意
+        // 开着别的文件 → 尊重不抢。slides 已在 artifact 事件即时弹过(cur===它、同对话非陈旧),
+        // 这里的 `!cur || stale` 判断天然不会重复弹它。
+        try {
+          const arts2 = useArtifactsStore();
+          let start = 0;
+          for (let i = arr.length - 1; i >= 0; i--) {
+            if (arr[i].role === "user") {
+              start = i;
+              break;
+            }
+          }
+          const round: string[] = [];
+          for (let i = start; i < arr.length; i++) {
+            if (arr[i].role === "assistant" && arr[i].artifacts)
+              round.push(...arr[i].artifacts!);
+          }
+          const deliverable = pickDeliverable(round);
+          if (deliverable && app.currentConvId === cid) {
+            const cur = arts2.current?.path;
+            const stale =
+              !!cur &&
+              !cur.replace(/\\/g, "/").includes(`/conversations/${cid}/`);
+            if (!cur || stale) {
+              app.drawerCollapsed = false;
+              void arts2.open(deliverable);
+            }
+          }
+        } catch {
+          /* 自动预览失败绝不能砸了终态处理 */
+        }
         // 唤醒分批编排循环：本轮已结束，可读清单决定续不续
         wakeWaiters(cid);
         // 本轮结束 → 该对话不再受「发送中」保护,顺手做一次 LRU 卸载(封顶常驻气泡)。

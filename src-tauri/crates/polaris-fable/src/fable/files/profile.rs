@@ -400,7 +400,13 @@ pub fn suggest_workflows(root: Option<String>) -> Result<Vec<SuggestedFlow>, Str
             } else {
                 std::env::temp_dir()
             };
-            crate::kb::run_claude_readonly(&cwd, &prompt, |_k, _t| {})?
+            // 墙钟超时:向导收尾的建议卡死不能钉住阻塞线程池(挂了就用本地兜底卡)。
+            crate::kb::run_claude_readonly_timeout(
+                &cwd,
+                &prompt,
+                |_k, _t| {},
+                std::time::Duration::from_secs(300),
+            )?
         };
         let raw =
             crate::kb::extract_balanced_json(&collected).ok_or("模型没有返回可解析的 JSON")?;

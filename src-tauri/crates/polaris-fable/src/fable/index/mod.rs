@@ -20,8 +20,10 @@ pub mod math;
 
 // 共享依赖统一在此升为 pub(crate) 供子模块 `use super::*` 取用(与原单文件同一作用域语义)。
 // 深度加一层:fable 级符号在此再导出到 index 层,子文件的 `super::xxx` 零改动命中。
+// 索引族的取消走 CANCEL_INDEX(与盘点族分立);别名保持模块内 `cancelled()`/`CANCEL` 旧写法零改动。
 pub(crate) use super::{
-    cancelled, lex_available, open_db, reencode_fs_path, FlagGuard, CANCEL, INDEXING,
+    index_cancelled as cancelled, lex_available, open_db, reencode_fs_path, FlagGuard,
+    CANCEL_INDEX as CANCEL, INDEXING,
 };
 pub(crate) use once_cell::sync::Lazy;
 pub(crate) use serde::Serialize;

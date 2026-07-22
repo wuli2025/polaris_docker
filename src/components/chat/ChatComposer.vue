@@ -738,7 +738,7 @@ async function onPaste(e: ClipboardEvent) {
 const permLabel: Record<PermissionMode, string> = {
   manual: "手动授权",
   auto_current: "自动 · 仅当前会话",
-  auto_all: "自动 · 所有会话",
+  auto_all: "自动 · 完全放行",
   deny: "拒绝授权",
 };
 
@@ -973,6 +973,8 @@ function prewarmOnType() {
     permissionMode: permMode.value,
     workMode: workMode.value,
     providerId: providerForConv(cid),
+    // 编排模式进指纹: 与真发送(dynamicWorkflow: orchestrateMode.value)对齐, 否则预热白做。
+    dynamicWorkflow: orchestrateMode.value || undefined,
   });
 }
 
@@ -1480,8 +1482,8 @@ defineExpose({ setInput, attachPaths: onDropFiles, sendOptions });
               },
               {
                 k: 'auto_all',
-                l: '自动 · 所有会话',
-                d: '所有会话放行非高危操作(不绕过权限确认)',
+                l: '自动 · 完全放行',
+                d: '全部工具免确认,体验等同终端 CLI(脚本/联网/执行不设限)',
               },
               {
                 k: 'deny',

@@ -308,6 +308,14 @@ pub fn build_index(
     // 不排除会被重复读盘/切块/嵌入(小文件场景费用放大 ~3 倍,计数虚高、预算虚耗)。
     let mut buffered_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
+    // 挂载僵死防护:整文件读在死 NAS 上会无限阻塞,且阻塞中的 syscall 连「取消」都拦不住
+    // (cancelled() 只在循环边界轮询)→ 读走 with_deadline 有界旁路。某根一旦读超时即整根
+    // 拉黑(其余待办零 IO 跳过、不再逐文件撞 20s),健康根照常构建。跳过的文件**不标记完成**
+    // ——若标 chunked/ftsed=1,空文本落库,挂载恢复后 mtime 没变、重扫也不会重置,等于造出
+    // 永久检索盲区;保持 0 让下轮「继续」自然重试。
+    const READ_DEADLINE_SECS: u64 = 20;
+    let mut skipped_reads: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut dead_read_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
     'outer: loop {
         if cancelled() {
             stopped = "已取消".into();
@@ -343,7 +351,7 @@ pub fn build_index(
         // 缓冲中的文件 → 强制 flush 让它们 chunked 置位,否则 pending 永远选中同一批死循环。
         let batch: Vec<_> = batch
             .into_iter()
-            .filter(|row| !buffered_ids.contains(&row.0))
+            .filter(|row| !buffered_ids.contains(&row.0) && !skipped_reads.contains(&row.0))
             .collect();
         if batch.is_empty() {
             if cancelled() {
@@ -367,12 +375,25 @@ pub fn build_index(
             }
             break;
         }
-        // 批级事务:本批全部轻量写(指纹/倒排 DELETE+INSERT/ftsed/chunked 标记)合成一笔。
-        // SQLite 写瓶颈在事务数(每次自动提交一次 fsync,见模块头注释),此前每文件 3-4 个
-        // 自动提交事务 → 现在每批 1 个,纯 FTS 构建(无 key 全盘建倒排)提速一个量级。
-        // 向量 flush 自带事务:进入前先 COMMIT、成功后再 BEGIN 新批(失败路径直接 break,不留悬挂)。
-        // 中途 `?` 上抛时连接随函数退出回滚 —— 本批标记重做,幂等无害。
-        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        // ── 先读后写(关键修):IO/切块全在事务外,事务只包纯内存 DB 写 ──
+        // 旧实现 BEGIN 之后才逐个 std::fs::read + chunk_text:写锁横跨整批慢 IO/CPU
+        // (死 NAS 单读 20s 死线、一批 32 个),盘点收尾/智能归类/审计等并行写者全被钉在
+        // busy_timeout(20s)后面 —— 「建索引把整个应用拖卡」的数据层主根因。
+        // 范式对齐 lexical.rs/dedupe.rs:Phase A 读盘+指纹+切块(零事务;嵌入 flush 自带
+        // 短事务,此刻无批事务不必 COMMIT/BEGIN 腾挪),Phase B 单短事务批量落库(毫秒级)。
+        // SQLite 写瓶颈在事务数(每次自动提交一次 fsync),每批仍是 1 个事务,吞吐不回退。
+        // Phase B 中途 `?` 上抛时连接随函数退出回滚 —— 本批标记重做,幂等无害。
+        struct Prep {
+            file_id: i64,
+            text: String,
+            fingerprint: Option<(String, String)>,
+            do_lex: bool,
+            mark_chunked: bool,
+        }
+        let mut prepared: Vec<Prep> = Vec::with_capacity(batch.len());
+        // 嵌入 flush 失败不立刻退出:本批已读好的轻量写(倒排/指纹)先经 Phase B 落库,
+        // 不白读白切;stopped 已在失败点设好,落完即 break 'outer。
+        let mut abort_after_flushfail = false;
         for (file_id, root, rel, ext, size, chunked, ftsed) in batch {
             if cancelled() || chunks_added >= max_chunks as u64 || files_done >= MAX_FILES_PER_BUILD
             {
@@ -383,113 +404,147 @@ pub fn build_index(
             let abs = super::reencode_fs_path(
                 &std::path::Path::new(&root).join(&rel).to_string_lossy(),
             );
-            let text = match std::fs::read(&abs) {
-                Ok(bytes) => {
+            if dead_read_roots.contains(&root) {
+                skipped_reads.insert(file_id);
+                continue; // 该根已判僵死:零 IO 跳过,不标记完成
+            }
+            let read = {
+                let p = abs.clone();
+                // _bg:读在旁路线程上发生,优先级不继承 → 旁路自己降后台档,IO 让路前台。
+                crate::fable::sched::with_deadline_bg(READ_DEADLINE_SECS, move || {
+                    std::fs::read(&p).map_err(|e| e.kind())
+                })
+            };
+            let text = match read {
+                None => {
+                    // 读超时(挂载僵死):跳过 + 整根拉黑,不标记完成(见上方大注释)。
+                    skipped_reads.insert(file_id);
+                    dead_read_roots.insert(root.clone());
+                    continue;
+                }
+                Some(Ok(bytes)) => {
                     if bytes.iter().take(4096).any(|&b| b == 0) {
                         String::new() // 伪文本(二进制改名),跳过
                     } else {
                         String::from_utf8_lossy(&bytes).into_owned()
                     }
                 }
-                Err(_) => String::new(), // 文件已消失/不可读:标记完成,下轮重扫会清
+                // 真消失(NotFound):标记完成,下轮重扫会清行。
+                Some(Err(std::io::ErrorKind::NotFound)) => String::new(),
+                // 瞬断/权限抖动:跳过不标记(标了=空文本落库且 mtime 不变永不重建,
+                // 一次抖动就把该文件永久踢出检索),下轮重试。
+                Some(Err(_)) => {
+                    skipped_reads.insert(file_id);
+                    continue;
+                }
             };
 
-            // ── 内容指纹 + 版本键(去重/新压旧/移动免重嵌的地基)──
+            // ── 内容指纹 + 版本键(去重/新压旧/移动免重嵌的地基;事务外算好,Phase B 只写)──
             // 索引读文件时顺手算,零额外 IO;只对真文本算(空/伪文本留 ''=无指纹)。
             // 文件只在 chunked=0 或 ftsed=0 时才进本批,处理完不再入选 → 指纹不会重复回写。
-            if !text.is_empty() {
+            let fingerprint = if text.is_empty() {
+                None
+            } else {
                 let name = std::path::Path::new(&rel)
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let chash = content_fingerprint(&text);
-                let dkey = doc_key(&name);
+                Some((content_fingerprint(&text), doc_key(&name)))
+            };
+
+            // ── 向量层(认意思腿):切块 + 攒缓冲(CPU 在事务外);P1-4 只覆盖「精华」文本 ──
+            // 无 key 时整块跳过:chunked 保持 0,补 key 后再点构建即补建向量(认字腿已先行覆盖)。
+            let mut buffered = false;
+            if embed_ok && chunked == 0 && embeddable(&ext, size) && !text.is_empty() {
+                let mut chunks = chunk_text(&text);
+                // 实验:给每个 chunk 前缀「【文件名 · 父目录】」上下文头(默认关,POLARIS_CHUNK_HEADER=1
+                // 开)。同嵌入空间、不动 chunks.model → 只影响新建/重建的 chunk,存量随自然重建轮换,
+                // 绝不触发全库重嵌。命中率须经 eval A/B 达标(nDCG/recall ≥+2pt)再考虑默认开。
+                if chunk_header_enabled() {
+                    let hdr = chunk_header_for(&rel);
+                    if !hdr.is_empty() {
+                        for c in chunks.iter_mut() {
+                            *c = format!("{hdr}{c}");
+                        }
+                    }
+                }
+                if !chunks.is_empty() {
+                    // 攒进跨文件缓冲(整文件的 chunk 一次性加入,seq 从 0 起,不跨 flush)。
+                    for (i, c) in chunks.into_iter().enumerate() {
+                        buf_keys.push((file_id, i as i64));
+                        buf_texts.push(c);
+                    }
+                    buffered = true;
+                    buffered_ids.insert(file_id);
+                    // 攒够目标就 flush:嵌完落库,chunked=1 由 flush 内对涉及文件统一置位。
+                    // flush 自带事务;Phase A 无批事务在身,无需 COMMIT/BEGIN 腾挪。
+                    if buf_texts.len() >= coalesce_target {
+                        match flush_embed_buffer(&conn, &buf_keys, &buf_texts, &model, embed_batch())
+                        {
+                            Ok(n) => {
+                                chunks_added += n;
+                                buffered_ids.clear(); // flush 成功已统一置 chunked=1,不再需要挡重选
+                            }
+                            Err(e) => {
+                                // 整个 flush 放弃:涉及文件保持 chunked=0(旧 chunk 未动),下轮重试。
+                                // 清空缓冲避免收尾 flush 再次撞同一错误。
+                                stopped = format!("嵌入中断(可再点继续补建向量):{e}");
+                                abort_after_flushfail = true;
+                            }
+                        }
+                        buf_keys.clear();
+                        buf_texts.clear();
+                    }
+                }
+            }
+            prepared.push(Prep {
+                file_id,
+                text,
+                fingerprint,
+                do_lex: lex_ok && ftsed == 0,
+                // 不可嵌入 / 空文本 / 无 chunk:向量决策已完成,Phase B 标 chunked=1 防重复选中。
+                // 已进缓冲的文件不标 —— 由 flush 成功后统一置位(失败则保持 0 重试)。
+                mark_chunked: embed_ok && chunked == 0 && !buffered,
+            });
+            files_done += 1;
+            progress(files_done, chunks_added, &rel);
+            if abort_after_flushfail {
+                break;
+            }
+        }
+        // ── Phase B:单短事务批量落库(指纹/倒排/标记全是纯内存写,写锁毫秒级即释放)──
+        // 预算/取消/flush 失败的内层 break 也走到这里:已读好的文件照常落库,提交多少算多少。
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        for p in &prepared {
+            if let Some((chash, dkey)) = &p.fingerprint {
                 let _ = conn.execute(
                     "UPDATE files SET content_hash=?1, doc_key=?2 WHERE id=?3",
-                    rusqlite::params![chash, dkey, file_id],
+                    rusqlite::params![chash, dkey, p.file_id],
                 );
             }
-
-            // ── P1-2 全文倒排(认字腿):提前建好,查词秒回、覆盖全部文本文件 ──
-            if lex_ok && ftsed == 0 {
-                conn.execute("DELETE FROM lex WHERE rowid=?1", [file_id])
+            // P1-2 全文倒排(认字腿):提前建好,查词秒回、覆盖全部文本文件。
+            if p.do_lex {
+                conn.execute("DELETE FROM lex WHERE rowid=?1", [p.file_id])
                     .map_err(|e| e.to_string())?;
-                if !text.is_empty() {
+                if !p.text.is_empty() {
                     conn.execute(
                         "INSERT INTO lex(rowid, body) VALUES(?1, ?2)",
-                        rusqlite::params![file_id, text],
+                        rusqlite::params![p.file_id, p.text],
                     )
                     .map_err(|e| e.to_string())?;
                 }
-                conn.execute("UPDATE files SET ftsed=1 WHERE id=?1", [file_id])
+                conn.execute("UPDATE files SET ftsed=1 WHERE id=?1", [p.file_id])
                     .map_err(|e| e.to_string())?;
             }
-
-            // ── 向量层(认意思腿):P1-4 只覆盖「精华」文本(按类型/大小分流)──
-            // 无 key 时整块跳过:chunked 保持 0,补 key 后再点构建即补建向量(认字腿已先行覆盖)。
-            if embed_ok && chunked == 0 {
-                let mut buffered = false;
-                if embeddable(&ext, size) && !text.is_empty() {
-                    let mut chunks = chunk_text(&text);
-                    // 实验:给每个 chunk 前缀「【文件名 · 父目录】」上下文头(默认关,POLARIS_CHUNK_HEADER=1
-                    // 开)。同嵌入空间、不动 chunks.model → 只影响新建/重建的 chunk,存量随自然重建轮换,
-                    // 绝不触发全库重嵌。命中率须经 eval A/B 达标(nDCG/recall ≥+2pt)再考虑默认开。
-                    if chunk_header_enabled() {
-                        let hdr = chunk_header_for(&rel);
-                        if !hdr.is_empty() {
-                            for c in chunks.iter_mut() {
-                                *c = format!("{hdr}{c}");
-                            }
-                        }
-                    }
-                    if !chunks.is_empty() {
-                        // 攒进跨文件缓冲(整文件的 chunk 一次性加入,seq 从 0 起,不跨 flush)。
-                        for (i, c) in chunks.into_iter().enumerate() {
-                            buf_keys.push((file_id, i as i64));
-                            buf_texts.push(c);
-                        }
-                        buffered = true;
-                        buffered_ids.insert(file_id);
-                        // 攒够目标就 flush:嵌完落库,chunked=1 由 flush 内对涉及文件统一置位。
-                        // flush 自带事务 → 先提交批事务(把本批已做的轻量写落盘),成功后再开新批事务。
-                        if buf_texts.len() >= coalesce_target {
-                            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-                            match flush_embed_buffer(
-                                &conn,
-                                &buf_keys,
-                                &buf_texts,
-                                &model,
-                                embed_batch(),
-                            ) {
-                                Ok(n) => chunks_added += n,
-                                Err(e) => {
-                                    // 整个 flush 放弃:涉及文件保持 chunked=0(旧 chunk 未动),下轮重试。
-                                    // 清空缓冲避免收尾 flush 再次撞同一错误。批事务已提交,无悬挂。
-                                    buf_keys.clear();
-                                    buf_texts.clear();
-                                    stopped = format!("嵌入中断(可再点继续补建向量):{e}");
-                                    break 'outer;
-                                }
-                            }
-                            buf_keys.clear();
-                            buf_texts.clear();
-                            buffered_ids.clear(); // flush 成功已统一置 chunked=1,不再需要挡重选
-                            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-                        }
-                    }
-                }
-                // 不可嵌入 / 空文本 / 无 chunk:向量决策已完成,当即标 chunked=1 防重复选中。
-                // 已进缓冲的文件不在此标记 —— 由 flush 成功后统一置位(失败则保持 0 重试)。
-                if !buffered {
-                    conn.execute("UPDATE files SET chunked=1 WHERE id=?1", [file_id])
-                        .map_err(|e| e.to_string())?;
-                }
+            if p.mark_chunked {
+                conn.execute("UPDATE files SET chunked=1 WHERE id=?1", [p.file_id])
+                    .map_err(|e| e.to_string())?;
             }
-            files_done += 1;
-            progress(files_done, chunks_added, &rel);
         }
-        // 收批:预算/取消的内层 break 也走到这里,把本批已做的写落盘(幂等标记,提交多少算多少)。
         conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        if abort_after_flushfail {
+            break 'outer;
+        }
     }
 
     // ── 收尾:把残留缓冲一次性落库 ──
@@ -521,6 +576,10 @@ pub fn build_index(
     // 首次跨过规模门槛时自动建一次 IVF 倒排单元(20TB 级检索开箱即亚秒);未取消、有向量可聚类时才做。
     if !cancelled() && embed_ok {
         maybe_optimize(&conn, &model);
+    }
+    // 有根因读超时被整根拉黑 → 如实上报,别让「全部完成」掩盖半截结果。
+    if !dead_read_roots.is_empty() && stopped == "全部完成" {
+        stopped = "部分存储无响应(NAS 掉线?),其上文件已跳过 —— 恢复连接后再点继续".into();
     }
     Ok(IndexSummary {
         files_done,
@@ -611,6 +670,138 @@ mod tests {
         // 顶层文件无父目录段,只放文件名
         let top = chunk_header_for("readme.txt");
         assert!(top.contains("readme.txt") && !top.contains(" · "));
+    }
+
+    /// e2e(**单进程跑**:`cargo test -p polaris-fable --lib build_index_lex_only_e2e -- --ignored`;
+    /// 与其它测试同进程会撞 MIGRATED 单次迁移闸/环境变量):纯词法路径(测试进程 STORE 为空,
+    /// 无嵌入服务商)的 build_index 全链路 + 「先读后写」重构回归闸 ——
+    /// ① 正文进 FTS 倒排、指纹/doc_key 回填、ftsed/chunked 置位、pending 清零;
+    /// ② 真消失文件(NotFound)标记完成不留死待办;伪二进制(含 \0)不进倒排;
+    /// ③ 二次调用幂等 no-op;
+    /// ④ 构建期间并发写者(模拟盘点/归类)持续小事务写,最大等锁时长必须远小于
+    ///    busy_timeout(20s)—— 写锁不再被文件 IO 钉住,「建索引拖垮全应用」的回归哨兵。
+    #[test]
+    #[ignore]
+    fn build_index_lex_only_e2e() {
+        let base = std::env::temp_dir().join(format!("polaris_bidx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root_dir = base.join("root");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        std::env::set_var("POLARIS_FABLE_DB", base.join("fable_test.db"));
+
+        // 盘面:600 个真文本(内容含可检索关键词)+ 1 个伪二进制 + 1 个库里有行、盘上没有的文件
+        const N_TEXT: i64 = 600;
+        for i in 0..N_TEXT {
+            std::fs::write(
+                root_dir.join(format!("doc{i}.txt")),
+                format!("北极星知识库测试文档 {i}:先读后写重构验证正文。"),
+            )
+            .unwrap();
+        }
+        std::fs::write(base.join("root").join("fake.txt"), b"PK\x00\x01binary").unwrap();
+
+        let conn = open_db().unwrap();
+        conn.execute(
+            "INSERT INTO roots(id, path) VALUES(1, ?1)",
+            [root_dir.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        let ins = |id: i64, rel: &str| {
+            conn.execute(
+                "INSERT INTO files(id, root_id, relpath, name, ext, kind, size, mtime, chunked, ftsed, seen)
+                 VALUES(?1, 1, ?2, ?2, 'txt', 'text', 64, 1000, 0, 0, 1)",
+                rusqlite::params![id, rel],
+            )
+            .unwrap();
+        };
+        for i in 0..N_TEXT {
+            ins(i + 1, &format!("doc{i}.txt"));
+        }
+        ins(N_TEXT + 1, "fake.txt");
+        ins(N_TEXT + 2, "missing.txt"); // 盘上不存在 → NotFound → 标记完成
+        drop(conn);
+
+        // 并发写者:构建全程每 10ms 一笔小事务写(模拟盘点收尾/归类落库),测最大等锁时长。
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let c = open_db().unwrap();
+                let mut max_ms = 0u128;
+                let mut errors = 0u32;
+                let mut i = 0i64;
+                while !stop.load(Ordering::SeqCst) {
+                    let t = std::time::Instant::now();
+                    let r: Result<(), rusqlite::Error> = (|| {
+                        c.execute_batch("BEGIN IMMEDIATE")?;
+                        c.execute(
+                            "UPDATE files SET seen=1 WHERE id=?1",
+                            [(i % N_TEXT) + 1],
+                        )?;
+                        c.execute_batch("COMMIT")?;
+                        Ok(())
+                    })();
+                    if r.is_err() {
+                        let _ = c.execute_batch("ROLLBACK");
+                        errors += 1;
+                    }
+                    max_ms = max_ms.max(t.elapsed().as_millis());
+                    i += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                (max_ms, errors)
+            })
+        };
+
+        let sum = build_index(200_000, &|_, _, _| {}).expect("build_index");
+        stop.store(true, Ordering::SeqCst);
+        let (max_ms, errors) = writer.join().unwrap();
+
+        // ① 全部消化:602 个待办全处理,pending 清零,自然收尾。
+        assert_eq!(sum.files_done as i64, N_TEXT + 2);
+        assert_eq!(sum.files_pending, 0);
+        assert_eq!(sum.stopped, "全部完成");
+        let conn = open_db().unwrap();
+        let lex_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lex", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lex_rows, N_TEXT, "只有真文本进倒排(伪二进制/消失文件不进)");
+        // trigram 分词:MATCH 词须 ≥3 字符(见 mod.rs 的 lex 建表注释)。
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM lex WHERE lex MATCH '重构验证'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, N_TEXT, "关键词可检索到全部真文本");
+        let fp_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE content_hash LIKE 'f:%' AND doc_key<>''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fp_rows, N_TEXT, "真文本全部回填内容指纹与版本键");
+        let ftsed_all: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE ftsed=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ftsed_all, N_TEXT + 2, "伪二进制/消失文件也标记完成,不留死待办");
+        drop(conn);
+
+        // ③ 幂等:再跑一遍应 no-op。
+        let again = build_index(200_000, &|_, _, _| {}).expect("build_index again");
+        assert_eq!(again.files_done, 0, "二次调用应无待办");
+
+        // ④ 并发写者全程零锁错误、最大等锁远小于 busy_timeout —— 写锁没被 IO 钉住。
+        assert_eq!(errors, 0, "构建期间并发小写者不应撞锁失败");
+        assert!(
+            max_ms < 5_000,
+            "并发写者最大等锁 {max_ms}ms,应远小于 busy_timeout(20s)"
+        );
+
+        std::env::remove_var("POLARIS_FABLE_DB");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

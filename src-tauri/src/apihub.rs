@@ -588,7 +588,7 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
 
         // ── 寓言计划 · 检索枢纽(盘点 L1a + 向量索引 + 塌平混检)──
         "fable_status" => ok(fable::fable_status()?),
-        "fable_cancel" => ok(fable::fable_cancel()),
+        "fable_cancel" => ok(fable::fable_cancel(opt_str(a, "task"))),
         "fable_inventory_start" => ok(fable::inventory::fable_inventory_start(
             app,
             Some(vec_str(a, "roots")),
@@ -706,6 +706,10 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
         "conv_set_project_kb_scope" => ok(conv::conv_set_project_kb_scope(
             req_str(a, "projectId")?,
             opt_str(a, "kbScope"),
+        )?),
+        "conv_set_project_work_dir" => ok(conv::conv_set_project_work_dir(
+            req_str(a, "projectId")?,
+            opt_str(a, "workDir"),
         )?),
         "conv_open_project_dir" => ok(conv::conv_open_project_dir(req_str(a, "projectId")?)?),
         "conv_archive_project" => ok(conv::conv_archive_project(req_str(a, "projectId")?)?),

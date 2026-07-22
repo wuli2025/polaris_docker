@@ -94,38 +94,47 @@ pub fn fable_audit(mode: Option<String>, sample: Option<usize>) -> Result<AuditR
             rep.dirs_sampled += 1;
             let abs_dir =
                 super::reencode_fs_path(&PathBuf::from(&root_path).join(&drel).to_string_lossy());
-            let rd = match std::fs::read_dir(&abs_dir) {
-                Ok(rd) => rd,
-                Err(_) => {
-                    rep.unreachable_dirs += 1;
-                    continue;
-                }
+            // 抽到的目录可能在死 NAS 上:read_dir/逐项 metadata 无限阻塞会把整条 audit 命令
+            // 吊死(取消只在目录间轮询,拦不住阻塞中的 syscall)→ 整个目录清单在有界旁路里
+            // 收集,超死线记 unreachable 继续下一个。
+            let listing: Option<Vec<(String, i64)>> = {
+                let dir = abs_dir.clone();
+                sched::with_deadline(15, move || {
+                    let rd = std::fs::read_dir(&dir).ok()?;
+                    let mut v: Vec<(String, i64)> = Vec::new();
+                    for ent in rd.flatten() {
+                        let Ok(ft) = ent.file_type() else { continue };
+                        if ft.is_dir() {
+                            continue;
+                        }
+                        let name = crate::fable::decode_fs(ent.file_name().as_os_str());
+                        let mtime = ent
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        v.push((name, mtime));
+                    }
+                    Some(v)
+                })
+                .flatten()
+            };
+            let Some(listing) = listing else {
+                rep.unreachable_dirs += 1;
+                continue;
             };
             // 盘上直属文件:显示名 → mtime 秒(与盘点写库同口径)。
             let mut disk: HashSet<String> = HashSet::new();
             let mut dir_missing = 0u64;
-            for ent in rd.flatten() {
-                let ft = match ent.file_type() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if ft.is_dir() {
-                    continue;
-                }
-                let name = super::decode_fs(ent.file_name().as_os_str());
+            for (name, disk_mtime) in listing {
                 let rel = if drel.is_empty() {
                     name.clone()
                 } else {
                     format!("{drel}/{name}")
                 };
                 disk.insert(name);
-                let disk_mtime = ent
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
                 let db_mtime: Option<i64> = conn
                     .query_row(
                         "SELECT mtime FROM files WHERE root_id=?1 AND relpath=?2",
@@ -162,12 +171,20 @@ pub fn fable_audit(mode: Option<String>, sample: Option<usize>) -> Result<AuditR
                     Err(_) => Vec::new(),
                 }
             } else {
+                // 不能用 LIKE ?2||'/%':目录名里的 `_`/`%` 是 LIKE 通配符(`my_dir/%` 会连
+                // `myXdir/…` 一起命中),幻影计数虚高。改走 UNIQUE(root_id,relpath) 索引的
+                // [lo,hi) 区间 + instr 收窄到「直属」(与 scan.rs 写库侧 bump_files 同款口径)。
+                let lo = format!("{drel}/");
+                let hi = format!("{drel}0"); // '0' = '/'(0x2F)+1
+                let off = drel.chars().count() as i64 + 2;
                 match conn.prepare(
                     "SELECT relpath FROM files WHERE root_id=?1
-                     AND relpath LIKE ?2||'/%' AND relpath NOT LIKE ?2||'/%/%'",
+                     AND relpath>=?2 AND relpath<?3 AND instr(substr(relpath,?4),'/')=0",
                 ) {
                     Ok(mut s) => s
-                        .query_map(rusqlite::params![root_id, drel], |r| r.get::<_, String>(0))
+                        .query_map(rusqlite::params![root_id, lo, hi, off], |r| {
+                            r.get::<_, String>(0)
+                        })
                         .map(|rs| rs.flatten().collect())
                         .unwrap_or_default(),
                     Err(_) => Vec::new(),

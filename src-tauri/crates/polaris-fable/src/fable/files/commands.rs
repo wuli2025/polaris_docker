@@ -134,6 +134,9 @@ pub(crate) fn smart_cluster_progressive(
         }),
     );
 
+    if cluster_cancelled() {
+        return Err("已取消".into());
+    }
     // ── T1:AI 初级命名 + 关系(读簇画像,不读文件,成本与文件数无关)──
     let mut report = String::new();
     match cluster_rename_llm(app, root.clone(), "ai-primary") {
@@ -162,6 +165,9 @@ pub(crate) fn smart_cluster_progressive(
     // ── T2:全量向量化 → 语义重聚 → 再命名(配了嵌入能力时;全程后台)──
     // 「嵌入能力」= 云 API 服务商 **或** 本地开源嵌入(local-embed,离线就能产向量);
     // 后者此前不被计入 → 纯本地用户永远停在结构归类、走不到「按内容语义」这一档。见 embed_capable。
+    if deep && cluster_cancelled() {
+        return Err("已取消".into()); // T2 是几十分钟级的全量向量化,进场前必须再看一眼取消
+    }
     if deep && crate::fable::index::embed_capable() {
         emit_cluster(
             app,
@@ -225,12 +231,15 @@ pub fn file_cluster_build(app: AppHandle, root: Option<String>) -> Result<(), St
     let Some(guard) = FlagGuard::acquire(&CLUSTERING) else {
         return Err("归类正在进行中".into());
     };
+    CANCEL_CLUSTER.store(false, Ordering::SeqCst);
     emit_cluster(
         &app,
         json!({ "kind": "phase", "text": "正在把相似文件归类…" }),
     );
     std::thread::spawn(move || {
         let _guard = guard; // panic 栈展开也释放闸,防永久锁死
+        // 专属线程降后台档:归类(读盘+向量计算)不与 UI/对话抢 CPU·IO。
+        crate::fable::sched::demote_current_thread_to_background();
         match cluster_build(root) {
             Ok(s) => emit_cluster(
                 &app,
@@ -246,7 +255,8 @@ pub fn file_cluster_build(app: AppHandle, root: Option<String>) -> Result<(), St
 }
 
 /// 文件中心 v3 渐进式智能归类(秒级骨架 → AI 初级命名+关系 → 全量向量化后语义重聚再命名)。
-/// 后台线程跑,进度/各档完成走 `file:cluster` 事件(phase / tick / tier / done / error);
+/// 后台线程跑,进度/各档完成走 `file:cluster` 事件(phase / tier / done / error;
+/// `tick` 心跳只有 cluster_llm / titles_llm 发,本管线不发,前端勿依赖);
 /// 切走文件中心也不中断,与 [`file_cluster_build`] / [`file_cluster_llm`] 同构。
 ///
 /// `quick=Some(true)`:只跑 T0+T1(全覆盖词法 + AI 命名)就收尾,不追加耗时的 T2 全量向量化
@@ -260,6 +270,7 @@ pub fn file_smart_cluster(
     let Some(guard) = FlagGuard::acquire(&SMART_CLUSTERING) else {
         return Err("智能归类正在进行中".into());
     };
+    CANCEL_CLUSTER.store(false, Ordering::SeqCst);
     let deep = !quick.unwrap_or(false);
     emit_cluster(
         &app,
@@ -267,6 +278,8 @@ pub fn file_smart_cluster(
     );
     std::thread::spawn(move || {
         let _guard = guard; // panic 栈展开也释放闸,防永久锁死
+        // 专属线程降后台档:T2 全量向量化是最重的长任务,绝不能与 UI/对话抢 CPU·IO。
+        crate::fable::sched::demote_current_thread_to_background();
         if let Err(e) = smart_cluster_progressive(&app, root, deep) {
             emit_cluster(&app, json!({ "kind": "error", "message": e }));
         }

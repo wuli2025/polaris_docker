@@ -17,6 +17,8 @@ pub fn fable_index_start(app: AppHandle, max_chunks: Option<usize>) -> Result<()
     std::thread::spawn(move || {
         // 守卫 move 进线程:正常结束或 panic 栈展开都会释放 INDEXING 闸(防永久锁死)。
         let _index_guard = index_guard;
+        // 专属线程降后台档:狂读盘+切块+落库的长任务不与 UI/对话抢 CPU·IO(线程结束即回收)。
+        crate::fable::sched::demote_current_thread_to_background();
         let app2 = app.clone();
         let result = build_index(budget, &move |files, chunks, current| {
             emit(
@@ -48,6 +50,8 @@ pub fn fable_lex_build_start(app: AppHandle) -> Result<(), String> {
     CANCEL.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
         let _index_guard = index_guard;
+        // 专属线程降后台档(理由同 fable_index_start)。
+        crate::fable::sched::demote_current_thread_to_background();
         let app2 = app.clone();
         let result = build_lexical_index(&move |files, pending| {
             let _ = app2.emit(

@@ -99,7 +99,7 @@ pub(crate) fn app_data_roots() -> Vec<ScanRootInfo> {
 ///   (只摸 mtime 变过的子树,见 [`scan_root`]),日常重扫快一个数量级。
 ///
 /// **`(async)`**:函数体里对每个根做 [`dir_reachable`] 有界探测(死 NAS 上每根最多卡
-/// `probe_secs`≈12s)。同步 tauri 命令跑在主线程会冻住 UI;标 `(async)` 让 tauri 把这段
+/// `probe_secs`≈10s)。同步 tauri 命令跑在主线程会冻住 UI;标 `(async)` 让 tauri 把这段
 /// 同步活儿派到工作线程,主线程不被吊死(冷 NAS 盘上点「盘点」UI 仍跟手)。
 #[cfg_attr(feature = "desktop", tauri::command(async))]
 pub fn fable_inventory_start(
@@ -135,17 +135,25 @@ pub fn fable_inventory_start(
     // 有界探测可达性:挂载点掉线时 is_dir 会吊死「开始盘点」请求 → 超死线判不可达即剔除(scan_root
     // 内部还有看门狗兜底,这里先把死根挡在请求路径外,点「盘点」立刻有反应)。
     // **连不上的根不再默默丢弃**,而是收进 `unreachable` 一并报给前端 —— 否则用户只看到「盘点完成」
-    // 却不知道群晖 NAS / 拔掉的外置盘这次根本没扫到。远程盘(映射的 NAS、UNC)给更长的冷连接时间:
-    // Tailscale/SMB 首次握手本就慢,免得「只是第一下慢」被误判不可达而整盘采集不到。
+    // 却不知道群晖 NAS / 拔掉的外置盘这次根本没扫到。远程盘不再额外放宽死线(旧 25s 冷连接
+    // 宽限已撤,用户拍板:NAS 最多等 [`probe_secs`]=10s,连不上就跳过继续盘其余的根)。
+    // 并行探测:每根一个有界旁路,**同时**起跑 → 总等待 ≈ 一个 probe_secs,而非 Σ(根数×死线)。
+    // 旧的串行版在「多个 NAS/外置盘同时掉线」时要 N×10s 才返回,点「开始盘点」半分钟没动静,
+    // 用户观感就是「又卡死了」。
     let mut roots: Vec<String> = Vec::new();
     let mut unreachable: Vec<String> = Vec::new();
-    for r in candidates {
-        let secs = if is_remote_root(&r) {
-            probe_secs().max(25)
-        } else {
-            probe_secs()
-        };
-        if super::sched::dir_reachable(std::path::Path::new(&r), secs) {
+    let probes: Vec<(String, std::thread::JoinHandle<bool>)> = candidates
+        .into_iter()
+        .map(|r| {
+            let p = r.clone();
+            let h = std::thread::spawn(move || {
+                super::sched::dir_reachable(std::path::Path::new(&p), probe_secs())
+            });
+            (r, h)
+        })
+        .collect();
+    for (r, h) in probes {
+        if h.join().unwrap_or(false) {
             roots.push(r);
         } else {
             unreachable.push(r);

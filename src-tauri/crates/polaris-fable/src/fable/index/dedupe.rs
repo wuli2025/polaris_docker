@@ -83,15 +83,30 @@ pub(crate) fn dedupe_scan(backfill: bool) -> Result<DedupeSummary, String> {
             }
             batch.clear();
         };
+        // 死挂载防护(同 build_index 的读路径):整文件读走有界旁路,某根一超时即整根拉黑,
+        // 其余根照常回填;跳过的文件不打标,下轮重试。
+        let mut dead_read_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (id, root, rel) in targets {
             if cancelled() {
                 stopped = "已取消".into();
                 break;
             }
+            if dead_read_roots.contains(&root) {
+                continue;
+            }
             let abs =
                 super::reencode_fs_path(&std::path::Path::new(&root).join(&rel).to_string_lossy());
-            let Ok(bytes) = std::fs::read(&abs) else {
-                continue;
+            let read = {
+                let p = abs.clone();
+                crate::fable::sched::with_deadline(20, move || std::fs::read(&p).ok())
+            };
+            let bytes = match read {
+                None => {
+                    dead_read_roots.insert(root.clone());
+                    continue; // 读超时(挂载僵死):整根拉黑
+                }
+                Some(Some(b)) => b,
+                Some(None) => continue,
             };
             if bytes.iter().take(4096).any(|&b| b == 0) {
                 continue;

@@ -160,8 +160,16 @@ pub(crate) fn natural_lang(sample: &str) -> &'static str {
     }
 }
 
-/// 读文件头(≤16KB)做文本采样;二进制(含 NUL)或不可读返回 None。
+/// 读文件头(≤16KB)做文本采样;二进制(含 NUL)、不可读或**读超时**返回 None。
+///
+/// 走 [`sched::with_deadline`] 有界旁路:死挂载上的 open/read 无限阻塞且无法从外部中断,
+/// 语言回填的 `thread::scope` 会因一个卡死 worker 永久 join 不返回 → 整条命令冻死。
 pub(crate) fn read_head_sample(abs: &std::path::Path) -> Option<String> {
+    let p = abs.to_path_buf();
+    super::sched::with_deadline(15, move || read_head_sample_inner(&p)).flatten()
+}
+
+fn read_head_sample_inner(abs: &std::path::Path) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(abs).ok()?;
     let mut buf = vec![0u8; 16 * 1024];
