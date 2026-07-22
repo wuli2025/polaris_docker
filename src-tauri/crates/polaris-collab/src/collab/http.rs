@@ -90,11 +90,18 @@ pub fn detect_advertise_urls(port: u16) -> Vec<String> {
         }
     }
     for ip in ips {
-        if !ip.is_loopback() {
+        if !ip.is_loopback() && !is_tun_fake_ip(&ip) {
             out.push(format!("http://{ip}:{port}"));
         }
     }
     out
+}
+
+/// 198.18.0.0/15 是基准测试保留段,被 Clash/Surge 等 TUN 代理拿来当 fake-ip。
+/// 开着 TUN 时「默认路由出口 IP」探到的就是它;把它通告进连接码,对方(往往也开着
+/// TUN)连它会回环到**对方自己**的 Polaris,表现为 401/串机迷惑 —— 一律不通告。
+fn is_tun_fake_ip(ip: &std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V4(v) if v.octets()[0] == 198 && (v.octets()[1] & 0xfe) == 18)
 }
 
 // ───────────────────────── 鉴权 ─────────────────────────
@@ -275,14 +282,256 @@ async fn collab_bootstrap(
     unwrap_api(out)
 }
 
+/// 密码登录。成员主机(delegated)上密码**不在本机**,故转交账号权威代验:
+/// 主机 → 权威取断言 → 本地验签 → 签本机会话。这条路是给「客户端只连得上主机、
+/// 连不上云机」的场景兜底(局域网里的手机);客户端自己够得着云机时应当直接走
+/// `/api/account/login` + `/api/collab/login_assertion`,不占主机的出口带宽。
+///
+/// 权威不可达时**回落本地密码库**:应急 owner、老的本地账号仍然进得去 ——
+/// 否则云机一挂,全世界的桌面主机一起锁死,那是把单点故障从「登录慢」升级成「全线瘫痪」。
 async fn collab_login(Json(v): Json<Value>) -> Response {
     let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
-        let (u, token) = crate::collab::auth::login(
-            &s_of(&v, "username"),
+        let username = s_of(&v, "username");
+        let password = s_of(&v, "password");
+        let device_id = s_of(&v, "deviceId");
+        if crate::collab::authority::upstream_url().is_some() {
+            match crate::collab::authority::upstream_login(&username, &password) {
+                Ok(assertion) => {
+                    let (u, token) =
+                        crate::collab::authority::login_with_assertion(&assertion, &device_id)?;
+                    return Ok(json!({"user": u, "token": token, "via": "authority"}));
+                }
+                Err(e) => {
+                    // 只有「连不上」才回落本地;权威明确说密码错就得原样报错,
+                    // 否则等于给联邦账号开了一条「云端拒了还能试本机」的旁门。
+                    let unreachable = e.contains("连不上") || e.contains("未配置账号权威");
+                    if !unreachable {
+                        return Err(e);
+                    }
+                    // 回落本地。本地也进不去时**不能**报「用户名或密码错误」—— 真正的原因是
+                    // 云端账号中心连不上,报成密码错会让人对着正确的密码反复重试查不出所以然。
+                    match crate::collab::auth::login(&username, &password, &device_id) {
+                        Ok((u, token)) => {
+                            return Ok(json!({"user": u, "token": token, "via": "local-fallback"}))
+                        }
+                        Err(local_err) => {
+                            return Err(format!(
+                                "连不上云端账号中心,且本机没有这个账号的本地凭据 —— \
+                                 你的账号在云端,请等网络恢复再登(本机回落结果:{local_err})"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        let (u, token) = crate::collab::auth::login(&username, &password, &device_id)?;
+        Ok(json!({"user": u, "token": token}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+// ───────────────────────── 账号权威 /api/account/* ─────────────────────────
+//
+// 权威机(云机,POLARIS_ACCOUNT_AUTHORITY=1)是**唯一**能建账号、验密码的地方。
+// 它签一张短命的身份断言(5 分钟),客户端拿着它去任何一台成员主机换本机会话。
+// 成员主机纯本地验签、不联网 —— 家里的桌面断网了照样能让人登进来。
+
+fn not_authority() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":"本机不是账号权威(未设 POLARIS_ACCOUNT_AUTHORITY=1)"})),
+    )
+        .into_response()
+}
+
+/// 账号体系自述(公开):告诉客户端「本机的账号该在哪儿登」。
+/// 三种回答对应三种部署:authority(我就是权威)/ delegated(去这个 URL 登)/ local(老行为,就地登)。
+async fn account_info() -> Response {
+    let out = tokio::task::spawn_blocking(|| -> Result<Value, String> {
+        use crate::collab::authority::{self, Mode};
+        // emailRequired 恒 false:邮箱是**可选**的(绑了才有自助找回)。
+        // emailCapable 告诉前端「这儿发得出验证码吗」—— 发不出就别让人填邮箱空等。
+        Ok(match authority::mode() {
+            Mode::Authority => json!({
+                "mode": "authority",
+                "kid": authority::kid().unwrap_or_default(),
+                "emailRequired": false,
+                "emailCapable": crate::collab::mail::configured(),
+            }),
+            Mode::Delegated(url) => {
+                let pin = authority::pinned();
+                json!({
+                    "mode": "delegated",
+                    "authorityUrl": url,
+                    "trusted": pin.is_some(),
+                    "kid": pin.map(|(_, _, k)| k).unwrap_or_default(),
+                    "emailRequired": false,
+                })
+            }
+            Mode::Local => json!({"mode": "local", "emailRequired": false}),
+        })
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 权威公钥(公开):成员主机首次接触时钉住这一串。
+async fn account_pubkey() -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(|| -> Result<Value, String> {
+        let pk = crate::collab::authority::public_key_b64()?;
+        Ok(json!({"publicKey": pk, "kid": crate::collab::authority::kid_of(&pk), "alg": "ed25519"}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 全局注册。邮箱**可选**:
+///  · 不填邮箱 → 直接建号(没有自助找回,忘了密码得找管理员重置)。
+///  · 填了邮箱 → 必须同时给出发到该邮箱的验证码,验过才绑 —— 绑一个没验证过的邮箱
+///    等于把「找回密码」的钥匙交给一个不确定属于谁的地址,比不绑还危险。
+async fn account_signup(Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let email = s_of(&v, "email");
+        if !email.trim().is_empty() {
+            if !crate::collab::mail::configured() {
+                return Err(
+                    "本账号中心没配邮件服务,发不出验证码 —— 请留空邮箱直接注册".into(),
+                );
+            }
+            crate::collab::mail::verify_code(&email, "signup", &s_of(&v, "code"))?;
+        }
+        let username = s_of(&v, "username");
+        let display = {
+            let d = s_of(&v, "displayName");
+            if d.trim().is_empty() {
+                username.clone()
+            } else {
+                d
+            }
+        };
+        let (u, uid) = crate::collab::auth::create_authority_account(
+            &username,
             &s_of(&v, "password"),
+            &display,
+            &email,
+        )?;
+        let assertion =
+            crate::collab::authority::sign_assertion(&uid, &u.username, &email, &display)?;
+        Ok(json!({"user": u, "uid": uid, "email": email, "assertion": assertion}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 全局登录:用户名**或邮箱** + 密码 → 身份断言。权威只回答「你是谁」,
+/// 不回答「你在某台主机上能干什么」—— 那是各主机自己的账。
+async fn account_login(Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let ident = {
+            let u = s_of(&v, "username");
+            if u.trim().is_empty() {
+                s_of(&v, "email")
+            } else {
+                u
+            }
+        };
+        let (u, uid, email) =
+            crate::collab::auth::authority_login(&ident, &s_of(&v, "password"))?;
+        let assertion =
+            crate::collab::authority::sign_assertion(&uid, &u.username, &email, &u.display_name)?;
+        Ok(json!({
+            "user": {"username": u.username, "displayName": u.display_name, "email": email},
+            "uid": uid,
+            "assertion": assertion,
+        }))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 全局改密(邮箱验证码):改的是权威库里的密码,**所有**主机随之生效 ——
+/// 因为没有任何一台主机存着这个密码。
+async fn account_reset(Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let email = s_of(&v, "email");
+        crate::collab::mail::verify_code(&email, "reset", &s_of(&v, "code"))?;
+        let u = crate::collab::auth::find_user_by_email(&email)?
+            .ok_or("该邮箱没有绑定任何账号")?;
+        crate::collab::auth::set_password(u.id, &s_of(&v, "newPassword"))?;
+        Ok(json!({"ok": true, "username": u.username}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 成员主机进门:拿权威签的断言换本机会话 token。
+///
+/// 这里**不联网** —— 只做本地验签 + 落本机成员资格。故家里的桌面主机断网时,
+/// 只要手机自己连得上云机把断言取回来,照样登得进桌面。
+async fn collab_login_assertion(Json(v): Json<Value>) -> Response {
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (u, token) = crate::collab::authority::login_with_assertion(
+            &s_of(&v, "assertion"),
             &s_of(&v, "deviceId"),
         )?;
         Ok(json!({"user": u, "token": token}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 云端账号 + 邀请码 → 成为本机成员。
+///
+/// 联邦模式下,「你是谁」由云端证明,「这台主机欢不欢迎你」由本机的邀请票据证明,
+/// 两把钥匙缺一不可 —— 只有前者就成了「谁在云端注册都能登进你家电脑」。
+async fn collab_join(Json(v): Json<Value>) -> Response {
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (u, token) = crate::collab::authority::join_with_ticket(
+            &s_of(&v, "assertion"),
+            &s_of(&v, "code"),
+            &s_of(&v, "deviceName"),
+            &s_of(&v, "nodeId"),
+        )?;
+        Ok(json!({"user": u, "token": token}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// owner 显式「重新信任」账号权威(换云机 / 权威轮换了密钥)。
+/// 要 owner 亲自确认公钥指纹 —— 自动接受新公钥等于把验签这道防线拆了。
+async fn collab_authority_repin(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let want = s_of(&v, "kid");
+        let (url, pk) = crate::collab::authority::repin(if want.trim().is_empty() {
+            None
+        } else {
+            Some(&want)
+        })?;
+        Ok(json!({"ok": true, "authorityUrl": url, "kid": crate::collab::authority::kid_of(&pk)}))
     })
     .await;
     unwrap_api(out)
@@ -328,6 +577,13 @@ async fn collab_redeem(
                 &s_of(&v, "nodeId"),
             )?;
             return Ok(json!({"user": user, "token": token}));
+        }
+        // 成员主机上「未登录 + 邀请码 → 就地建号」这条老路会造出孤岛账号,堵掉:
+        // 邀请码在联邦模式下只用于「已登录的云端账号把本设备绑进来」(上面那条路)。
+        if let Some(url) = crate::collab::authority::upstream_url() {
+            return Err(format!(
+                "本主机的账号由云端账号中心({url})统一管理:请先用云端账号登录,再用邀请码入伙"
+            ));
         }
         let (u, token) = crate::collab::identity::redeem_ticket(
             &s_of(&v, "code"),
@@ -616,6 +872,9 @@ async fn collab_device_revoke(
 /// proc-macro)—— 本质是「在主机上执行不可信代码」= 主机 RCE。故收紧为邀请制,把能 push 代码的
 /// 人限定在管理员亲自发票据请进来的可信成员。
 async fn collab_signup(Json(v): Json<Value>) -> Response {
+    if let Some(r) = refuse_local_account_creation() {
+        return r;
+    }
     let open = std::env::var("POLARIS_OPEN_SIGNUP")
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -641,6 +900,22 @@ async fn collab_signup(Json(v): Json<Value>) -> Response {
     unwrap_api(out)
 }
 
+/// 成员主机(delegated)上不许就地建号 —— 账号只能在权威那儿注册,否则又长出一座孤岛,
+/// 「一个账号到处登」当场破功。返回 Some 即调用方应直接把它当响应返回。
+fn refuse_local_account_creation() -> Option<Response> {
+    let url = crate::collab::authority::upstream_url()?;
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "本主机的账号由云端账号中心统一管理,请到账号中心注册后再登录",
+                "authorityUrl": url,
+            })),
+        )
+            .into_response(),
+    )
+}
+
 // ── 邮箱注册 / 找回密码(验证码 = 邮箱所有权证明) ──
 
 /// 邮箱服务状态(公开,无鉴权):前端据此决定「注册」入口亮不亮、「忘记密码」走不走邮箱。
@@ -664,7 +939,14 @@ async fn collab_email_send_code(Json(v): Json<Value>) -> Response {
         let purpose = s_of(&v, "purpose");
         match purpose.as_str() {
             "signup" => {
-                if !crate::collab::mail::signup_open() {
+                // 权威机就是注册入口:只要邮件服务配齐就放行,不再受 email_signup 开关约束
+                // (那个开关的语义是「本主机要不要收陌生人」,对权威机没有意义)。
+                let ok = if crate::collab::authority::is_authority() {
+                    crate::collab::mail::configured()
+                } else {
+                    crate::collab::mail::signup_open()
+                };
+                if !ok {
                     return Err("本主机未开放邮箱注册,请联系管理员或用邀请票据入伙".into());
                 }
                 if crate::collab::auth::find_user_by_email(&email)?.is_some() {
@@ -690,6 +972,9 @@ async fn collab_email_send_code(Json(v): Json<Value>) -> Response {
 
 /// 邮箱验证码注册:验证通过即建号(collaborator)+ 绑邮箱 + 签会话,一步登录。
 async fn collab_email_signup(Json(v): Json<Value>) -> Response {
+    if let Some(r) = refuse_local_account_creation() {
+        return r;
+    }
     let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         if !crate::collab::mail::signup_open() {
             return Err("本主机未开放邮箱注册,请联系管理员或用邀请票据入伙".into());
@@ -2772,6 +3057,18 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
         .route("/api/collab/logout", post(collab_logout))
         .route("/api/collab/me", get(collab_me))
         .route("/api/collab/redeem", post(collab_redeem))
+        // ── 账号权威(云机签发身份断言;成员主机离线验签)──
+        // 权威侧发号:公钥、注册(强制绑邮箱)、登录、改密。非权威机上这些路由一律 400,
+        // 前端据 /api/account/info 决定登录页往哪儿打,不靠猜。
+        .route("/api/account/info", get(account_info))
+        .route("/api/account/pubkey", get(account_pubkey))
+        .route("/api/account/signup", post(account_signup))
+        .route("/api/account/login", post(account_login))
+        .route("/api/account/reset", post(account_reset))
+        // 成员侧进门:拿权威签的断言换本机会话。
+        .route("/api/collab/login_assertion", post(collab_login_assertion))
+        .route("/api/collab/join", post(collab_join))
+        .route("/api/collab/authority/repin", post(collab_authority_repin))
         // GitHub 式:开放注册 + 用户名搜索 + 团队(一人多团队,团队下挂项目)
         .route("/api/collab/signup", post(collab_signup))
         // 邮箱验证码:注册 / 找回密码(验证码 = 邮箱所有权证明;频控在 mail 模块)
@@ -2909,6 +3206,7 @@ mod tests {
         for u in detect_advertise_urls(8484) {
             assert!(u.starts_with("http://"));
             assert!(!u.contains("127.0.0.1"));
+            assert!(!u.contains("//198.18.") && !u.contains("//198.19."));
             assert!(u.ends_with(":8484"));
         }
         std::env::set_var(
@@ -2924,5 +3222,16 @@ mod tests {
                 "https://p.example".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn tun_fake_ip_range_detection() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(is_tun_fake_ip(&ip("198.18.0.1")));
+        assert!(is_tun_fake_ip(&ip("198.19.255.254")));
+        assert!(!is_tun_fake_ip(&ip("198.17.0.1")));
+        assert!(!is_tun_fake_ip(&ip("198.20.0.1")));
+        assert!(!is_tun_fake_ip(&ip("192.168.1.5")));
+        assert!(!is_tun_fake_ip(&ip("100.126.0.21")));
     }
 }

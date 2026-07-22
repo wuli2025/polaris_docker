@@ -34,12 +34,15 @@ import {
   Plus,
   LogOut,
   Mail,
+  Terminal,
 } from "@lucide/vue";
+import RemoteTerminal from "./RemoteTerminal.vue";
 import { invoke, isTauri } from "../../tauri";
 import { useCollabStore } from "../collab/stores/collab";
 import { useAppStore } from "../../stores/app";
 import {
   collabApi,
+  parseConnectCode,
   type AdminDevice,
   type AuditRow,
   type EmailStatus,
@@ -148,6 +151,9 @@ const connectCode = computed(() => {
   try {
     const payload: Record<string, unknown> = { t, a };
     if (n) payload.n = n;
+    // 账号由云端账号中心统管时带上它的地址:收码人换账号登录时知道往哪儿打
+    // (令牌本身就是凭据,进门本身用不着这一项)。
+    if (collab.authorityUrl) payload.u = collab.authorityUrl;
     const b64 = btoa(JSON.stringify(payload))
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
@@ -610,6 +616,81 @@ async function saveMailCfg() {
     mailCfgBusy.value = false;
   }
 }
+// ── 受控远程执行(B 方案) ────────────────────────────────────────────────
+// 主机侧:本机是否允许「互联上的对端在我这跑命令」。默认关,且 Shell 档位自带过期。
+// 调用方:对某台远程设备开终端面板(RemoteTerminal),经隧道打它的 /api/exec。
+
+/** 打开终端的目标远程盘;null=面板关闭。 */
+const termTarget = ref<RemoteSource | null>(null);
+
+const execPolicy = ref<{ enabled: boolean; mode: string; shell_until: number } | null>(null);
+const execBusy = ref(false);
+
+async function loadExecPolicy() {
+  if (!isTauri) return;
+  try {
+    execPolicy.value = await invoke("exec_policy_get");
+  } catch {
+    /* 老版本/非桌面壳:开关不显示,不报错打扰 */
+  }
+}
+
+/** 总开关。关掉时后端会顺手清掉 Shell 解锁,不留悬空授权。 */
+async function toggleExec() {
+  if (execBusy.value) return;
+  const next = !execPolicy.value?.enabled;
+  if (
+    next &&
+    !confirm(
+      "开启后,任何经 iroh 隧道连上本机且持 owner 令牌的设备,都能在这台电脑上执行命令。\n\n" +
+        "默认是白名单模式(仅在册命令、不过 shell)。确定开启?"
+    )
+  )
+    return;
+  execBusy.value = true;
+  try {
+    execPolicy.value = await invoke("exec_policy_set", { enabled: next, shellMinutes: null });
+    toast.info(next ? "已开启远程执行 · 白名单模式" : "已关闭远程执行");
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    execBusy.value = false;
+  }
+}
+
+/** 临时解锁 Shell 模式(带过期)。再点一次立即落回白名单。 */
+async function toggleShellMode(minutes: number) {
+  if (execBusy.value || !execPolicy.value?.enabled) return;
+  const unlocking = execPolicy.value.mode !== "shell";
+  if (
+    unlocking &&
+    !confirm(
+      `Shell 模式 = 对端可在本机跑任意命令(管道/重定向可用),等同交出一个 shell。\n\n` +
+        `将在 ${minutes} 分钟后自动落回白名单。确定解锁?`
+    )
+  )
+    return;
+  execBusy.value = true;
+  try {
+    execPolicy.value = await invoke("exec_policy_set", {
+      enabled: true,
+      shellMinutes: unlocking ? minutes : 0,
+    });
+    toast.info(unlocking ? `Shell 模式已解锁 · ${minutes} 分钟后自动回收` : "已落回白名单模式");
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    execBusy.value = false;
+  }
+}
+
+/** Shell 解锁剩余分钟(向上取整);0=未解锁/已过期。 */
+const shellLeftMin = computed(() => {
+  const u = execPolicy.value?.shell_until ?? 0;
+  if (!u) return 0;
+  return Math.max(0, Math.ceil((u * 1000 - Date.now()) / 60000));
+});
+
 /** 使用盘:带着目标远程源直接跳文件中心的远程浏览(FileCenter onMounted 接棒)。 */
 function browseDisk(s: RemoteSource) {
   sessionStorage.setItem("polaris.fc.openRemote", s.id);
@@ -828,9 +909,23 @@ let portSeq = 18620; // 本地代理端口起点,逐个 +1 避冲突
 const connBusy = ref(false);
 
 async function connectRemote() {
-  const nodeId = addForm.nodeId.trim();
+  let nodeId = addForm.nodeId.trim();
+  let token = addForm.token.trim();
   if (!nodeId) {
-    toast.error("请填 NAS 的 iroh NodeId(或连接码)");
+    toast.error("粘对方「互联」页的连接码(PLRK1-…),或填 iroh NodeId");
+    return;
+  }
+  // 整串 PLRK1 连接码直接粘:解出 NodeId + owner 令牌,三端(手机/桌面/NAS)同一串码。
+  const conn = parseConnectCode(nodeId);
+  if (conn) {
+    if (!conn.nodeId) {
+      toast.error("这串连接码没带 P2P NodeId(对方 iroh 还没就绪)—— 让对方刷新「互联」页后重新复制");
+      return;
+    }
+    nodeId = conn.nodeId;
+    if (conn.token) token = conn.token; // 码里自带 owner 令牌,手填的可省
+  } else if (nodeId.startsWith("PLRS1-")) {
+    toast.error("这是邀请码(PLRS1,给别人入伙用)。接入远程主机请粘对方「互联」页的连接码(PLRK1)");
     return;
   }
   if (!isTauri) {
@@ -849,7 +944,7 @@ async function connectRemote() {
       name: addForm.name.trim() || "远程主机",
       nodeId,
       port,
-      token: addForm.token.trim(),
+      token,
       createdAt: Date.now(),
     };
     remotes.value = upsertRemoteSource(src);
@@ -898,6 +993,7 @@ onMounted(async () => {
   }
   await autoReconnectRemotes();
   await sampleLocal();
+  loadExecPolicy(); // 远程执行开关档位(主机侧)
   pollRemoteStats(); // 首屏就拉一次 NAS/远程盘实况(它们在「我的设备」里)
   pollTunnelPaths(); // 首屏也拉一次隧道链路,星图别先画个写死的 P2P
   // 本机仪表每 4s 跳一帧。盘实况:启动后前 ~40s 每 4s 密集试(iroh 握手要几秒,
@@ -1045,6 +1141,26 @@ onUnmounted(() => {
               <span class="switch" :class="{ on: remoteOn }"><i></i></span>
             </div>
 
+            <div v-if="isTauri && execPolicy" class="lan-toggle" :class="{ busy: execBusy }" @click="toggleExec">
+              <div class="lt-txt">
+                <span class="lt-title">允许互联设备在本机执行命令</span>
+                <span class="lt-sub">{{ execPolicy.enabled
+                  ? (execPolicy.mode === "shell"
+                      ? `已开 · Shell 模式(${shellLeftMin} 分钟后自动落回白名单)`
+                      : "已开 · 白名单模式,仅在册命令且不过 shell")
+                  : "关 · 对端调 /api/exec 一律拒绝(默认)" }}</span>
+              </div>
+              <span class="switch" :class="{ on: execPolicy.enabled }"><i></i></span>
+            </div>
+            <div v-if="isTauri && execPolicy?.enabled" class="exec-shell">
+              <button class="pill ghost" :class="{ hot: execPolicy.mode === 'shell' }" @click="toggleShellMode(30)">
+                {{ execPolicy.mode === "shell" ? "立即落回白名单" : "临时解锁 Shell 模式(30 分钟)" }}
+              </button>
+              <span class="ex-note">
+                白名单模式够日常用(git/npm/cargo/claude…)。需要管道、重定向或在册外的命令时才解锁 Shell,到点自动回收。
+              </span>
+            </div>
+
             <p class="foot-note">
               仅供你<b>自己的设备</b>用。想让<b>别人(不同账号)</b>加入?到「协作」生成邀请码(collaborator/visitor)。
               要手机从外网(不同 WiFi)连,需走中继/隧道。
@@ -1141,11 +1257,11 @@ onUnmounted(() => {
               <!-- ② 这台连别的 NAS / 主机 -->
               <div class="ap-block">
                 <div class="ap-h"><Network :size="14" :stroke-width="2" /> 接入一台 NAS / 远程主机</div>
-                <p class="foot-note" style="margin:2px 0 8px">粘对方的 <b>NodeId / 连接码</b> 与 <b>owner 令牌</b>,自动打洞直连(打不通走中继)。</p>
+                <p class="foot-note" style="margin:2px 0 8px">粘对方「互联」页复制的<b>连接码(PLRK1-…)</b>即可,NodeId 与 owner 令牌自动带出;也可手动分开填。自动打洞直连,打不通走中继。</p>
                 <div class="add-fields">
                   <input v-model="addForm.name" class="af-inp" placeholder="名称(如:群晖 NAS)" />
-                  <input v-model="addForm.nodeId" class="af-inp" placeholder="NodeId / 连接码" />
-                  <input v-model="addForm.token" class="af-inp" placeholder="owner 令牌" />
+                  <input v-model="addForm.nodeId" class="af-inp" placeholder="连接码(PLRK1-…)或 NodeId" />
+                  <input v-model="addForm.token" class="af-inp" placeholder="owner 令牌(粘连接码可不填)" />
                 </div>
                 <button class="cta" style="margin-top:8px" :disabled="connBusy" @click="connectRemote">
                   <LoaderCircle v-if="connBusy" :size="15" class="spin" /><Zap v-else :size="15" /> 发起连接
@@ -1199,6 +1315,9 @@ onUnmounted(() => {
                 <template v-if="c.kind === 'host'"><span class="b flat">本机 · 全权</span></template>
                 <template v-else-if="c.kind === 'disk'">
                   <button class="b" @click="browseDisk(c.src!)"><FolderInput :size="13" /> 浏览盘</button>
+                  <button class="b" title="在它上面跑命令(受对端策略约束)" @click="termTarget = c.src!">
+                    <Terminal :size="13" /> 终端
+                  </button>
                   <button class="b danger" title="断开" @click="forgetRemote(c.src!)"><ShieldOff :size="13" /></button>
                 </template>
                 <template v-else-if="!c.revoked">
@@ -1214,7 +1333,7 @@ onUnmounted(() => {
             <button class="dev add-card" @click="addForm.open = !addForm.open">
               <Plus :size="28" :stroke-width="1.8" />
               <span class="ac-t">接入设备 / NAS</span>
-              <span class="ac-s">手机粘连接码,或填 NAS 的 NodeId</span>
+              <span class="ac-s">手机、桌面、NAS 都认同一串连接码</span>
             </button>
           </div>
         </template>
@@ -1445,6 +1564,17 @@ onUnmounted(() => {
         </div>
       </div>
     </Teleport>
+
+    <!-- 远程终端:对某台互联设备发受控执行请求。模式由**对端**决定,本页只如实显示。 -->
+    <Teleport to="body">
+      <RemoteTerminal
+        v-if="termTarget"
+        :name="termTarget.name"
+        :port="termTarget.port"
+        :token="termTarget.token"
+        @close="termTarget = null"
+      />
+    </Teleport>
   </div>
 </template>
 
@@ -1629,6 +1759,11 @@ onUnmounted(() => {
   user-select: all; word-break: break-all; cursor: pointer;
 }
 .rc-actions { display: flex; gap: 10px; margin-top: 11px; }
+
+/* 远程执行:Shell 临时解锁那一行(总开关复用 .lan-toggle) */
+.exec-shell { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; margin-top: 9px; padding: 0 2px; }
+.exec-shell .pill.hot { color: #fb923c; border-color: rgba(251,146,60,.45); background: rgba(251,146,60,.12); }
+.exec-shell .ex-note { flex: 1; min-width: 220px; font-size: 11px; line-height: 1.6; color: var(--dim); opacity: .85; }
 
 /* ── 设备联盟 ── */
 .fed-head { display: flex; align-items: center; gap: 12px; padding: 13px 18px; }

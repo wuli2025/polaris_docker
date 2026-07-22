@@ -457,7 +457,6 @@ mod tests {
     #[test]
     fn context_block_surplus_when_nav_is_small() {
         // 实际库 < 100 字符, 注入应接近原样而不被 55% 上限「闲置」
-        use std::sync::OnceLock;
         // 直接读当前 KB 测 (单元测试跑时若有 KB 才有意义; 跑不过就当 placeholder)
         // 核心逻辑靠 nav_total ≤ nav_budget 时 nav_surplus = nav_budget − nav_total 来测
         let nav_budget = (KB_CTX_BUDGET as f32 * KB_CTX_NAV_RATIO) as usize;

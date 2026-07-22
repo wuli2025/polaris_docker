@@ -160,9 +160,12 @@ pub fn restore_blob(blob_b64: &str) -> Result<usize, String> {
         .and_then(|v| v.as_array())
         .unwrap_or(&vec![])
     {
+        // 导出走的是 SELECT *(自动带上后加的列),恢复却是写死的列名 —— 少写一列就是
+        // 静默丢数据。email 丢了 = 该账号再也没法自助找回;uid 丢了 = 联邦身份断链、
+        // 下次拿断言进来会当成新账号建号。两列都必须跟着回来。
         conn.execute(
-            "INSERT INTO users(id,username,pass_hash,role,display_name,created_at,disabled) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO users(id,username,pass_hash,role,display_name,created_at,disabled,email,uid) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 u.get("id").and_then(|x| x.as_i64()),
                 u.get("username").and_then(|x| x.as_str()).unwrap_or(""),
@@ -173,6 +176,8 @@ pub fn restore_blob(blob_b64: &str) -> Result<usize, String> {
                 u.get("display_name").and_then(|x| x.as_str()).unwrap_or(""),
                 u.get("created_at").and_then(|x| x.as_i64()).unwrap_or(0),
                 u.get("disabled").and_then(|x| x.as_i64()).unwrap_or(0),
+                u.get("email").and_then(|x| x.as_str()).unwrap_or(""),
+                u.get("uid").and_then(|x| x.as_str()).unwrap_or(""),
             ],
         )
         .map_err(|e| format!("恢复用户失败: {e}"))?;

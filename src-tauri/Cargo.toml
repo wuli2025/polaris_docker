@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "2.4.0"
+version = "2.5.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -48,7 +48,7 @@ anyhow = "1"
 # 自动更新「防卡死」用：停滞看门狗(time::sleep) + 与下载 future 竞速(select!)。
 # tokio 本就随 tauri 编进来了，这里只是显式开 time/macros 两个 feature；与 Codex 那条
 # 「无 tokio 的 ureq 同步流」互不影响。
-tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "sync", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "sync", "net", "io-util", "signal", "process"] }
 # 设备联盟遥测:本机 CPU/内存/磁盘 真实采样(跨平台)。见 sysstat.rs。
 sysinfo = "0.32"
 walkdir = "2"

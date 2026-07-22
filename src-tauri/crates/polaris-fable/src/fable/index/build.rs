@@ -114,10 +114,12 @@ pub(crate) fn doc_key(name: &str) -> String {
 /// 返回 Err,由调用方留待下轮重试。海量小文件时把「每文件一次 API 往返」聚成满批,
 /// 限速档(瓶颈是请求数而非字节)吞吐显著抬升。
 ///
-/// `keys[i]=(file_id, seq)` 与 `texts[i]` 平行对齐。返回提交的 chunk 数。
+/// `keys[i]=(file_id, seq)` 与 `texts[i]` 平行对齐;`mtimes[file_id]`=查询时 mtime,
+/// chunked=1 守卫用(文件在读写间隙被改过则不标完成,下轮重嵌新内容)。返回提交的 chunk 数。
 fn flush_embed_buffer(
     conn: &rusqlite::Connection,
     keys: &[(i64, i64)],
+    mtimes: &HashMap<i64, i64>,
     texts: &[String],
     model: &str,
     batch: usize,
@@ -207,8 +209,15 @@ fn flush_embed_buffer(
             .map_err(|e| e.to_string())?;
         }
         for fid in &file_ids {
-            conn.execute("UPDATE files SET chunked=1 WHERE id=?1", [fid])
+            // mtime 守卫:读写间隙文件被改(盘点已提交新 mtime 并清零标记)则不标完成,
+            // 下轮重读重嵌;缺 mtime(理论不可达)时保守不标,宁可重嵌不可漏建。
+            if let Some(mt) = mtimes.get(fid) {
+                conn.execute(
+                    "UPDATE files SET chunked=1 WHERE id=?1 AND mtime=?2",
+                    rusqlite::params![fid, mt],
+                )
                 .map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     })();
@@ -216,7 +225,12 @@ fn flush_embed_buffer(
         let _ = conn.execute_batch("ROLLBACK");
         return Err(e);
     }
-    conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    // COMMIT 失败(如 SQLITE_BUSY)时事务**仍保持打开**(SQLite 文档明确语义)——必须显式
+    // ROLLBACK 再上抛,否则调用方随后的 BEGIN 撞「嵌套事务」、pending 统计读到未提交数据。
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.to_string());
+    }
     Ok(keys.len() as u64)
 }
 
@@ -278,32 +292,40 @@ pub fn build_index(
     // - 仅认字腿(无 key): ftsed=0  ← 不因 chunked=0 反复空转(等补 key 再嵌)
     // - 仅认意思腿(FTS 未就绪): chunked=0
     // dup_of=0:内容完全重复的副本(dedupe_scan 已删其 chunks 并指向 canonical)不再花嵌入钱。
+    // 带 f.mtime:完成标记与指纹回写都要用「查询时的 mtime」做守卫(见 Phase B 注释)。
+    // 带 OFFSET ?2:本轮已跳过(读失败)的文件会被 LIMIT 页反复选中,整页全是跳过者时
+    // 翻页继续,否则排后面的健康文件被永久饿死(32 个坏文件就能堵死整条索引管线)。
     let pending_sql = match (embed_ok, lex_ok) {
         (true, true) => {
-            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
+            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.mtime, f.chunked, f.ftsed
              FROM files f JOIN roots r ON r.id=f.root_id
              WHERE f.kind='text' AND f.size<=?1 AND f.dup_of=0 AND (f.chunked=0 OR f.ftsed=0)
-             ORDER BY f.size ASC LIMIT 32"
+             ORDER BY f.size ASC LIMIT 32 OFFSET ?2"
         }
         (false, true) => {
-            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
+            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.mtime, f.chunked, f.ftsed
              FROM files f JOIN roots r ON r.id=f.root_id
              WHERE f.kind='text' AND f.size<=?1 AND f.dup_of=0 AND f.ftsed=0
-             ORDER BY f.size ASC LIMIT 32"
+             ORDER BY f.size ASC LIMIT 32 OFFSET ?2"
         }
         _ => {
-            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.chunked, f.ftsed
+            "SELECT f.id, r.path, f.relpath, f.ext, f.size, f.mtime, f.chunked, f.ftsed
              FROM files f JOIN roots r ON r.id=f.root_id
              WHERE f.kind='text' AND f.size<=?1 AND f.dup_of=0 AND f.chunked=0
-             ORDER BY f.size ASC LIMIT 32"
+             ORDER BY f.size ASC LIMIT 32 OFFSET ?2"
         }
     };
+    // 饿死防护的翻页游标:整页都是本轮已跳过者 → 前移;有真处理即归零(保持最小偏移,
+    // 处理过的文件离开待办集后页面左移,归零重扫最正确;重扫代价 = 若干次索引页查询,可忽略)。
+    let mut page_offset: usize = 0;
 
     // 跨文件 chunk 缓冲(凑批只凑计算,落库仍按文件)。keys[i]=(file_id, seq) 与 buf_texts[i] 平行。
     // 攒够 embed_coalesce_target() 就 flush 一次;POLARIS_EMBED_COALESCE=0 时目标=1,退回逐文件。
     let coalesce_target = embed_coalesce_target();
     let mut buf_keys: Vec<(i64, i64)> = Vec::new();
     let mut buf_texts: Vec<String> = Vec::new();
+    // file_id → 查询时 mtime:flush 里 chunked=1 的守卫依据(见 pending_sql 注释)。
+    let mut buf_mtimes: HashMap<i64, i64> = HashMap::new();
     // 已进缓冲但尚未 flush 的 file_id:它们 chunked 仍为 0,会被 pending 查询再次选中——
     // 不排除会被重复读盘/切块/嵌入(小文件场景费用放大 ~3 倍,计数虚高、预算虚耗)。
     let mut buffered_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -330,25 +352,30 @@ pub fn build_index(
             break;
         }
         // 小文件优先:先把海量小文档变可检索,大部头排后
-        let batch: Vec<(i64, String, String, String, i64, i64, i64)> = {
+        let batch: Vec<(i64, String, String, String, i64, i64, i64, i64)> = {
             let mut stmt = conn.prepare(pending_sql).map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map([MAX_LEX_FILE_BYTES], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, i64>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?,
-                    ))
-                })
+                .query_map(
+                    rusqlite::params![MAX_LEX_FILE_BYTES, page_offset as i64],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, i64>(7)?,
+                        ))
+                    },
+                )
                 .map_err(|e| e.to_string())?;
             rows.flatten().collect()
         };
         // 剔除已在缓冲中的文件(见 buffered_ids 注释)。剔完为空但缓冲非空 = 待办只剩
         // 缓冲中的文件 → 强制 flush 让它们 chunked 置位,否则 pending 永远选中同一批死循环。
+        let raw_len = batch.len();
         let batch: Vec<_> = batch
             .into_iter()
             .filter(|row| !buffered_ids.contains(&row.0) && !skipped_reads.contains(&row.0))
@@ -359,7 +386,14 @@ pub fn build_index(
                 break; // 取消优先:缓冲丢弃(chunked 保持 0 下轮补),不再发起整批网络请求
             }
             if !buf_texts.is_empty() {
-                match flush_embed_buffer(&conn, &buf_keys, &buf_texts, &model, embed_batch()) {
+                match flush_embed_buffer(
+                    &conn,
+                    &buf_keys,
+                    &buf_mtimes,
+                    &buf_texts,
+                    &model,
+                    embed_batch(),
+                ) {
                     Ok(n) => chunks_added += n,
                     Err(e) => {
                         stopped = format!("嵌入中断(可再点继续补建向量):{e}");
@@ -370,11 +404,20 @@ pub fn build_index(
                 }
                 buf_keys.clear();
                 buf_texts.clear();
+                buf_mtimes.clear();
                 buffered_ids.clear();
+                continue;
+            }
+            if raw_len > 0 {
+                // 整页都是本轮已跳过(读失败)的文件:翻页继续,别让 32 个坏文件
+                // 把排在后面的健康文件永久饿死(跳过者本轮不再重试,页游标只前移)。
+                page_offset += raw_len;
                 continue;
             }
             break;
         }
+        // 本页有真处理对象 → 游标归零(处理完的文件离开待办集,页面左移,重扫保证不漏)。
+        page_offset = 0;
         // ── 先读后写(关键修):IO/切块全在事务外,事务只包纯内存 DB 写 ──
         // 旧实现 BEGIN 之后才逐个 std::fs::read + chunk_text:写锁横跨整批慢 IO/CPU
         // (死 NAS 单读 20s 死线、一批 32 个),盘点收尾/智能归类/审计等并行写者全被钉在
@@ -385,6 +428,10 @@ pub fn build_index(
         // Phase B 中途 `?` 上抛时连接随函数退出回滚 —— 本批标记重做,幂等无害。
         struct Prep {
             file_id: i64,
+            /// 查询时的 mtime:所有完成标记/指纹回写都以它做守卫 —— 盘点在「索引读到
+            /// 内容 A → 用户存了内容 B → 盘点清零标记」间隙提交过新 mtime 的话,守卫
+            /// 不命中、标记保持 0,下轮重读新内容;否则旧内容 A 会顶着完成标记永久留库。
+            mtime: i64,
             text: String,
             fingerprint: Option<(String, String)>,
             do_lex: bool,
@@ -394,7 +441,7 @@ pub fn build_index(
         // 嵌入 flush 失败不立刻退出:本批已读好的轻量写(倒排/指纹)先经 Phase B 落库,
         // 不白读白切;stopped 已在失败点设好,落完即 break 'outer。
         let mut abort_after_flushfail = false;
-        for (file_id, root, rel, ext, size, chunked, ftsed) in batch {
+        for (file_id, root, rel, ext, size, mtime, chunked, ftsed) in batch {
             if cancelled() || chunks_added >= max_chunks as u64 || files_done >= MAX_FILES_PER_BUILD
             {
                 break;
@@ -476,11 +523,18 @@ pub fn build_index(
                     }
                     buffered = true;
                     buffered_ids.insert(file_id);
+                    buf_mtimes.insert(file_id, mtime);
                     // 攒够目标就 flush:嵌完落库,chunked=1 由 flush 内对涉及文件统一置位。
                     // flush 自带事务;Phase A 无批事务在身,无需 COMMIT/BEGIN 腾挪。
                     if buf_texts.len() >= coalesce_target {
-                        match flush_embed_buffer(&conn, &buf_keys, &buf_texts, &model, embed_batch())
-                        {
+                        match flush_embed_buffer(
+                            &conn,
+                            &buf_keys,
+                            &buf_mtimes,
+                            &buf_texts,
+                            &model,
+                            embed_batch(),
+                        ) {
                             Ok(n) => {
                                 chunks_added += n;
                                 buffered_ids.clear(); // flush 成功已统一置 chunked=1,不再需要挡重选
@@ -494,11 +548,13 @@ pub fn build_index(
                         }
                         buf_keys.clear();
                         buf_texts.clear();
+                        buf_mtimes.clear();
                     }
                 }
             }
             prepared.push(Prep {
                 file_id,
+                mtime,
                 text,
                 fingerprint,
                 do_lex: lex_ok && ftsed == 0,
@@ -514,12 +570,16 @@ pub fn build_index(
         }
         // ── Phase B:单短事务批量落库(指纹/倒排/标记全是纯内存写,写锁毫秒级即释放)──
         // 预算/取消/flush 失败的内层 break 也走到这里:已读好的文件照常落库,提交多少算多少。
+        // 所有完成标记/指纹回写带 `AND mtime=?`守卫:先读后写期间盘点若提交了新 mtime
+        // (用户改了文件),守卫不命中 → 标记保持 0、指纹不回写,下轮重读新内容 ——
+        // 否则「元数据是新内容、索引是旧内容」会顶着完成标记永久留库(倒排正文本身
+        // 不守卫:守卫失败时 ftsed 仍为 0,下轮必然重写,只是短暂陈旧)。
         conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
         for p in &prepared {
             if let Some((chash, dkey)) = &p.fingerprint {
                 let _ = conn.execute(
-                    "UPDATE files SET content_hash=?1, doc_key=?2 WHERE id=?3",
-                    rusqlite::params![chash, dkey, p.file_id],
+                    "UPDATE files SET content_hash=?1, doc_key=?2 WHERE id=?3 AND mtime=?4",
+                    rusqlite::params![chash, dkey, p.file_id, p.mtime],
                 );
             }
             // P1-2 全文倒排(认字腿):提前建好,查词秒回、覆盖全部文本文件。
@@ -533,12 +593,18 @@ pub fn build_index(
                     )
                     .map_err(|e| e.to_string())?;
                 }
-                conn.execute("UPDATE files SET ftsed=1 WHERE id=?1", [p.file_id])
-                    .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE files SET ftsed=1 WHERE id=?1 AND mtime=?2",
+                    rusqlite::params![p.file_id, p.mtime],
+                )
+                .map_err(|e| e.to_string())?;
             }
             if p.mark_chunked {
-                conn.execute("UPDATE files SET chunked=1 WHERE id=?1", [p.file_id])
-                    .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE files SET chunked=1 WHERE id=?1 AND mtime=?2",
+                    rusqlite::params![p.file_id, p.mtime],
+                )
+                .map_err(|e| e.to_string())?;
             }
         }
         conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
@@ -551,7 +617,7 @@ pub fn build_index(
     // 正常/预算耗尽退出都要把攒着的 chunk 嵌完(否则这些文件白读白切,下轮重来)。
     // 取消时丢弃:涉及文件保持 chunked=0,下轮重扫自然补上,不浪费网络。
     if !cancelled() && !buf_texts.is_empty() {
-        match flush_embed_buffer(&conn, &buf_keys, &buf_texts, &model, embed_batch()) {
+        match flush_embed_buffer(&conn, &buf_keys, &buf_mtimes, &buf_texts, &model, embed_batch()) {
             Ok(n) => chunks_added += n,
             Err(e) => {
                 if stopped == "全部完成" {
@@ -604,6 +670,9 @@ pub fn build_index_full(progress: &dyn Fn(u64, u64, u64)) -> Result<IndexSummary
     let mut total_chunks = 0u64;
     let mut last_pending = u64::MAX;
     let mut stalled = 0u32;
+    // 提前退出(取消/卡住)时如实带出剩余待办 —— 此前硬编码 0,智能归类会把「剩 N 个
+    // 无法嵌入」误当「向量化完成」,对残缺索引做语义聚类。
+    let mut final_pending = 0u64;
     let stopped = loop {
         // 大预算单轮:尽量多消化、少轮次开销;MAX_FILES_PER_BUILD 仍在内部封顶单轮文件数。
         let s = build_index(200_000, &|f, c, _cur| {
@@ -613,6 +682,7 @@ pub fn build_index_full(progress: &dyn Fn(u64, u64, u64)) -> Result<IndexSummary
         total_chunks += s.chunks_added;
         progress(total_files, total_chunks, s.files_pending);
         if cancelled() {
+            final_pending = s.files_pending;
             break "已取消".to_string();
         }
         if s.files_pending == 0 {
@@ -622,6 +692,7 @@ pub fn build_index_full(progress: &dyn Fn(u64, u64, u64)) -> Result<IndexSummary
         if s.files_done == 0 || s.files_pending >= last_pending {
             stalled += 1;
             if stalled >= 2 {
+                final_pending = s.files_pending;
                 break format!(
                     "剩 {} 个文件无法嵌入(超限/不可读),已尽力完成",
                     s.files_pending
@@ -640,7 +711,7 @@ pub fn build_index_full(progress: &dyn Fn(u64, u64, u64)) -> Result<IndexSummary
     Ok(IndexSummary {
         files_done: total_files,
         chunks_added: total_chunks,
-        files_pending: 0,
+        files_pending: final_pending,
         seconds: started.elapsed().as_secs_f64(),
         stopped,
     })

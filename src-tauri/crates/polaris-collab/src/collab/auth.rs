@@ -7,7 +7,7 @@ use argon2::password_hash::{
 use argon2::Argon2;
 use base64::Engine;
 use once_cell::sync::Lazy;
-use rusqlite::{params, Transaction, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -190,6 +190,23 @@ pub(crate) fn insert_user_tx(
     role: &str,
     display_name: &str,
 ) -> Result<User, String> {
+    // 查重不区分大小写:UNIQUE 约束是 BINARY 排序,「wuli」「Wuli」在它眼里是两个名,
+    // 对人却是同一身份。所有建号入口都汇入本函数,在这里拦一道即全线生效。
+    let clash: Option<String> = tx
+        .query_row(
+            "SELECT username FROM users WHERE username=?1 COLLATE NOCASE LIMIT 1",
+            params![username],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("查用户名失败: {e}"))?;
+    if let Some(existing) = clash {
+        return Err(if existing == username {
+            "用户名已存在".into()
+        } else {
+            format!("用户名已存在(与已有账号「{existing}」仅大小写不同)")
+        });
+    }
     tx.execute(
         "INSERT INTO users(username,pass_hash,role,display_name,created_at) VALUES(?1,?2,?3,?4,?5)",
         params![username, pass_hash, role, display_name.trim(), now()],
@@ -420,13 +437,7 @@ pub fn login(username: &str, password: &str, device_id: &str) -> Result<(User, S
         return Err("用户名或密码错误".into());
     }
     login_clear(&uname); // 登录成功清零失败计数
-    let token = random_token();
-    let t = now();
-    conn.execute(
-        "INSERT INTO sessions(token,user_id,device_id,created_at,expires_at) VALUES(?1,?2,?3,?4,?5)",
-        params![token, id, device_id, t, t + SESSION_TTL],
-    )
-    .map_err(|e| format!("签发会话失败: {e}"))?;
+    let token = issue_session(id, device_id)?;
     db::audit(username, "auth.login", device_id, "");
     Ok((
         User {
@@ -437,6 +448,134 @@ pub fn login(username: &str, password: &str, device_id: &str) -> Result<(User, S
             disabled: false,
         },
         token,
+    ))
+}
+
+/// 签一张本机会话 token（不校验密码——调用方必须**已经**证明了身份）。
+/// 密码登录与联邦断言登录共用同一个出口:会话表的形态只有这一处写法,不会各写各的漂掉。
+pub fn issue_session(user_id: i64, device_id: &str) -> Result<String, String> {
+    let token = random_token();
+    let t = now();
+    let conn = open_db()?;
+    conn.execute(
+        "INSERT INTO sessions(token,user_id,device_id,created_at,expires_at) VALUES(?1,?2,?3,?4,?5)",
+        params![token, user_id, device_id, t, t + SESSION_TTL],
+    )
+    .map_err(|e| format!("签发会话失败: {e}"))?;
+    Ok(token)
+}
+
+/// 账号权威侧:建一个**全局账号**(签发全局 uid)。
+///
+/// 与 `create_user_with_email` 的区别:那个是「本机账号顺带记个邮箱」,这个是
+/// 「签发一个能在任何主机上登录的身份」——uid 是它的身份证号。
+///
+/// 邮箱**可选**:传空串就是不绑。绑了才有自助找回密码(验证码发到它);不绑就只能
+/// 找管理员重置。空邮箱不进唯一索引(那是个 `WHERE email<>''` 的部分索引),
+/// 所以任意多个账号可以都不绑,互不冲突。
+pub fn create_authority_account(
+    username: &str,
+    password: &str,
+    display_name: &str,
+    email: &str,
+) -> Result<(User, String), String> {
+    // 空 = 不绑;非空才校验格式(调用方负责已验过验证码)。
+    let e = if email.trim().is_empty() {
+        String::new()
+    } else {
+        validate_email(email)?
+    };
+    let phc = prepare_new_account(username, password, display_name)?;
+    let uid = super::authority::new_uid();
+    let mut conn = open_db()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| format!("建账号事务失败: {err}"))?;
+    let user = insert_user_tx(&tx, username, &phc, "collaborator", display_name)?;
+    tx.execute(
+        "UPDATE users SET email=?1, uid=?2 WHERE id=?3",
+        params![e, uid, user.id],
+    )
+    .map_err(|err| {
+        if err.to_string().contains("UNIQUE") {
+            "该邮箱已被其他账号绑定".to_string()
+        } else {
+            format!("绑定邮箱失败: {err}")
+        }
+    })?;
+    tx.commit().map_err(|err| format!("提交账号失败: {err}"))?;
+    db::audit(username, "account.create", &uid, &e);
+    Ok((user, uid))
+}
+
+/// 账号权威侧登录:用户名**或邮箱**都收,校验密码,回 (用户, uid, 邮箱)。
+/// 权威只做这一件事——确认「你是谁」,至于你在某台主机上有什么权限,那是主机自己的事。
+pub fn authority_login(
+    username_or_email: &str,
+    password: &str,
+) -> Result<(User, String, String), String> {
+    let ident = username_or_email.trim().to_string();
+    if ident.is_empty() {
+        return Err("请填用户名或邮箱".into());
+    }
+    login_cooldown_check(&ident)?;
+    let conn = open_db()?;
+    // 带 @ 按邮箱查,否则按用户名查(用户名规则不允许 @,两个命名空间不会撞)。
+    let by_email = ident.contains('@');
+    let (sql, key) = if by_email {
+        (
+            "SELECT id,username,pass_hash,role,display_name,disabled,uid,email \
+             FROM users WHERE email=?1 LIMIT 1",
+            ident.to_ascii_lowercase(),
+        )
+    } else {
+        (
+            "SELECT id,username,pass_hash,role,display_name,disabled,uid,email \
+             FROM users WHERE username=?1 COLLATE NOCASE LIMIT 1",
+            ident.clone(),
+        )
+    };
+    let row = conn.query_row(sql, params![key], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+        ))
+    });
+    let (id, real_name, phc, role, display_name, disabled, uid, email) = match row {
+        Ok(v) => v,
+        Err(_) => {
+            login_record_fail(&ident);
+            return Err("用户名或密码错误".into());
+        }
+    };
+    if disabled != 0 {
+        return Err("账号已停用".into());
+    }
+    if !verify_password(password, &phc) {
+        login_record_fail(&ident);
+        return Err("用户名或密码错误".into());
+    }
+    login_clear(&ident);
+    if uid.trim().is_empty() {
+        return Err("该账号还没有全局身份(uid)——请联系管理员为它补签,或走邮箱重新注册".into());
+    }
+    db::audit(&real_name, "account.login", &uid, "");
+    Ok((
+        User {
+            id,
+            username: real_name,
+            role,
+            display_name,
+            disabled: false,
+        },
+        uid,
+        email,
     ))
 }
 
@@ -632,6 +771,21 @@ mod tests {
         assert!(login("alice", "nope", "dev1").is_err());
         logout(&tok).unwrap();
         assert!(check_session(&tok).is_err());
+    }
+
+    #[test]
+    fn username_conflict_is_case_insensitive() {
+        let _g = tmp_db();
+        create_user("wuli", "s3cret-8", "owner", "polaris").unwrap();
+        // 完全同名与仅大小写不同,一律判冲突;报错要指认已有账号,别让人猜。
+        assert_eq!(
+            create_user("wuli", "s3cret-8", "collaborator", "x").unwrap_err(),
+            "用户名已存在"
+        );
+        let e = create_user("Wuli", "s3cret-8", "collaborator", "x").unwrap_err();
+        assert!(e.contains("wuli") && e.contains("大小写"), "err={e}");
+        // 真正不同的名字照常放行
+        create_user("wuli2", "s3cret-8", "collaborator", "x").unwrap();
     }
 
     #[test]

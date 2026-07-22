@@ -386,6 +386,45 @@ const get = <T>(path: string) => req<T>(path);
 const post = <T>(path: string, body?: unknown) =>
   req<T>(path, { method: "POST", body: body ?? {} });
 
+/**
+ * 打**账号权威**(云端账号中心),而不是当前协作主机 —— 这是登录链路里唯一一处
+ * 绝对地址请求:注册/改密/换身份断言都发生在云端,主机根本没有密码可验。
+ * 不带会话 token(权威不认主机的会话,凭据是密码本身)。
+ */
+async function authorityReq<T>(
+  authorityUrl: string,
+  path: string,
+  body?: unknown
+): Promise<T> {
+  const base = authorityUrl.trim().replace(/\/+$/, "");
+  if (!base) throw new Error("还没有配置云端账号中心地址");
+  let res: Response;
+  try {
+    res = await fetch(base + path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new Error("连不上云端账号中心,请检查网络");
+  }
+  const text = await res.text();
+  let data: unknown = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error("云端账号中心返回了非 JSON —— 请确认地址填对了");
+  }
+  if (!res.ok) {
+    const err = new Error(
+      (data as { error?: string } | null)?.error ?? `账号中心请求失败(HTTP ${res.status})`
+    ) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
+  return data as T;
+}
+
 // ── 会话 ──────────────────────────────────────────────
 
 export interface AuthResult {
@@ -410,7 +449,92 @@ export interface EmailConfig {
   signupOpen: boolean;
 }
 
+/** 主机的账号体系自述:决定登录页往哪儿打。 */
+export interface AccountInfo {
+  /** authority=本机就是账号中心;delegated=账号在云端(authorityUrl);local=老的本机账号 */
+  mode: "authority" | "delegated" | "local";
+  authorityUrl?: string;
+  /** delegated:本机是否已信任(钉住)该账号中心的公钥 */
+  trusted?: boolean;
+  /** 公钥指纹,换云机时给人眼核对 */
+  kid?: string;
+  /** 恒 false —— 邮箱是可选的(绑了才有自助找回) */
+  emailRequired: boolean;
+  /** authority:这台账号中心发得出验证码吗(发不出就别让人填邮箱空等) */
+  emailCapable?: boolean;
+}
+
+/** 云端账号中心签发的身份断言(5 分钟有效,进主机即换成主机会话) */
+export interface AssertionResult {
+  assertion: string;
+  uid: string;
+  user?: { username: string; displayName?: string; email?: string };
+}
+
 export const collabApi = {
+  // ── 云端账号中心(账号权威)──
+  /** 本机的账号体系自述(公开,免登录) */
+  accountInfo(): Promise<AccountInfo> {
+    return get("/api/account/info");
+  },
+  /** 云端注册。email/code 可留空 = 不绑邮箱(不绑就没有自助找回)。成功即回身份断言 */
+  authoritySignup(
+    authorityUrl: string,
+    args: {
+      email?: string;
+      code?: string;
+      username: string;
+      password: string;
+      displayName: string;
+    }
+  ): Promise<AssertionResult> {
+    return authorityReq(authorityUrl, "/api/account/signup", args);
+  },
+  /** 云端账号 + 本机邀请码 → 成为这台主机的成员(联邦模式下的入伙路径) */
+  joinWithTicket(args: {
+    assertion: string;
+    code: string;
+    deviceName: string;
+  }): Promise<AuthResult> {
+    return post("/api/collab/join", { ...args, nodeId: deviceId() });
+  },
+  /** 云端登录:用户名**或邮箱** + 密码 → 身份断言 */
+  authorityLogin(
+    authorityUrl: string,
+    args: { username: string; password: string }
+  ): Promise<AssertionResult> {
+    return authorityReq(authorityUrl, "/api/account/login", args);
+  },
+  /** 云端发验证码(注册/找回共用,后端频控) */
+  authoritySendCode(
+    authorityUrl: string,
+    email: string,
+    purpose: "signup" | "reset"
+  ): Promise<void> {
+    return authorityReq(authorityUrl, "/api/collab/email/send_code", {
+      email,
+      purpose,
+    });
+  },
+  /** 云端改密:改完**所有主机**同时生效(没有任何主机存着这个密码) */
+  authorityReset(
+    authorityUrl: string,
+    args: { email: string; code: string; newPassword: string }
+  ): Promise<{ ok: boolean; username?: string }> {
+    return authorityReq(authorityUrl, "/api/account/reset", args);
+  },
+  /** 拿云端断言换**当前主机**的会话:主机纯本地验签,断网也认 */
+  loginWithAssertion(assertion: string): Promise<AuthResult> {
+    return post("/api/collab/login_assertion", {
+      assertion,
+      deviceId: deviceId(),
+    });
+  },
+  /** owner 重新信任账号中心(换云机/轮换密钥);kid 非空则要求指纹对得上 */
+  authorityRepin(kid?: string): Promise<{ ok: boolean; authorityUrl: string; kid: string }> {
+    return post("/api/collab/authority/repin", { kid: kid ?? "" });
+  },
+
   /** 仅零账号时可用:首次初始化,创建 owner。hostSelf=本机正当主机(设备页点亮主机徽标)。
    *  setupToken = 主机访问口令(collab_host_status.accessToken)—— 后端 bootstrap 现在
    *  强制校验它,不带必 401。 */
@@ -801,7 +925,7 @@ export function fmtTime(ts: number | null | undefined): string {
 /** 分享码 PLRS1-<base64url(json{c,a})> → {code, addrs};不是分享码返回 null(裸码走旧流程) */
 export function parseShareCode(
   s: string
-): { code: string; addrs: string[] } | null {
+): { code: string; addrs: string[]; authority?: string; kid?: string } | null {
   const m = s.trim();
   if (!m.startsWith("PLRS1-")) return null;
   try {
@@ -812,6 +936,41 @@ export function parseShareCode(
     return {
       code: v.c,
       addrs: v.a.filter((x: unknown): x is string => typeof x === "string"),
+      // u/k:主机的账号由云端账号中心统管时带上 —— 收码人据此知道去哪儿注册/登录,
+      // 以及该信任哪把钥匙(kid 供人眼核对)。老码没有这两项,读到 undefined 即老行为。
+      authority: typeof v.u === "string" && v.u ? v.u : undefined,
+      kid: typeof v.k === "string" && v.k ? v.k : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 连接码 PLRK1-<base64url(json{t:token, a:[addrs], n?:nodeId})> → {token, addrs, nodeId};
+ *  非该格式返回 null。与手机端 net.ts 的 parseConnectCode 同一套:主机「互联」页把
+ *  地址 + owner 令牌 + iroh NodeId 打包成一串,自己的设备粘一串即连,不用分别手填。 */
+export function parseConnectCode(
+  s: string
+): {
+  token: string;
+  addrs: string[];
+  nodeId?: string;
+  authority?: string;
+} | null {
+  const m = s.trim();
+  if (!m.startsWith("PLRK1-")) return null;
+  try {
+    const b64 = m.slice(6).replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const v = JSON.parse(atob(pad));
+    if (typeof v.t !== "string" || !Array.isArray(v.a)) return null;
+    return {
+      token: v.t,
+      addrs: v.a.filter((x: unknown): x is string => typeof x === "string"),
+      nodeId: typeof v.n === "string" && v.n ? v.n : undefined,
+      // u:这台主机的账号中心。令牌本身就是凭据、进门用不着它,
+      // 但收码人换账号登录时得知道往哪儿打。
+      authority: typeof v.u === "string" && v.u ? v.u : undefined,
     };
   } catch {
     return null;

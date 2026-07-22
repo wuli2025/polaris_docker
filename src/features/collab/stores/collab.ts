@@ -25,6 +25,7 @@ import {
   type CollabUser,
   type ProjectMember,
   type TeamMember,
+  type AccountInfo,
   type MorningReport,
   type ReviewComment,
   type TaskCard,
@@ -196,8 +197,100 @@ export const useCollabStore = defineStore("collab", () => {
     return info;
   }
 
+  // ── 账号体系(云端账号中心 / 本机账号)──
+  const accountInfo = ref<AccountInfo | null>(null);
+  /** 账号在云端统管(delegated):注册/改密都得去账号中心,本机只认它签的身份 */
+  const federated = computed(() => accountInfo.value?.mode === "delegated");
+  const authorityUrl = computed(() => accountInfo.value?.authorityUrl ?? "");
+
+  /** 拉一次主机的账号体系自述(免登录)。失败按老的本机账号处理,不挡登录页。 */
+  async function loadAccountInfo(): Promise<AccountInfo | null> {
+    try {
+      accountInfo.value = await collabApi.accountInfo();
+    } catch {
+      // 老版本主机没有这个端点 → 就是本机账号模式。
+      accountInfo.value = { mode: "local", emailRequired: false };
+    }
+    return accountInfo.value;
+  }
+
+  /**
+   * 云端账号登录:账号中心验密码签断言 → 当前主机验签换本机会话。
+   * 客户端直连账号中心,不经主机中转 —— 密码不在主机眼前过一遍。
+   */
+  async function loginViaAuthority(username: string, password: string) {
+    const url = authorityUrl.value;
+    if (!url) throw new Error("本机没有配置云端账号中心地址");
+    const { assertion } = await collabApi.authorityLogin(url, {
+      username,
+      password,
+    });
+    const r = requireAuth(await collabApi.loginWithAssertion(assertion));
+    persistSession(r.user, r.token);
+    await afterAuth();
+  }
+
+  /**
+   * 云端注册(邮箱可选),成功即用返回的断言进当前主机。
+   *
+   * 注册出来的是「全局身份」,不自动等于「这台主机的成员」:主机已经有主人时,
+   * 换会话那步会被拒并提示要邀请码 —— 这时把断言留着交给 joinViaTicket。
+   */
+  async function signupViaAuthority(args: {
+    email?: string;
+    code?: string;
+    username: string;
+    password: string;
+    displayName: string;
+    /** 有邀请码就直接连着入伙,省得注册完再被挡一次 */
+    inviteCode?: string;
+    deviceName?: string;
+  }) {
+    const url = authorityUrl.value;
+    if (!url) throw new Error("本机没有配置云端账号中心地址");
+    const { assertion } = await collabApi.authoritySignup(url, args);
+    const r = requireAuth(
+      args.inviteCode?.trim()
+        ? await collabApi.joinWithTicket({
+            assertion,
+            code: args.inviteCode.trim(),
+            deviceName: args.deviceName ?? "我的电脑",
+          })
+        : await collabApi.loginWithAssertion(assertion)
+    );
+    persistSession(r.user, r.token);
+    await afterAuth();
+  }
+
+  /** 已有云端账号 + 本机邀请码 → 成为这台主机的成员。 */
+  async function joinViaTicket(args: {
+    username: string;
+    password: string;
+    code: string;
+    deviceName?: string;
+  }) {
+    const url = authorityUrl.value;
+    if (!url) throw new Error("本机没有配置云端账号中心地址");
+    const { assertion } = await collabApi.authorityLogin(url, {
+      username: args.username,
+      password: args.password,
+    });
+    const r = requireAuth(
+      await collabApi.joinWithTicket({
+        assertion,
+        code: args.code,
+        deviceName: args.deviceName ?? "我的电脑",
+      })
+    );
+    persistSession(r.user, r.token);
+    await afterAuth();
+  }
+
   // ── 登录三入口 ──
+  /** 账号在云端时自动改走账号中心;本机账号模式保持老行为。 */
   async function login(username: string, password: string) {
+    if (accountInfo.value === null) await loadAccountInfo();
+    if (federated.value) return loginViaAuthority(username, password);
     const r = requireAuth(await collabApi.login({ username, password }));
     persistSession(r.user, r.token);
     await afterAuth();
@@ -690,6 +783,14 @@ export const useCollabStore = defineStore("collab", () => {
     redeem,
     logout,
     init,
+    // 云端账号中心(账号权威)
+    accountInfo,
+    federated,
+    authorityUrl,
+    loadAccountInfo,
+    loginViaAuthority,
+    signupViaAuthority,
+    joinViaTicket,
     // 团队
     teams,
     currentTeamId,

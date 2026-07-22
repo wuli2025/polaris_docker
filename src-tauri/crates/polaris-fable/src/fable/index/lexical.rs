@@ -38,10 +38,13 @@ pub fn build_lexical_index(progress: &dyn Fn(u64, u64)) -> Result<LexSummary, St
 
     // recency 优先(报告 P0③):最近动过的文件先进倒排,大库下用户最可能搜的先可搜。
     // mtime 列自盘点起即有;按它 DESC 排序走 idx_files_lex_pending 仍是范围扫,代价可接受。
-    const PENDING_SQL: &str = "SELECT f.id, r.path, f.relpath
+    // 带 f.mtime(ftsed=1 守卫依据,见批尾注释)+ OFFSET ?2(整页全是读失败跳过者时翻页,
+    // 防 256 个坏文件把后面的健康文件永久饿死)。
+    const PENDING_SQL: &str = "SELECT f.id, r.path, f.relpath, f.mtime
          FROM files f JOIN roots r ON r.id=f.root_id
          WHERE f.kind='text' AND f.size<=?1 AND f.ftsed=0
-         ORDER BY f.mtime DESC LIMIT 256";
+         ORDER BY f.mtime DESC LIMIT 256 OFFSET ?2";
+    let mut page_offset: usize = 0;
 
     loop {
         if cancelled() {
@@ -52,29 +55,41 @@ pub fn build_lexical_index(progress: &dyn Fn(u64, u64)) -> Result<LexSummary, St
             stopped = format!("本轮文件预算({MAX_LEX_FILES_PER_BUILD} 文件)耗尽,可再点继续");
             break;
         }
-        let batch: Vec<(i64, String, String)> = {
+        let batch: Vec<(i64, String, String, i64)> = {
             let mut stmt = conn.prepare(PENDING_SQL).map_err(|e| e.to_string())?;
-            let rows: Vec<(i64, String, String)> = stmt
-                .query_map([MAX_LEX_FILE_BYTES], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })
+            let rows: Vec<(i64, String, String, i64)> = stmt
+                .query_map(
+                    rusqlite::params![MAX_LEX_FILE_BYTES, page_offset as i64],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
                 .map_err(|e| e.to_string())?
                 .flatten()
                 .collect();
             rows
         };
         // 被跳过的文件 ftsed 仍为 0,会被 PENDING_SQL 反复选中 → 本轮过滤掉,防死循环。
+        let raw_len = batch.len();
         let batch: Vec<_> = batch
             .into_iter()
             .filter(|r| !skipped_ids.contains(&r.0))
             .collect();
         if batch.is_empty() {
+            if raw_len > 0 {
+                // 整页都是本轮已跳过者:翻页继续,别饿死排在后面的健康文件。
+                page_offset += raw_len;
+                continue;
+            }
             break;
         }
+        // 本页有真处理对象 → 游标归零(处理完的文件离开待办集,页面左移,重扫保证不漏)。
+        page_offset = 0;
         // ── 先读后写:整批正文在**事务外**读完,再开短事务批量写 ──
         // 旧实现 BEGIN 之后才逐个 std::fs::read:写锁横跨整批慢 IO(NAS 上分钟级),
         // 盘点 writer/索引/归类全被钉在 busy_timeout 后面,一个僵死读更是无限期。
@@ -88,13 +103,13 @@ pub fn build_lexical_index(progress: &dyn Fn(u64, u64)) -> Result<LexSummary, St
             /// 瞬断 / 权限 / 读超时:不写不标,下轮重试。
             Skip,
         }
-        let mut bodies: Vec<(i64, Body)> = Vec::with_capacity(batch.len());
-        for (file_id, root, rel) in &batch {
+        let mut bodies: Vec<(i64, i64, Body)> = Vec::with_capacity(batch.len());
+        for (file_id, root, rel, mtime) in &batch {
             if cancelled() {
                 break;
             }
             if dead_read_roots.contains(root) {
-                bodies.push((*file_id, Body::Skip));
+                bodies.push((*file_id, *mtime, Body::Skip));
                 continue;
             }
             // 显示路径 → 真实字节路径(GBK 名文件在 Unix 上直接 read 恒失败,会被
@@ -124,11 +139,13 @@ pub fn build_lexical_index(progress: &dyn Fn(u64, u64)) -> Result<LexSummary, St
                 Some(Err(std::io::ErrorKind::NotFound)) => Body::MarkDone, // 真消失
                 Some(Err(_)) => Body::Skip, // 权限/瞬断:下轮重试
             };
-            bodies.push((*file_id, body));
+            bodies.push((*file_id, *mtime, body));
         }
         // 整批单事务:几万小文件逐条提交会被 fsync 拖死,批量提交把吞吐拉满。
+        // ftsed=1 带 `AND mtime=?` 守卫:先读后写期间盘点提交了新 mtime(用户改了文件)
+        // 则标记保持 0、下轮重读新内容 —— 否则旧正文顶着完成标记永久留在倒排里。
         conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-        for (file_id, body) in &bodies {
+        for (file_id, mtime, body) in &bodies {
             match body {
                 Body::Skip => {
                     skipped_ids.insert(*file_id);
@@ -148,8 +165,11 @@ pub fn build_lexical_index(progress: &dyn Fn(u64, u64)) -> Result<LexSummary, St
                     .map_err(|e| e.to_string())?;
                 }
             }
-            conn.execute("UPDATE files SET ftsed=1 WHERE id=?1", [file_id])
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE files SET ftsed=1 WHERE id=?1 AND mtime=?2",
+                rusqlite::params![file_id, mtime],
+            )
+            .map_err(|e| e.to_string())?;
             files_done += 1;
         }
         conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;

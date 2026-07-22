@@ -55,7 +55,7 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    pub fn new(cfg: EncodeConfig) -> Result<Self> {
+    pub fn new(_cfg: EncodeConfig) -> Result<Self> {
         // P1.5:openh264::OpenH264API::new() 拉 encoder,落 nals Vec<H264NAL>
         // 当前 stub:返 NeedFallback,让上层先调 ffmpeg_fallback
         Err(ForgeError::NeedFallback {

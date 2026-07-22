@@ -1010,6 +1010,8 @@ export const chat = {
   send: (args: ChatSendArgs) =>
     invoke<string>("chat_send", { args: args as unknown as Record<string, unknown> }),
   cancel: (reqId: string) => invoke<void>("chat_cancel", { reqId }),
+  /** 某轮是否仍在后端真实运行(常驻池活跃轮/子进程在册)。无声死亡看门狗熔断前先问这里。 */
+  isRunning: (reqId: string) => invoke<boolean>("chat_is_running", { reqId }),
   /**
    * 预热常驻 claude 进程(fire-and-forget): 用户打开对话/开始打字时提前 spawn,
    * 把 CLI ~6.4s 自举挪进打字期间, 首条消息首响 ~10s → ~3s。

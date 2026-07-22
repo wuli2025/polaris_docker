@@ -59,6 +59,7 @@ pub fn api_router(state: ApiState) -> Router {
             post(upload).layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
         .route("/api/file", get(serve_file))
+        .route("/api/exec", post(exec_ep))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -68,6 +69,14 @@ pub fn api_router(state: ApiState) -> Router {
 // 基础应用面(对话/知识库/文件…)与 collab 面**分开**:维持历史语义——没设全局口令就
 // 开放(合成 owner),避免"有人建了协作账号就把整个 App 锁死"。真会话 token 仍会升级成
 // 真实身份并受命令角色闸约束。多用户部署要连基础命令也强制登录时设 POLARIS_REQUIRE_LOGIN=1。
+
+/// 是否显式要求登录。抽出来是因为 exec 端点要独立判「开放模式」——
+/// 开放模式会合成 owner 全放行,那对读接口尚可,对远程执行等于无鉴权 shell。
+fn require_login_env() -> bool {
+    std::env::var("POLARIS_REQUIRE_LOGIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// 基础面鉴权核心:按访问口令 + 传入 token 解析身份。server.rs 的壳专属端点
 /// (/api/status 等)也复用它,故 pub(crate)、且不吃 State(只吃 auth_token 引用)。
@@ -96,10 +105,7 @@ pub(crate) fn resolve_app_auth_token(
         }
     }
     // 是否强制登录:设了全局口令,或显式打开 POLARIS_REQUIRE_LOGIN。
-    let require_login = auth_token.is_some()
-        || std::env::var("POLARIS_REQUIRE_LOGIN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+    let require_login = auth_token.is_some() || require_login_env();
     if require_login {
         return None; // 上面没拿到有效凭据 → 拒绝
     }
@@ -170,6 +176,63 @@ fn invoke_err_resp(e: String) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     (status, Json(json!({ "error": e }))).into_response()
+}
+
+/// 受控远程执行端点(B 方案)。刻意**不**并进 /api/invoke:
+/// invoke 的闸是「命令在不在分发表」,exec 的闸是「总开关+模式+白名单」,
+/// 两套语义混一个入口迟早互相漏。闸门顺序与理由见 exec.rs 头注释。
+async fn exec_ep(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<crate::exec::ExecRequest>,
+) -> Response {
+    // 闸 2:fail-closed。没设访问口令且没强制登录 = 基础面开放模式(合成 owner),
+    // 那对 exec 就是**无鉴权 shell**。这里直接拒,且不提供开关绕过。
+    if state.auth_token.is_none() && !require_login_env() {
+        crate::collab::db::audit("anonymous", "exec.denied", &req.cmd, "开放模式(未设访问口令)");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"本机未设访问口令,远程执行已禁用。请先设置访问口令(或 POLARIS_REQUIRE_LOGIN=1)再用"})),
+        )
+            .into_response();
+    }
+    let Some(ctx) = app_ctx(&state, &headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"未授权 (口令错误或会话失效)"})),
+        )
+            .into_response();
+    };
+    if role_rank(&ctx.role) < 3 {
+        crate::collab::db::audit(&ctx.username, "exec.denied", &req.cmd, "角色不足");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"远程执行需要 owner 权限"})),
+        )
+            .into_response();
+    }
+    match crate::exec::run(&ctx.username, req).await {
+        // 命令跑完即 200(哪怕退出码非 0)——那是命令的结果,不是接口的错误;
+        // 调用方看 exit_code/ok 字段。只有闸门拒绝/启动失败才给非 2xx。
+        Ok(r) => Json(r).into_response(),
+        Err(e) => {
+            // 闸门拒绝是 403(不是 500):调用方据此提示「让主机侧开开关/解锁 Shell」。
+            let status = if e.contains("未开启远程执行")
+                || e.contains("不在白名单")
+                || e.contains("白名单模式")
+                || e.contains("元字符")
+                || e.contains("不能带路径")
+            {
+                StatusCode::FORBIDDEN
+            } else if e.contains("缺少参数") || e.contains("工作目录不存在") || e.contains("启动失败")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "error": e }))).into_response()
+        }
+    }
 }
 
 async fn invoke(
@@ -336,8 +399,16 @@ async fn dispatch_desktop(cmd: &str, a: &Args, _app: AppHandle) -> Result<Value,
         // ── 知识库检索(手机备用) ──
         "kb_search" => ok(kb::kb_search(req_str(a, "query")?, opt_usize(a, "topK")).await),
 
+        // ── 受控远程执行策略(exec 本体走 /api/exec 专用端点,不走 invoke) ──
+        "exec_policy_get" => ok(crate::exec::exec_policy_get()),
+        "exec_policy_set" => ok(crate::exec::exec_policy_set(
+            a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            a.get("shellMinutes").and_then(|v| v.as_i64()),
+        )?),
+
         // ── 对话辅助(chat_send 在 invoke 里单独特判) ──
         "chat_cancel" => ok(chat::chat_cancel(req_str(a, "reqId")?)?),
+        "chat_is_running" => ok(chat::chat_is_running(req_str(a, "reqId")?)),
         "chat_attach_files" => ok(chat::chat_attach_files(
             opt_str(a, "conversationId"),
             vec_str(a, "paths"),
@@ -466,6 +537,12 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
         "kb_default_root" => ok(kb::kb_default_root()),
         // 设备联盟遥测:云主机/server 壳自采本机资源。
         "sys_stats" => ok(crate::sysstat::sample()),
+        // 受控远程执行策略(exec 本体走 /api/exec 专用端点,不走 invoke)
+        "exec_policy_get" => ok(crate::exec::exec_policy_get()),
+        "exec_policy_set" => ok(crate::exec::exec_policy_set(
+            a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            a.get("shellMinutes").and_then(|v| v.as_i64()),
+        )?),
         "kb_set_root" => ok(kb::kb_set_root(req_str(a, "newPath")?)?),
         "kb_scan" => ok(kb::kb_scan_sync()?),
         "kb_compile" => ok(wiki::kb_compile(app)?),
@@ -776,6 +853,7 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
 
         // ── Chat (sync 部分) ──
         "chat_cancel" => ok(chat::chat_cancel(req_str(a, "reqId")?)?),
+        "chat_is_running" => ok(chat::chat_is_running(req_str(a, "reqId")?)),
         "chat_build_manifest" => ok(chat::chat_build_manifest(opt_str(a, "conversationId"))),
         "chat_attach_files" => ok(chat::chat_attach_files(
             opt_str(a, "conversationId"),
@@ -1245,8 +1323,16 @@ async fn serve_file(
     let Some(ctx) = ctx else {
         return (StatusCode::UNAUTHORIZED, "未授权").into_response();
     };
-    if role_rank(&ctx.role) < 3 {
-        return (StatusCode::FORBIDDEN, "文件访问需要 owner 权限").into_response();
+    // 读文件放到 collaborator/lead(rank>=2):手机端团队成员要能点开对话产物看。
+    // 仍然 fail-closed 挡住 visitor/未知角色;真正的边界是下面的 allowed_roots 白名单
+    // ——只有知识库根、~/Polaris/{data/artifacts,projects,uploads-inbox} 和项目绑定的
+    // 工作目录能读,整机文件系统读不到。逐用户 ACL 做好前不再往下放。
+    if role_rank(&ctx.role) < 2 {
+        return (
+            StatusCode::FORBIDDEN,
+            "文件访问需要协作者及以上权限",
+        )
+            .into_response();
     }
     let path = PathBuf::from(&q.path);
     let allowed = allowed_roots();
@@ -1342,6 +1428,13 @@ fn allowed_roots() -> Vec<PathBuf> {
             }
         }
     }
+    // 项目绑定的工作目录(Project.work_dir):大项目的产物写在用户自选的仓库目录里,
+    // 不补进白名单的话手机端点开必 403「路径不在允许范围」——功能加了、读口没跟上。
+    for wd in crate::conv::all_project_work_dirs() {
+        if let Ok(c) = std::fs::canonicalize(&wd) {
+            v.push(c);
+        }
+    }
     v
 }
 
@@ -1361,3 +1454,222 @@ pub(crate) fn mime_for(p: &Path) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+// ── /api/exec 的鉴权闸(HTTP 层真起服务测) ──────────────────────────────────
+//
+// exec 是本仓唯一「外部可触发本机任意进程」的入口,它的边界不能只靠编译期保证。
+// 这组测试起真 axum 服务、发真 HTTP 请求,逐条验证闸门。
+// 只在 server flavor 跑:桌面 flavor 的 AppHandle 是 tauri 真句柄,测试里造不出。
+#[cfg(all(test, feature = "server", not(feature = "desktop")))]
+mod exec_gate_tests {
+    use super::*;
+
+    /// 起一个只挂 api_router 的真服务,返回端口与停机开关。
+    async fn serve(auth_token: Option<String>) -> (u16, tokio::sync::oneshot::Sender<()>) {
+        let (tx, _rx) = broadcast::channel(64);
+        let state = ApiState {
+            app: AppHandle::new(tx.clone()),
+            tx,
+            auth_token: Arc::new(auth_token),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stx, srx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, api_router(state))
+                .with_graceful_shutdown(async {
+                    let _ = srx.await;
+                })
+                .await;
+        });
+        (port, stx)
+    }
+
+    /// 发一条 exec 请求,返回 (状态码, 响应体)。
+    async fn post_exec(port: u16, token: Option<&str>, body: Value) -> (u16, String) {
+        let token = token.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let mut r = ureq::post(&format!("http://127.0.0.1:{port}/api/exec"));
+            if let Some(t) = token {
+                r = r.set("Authorization", &format!("Bearer {t}"));
+            }
+            match r.send_json(body) {
+                Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
+                Err(ureq::Error::Status(code, resp)) => {
+                    (code, resp.into_string().unwrap_or_default())
+                }
+                Err(e) => panic!("请求失败: {e}"),
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn tmp_db(name: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("polaris-execgate-{name}.db"));
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("POLARIS_COLLAB_DB", &tmp);
+        tmp
+    }
+
+    /// 最关键的一条:没设访问口令时,基础面会「合成 owner 全放行」(开放模式)。
+    /// 那对读接口尚可,对 exec 等于把无鉴权 shell 挂在隧道上。必须 fail-closed,
+    /// **且不受远程执行总开关影响** —— 哪怕开关开着也得拒。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_mode_is_fail_closed_even_when_enabled() {
+        let _g = crate::collab::db::TEST_LOCK.lock().unwrap();
+        let tmp = tmp_db("open");
+        std::env::remove_var("POLARIS_REQUIRE_LOGIN");
+        crate::exec::set_policy(true, None).unwrap(); // 开关开着,也必须拒
+
+        let (port, stx) = serve(None).await; // None = 未设访问口令 = 开放模式
+        let (code, body) = post_exec(
+            port,
+            None,
+            json!({"cmd":"cargo","args":["--version"]}),
+        )
+        .await;
+        assert_eq!(code, 403, "开放模式必须拒绝 exec,实际 body={body}");
+        assert!(body.contains("未设访问口令"), "body={body}");
+
+        // 同一台服务上,/api/invoke 在开放模式下仍照旧放行 —— 证明这条 fail-closed
+        // 是 exec 专属加严,没有殃及既有的基础面语义。
+        let ok = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("http://127.0.0.1:{port}/api/invoke"))
+                .send_json(json!({"cmd":"kb_root","args":{}}))
+                .map(|r| r.status())
+        })
+        .await
+        .unwrap();
+        assert_eq!(ok.ok(), Some(200), "开放模式下 /api/invoke 应维持原行为");
+
+        let _ = stx.send(());
+        std::env::remove_var("POLARIS_COLLAB_DB");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 设了访问口令后:不带/带错 token = 401;带对 token 但总开关没开 = 403。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_required_then_switch_required() {
+        let _g = crate::collab::db::TEST_LOCK.lock().unwrap();
+        let tmp = tmp_db("token");
+        std::env::remove_var("POLARIS_REQUIRE_LOGIN");
+        crate::exec::set_policy(false, None).unwrap(); // 总开关关
+
+        let (port, stx) = serve(Some("s3cret".into())).await;
+        let body = json!({"cmd":"cargo","args":["--version"]});
+
+        let (code, _) = post_exec(port, None, body.clone()).await;
+        assert_eq!(code, 401, "无 token 必须 401");
+        let (code, _) = post_exec(port, Some("wrong"), body.clone()).await;
+        assert_eq!(code, 401, "错 token 必须 401");
+
+        let (code, b) = post_exec(port, Some("s3cret"), body.clone()).await;
+        assert_eq!(code, 403, "口令对但总开关没开,必须 403");
+        assert!(b.contains("未开启远程执行"), "body={b}");
+
+        let _ = stx.send(());
+        std::env::remove_var("POLARIS_COLLAB_DB");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 四道闸全过:真起进程、真拿到 stdout 与退出码;白名单外的命令仍是 403。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_pass_runs_and_still_enforces_whitelist() {
+        let _g = crate::collab::db::TEST_LOCK.lock().unwrap();
+        let tmp = tmp_db("pass");
+        std::env::remove_var("POLARIS_REQUIRE_LOGIN");
+        crate::exec::set_policy(true, None).unwrap();
+
+        let (port, stx) = serve(Some("s3cret".into())).await;
+
+        let (code, b) = post_exec(
+            port,
+            Some("s3cret"),
+            json!({"cmd":"cargo","args":["--version"]}),
+        )
+        .await;
+        assert_eq!(code, 200, "闸门全过应 200,body={b}");
+        let v: Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["ok"], true, "body={b}");
+        assert_eq!(v["exit_code"], 0);
+        assert_eq!(v["mode"], "whitelist");
+        assert!(
+            v["stdout"].as_str().unwrap_or("").contains("cargo"),
+            "应拿到真实 stdout,body={b}"
+        );
+
+        // 白名单闸仍在:鉴权过了不等于什么都能跑。
+        let (code, b) = post_exec(port, Some("s3cret"), json!({"cmd":"rm","args":["-rf","/"]})).await;
+        assert_eq!(code, 403, "白名单外命令必须 403,body={b}");
+
+        let _ = stx.send(());
+        std::env::remove_var("POLARIS_COLLAB_DB");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── /api/file 的白名单闸(手机端「远程预览」的读口)────────────────────────
+    //
+    // 起真服务发真 GET。两条都是踩过的坑:
+    //  ① 项目绑了工作目录后,产物落在用户自选目录里,白名单没跟上 → 手机端预览一律
+    //     403「路径不在允许范围」(功能加了、读口没跟上);
+    //  ② 放开工作目录不等于开放整机:目录外的文件必须照旧 403。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_whitelist_covers_project_work_dir_only() {
+        let _g = crate::collab::db::TEST_LOCK.lock().unwrap();
+        let tmp = tmp_db("file");
+        std::env::remove_var("POLARIS_REQUIRE_LOGIN");
+
+        // 工作目录(白名单内)与它外面的一个目录(白名单外)
+        let root = std::env::temp_dir().join("polaris-filegate");
+        let inside = root.join("work");
+        let outside = root.join("elsewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let art = inside.join("dashboard.html");
+        std::fs::write(&art, "<h1>看板</h1>").unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "不该被读到").unwrap();
+
+        // 建项目并绑工作目录(测试里 conv 没 init,STATE_PATH 为空 → persist 是空操作,
+        // 不会污染真实 state.json)
+        let p = crate::conv::conv_create_project("预览白名单测试".into()).unwrap();
+        crate::conv::conv_set_project_work_dir(
+            p.id.clone(),
+            Some(inside.to_string_lossy().to_string()),
+        )
+        .unwrap();
+
+        let (port, stx) = serve(Some("s3cret".into())).await;
+        let get = |path: std::path::PathBuf| async move {
+            tokio::task::spawn_blocking(move || {
+                // pct_encode 只留 unreserved,Windows 路径的 `:` `\` 都会转义,当查询值够用
+                let url = format!(
+                    "http://127.0.0.1:{port}/api/file?path={}",
+                    pct_encode(&path.to_string_lossy())
+                );
+                match ureq::get(&url).set("Authorization", "Bearer s3cret").call() {
+                    Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+                    Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+                    Err(e) => panic!("请求失败: {e}"),
+                }
+            })
+            .await
+            .unwrap()
+        };
+
+        let (code, body) = get(art.clone()).await;
+        assert_eq!(code, 200, "工作目录内的产物必须能读,body={body}");
+        assert!(body.contains("看板"), "应拿到真实文件内容,body={body}");
+
+        let (code, body) = get(secret.clone()).await;
+        assert_eq!(code, 403, "工作目录外的文件必须照旧拒绝,body={body}");
+        assert!(body.contains("不在允许范围"), "body={body}");
+
+        let _ = stx.send(());
+        std::env::remove_var("POLARIS_COLLAB_DB");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+

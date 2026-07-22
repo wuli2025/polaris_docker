@@ -652,6 +652,21 @@ pub fn project_work_dir(project_id: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty() && std::path::Path::new(s).is_dir())
 }
 
+/// 所有项目当前绑定的工作目录(去重, 只留磁盘上仍存在的)。
+/// 供数据面 `/api/file` 的白名单用 —— 绑了工作目录的项目, 产物写在那儿, 手机端要读得到。
+pub fn all_project_work_dirs() -> Vec<String> {
+    let mut v: Vec<String> = STATE
+        .read()
+        .projects
+        .iter()
+        .filter_map(|p| p.work_dir.clone())
+        .filter(|s| !s.trim().is_empty() && std::path::Path::new(s).is_dir())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// project_id 直接拼进文件系统路径, 必须挡掉 `..` / 路径分隔符 / 盘符,
 /// 否则前端传 `..\..\dir` 可让 create_dir_all / 写 CLAUDE.md 越出 projects 根。
 /// 真实 id 由 `new_id("p")` 生成(纯字母数字), 故该闸不会误伤合法项目。

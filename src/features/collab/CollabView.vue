@@ -139,8 +139,26 @@ async function probeEmail() {
   }
 }
 onMounted(() => {
-  if (!collab.authed) void probeEmail();
+  if (!collab.authed) {
+    void probeEmail();
+    void collab.loadAccountInfo(); // 账号在云端还是本机 —— 决定注册/找回往哪儿打
+  }
 });
+
+/** 账号由云端账号中心统管:注册/找回都得去它那儿,本机只认它签的身份。 */
+const federated = computed(() => collab.federated);
+/**
+ * 注册表单要不要显示邮箱行。
+ *  · 云端统管:邮箱**可选** —— 显示出来但允许留空(绑了才有自助找回密码)。
+ *  · 本机账号:沿用老逻辑,主机开了邮箱注册才显示,且那条路上验证码是硬门槛。
+ */
+const showEmailOnSignup = computed(
+  () => federated.value || !!emailInfo.value?.signupOpen
+);
+/** 邮箱是不是硬性要求:只有本机账号的「邮箱验证注册」那条老路才是。 */
+const emailMandatory = computed(
+  () => !federated.value && !!emailInfo.value?.signupOpen
+);
 
 const codeCooldown = ref(0);
 let codeTimer: ReturnType<typeof setInterval> | null = null;
@@ -156,7 +174,13 @@ async function sendEmailCode() {
   if (codeCooldown.value > 0) return;
   authErr.value = "";
   try {
-    await collabApi.sendEmailCode(email, tab.value === "reset" ? "reset" : "signup");
+    const purpose = tab.value === "reset" ? "reset" : "signup";
+    // 账号在云端 → 验证码由账号中心发(本机主机根本没有这个账号的邮箱)
+    if (federated.value) {
+      await collabApi.authoritySendCode(collab.authorityUrl, email, purpose);
+    } else {
+      await collabApi.sendEmailCode(email, purpose);
+    }
     toast.info(`验证码已发往 ${email},10 分钟内有效`);
     codeCooldown.value = 60;
     if (codeTimer) clearInterval(codeTimer);
@@ -186,16 +210,24 @@ async function doReset() {
   }
   busy.value = true;
   try {
-    const r = await collabApi.emailReset({
+    const args = {
       email: v.email.trim(),
       code: v.ecode.trim(),
       newPassword: v.newPassword,
-    });
+    };
+    // 云端统管时改的是云端那把口令 —— 改完**所有主机**同时生效。
+    const r = federated.value
+      ? await collabApi.authorityReset(collab.authorityUrl, args)
+      : await collabApi.emailReset(args);
     if (r.username) v.username = r.username;
     v.ecode = "";
     v.newPassword = "";
     tab.value = "login";
-    toast.info(`密码已重置${r.username ? `,请用「${r.username}」登录` : ""}`);
+    toast.info(
+      `密码已重置${r.username ? `,请用「${r.username}」登录` : ""}${
+        federated.value ? "(所有主机同时生效)" : ""
+      }`
+    );
   } catch (e) {
     authErr.value = (e as Error).message;
   } finally {
@@ -220,9 +252,15 @@ async function doAuth() {
     authErr.value = "请填写显示昵称";
     return;
   }
-  // 邮箱注册:验证码是硬门槛
-  if (tab.value === "signup" && emailInfo.value?.signupOpen && (!v.email.trim() || !v.ecode.trim())) {
+  // 本机的「邮箱验证注册」那条路:验证码是硬门槛。
+  if (tab.value === "signup" && emailMandatory.value && (!v.email.trim() || !v.ecode.trim())) {
     authErr.value = "请填写邮箱并获取验证码";
+    return;
+  }
+  // 云端注册:邮箱可留空;但**填了就必须验** —— 绑一个没验证过的邮箱,
+  // 等于把找回密码的钥匙交给一个不确定属于谁的地址,比不绑更危险。
+  if (tab.value === "signup" && federated.value && v.email.trim() && !v.ecode.trim()) {
+    authErr.value = "填了邮箱就要点「发验证码」并填入,或者把邮箱留空(留空则不绑定)";
     return;
   }
   if (tab.value === "redeem" && !v.code.trim()) {
@@ -243,7 +281,19 @@ async function doAuth() {
     if (tab.value === "login") {
       await collab.login(v.username.trim(), v.password);
     } else if (tab.value === "signup") {
-      if (emailInfo.value?.signupOpen) {
+      if (federated.value) {
+        // 云端账号中心注册:注册成功即拿断言进当前主机(一次填,两处生效)。
+        // 有邀请码就连着入伙,免得注册完在主机门口被拦一次。
+        await collab.signupViaAuthority({
+          email: v.email.trim(),
+          code: v.ecode.trim(),
+          username: v.username.trim(),
+          password: v.password,
+          displayName: v.displayName.trim() || v.username.trim(),
+          inviteCode: v.code.trim(),
+          deviceName: v.deviceName.trim() || "我的电脑",
+        });
+      } else if (emailInfo.value?.signupOpen) {
         // 邮箱验证注册(主机配了 SMTP 且开放):验证码即邮箱所有权证明
         await collab.emailSignup({
           email: v.email.trim(),
@@ -263,6 +313,14 @@ async function doAuth() {
         // 本机正在当主机 → 自报主机设备,设备页点亮「主机」徽标
         !!collab.hostInfo?.running
       );
+    } else if (federated.value) {
+      // 联邦模式的「票据入伙」:身份来自云端账号,准入来自本机邀请码 —— 两把钥匙。
+      await collab.joinViaTicket({
+        username: v.username.trim(),
+        password: v.password,
+        code: v.code.trim(),
+        deviceName: v.deviceName.trim() || "我的电脑",
+      });
     } else {
       await collab.redeem({
         code: v.code.trim(),
@@ -421,18 +479,29 @@ const MAIN_TABS: { key: AuthTab; label: string }[] = [
             票据入伙
           </button>
         </div>
+        <!-- 账号云端统管:说清楚账号存在哪儿,以及「一处注册,处处能登」 -->
+        <p v-if="federated" class="account-origin">
+          账号由云端账号中心统一管理 —— 一个账号在你所有主机上都能登。
+          <span class="account-origin-url">{{ collab.authorityUrl }}</span>
+        </p>
         <p class="tab-hint">
           {{
             tab === "login"
-              ? "已有账号,直接登录"
+              ? (federated ? "用云端账号登录(用户名或邮箱都行)" : "已有账号,直接登录")
               : tab === "signup"
-                ? (emailInfo?.signupOpen
-                    ? "邮箱验证注册:收验证码证明邮箱是你的,注册成功直接进入"
-                    : "开放注册:用户名 + 密码 + 昵称,注册成功直接进入")
+                ? (federated
+                    ? "在云端账号中心注册,注册出来的账号在你所有主机上通用;邮箱可留空(绑了才能自助找回密码)"
+                    : emailInfo?.signupOpen
+                      ? "邮箱验证注册:收验证码证明邮箱是你的,注册成功直接进入"
+                      : "开放注册:用户名 + 密码 + 昵称,注册成功直接进入")
                 : tab === "redeem"
-                  ? "拿到管理者发的配对码?在这里建号加入"
+                  ? (federated
+                      ? "用你的云端账号 + 这台主机的邀请码入伙(身份来自云端,准入来自邀请码)"
+                      : "拿到管理者发的配对码?在这里建号加入")
                   : tab === "reset"
-                    ? "验证码发到注册时绑定的邮箱,验证通过即可重设密码"
+                    ? (federated
+                        ? "验证码发到注册邮箱;改的是云端那把口令,所有主机同时生效"
+                        : "验证码发到注册时绑定的邮箱,验证通过即可重设密码")
                     : "全新协作服务:创建第一个管理者账号(仅零账号时可用)"
           }}
         </p>
@@ -451,15 +520,20 @@ const MAIN_TABS: { key: AuthTab; label: string }[] = [
           </template>
           <template v-else>
             <input v-if="tab === 'redeem'" v-model="f.code" class="inp code" placeholder="邀请配对码(整串粘贴,自动找到主机)" />
-            <!-- 邮箱验证注册(主机已配 SMTP 且开放) -->
-            <template v-if="tab === 'signup' && emailInfo?.signupOpen">
+            <!-- 邮箱行。云端统管时**可留空**(不绑就是没有自助找回);本机的邮箱注册那条路是硬门槛 -->
+            <template v-if="tab === 'signup' && showEmailOnSignup">
               <div class="email-row">
-                <input v-model="f.email" class="inp" placeholder="邮箱(如 xxx@qq.com)" autocomplete="email" />
+                <input
+                  v-model="f.email"
+                  class="inp"
+                  :placeholder="emailMandatory ? '邮箱(如 xxx@qq.com)' : '邮箱(可留空;绑了才能自助找回密码)'"
+                  autocomplete="email"
+                />
                 <button type="button" class="btn ghost code-send" :disabled="codeCooldown > 0" @click="sendEmailCode">
                   {{ codeCooldown > 0 ? `${codeCooldown}s` : "发验证码" }}
                 </button>
               </div>
-              <input v-model="f.ecode" class="inp" placeholder="邮箱验证码(6 位)" inputmode="numeric" />
+              <input v-if="emailMandatory || f.email.trim()" v-model="f.ecode" class="inp" placeholder="邮箱验证码(6 位)" inputmode="numeric" />
             </template>
             <input v-model="f.username" class="inp" placeholder="用户名" autocomplete="username" />
             <input
@@ -786,6 +860,19 @@ const MAIN_TABS: { key: AuthTab; label: string }[] = [
 .tab.active { color: var(--ink); font-weight: 600; border-bottom-color: var(--ink); }
 .tab.minor { margin-left: auto; font-size: 11.5px; }
 .tab-hint { margin: 10px 0 12px; font-size: 11.5px; color: var(--muted); line-height: 1.7; }
+
+/* 账号云端统管的说明条:让人一眼知道账号存在哪儿,不用猜 */
+.account-origin {
+  margin: 10px 0 0; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: color-mix(in srgb, var(--primary, var(--ink)) 6%, transparent);
+  font-size: 11.5px; color: var(--ink); line-height: 1.7;
+}
+.account-origin-url {
+  display: block; margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: var(--muted); word-break: break-all;
+}
 
 .auth-form { display: flex; flex-direction: column; gap: 10px; }
 .inp {

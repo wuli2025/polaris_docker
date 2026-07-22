@@ -1011,6 +1011,16 @@ pub fn chat_cancel(req_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 某轮是否仍在后端真实运行(常驻池活跃轮 或 旧路径子进程仍在册)。
+/// 前端「无声死亡」看门狗静默超阈后**先问这里**:仍在跑 → 继续等(长工具零输出静默是
+/// 常态,判死交给后端看门狗 —— 它有进程树深检);确认不在了才熔断收尾。
+/// 没有这一问,前端定长超时单方面放弃会造成同会话重叠轮次(旧轮还在产出,分批编排
+/// 已把下一批发进同一常驻进程,active_req 被顶掉、输出错误归属)。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn chat_is_running(req_id: String) -> bool {
+    session_pool::is_active_req(&req_id) || CHILDREN.lock().get(&req_id).is_some()
+}
+
 /// 读取某会话的分批构建清单 `polaris.build.json`(分批长任务的断点/进度凭据)。
 /// 前端编排循环每轮结束后读它, 算还剩几个 pending 来决定续不续、断了从哪接。
 /// 不存在或解析失败返回 None(前端据此判定「还没规划」或「读不到, 当作未完成重试」)。

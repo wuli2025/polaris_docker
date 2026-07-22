@@ -47,6 +47,8 @@ pub use polaris_runtime::host;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod sysstat;
+// 受控远程执行：iroh 互联的对端在本机跑命令（总开关默认关 + 白名单/Shell 两档 + 全审计）。
+pub mod exec;
 
 // ── 桌面外壳入口(run + 适配器):`not(test)` 门控 ──
 // 单测二进制永远不会跑 Tauri 事件循环, 却会因编入 run() 把 tauri-plugin-dialog→rfd
@@ -318,6 +320,9 @@ pub fn run() {
             conv::conv_get_messages,
             conv::conv_set_project_kb_scope,
             conv::conv_set_project_work_dir,
+            // 受控远程执行策略(主机侧总开关 / Shell 临时解锁)
+            exec::exec_policy_get,
+            exec::exec_policy_set,
             // 人格模块 (板块⑫)
             persona::persona_list,
             persona::persona_apply,
@@ -367,6 +372,7 @@ pub fn run() {
             chat::chat_send,
             chat::chat_prewarm, // 打字期预热常驻 claude 进程(best-effort)
             chat::chat_cancel,
+            chat::chat_is_running, // 前端无声死亡看门狗:熔断前先确认后端真死了
             chat::chat_attach_files,
             chat::chat_attach_image,
             chat::open_url,

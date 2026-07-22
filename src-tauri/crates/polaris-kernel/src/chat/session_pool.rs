@@ -248,6 +248,28 @@ impl<T> PoolCore<T> {
         evicted
     }
 
+    /// 超编收敛:insert 在「其余全员忙碌」时容忍超上限(不杀活轮),这里在**检出路径**
+    /// 把编制收回来 —— 轮次结束后条目不再忙碌,下一次任何对话发消息/预热即逐出
+    /// 「最久未用 · 非忙碌 · 非当前 conv」者。没有它,超编会因每次使用都 touch 续命
+    /// 而永久滞留(N 个常驻进程 × 200-400MB,违背上限 2 的资源承诺)。
+    fn trim_over_cap(&mut self, keep_conv: &str, busy: impl Fn(&T) -> bool) -> Vec<T> {
+        let mut evicted = Vec::new();
+        while self.entries.len() > MAX_SESSIONS {
+            let candidate = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.conv != keep_conv && !busy(&e.payload))
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(i, _)| i);
+            match candidate {
+                Some(idx) => evicted.push(self.entries.remove(idx).payload),
+                None => break, // 仍全员忙碌(或只剩当前 conv):等下次检出再收
+            }
+        }
+        evicted
+    }
+
     fn drain_all(&mut self) -> Vec<T> {
         self.entries.drain(..).map(|e| e.payload).collect()
     }
@@ -342,6 +364,16 @@ pub fn cancel_by_req(req_id: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// 某 req 是否仍是池内某会话的活跃轮(前端「无声死亡」看门狗查询用)。
+pub fn is_active_req(req_id: &str) -> bool {
+    let mut g = POOL.lock();
+    let active = g.iter_mut().any(|(_, sp)| {
+        sp.shared.alive.load(Ordering::SeqCst)
+            && sp.shared.active_req.lock().as_deref() == Some(req_id)
+    });
+    active
 }
 
 /// 对话删除时收割其常驻进程(没有则无事)。
@@ -467,6 +499,7 @@ pub fn prewarm(
     let hit = {
         let mut g = POOL.lock();
         to_reap.extend(g.sweep_expired(now_ms(), session_busy));
+        to_reap.extend(g.trim_over_cap(&conv_id, session_busy));
         match g.get_mut(&conv_id) {
             Some((cur_fp, sp)) if *cur_fp == fp && sp.shared.alive.load(Ordering::SeqCst) => true,
             Some(_) => {
@@ -526,6 +559,7 @@ pub(super) fn run_persistent_turn(p: TurnParams) -> Result<(), String> {
         {
             let mut g = POOL.lock();
             to_reap.extend(g.sweep_expired(now_ms(), session_busy));
+            to_reap.extend(g.trim_over_cap(&p.conv_id, session_busy));
             if let Some((cur_fp, sp)) = g.get_mut(&p.conv_id) {
                 if *cur_fp == fp && sp.shared.alive.load(Ordering::SeqCst) {
                     reusable = true;
@@ -746,6 +780,12 @@ fn reader_loop(stdout: ChildStdout, rx: mpsc::Receiver<TurnJob>, shared: Arc<Ses
         // 静默不受 idle 判定管辖(常驻进程等下一条消息是常态, 不是卡死)。
         *shared.active_req.lock() = None;
         *shared.watchdog.lock() = None;
+        // 轮次收尾续 TTL: last_used 只在轮次**开始**时刷新, 一轮跑得比 TTL(10min)久的
+        // 长任务结束瞬间就已"过期", busy 豁免也随 active_req 清空失效 —— 任何别的对话
+        // 一发消息, 惰性清扫就会把这个刚跑完、还带着服务端 prompt cache 的热进程收割掉,
+        // 用户续问被迫重建(6.4s + 丢缓存)。这里补一次 touch, 给完整 TTL 窗口。
+        // 锁序: 此刻不持任何锁, 单独取 POOL, 与全局 POOL→active_req 顺序不冲突。
+        POOL.lock().touch(&shared.conv, now_ms());
         if !got_result {
             // EOF = 进程死亡。主动杀(取消/看门狗/退出)已各自告知过前端, 这里只对
             // 「自然猝死」补一条 error; 随后照常 finish 发 done, 前端正常收尾,
@@ -1022,6 +1062,35 @@ mod tests {
         assert!(evicted.is_empty(), "其余全员忙碌时宁可超上限也不杀活轮");
         assert!(core.get_mut("a").is_some() && core.get_mut("c").is_some());
         assert!(core.get_mut("d").is_some(), "新插入者不可被自己逐出");
+    }
+
+    /// 超编收敛闭环: 全员忙碌导致超上限后, 轮次结束(不再忙)的下一次检出必须把编制
+    /// 收回上限 —— 只逐「最久未用 · 非忙碌 · 非当前 conv」, 忙碌期间则原地等待。
+    #[test]
+    fn trim_over_cap_converges_after_turns_end() {
+        let mut core: PoolCore<u32> = PoolCore::new();
+        core.insert("a".into(), fp("p", ""), 1, 0, idle_only);
+        core.insert("b".into(), fp("p", ""), 2, 100, idle_only);
+        // a、b 忙时插入 c → 超编到 3
+        core.insert("c".into(), fp("p", ""), 3, 200, |v| *v == 1 || *v == 2);
+        assert_eq!(core.entries.len(), 3, "前置: 全员忙碌导致超编");
+        // 全员仍忙 → 不裁(当前 conv=c)
+        assert!(core
+            .trim_over_cap("c", |v| *v == 1 || *v == 2)
+            .is_empty());
+        assert_eq!(core.entries.len(), 3);
+        // 轮次结束(无人忙碌) → 检出 c 时收敛回 2, 逐出最久未用的 a
+        let evicted = core.trim_over_cap("c", idle_only);
+        assert_eq!(evicted, vec![1], "应逐出最久未用的 a");
+        assert_eq!(core.entries.len(), 2);
+        assert!(core.get_mut("b").is_some() && core.get_mut("c").is_some());
+        // 当前 conv 自己是最久未用者时不可被逐出
+        let mut core2: PoolCore<u32> = PoolCore::new();
+        core2.insert("x".into(), fp("p", ""), 7, 0, idle_only);
+        core2.insert("y".into(), fp("p", ""), 8, 10, |v| *v == 7);
+        core2.insert("z".into(), fp("p", ""), 9, 20, |v| *v == 7 || *v == 8);
+        let ev = core2.trim_over_cap("x", idle_only);
+        assert_eq!(ev, vec![8], "keep_conv=x 受保护, 逐出次久未用的 y");
     }
 
     /// PromptPlan 首条/续轮拆分: 续轮剔除 Session 段与已发过的 Keyed 段, 保留 Turn 段。

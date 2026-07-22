@@ -51,6 +51,14 @@ services:
       POLARIS_SMTP_PASS: "${POLARIS_SMTP_PASS:-}"
       POLARIS_SMTP_FROM: "${POLARIS_SMTP_FROM:-}"
       POLARIS_EMAIL_SIGNUP: "${POLARIS_EMAIL_SIGNUP:-}"
+      # ── 账号权威(「一个账号在哪台机器都能登」)──
+      # 本机当账号中心:设 POLARIS_ACCOUNT_AUTHORITY=1。它持账号签名私钥
+      #   /root/Polaris/data/account_authority.key(在 polaris-data 卷里,随卷备份;
+      #   丢了所有成员主机都要重新信任)。
+      # 本机是成员主机:改填 POLARIS_ACCOUNT_AUTHORITY_URL=https://你的账号中心。
+      # 两个都不设 = 老行为(本机 collab.db 自己管账号),现有部署零影响。
+      POLARIS_ACCOUNT_AUTHORITY: "${POLARIS_ACCOUNT_AUTHORITY:-}"
+      POLARIS_ACCOUNT_AUTHORITY_URL: "${POLARIS_ACCOUNT_AUTHORITY_URL:-}"
     volumes:
       # 数据持久化（KB / 对话历史 / 项目 / 产物 / 技能）：容器重建不丢
       - polaris-data:/root/Polaris

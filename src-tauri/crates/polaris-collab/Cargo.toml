@@ -33,6 +33,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # 账号密码哈希(argon2id PHC)与账号镜像加密(云端零知识)
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
+# 账号权威签名(Ed25519):云机签身份断言,成员主机离线验签 —— 不进 collab-net,
+# 因为**普通桌面主机也要验签**,而它不编 iroh。
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "sync", "net", "io-util", "signal"] }
 tauri = { version = "2.1", features = [], optional = true }
 # 协作路由(collab-host)

@@ -35,7 +35,7 @@ pub use artifacts::{
     artifact_write, ArtifactEntry, ArtifactPayload, ArtifactSearchHit, ARTIFACT_MARKER_PREFIX,
 };
 pub use attach::{chat_attach_files, chat_attach_image, AttachedFile};
-pub use pipeline::{chat_build_manifest, chat_cancel, chat_prewarm, chat_send};
+pub use pipeline::{chat_build_manifest, chat_cancel, chat_is_running, chat_prewarm, chat_send};
 pub use types::{ChatPrewarmArgs, ChatSendArgs, ChatStreamEvent, PermissionMode};
 
 // tauri::command 生成的 __cmd__* 宏也要跟着 re-export, generate_handler!(chat::xxx)
@@ -59,12 +59,14 @@ pub use attach::{
 };
 #[cfg(feature = "desktop")]
 pub use pipeline::{
-    __cmd__chat_build_manifest, __cmd__chat_cancel, __cmd__chat_prewarm, __cmd__chat_send,
+    __cmd__chat_build_manifest, __cmd__chat_cancel, __cmd__chat_is_running, __cmd__chat_prewarm,
+    __cmd__chat_send,
 };
 #[cfg(feature = "desktop")]
 pub use pipeline::{
     __tauri_command_name_chat_build_manifest, __tauri_command_name_chat_cancel,
-    __tauri_command_name_chat_prewarm, __tauri_command_name_chat_send,
+    __tauri_command_name_chat_is_running, __tauri_command_name_chat_prewarm,
+    __tauri_command_name_chat_send,
 };
 
 pub fn init(_app: &AppHandle) -> Result<(), anyhow::Error> {

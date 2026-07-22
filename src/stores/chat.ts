@@ -11,6 +11,7 @@ import {
 import { useAppStore } from "./app";
 import { useArtifactsStore } from "./artifacts";
 import { useSessionsStore } from "../features/coworker/stores/sessions";
+import { humanizeError } from "../lib/humanizeError";
 
 export interface Bubble {
   role: "user" | "assistant" | "tool";
@@ -145,15 +146,45 @@ export const useChatStore = defineStore("chatRuntime", () => {
     }
   }
   /** 启动某对话的无声死亡看门狗(幂等:已存在则不重复挂)。每 15s 巡检一次,
-   *  仍在发送态且持续静默超阈值 → 判后端异常终止,熔断收尾。 */
+   *  仍在发送态且持续静默超阈值 → **先问后端这轮是否还在真实运行**:
+   *  在跑 → 继续等(长工具零输出静默是常态;后端看门狗有进程树深检,判死交给它——
+   *  前端定长超时单方面放弃会造成同会话重叠轮次:旧轮还在产出,分批编排已把下一批
+   *  发进同一常驻进程);确认不在了(或查询本身失败=后端死透)才熔断收尾。 */
   function armWatchdog(convId: string) {
     if (watchdogs[convId]) return;
-    watchdogs[convId] = window.setInterval(() => {
+    let probing = false; // 防上一次 isRunning 未返回时叠加探测
+    watchdogs[convId] = window.setInterval(async () => {
       if (!sendingByConv.value[convId]) {
         stopWatchdog(convId);
         return;
       }
-      if (Date.now() - activityAt(convId) >= SILENCE_LIMIT_MS) failSilent(convId);
+      if (Date.now() - activityAt(convId) < SILENCE_LIMIT_MS || probing) return;
+      const reqId = reqByConv.value[convId];
+      if (!reqId) {
+        failSilent(convId); // 连 reqId 都没有:本轮从未真正启动,直接熔断
+        return;
+      }
+      probing = true;
+      try {
+        const alive = await chatApi.isRunning(reqId);
+        // 熔断前必须复核「这轮还是探测发起时那轮」:await 期间旧轮可能正常收尾、
+        // 分批编排已接棒发新轮(send 同步删 reqByConv → IPC 落地前有几百 ms 空窗)。
+        // 拿旧 reqId 的 false 去熔断会误杀新轮:UI 置终态+再唤醒续批,与仍在跑的
+        // 新轮重叠 —— 恰是本探测要消灭的事故。reqId 复核后:旧轮已收尾则条目为空
+        // 或已是新值,天然不命中。
+        if (
+          !alive &&
+          sendingByConv.value[convId] &&
+          reqByConv.value[convId] === reqId
+        )
+          failSilent(convId);
+      } catch {
+        // 查询失败 = 后端进程/桥接已死,按无声死亡熔断(同样先复核 reqId 未换代)。
+        if (sendingByConv.value[convId] && reqByConv.value[convId] === reqId)
+          failSilent(convId);
+      } finally {
+        probing = false;
+      }
     }, 15_000);
   }
   function stopWatchdog(convId: string) {
@@ -391,7 +422,6 @@ export const useChatStore = defineStore("chatRuntime", () => {
       });
       reqByConv.value[convId] = reqId;
     } catch (e: any) {
-      const { humanizeError } = await import("../lib/humanizeError");
       arr.push({
         role: "assistant",
         text: `[发送失败] ${humanizeError(e)}`,

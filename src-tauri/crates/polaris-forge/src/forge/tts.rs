@@ -71,8 +71,7 @@ pub fn synth(
     voice: Option<&str>,
     language_boost: Option<&str>,
 ) -> Result<Value, String> {
-    // 有 key → MiniMax(L0 最佳);无 key → macOS 退系统 say 离线配音(L3,零安装),
-    // 其余平台报错让调用方降级无声。
+    // 有 key → MiniMax(L0 最佳);无 key → 各平台的本地离线引擎，最终才降静音。
     if let Some(key) = discover_key() {
         return synth_minimax(text, out_mp3, voice, language_boost, &key);
     }
@@ -81,9 +80,13 @@ pub fn synth(
     {
         synth_macos_say(text, out_mp3)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Err("找不到 MiniMax key：在供应商坞启用「MiniMax」或设环境变量 MINIMAX_API_KEY（macOS 无 key 可走系统 say 离线配音）".to_string())
+        synth_windows_sapi(text, out_mp3)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        synth_linux_espeak(text, out_mp3)
     }
 }
 
@@ -325,9 +328,24 @@ pub fn synth_with_strategy(text: &str, out_mp3: &str) -> Result<Value, String> {
     let mut r: Result<Value, String> = match tier {
         Tier::MiniMax => synth_minimax_strategy(text, out_mp3, None, None),
         Tier::Silent => synth_silent(out_mp3),
-        // macOS/Windows/Linux 离线兜底统一走 Silent stub;
-        // 真实系统调用(WinSapi/LinuxEspeak/MacSay)在 P1.5 按平台填
-        Tier::MacSay | Tier::WinSapi | Tier::LinuxEspeak => synth_silent(out_mp3),
+        Tier::MacSay => {
+            #[cfg(target_os = "macos")]
+            { synth_macos_say(text, out_mp3) }
+            #[cfg(not(target_os = "macos"))]
+            { Err("MacSay 仅在 macOS 可用".into()) }
+        }
+        Tier::WinSapi => {
+            #[cfg(target_os = "windows")]
+            { synth_windows_sapi(text, out_mp3) }
+            #[cfg(not(target_os = "windows"))]
+            { Err("WinSapi 仅在 Windows 可用".into()) }
+        }
+        Tier::LinuxEspeak => {
+            #[cfg(target_os = "linux")]
+            { synth_linux_espeak(text, out_mp3) }
+            #[cfg(not(target_os = "linux"))]
+            { Err("LinuxEspeak 仅在 Linux 可用".into()) }
+        }
     };
     if r.is_err() && tier != Tier::Silent {
         // 自动降 Silent

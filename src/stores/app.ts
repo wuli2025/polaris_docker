@@ -8,6 +8,8 @@ import {
   type Project,
 } from "../tauri";
 import { useChatStore } from "./chat";
+import { toast } from "../composables/useToast";
+import { humanizeError } from "../lib/humanizeError";
 
 /** 右抽屉的三种宽度形态：默认抽屉 / 成品预览 / 放大编辑 */
 export type DrawerWidthMode = "default" | "preview" | "expand";
@@ -250,8 +252,6 @@ export const useAppStore = defineStore("app", () => {
       projects.value = await convApi.listProjects();
     } catch (e) {
       // 静默失败=侧栏空白没人知道为什么;报出去并保留旧列表
-      const { toast } = await import("../composables/useToast");
-      const { humanizeError } = await import("../lib/humanizeError");
       toast.error(`项目列表加载失败:${humanizeError(e)}`);
       return;
     }
@@ -290,8 +290,6 @@ export const useAppStore = defineStore("app", () => {
       conversationsByProject.value[projectId] =
         await convApi.listConversations(projectId);
     } catch (e) {
-      const { toast } = await import("../composables/useToast");
-      const { humanizeError } = await import("../lib/humanizeError");
       toast.error(`对话列表加载失败:${humanizeError(e)}`);
       return;
     }

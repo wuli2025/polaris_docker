@@ -42,12 +42,6 @@ struct ReadinessState {
     init_errors: Vec<String>,
 }
 
-impl AppState {
-    fn app(&self) -> AppHandle {
-        self.app.clone()
-    }
-}
-
 /// 入口：初始化各引擎模块 + 起 axum。由 bin/polaris-server.rs 调用。
 pub async fn serve() -> anyhow::Result<()> {
     // 广播频道：所有 emit 走这里 → 全部 WS 订阅者。容量给大些，避免流式 token 丢帧。

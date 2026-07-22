@@ -406,6 +406,33 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建 users.email 唯一索引失败: {e}"))?;
+
+    // 增量列:users.uid —— 账号权威签发的**全局账号 id**。跨主机认人只认它,
+    // 用户名会改、各主机的 users.id 各不相同,uid 不变。
+    // 空串 = 本机本地账号(老账号、应急 owner),不参与联邦;唯一索引因此只约束非空。
+    let has_uid: bool = conn
+        .prepare("PRAGMA table_info(users)")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(1))
+                .map(|rows| rows.flatten().any(|c| c == "uid"))
+        })
+        .unwrap_or(false);
+    if !has_uid {
+        conn.execute("ALTER TABLE users ADD COLUMN uid TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|e| format!("补 users.uid 列失败: {e}"))?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uid ON users(uid) WHERE uid<>''",
+        [],
+    )
+    .map_err(|e| format!("建 users.uid 唯一索引失败: {e}"))?;
+    // 用户名唯一升级为不区分大小写。历史库若已存在仅大小写不同的双账号,建索引会失败——
+    // 容忍(.ok()):注册边界 insert_user_tx 的 NOCASE 查重照样拦新增,老双胞胎由 owner 手工清理。
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)",
+        [],
+    )
+    .ok();
     Ok(())
 }
 
