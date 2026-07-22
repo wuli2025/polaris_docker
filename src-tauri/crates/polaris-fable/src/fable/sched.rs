@@ -221,7 +221,9 @@ pub fn demote_current_thread_to_background() {
     }
     #[cfg(target_os = "macos")]
     unsafe {
-        let _ = libc::pthread_set_qos_class_self_np(libc::QOS_CLASS_UTILITY, 0);
+        // QOS_CLASS_UTILITY 是 `qos_class_t` 的**枚举变体**,不是顶层常量 ——
+        // 写成 `libc::QOS_CLASS_UTILITY` 在 mac 上必 E0425(Win/Linux 编译期看不见,CI 才炸)。
+        let _ = libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
     }
 }
 
