@@ -358,6 +358,10 @@ async fn account_info() -> Response {
                 "kid": authority::kid().unwrap_or_default(),
                 "emailRequired": false,
                 "emailCapable": crate::collab::mail::configured(),
+                // 前端据此决定「注册」入口亮不亮:关着还亮就是骗用户填一遍再报 403。
+                "signupOpen": std::env::var("POLARIS_ACCOUNT_OPEN_SIGNUP")
+                    .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             }),
             Mode::Delegated(url) => {
                 let pin = authority::pinned();
@@ -393,9 +397,25 @@ async fn account_pubkey() -> Response {
 ///  · 不填邮箱 → 直接建号(没有自助找回,忘了密码得找管理员重置)。
 ///  · 填了邮箱 → 必须同时给出发到该邮箱的验证码,验过才绑 —— 绑一个没验证过的邮箱
 ///    等于把「找回密码」的钥匙交给一个不确定属于谁的地址,比不绑还危险。
+///
+/// **默认关闭自助注册**(须显式 `POLARIS_ACCOUNT_OPEN_SIGNUP=1` 才开)。
+/// 原因:账号中心的 `users` 表同时就是这台机器自己的成员表 —— 放开自助注册,
+/// 等于任何人都能拿到本机的 collaborator 会话,而成员能建项目、触发 checks 跑构建脚本,
+/// 本质是主机 RCE。这与 `collab_signup` 默认邀请制是同一条理由,不能因为「它是账号中心」就松口。
+/// 关闭时建号走服务端的 `seed_authority_account` 工具(要能读写权威库,不是远程口子)。
 async fn account_signup(Json(v): Json<Value>) -> Response {
     if !crate::collab::authority::is_authority() {
         return not_authority();
+    }
+    let open = std::env::var("POLARIS_ACCOUNT_OPEN_SIGNUP")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !open {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"本账号中心未开放自助注册,请联系管理员开通账号"})),
+        )
+            .into_response();
     }
     let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
         let email = s_of(&v, "email");

@@ -59,6 +59,8 @@ services:
       # 两个都不设 = 老行为(本机 collab.db 自己管账号),现有部署零影响。
       POLARIS_ACCOUNT_AUTHORITY: "${POLARIS_ACCOUNT_AUTHORITY:-}"
       POLARIS_ACCOUNT_AUTHORITY_URL: "${POLARIS_ACCOUNT_AUTHORITY_URL:-}"
+      # 自助注册默认关(邀请制) —— 放开等于任何人都能拿到本机 collaborator 会话
+      POLARIS_ACCOUNT_OPEN_SIGNUP: "${POLARIS_ACCOUNT_OPEN_SIGNUP:-}"
     volumes:
       # 数据持久化（KB / 对话历史 / 项目 / 产物 / 技能）：容器重建不丢
       - polaris-data:/root/Polaris
