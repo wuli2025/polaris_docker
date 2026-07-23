@@ -689,6 +689,34 @@ async fn collab_user_disable(
     unwrap_api(out)
 }
 
+/// 成员主机上建号没有意义:账号是云端签发的,本机建出来的号在别处一律不认。
+/// 权威机与本地权威(老部署)照旧放行。
+fn reject_if_delegated(what: &str) -> Option<Response> {
+    let url = crate::collab::authority::upstream_url()?;
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!("本机不是账号中心,{what}请到账号中心操作:{url}")
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// 联邦账号的密码与邮箱只有账号权威说得算:在成员主机上改,不但对别的主机毫无作用,
+/// 设密码更是给它开了一条绕过权威的本地后门(那一位本该只能凭权威签的断言进门)。
+/// 故按**账号**拦 —— 同一台机器上的本地应急账号不受影响,照旧能就地重置。
+fn ensure_not_federated(user_id: i64, what: &str) -> Result<(), String> {
+    if !crate::collab::auth::is_federated_account(user_id)? {
+        return Ok(());
+    }
+    let tail = crate::collab::authority::upstream_url()
+        .map(|u| format!(":{u}"))
+        .unwrap_or_default();
+    Err(format!("这是云端账号,{what}请到账号中心操作{tail}"))
+}
+
 /// owner 直接重置任意用户密码(邮箱没绑/邮件服务没配时的兜底通道)。
 /// 改密即踢掉该用户全部旧会话。
 async fn collab_admin_user_reset_password(
@@ -708,9 +736,166 @@ async fn collab_admin_user_reset_password(
             .get("userId")
             .and_then(|x| x.as_i64())
             .ok_or("缺 userId")?;
+        ensure_not_federated(id, "改密码")?;
         crate::collab::auth::set_password(id, &s_of(&v, "newPassword"))?;
         crate::collab::db::audit(&actor, "user.reset_password", &id.to_string(), "owner 重置");
         Ok(json!({"ok": true}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+// ── owner 远程账号管理 ────────────────────────────────────────────────────
+//
+// 此前云机上开一个账号只有两条路:开自助注册(等于把主机 RCE 交给公网,见 account_signup
+// 的注释),或者 SSH 进服务器跑 `seed_authority_account`。前者不能开,后者要有服务器 shell,
+// 于是「远程管好账号」这件事实际上没有出口。这组端点补的就是它:**owner 会话**从任何地方
+// (桌面、手机壳、浏览器)都能建号/改号/删号,权限门槛与既有 admin/* 完全一致。
+//
+// 注意它们操作的始终是**本进程这台机器**的 users 表:在账号权威上是全局账号,
+// 在成员主机上是本机成员资格。密码与邮箱只属于权威,故成员主机上被 reject_if_delegated 挡住。
+
+/// owner 建号。权威机上顺带签发全局 uid(即「一个账号在所有主机上登」的那个身份);
+/// 本地权威(老部署)则只建本机账号。邮箱可选,**不发验证码**——这是管理员当面开号,
+/// 不是自助注册,邮箱由管理员负责填对(它只用于日后自助找回)。
+async fn collab_admin_account_create(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    if let Some(r) = reject_if_delegated("建账号") {
+        return r;
+    }
+    let actor = ctx.username.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let username = s_of(&v, "username");
+        let display = {
+            let d = s_of(&v, "displayName");
+            if d.trim().is_empty() {
+                username.clone()
+            } else {
+                d
+            }
+        };
+        let role = {
+            let r = s_of(&v, "role");
+            if r.trim().is_empty() {
+                "collaborator".to_string()
+            } else {
+                r
+            }
+        };
+        let (u, uid) = crate::collab::auth::create_account_full(
+            &username,
+            &s_of(&v, "password"),
+            &display,
+            &s_of(&v, "email"),
+            &role,
+            crate::collab::authority::is_authority(),
+        )?;
+        crate::collab::db::audit(&actor, "user.create", &u.role, "owner 远程建号");
+        Ok(json!({"user": u, "uid": uid}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// owner 改号:昵称 / 邮箱 / 角色,三项都可单独改(字段缺席 = 不动这一项)。
+/// 云端账号的邮箱改不了(那把找回密码的钥匙在账号中心);角色是**本机**的,哪台机器都可改。
+async fn collab_admin_account_update(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    let actor = ctx.username.clone();
+    let me = ctx.user_id;
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let id = i_of(&v, "userId").ok_or("缺 userId")?;
+        let display = v.get("displayName").and_then(|x| x.as_str());
+        let email = v.get("email").and_then(|x| x.as_str());
+        if email.is_some() {
+            ensure_not_federated(id, "改邮箱")?;
+        }
+        if display.is_some() || email.is_some() {
+            crate::collab::auth::update_user_profile(id, display, email)?;
+        }
+        if let Some(role) = v.get("role").and_then(|x| x.as_str()) {
+            // 自己把自己降级 = 当场把管理面关在门外(且不一定是最后一个 owner,
+            // last-owner 那道闸拦不住),故单独拦一道。
+            if id == me && role != "owner" {
+                return Err("不能给自己降级 —— 请让另一个管理员来操作".into());
+            }
+            crate::collab::auth::set_user_role(id, role)?;
+        }
+        crate::collab::db::audit(&actor, "user.update", &id.to_string(), "owner 远程改号");
+        Ok(json!({"ok": true}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// owner 删号。级联清掉该账号的会话、设备、项目/团队成员关系(外键 ON DELETE CASCADE)。
+/// 不能删自己,也不能删最后一个在岗 owner。
+async fn collab_admin_account_delete(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    let actor = ctx.username.clone();
+    let me = ctx.user_id;
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let id = i_of(&v, "userId").ok_or("缺 userId")?;
+        if id == me {
+            return Err("不能删除自己的账号".into());
+        }
+        // 先把该账号名下的中继挂牌摘掉,再删行 —— 顺序反了会留下「查不到主人的挂牌」。
+        #[cfg(feature = "collab-net")]
+        crate::collab::gateway::unregister_user(id);
+        let username = crate::collab::auth::delete_user(id)?;
+        crate::collab::db::audit(&actor, "user.delete", &username, "owner 远程删号");
+        Ok(json!({"ok": true, "username": username}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 给 v2.5.0 之前建的老账号补签全局 uid(仅账号权威)。没有 uid 的账号登不了别的主机,
+/// `authority_login` 会直接拒绝并叫人来找管理员 —— 这就是那个补签口。已有 uid 的原样返回。
+async fn collab_admin_account_uid_backfill(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Json(v): Json<Value>,
+) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let id = i_of(&v, "userId").ok_or("缺 userId")?;
+        Ok(json!({"uid": crate::collab::auth::backfill_uid(id)?}))
     })
     .await;
     unwrap_api(out)
@@ -3113,6 +3298,23 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
         .route(
             "/api/collab/admin/user_reset_password",
             post(collab_admin_user_reset_password),
+        )
+        // owner 远程账号管理(建/改/删/补签 uid)
+        .route(
+            "/api/collab/admin/account_create",
+            post(collab_admin_account_create),
+        )
+        .route(
+            "/api/collab/admin/account_update",
+            post(collab_admin_account_update),
+        )
+        .route(
+            "/api/collab/admin/account_delete",
+            post(collab_admin_account_delete),
+        )
+        .route(
+            "/api/collab/admin/account_uid_backfill",
+            post(collab_admin_account_uid_backfill),
         )
         .route("/api/collab/admin/devices", get(collab_devices))
         .route("/api/collab/admin/audit", get(collab_audit_recent))

@@ -170,6 +170,9 @@ export interface AdminUser {
   disabled: boolean;
   /** 绑定邮箱(空 = 未绑,不能自助找回,只能 owner 重置) */
   email?: string;
+  /** 全局身份(账号中心签发)。空 = 只是本机账号,登不了别的主机 */
+  uid?: string;
+  created_at?: number;
 }
 
 export interface AdminDevice {
@@ -667,6 +670,33 @@ export const collabApi = {
   /** owner 直接重置某用户密码(邮箱没绑时的兜底通道,旧会话全部作废) */
   adminUserResetPassword(userId: number, newPassword: string): Promise<void> {
     return post("/api/collab/admin/user_reset_password", { userId, newPassword });
+  },
+  /** owner 远程建号。在账号中心上建的号顺带签全局 uid(能在所有主机登) */
+  adminAccountCreate(args: {
+    username: string;
+    password: string;
+    displayName?: string;
+    email?: string;
+    role?: string;
+  }): Promise<{ user: AdminUser; uid: string }> {
+    return post("/api/collab/admin/account_create", args);
+  },
+  /** owner 改号。字段缺席 = 不动这一项;email 传空串 = 解绑 */
+  adminAccountUpdate(args: {
+    userId: number;
+    displayName?: string;
+    email?: string;
+    role?: string;
+  }): Promise<void> {
+    return post("/api/collab/admin/account_update", args);
+  },
+  /** owner 删号(会话/设备/成员关系一并清掉) */
+  adminAccountDelete(userId: number): Promise<{ username: string }> {
+    return post("/api/collab/admin/account_delete", { userId });
+  },
+  /** 给老账号补签全局 uid(仅账号中心) */
+  adminAccountUidBackfill(userId: number): Promise<{ uid: string }> {
+    return post("/api/collab/admin/account_uid_backfill", { userId });
   },
   adminDevices(): Promise<AdminDevice[]> {
     return get("/api/collab/admin/devices");

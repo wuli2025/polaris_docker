@@ -479,6 +479,24 @@ pub fn create_authority_account(
     display_name: &str,
     email: &str,
 ) -> Result<(User, String), String> {
+    create_account_full(username, password, display_name, email, "collaborator", true)
+}
+
+/// 建账号的统一实现。`sign_uid=true` 即同时签发全局 uid(权威机建号);
+/// `false` 则只建本机账号(本地权威的老行为),uid 位留空。
+///
+/// 邮箱可选,规则同 [`create_authority_account`]。角色过 [`ASSIGNABLE_ROLES`] 白名单 ——
+/// 建号和改角色必须同一套口径,否则一个手误(`Owner` / `admin`)就建出个 role_rank=0
+/// 的死号,填 `lead` 更会造出一个本不该存在的「全局 lead」。
+pub fn create_account_full(
+    username: &str,
+    password: &str,
+    display_name: &str,
+    email: &str,
+    role: &str,
+    sign_uid: bool,
+) -> Result<(User, String), String> {
+    let role = validate_role(role)?;
     // 空 = 不绑;非空才校验格式(调用方负责已验过验证码)。
     let e = if email.trim().is_empty() {
         String::new()
@@ -486,12 +504,16 @@ pub fn create_authority_account(
         validate_email(email)?
     };
     let phc = prepare_new_account(username, password, display_name)?;
-    let uid = super::authority::new_uid();
+    let uid = if sign_uid {
+        super::authority::new_uid()
+    } else {
+        String::new()
+    };
     let mut conn = open_db()?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("建账号事务失败: {err}"))?;
-    let user = insert_user_tx(&tx, username, &phc, "collaborator", display_name)?;
+    let user = insert_user_tx(&tx, username, &phc, role, display_name)?;
     tx.execute(
         "UPDATE users SET email=?1, uid=?2 WHERE id=?3",
         params![e, uid, user.id],
@@ -677,7 +699,8 @@ pub fn logout(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// owner 管理面的用户行:比会话 User 多一列邮箱(找回密码的绑定情况一目了然)。
+/// owner 管理面的用户行:比会话 User 多邮箱(找回密码的绑定情况)、
+/// 全局 uid(空 = 只是本机账号,不能在别的主机上登)和建号时间。
 #[derive(serde::Serialize)]
 pub struct AdminUserRow {
     pub id: i64,
@@ -686,13 +709,19 @@ pub struct AdminUserRow {
     pub display_name: String,
     pub disabled: bool,
     pub email: String,
+    /// 全局身份(账号权威签发)。成员主机上这一列是「这个人是谁」的真身份。
+    pub uid: String,
+    pub created_at: i64,
 }
 
 /// 列所有账号（owner 管理面用）。
 pub fn list_users() -> Result<Vec<AdminUserRow>, String> {
     let conn = open_db()?;
     let mut stmt = conn
-        .prepare("SELECT id,username,role,display_name,disabled,email FROM users ORDER BY id")
+        .prepare(
+            "SELECT id,username,role,display_name,disabled,email,uid,created_at \
+             FROM users ORDER BY id",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -703,15 +732,198 @@ pub fn list_users() -> Result<Vec<AdminUserRow>, String> {
                 display_name: r.get(3)?,
                 disabled: r.get::<_, i64>(4)? != 0,
                 email: r.get(5)?,
+                uid: r.get(6)?,
+                created_at: r.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
 }
 
+// ── owner 远程账号管理(改角色 / 改资料 / 删号 / 补签 uid)────────────────────
+//
+// 这一组和 `list_users` / `set_user_disabled` 一样,操作的是**当前进程这台机器**的
+// `users` 表 —— 在账号权威(云机)上跑,它就是全局账号表;在成员主机上跑,它是
+// 「谁能进这台机器」的成员表。因此密码/邮箱这类**只属于权威**的字段,调用方
+// (http 层)在成员主机模式下必须拒绝,见 `admin_local_only`。
+
+/// 这个账号是不是「联邦账号」——身份由账号权威签发,本机 `pass_hash` 是永不可验的哨兵。
+///
+/// 用来区分成员主机上的两类行:联邦账号(密码/邮箱只有权威说了算,本机改了不但没用,
+/// 还会开出一条绕过权威的本地后门)与本地应急账号(老账号、断网备用 owner,本机就是它的家,
+/// 照旧可以本机重置)。按账号判而不是按机器模式判,才不会把应急账号一起锁死。
+pub fn is_federated_account(user_id: i64) -> Result<bool, String> {
+    let conn = open_db()?;
+    let phc: Option<String> = conn
+        .query_row(
+            "SELECT pass_hash FROM users WHERE id=?1",
+            params![user_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("查账号失败: {e}"))?;
+    Ok(phc.ok_or("账号不存在")? == super::authority::FEDERATED_SENTINEL)
+}
+
+/// 管理面可指派的角色。`lead` 不在其中:项目负责人是**按项目**任命的(见 project_set_lead),
+/// 不是一个全局身份,放进这里会让两套语义打架。
+pub const ASSIGNABLE_ROLES: [&str; 3] = ["owner", "collaborator", "visitor"];
+
+fn validate_role(role: &str) -> Result<&str, String> {
+    ASSIGNABLE_ROLES
+        .iter()
+        .find(|r| **r == role)
+        .copied()
+        .ok_or_else(|| format!("角色只能是 {}", ASSIGNABLE_ROLES.join(" / ")))
+}
+
+/// 还剩几个「登得进来的 owner」。停用/降级/删掉最后一个 owner 会把管理面永久锁在门外
+/// (再没有人能签票据、改角色),故所有会减少 owner 的操作都先过这一关。
+fn enabled_owner_count(conn: &rusqlite::Connection) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE role='owner' AND disabled=0",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(|e| format!("清点管理员失败: {e}"))
+}
+
+/// 目标用户当前是不是「唯一在岗的 owner」。
+fn is_last_owner(conn: &rusqlite::Connection, user_id: i64) -> Result<bool, String> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT role,disabled FROM users WHERE id=?1",
+            params![user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("查账号失败: {e}"))?;
+    let Some((role, disabled)) = row else {
+        return Err("账号不存在".into());
+    };
+    Ok(role == "owner" && disabled == 0 && enabled_owner_count(conn)? <= 1)
+}
+
+/// 改角色。降级最后一个 owner 会被拒。改完踢缓存(权限即时生效,不等 TTL)。
+pub fn set_user_role(user_id: i64, role: &str) -> Result<(), String> {
+    let role = validate_role(role)?;
+    let conn = open_db()?;
+    if role != "owner" && is_last_owner(&conn, user_id)? {
+        return Err("这是唯一一个在岗管理员,不能降级 —— 请先另立一个 owner".into());
+    }
+    let n = conn
+        .execute(
+            "UPDATE users SET role=?1 WHERE id=?2",
+            params![role, user_id],
+        )
+        .map_err(|e| format!("改角色失败: {e}"))?;
+    if n == 0 {
+        return Err("账号不存在".into());
+    }
+    bump_session_revocation();
+    db::audit("owner", "user.role", &user_id.to_string(), role);
+    Ok(())
+}
+
+/// 改资料。两项都是 Option:None = 这次不改(区别于「改成空」)。
+/// 邮箱传空串 = 解绑(解绑后没有自助找回,只能管理员重置)。
+pub fn update_user_profile(
+    user_id: i64,
+    display_name: Option<&str>,
+    email: Option<&str>,
+) -> Result<(), String> {
+    if display_name.is_none() && email.is_none() {
+        return Err("没有要改的字段".into());
+    }
+    let conn = open_db()?;
+    if let Some(d) = display_name {
+        validate_display_name(d)?;
+        conn.execute(
+            "UPDATE users SET display_name=?1 WHERE id=?2",
+            params![d.trim(), user_id],
+        )
+        .map_err(|e| format!("改昵称失败: {e}"))?;
+    }
+    if let Some(raw) = email {
+        let e = if raw.trim().is_empty() {
+            String::new()
+        } else {
+            validate_email(raw)?
+        };
+        conn.execute("UPDATE users SET email=?1 WHERE id=?2", params![e, user_id])
+            .map_err(|err| {
+                if err.to_string().contains("UNIQUE") {
+                    "该邮箱已被其他账号绑定".to_string()
+                } else {
+                    format!("改邮箱失败: {err}")
+                }
+            })?;
+    }
+    // 昵称进会话缓存的 User 里,不吊销就要等 TTL 才更新。
+    bump_session_revocation();
+    db::audit("owner", "user.profile", &user_id.to_string(), "");
+    Ok(())
+}
+
+/// 删号。会话/设备/项目成员/团队成员由外键 ON DELETE CASCADE 一并清掉。
+/// 拒绝删最后一个 owner;返回被删的用户名供审计与前端提示。
+///
+/// 注意:在**账号权威**上删号 = 这个人在所有主机上都登不进来了(密码只有权威有);
+/// 在**成员主机**上删号 = 只是撤销他在这台机器上的成员资格,云端账号还在。
+pub fn delete_user(user_id: i64) -> Result<String, String> {
+    let conn = open_db()?;
+    if is_last_owner(&conn, user_id)? {
+        return Err("这是唯一一个在岗管理员,不能删除 —— 请先另立一个 owner".into());
+    }
+    let username: Option<String> = conn
+        .query_row(
+            "SELECT username FROM users WHERE id=?1",
+            params![user_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("查账号失败: {e}"))?;
+    let username = username.ok_or("账号不存在")?;
+    conn.execute("DELETE FROM users WHERE id=?1", params![user_id])
+        .map_err(|e| format!("删账号失败: {e}"))?;
+    bump_session_revocation();
+    db::audit("owner", "user.delete", &user_id.to_string(), &username);
+    Ok(username)
+}
+
+/// 给老账号补签全局 uid(权威机专用)。
+///
+/// v2.5.0 之前建的账号没有 uid,`authority_login` 会明确拒绝它们并让人找管理员补签 ——
+/// 这就是那个补签口。已有 uid 的账号原样返回,**绝不换号**:uid 换了等于换了个人,
+/// 各成员主机上那份成员资格会全部对不上。
+pub fn backfill_uid(user_id: i64) -> Result<String, String> {
+    let conn = open_db()?;
+    let cur: Option<String> = conn
+        .query_row("SELECT uid FROM users WHERE id=?1", params![user_id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| format!("查账号失败: {e}"))?;
+    let cur = cur.ok_or("账号不存在")?;
+    if !cur.trim().is_empty() {
+        return Ok(cur);
+    }
+    let uid = super::authority::new_uid();
+    conn.execute(
+        "UPDATE users SET uid=?1 WHERE id=?2",
+        params![uid, user_id],
+    )
+    .map_err(|e| format!("补签全局身份失败: {e}"))?;
+    db::audit("owner", "user.uid_backfill", &user_id.to_string(), &uid);
+    Ok(uid)
+}
+
 /// 停用/启用账号（owner 一键止血）。停用即删其所有会话。
 pub fn set_user_disabled(user_id: i64, disabled: bool) -> Result<(), String> {
     let conn = open_db()?;
+    if disabled && is_last_owner(&conn, user_id)? {
+        return Err("这是唯一一个在岗管理员,停用后就没人能管账号了 —— 请先另立一个 owner".into());
+    }
     conn.execute(
         "UPDATE users SET disabled=?1 WHERE id=?2",
         params![disabled as i64, user_id],
@@ -771,6 +983,93 @@ mod tests {
         assert!(login("alice", "nope", "dev1").is_err());
         logout(&tok).unwrap();
         assert!(check_session(&tok).is_err());
+    }
+
+    /// 远程账号管理:建号 → 改资料 → 改角色 → 删号,一条龙。
+    #[test]
+    fn admin_account_lifecycle() {
+        let _g = tmp_db();
+        create_user("alice", "s3cret-8", "owner", "Alice").unwrap();
+        let (bob, uid) =
+            create_account_full("bob", "s3cret-8", "Bob", "bob@ex.com", "collaborator", true)
+                .unwrap();
+        assert!(!uid.is_empty(), "权威建号必须签出 uid");
+
+        update_user_profile(bob.id, Some("鲍勃"), Some("bob2@ex.com")).unwrap();
+        set_user_role(bob.id, "visitor").unwrap();
+        let row = list_users()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == bob.id)
+            .unwrap();
+        assert_eq!((row.display_name.as_str(), row.role.as_str()), ("鲍勃", "visitor"));
+        assert_eq!(row.email, "bob2@ex.com");
+        assert_eq!(row.uid, uid);
+
+        // 邮箱传空串 = 解绑;昵称 None = 这次不动
+        update_user_profile(bob.id, None, Some("")).unwrap();
+        assert!(list_users().unwrap().iter().any(|r| r.id == bob.id && r.email.is_empty()));
+
+        assert!(set_user_role(bob.id, "root").is_err(), "非法角色必须拒绝");
+        // 建号与改角色同一套白名单:大小写手误也算非法,不能建出个 role_rank=0 的死号
+        assert!(
+            create_account_full("carol", "s3cret-8", "Carol", "", "Owner", true).is_err(),
+            "建号的角色也必须过白名单"
+        );
+
+        // 删号连会话一起走(外键 CASCADE)
+        let (_, tok) = login("bob", "s3cret-8", "dev1").unwrap();
+        assert_eq!(delete_user(bob.id).unwrap(), "bob");
+        assert!(check_session(&tok).is_err());
+        assert!(delete_user(bob.id).is_err(), "删不存在的账号应报错");
+    }
+
+    /// 最后一个在岗 owner 是管理面的最后一把钥匙:停用/降级/删除都必须被拦下,
+    /// 否则这台机器再没人能建号改权限,只能进服务器改库。
+    #[test]
+    fn last_owner_is_protected() {
+        let _g = tmp_db();
+        let alice = create_user("alice", "s3cret-8", "owner", "Alice").unwrap();
+        create_user("bob", "s3cret-8", "collaborator", "Bob").unwrap();
+        assert!(set_user_disabled(alice.id, true).is_err());
+        assert!(set_user_role(alice.id, "collaborator").is_err());
+        assert!(delete_user(alice.id).is_err());
+
+        // 另立一个 owner 之后,原来那个就不再是「最后一个」
+        let carol = create_user("carol", "s3cret-8", "owner", "Carol").unwrap();
+        set_user_role(alice.id, "collaborator").unwrap();
+        // 现在 carol 成了唯一在岗 owner,轮到她被保护
+        assert!(delete_user(carol.id).is_err());
+    }
+
+    /// 补签 uid 只补空的,已有的原样返回 —— uid 换了等于换了个人,
+    /// 各成员主机上那份成员资格会全部对不上。
+    /// 联邦账号按**账号**认(pass_hash 是哨兵),不是按机器模式认 ——
+    /// 同一台成员主机上的本地应急账号仍然可以就地重置密码。
+    #[test]
+    fn federated_account_is_detected_per_account() {
+        let _g = tmp_db();
+        let local = create_user("alice", "s3cret-8", "owner", "Alice").unwrap();
+        let fed = create_user("bob", "s3cret-8", "collaborator", "Bob").unwrap();
+        open_db()
+            .unwrap()
+            .execute(
+                "UPDATE users SET pass_hash=?1 WHERE id=?2",
+                params![super::super::authority::FEDERATED_SENTINEL, fed.id],
+            )
+            .unwrap();
+        assert!(is_federated_account(fed.id).unwrap());
+        assert!(!is_federated_account(local.id).unwrap());
+        assert!(is_federated_account(9999).is_err());
+    }
+
+    #[test]
+    fn uid_backfill_is_idempotent() {
+        let _g = tmp_db();
+        let u = create_user("alice", "s3cret-8", "owner", "Alice").unwrap();
+        let first = backfill_uid(u.id).unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(backfill_uid(u.id).unwrap(), first);
     }
 
     #[test]

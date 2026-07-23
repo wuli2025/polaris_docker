@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import {
   TicketPlus,
   Copy,
@@ -7,12 +7,14 @@ import {
   RefreshCw,
   Server,
   Users,
+  UserPlus,
   MonitorSmartphone,
   ShieldOff,
 } from "@lucide/vue";
 import {
   collabApi,
   fmtTime,
+  type AccountInfo,
   type AdminDevice,
   type AdminUser,
   type Ticket,
@@ -63,6 +65,17 @@ async function stopHost() {
   }
 }
 
+// ── 账号体系自述:决定这台机器上能做多少账号操作 ──
+// authority(账号中心)/ local(老的本机账号)= 密码邮箱都归本机管,全套能改;
+// delegated(成员主机)= 这里的账号行只是本机成员资格,密码邮箱在云端,只能改角色/停用/移除。
+const acct = ref<AccountInfo | null>(null);
+const isDelegated = computed(() => acct.value?.mode === "delegated");
+const isAuthority = computed(() => acct.value?.mode === "authority");
+/** 这一行是不是「云端账号」:密码邮箱归账号中心管,本机改不动(本机应急账号不算) */
+function isCloud(u: AdminUser) {
+  return isDelegated.value && !!u.uid;
+}
+
 // ── 用户 ──
 const users = ref<AdminUser[]>([]);
 const usersLoading = ref(false);
@@ -74,6 +87,95 @@ async function loadUsers() {
     toast.error((e as Error).message);
   } finally {
     usersLoading.value = false;
+  }
+}
+
+// ── 建号(远程开户:不必再 SSH 进服务器跑脚本)──
+const nu = ref({ username: "", password: "", displayName: "", email: "", role: "collaborator" });
+const creating = ref(false);
+async function createAccount() {
+  if (nu.value.username.trim().length < 3) return toast.error("用户名至少 3 个字符");
+  if (nu.value.password.length < 8) return toast.error("密码至少 8 位");
+  creating.value = true;
+  try {
+    const r = await collabApi.adminAccountCreate({
+      username: nu.value.username.trim(),
+      password: nu.value.password,
+      displayName: nu.value.displayName.trim(),
+      email: nu.value.email.trim(),
+      role: nu.value.role,
+    });
+    toast.info(
+      r.uid
+        ? `已建全局账号「${nu.value.username.trim()}」,他可以在任何一台主机上登录`
+        : `已建本机账号「${nu.value.username.trim()}」`,
+    );
+    nu.value = { username: "", password: "", displayName: "", email: "", role: "collaborator" };
+    await loadUsers();
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    creating.value = false;
+  }
+}
+
+// ── 行内编辑(昵称/邮箱/角色)──
+const editingId = ref<number | null>(null);
+const draft = ref({ displayName: "", email: "", role: "" });
+const saving = ref(false);
+function startEdit(u: AdminUser) {
+  editingId.value = u.id;
+  draft.value = { displayName: u.display_name || "", email: u.email || "", role: u.role };
+}
+async function saveEdit(u: AdminUser) {
+  saving.value = true;
+  try {
+    const args: { userId: number; displayName?: string; email?: string; role?: string } = {
+      userId: u.id,
+    };
+    // 只提交真正改过的字段:后端「字段缺席 = 不动这一项」,顺带避开成员主机上改邮箱的 403。
+    if (draft.value.displayName.trim() !== (u.display_name || "")) {
+      args.displayName = draft.value.displayName.trim();
+    }
+    if (!isCloud(u) && draft.value.email.trim() !== (u.email || "")) {
+      args.email = draft.value.email.trim();
+    }
+    if (draft.value.role !== u.role) args.role = draft.value.role;
+    if (Object.keys(args).length === 1) {
+      editingId.value = null;
+      return;
+    }
+    await collabApi.adminAccountUpdate(args);
+    editingId.value = null;
+    toast.info("已保存");
+    await loadUsers();
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    saving.value = false;
+  }
+}
+async function removeAccount(u: AdminUser) {
+  const what = isDelegated.value
+    ? `把「${u.username}」移出本机?他在云端的账号不受影响,但将无法再访问这台主机。`
+    : `永久删除账号「${u.username}」?其会话、设备、项目成员关系一并清除,不可撤销。`;
+  if (!confirm(what)) return;
+  try {
+    await collabApi.adminAccountDelete(u.id);
+    toast.info(isDelegated.value ? "已移出本机" : "账号已删除");
+    await loadUsers();
+  } catch (e) {
+    toast.error((e as Error).message);
+  }
+}
+/** 老账号(v2.5.0 之前建的)没有全局 uid,登不了别的主机,给它补签一个 */
+async function backfillUid(u: AdminUser) {
+  try {
+    const r = await collabApi.adminAccountUidBackfill(u.id);
+    u.uid = r.uid;
+    toast.info(`已给「${u.username}」补签全局身份,现在他能在所有主机上登录了`);
+  } catch (e) {
+    toast.error((e as Error).message);
   }
 }
 async function toggleUser(u: AdminUser) {
@@ -126,7 +228,12 @@ async function revoke(d: AdminDevice) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
+  try {
+    acct.value = await collabApi.accountInfo();
+  } catch {
+    // 老主机没有 /api/account/info:当本地权威处理(全套可改),与升级前行为一致
+  }
   void loadUsers();
   void loadDevices();
   if (isTauri) void collab.hostStatus();
@@ -175,34 +282,116 @@ onMounted(() => {
       </div>
     </section>
 
+    <!-- 新建账号(远程开户) -->
+    <section v-if="!isDelegated" class="card">
+      <h3><UserPlus :size="15" :stroke-width="1.8" /> 新建账号</h3>
+      <p class="tip">
+        {{
+          isAuthority
+            ? "这台机器是账号中心:在这儿建的账号会拿到全局身份,同一套用户名密码可以登任何一台主机。"
+            : "直接给同事开一个本机账号(不必让对方走票据入伙)。"
+        }}
+      </p>
+      <div class="row">
+        <input v-model="nu.username" class="inp" placeholder="用户名(3–32 位,字母数字 _ . -)" />
+        <input v-model="nu.password" class="inp" type="password" placeholder="初始密码(至少 8 位)" />
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input v-model="nu.displayName" class="inp" placeholder="昵称(可选,默认同用户名)" />
+        <input v-model="nu.email" class="inp" placeholder="邮箱(可选,绑了才能自助找回密码)" />
+        <select v-model="nu.role" class="sel">
+          <option value="collaborator">成员(collaborator)</option>
+          <option value="visitor">访客(visitor)</option>
+          <option value="owner">管理者(owner)</option>
+        </select>
+        <button class="btn solid" :disabled="creating" @click="createAccount">
+          <LoaderCircle v-if="creating" :size="13" class="spin" /> 建账号
+        </button>
+      </div>
+      <p class="tip" style="margin:10px 0 0">
+        管理员开户不发验证码,邮箱由你填对即可;把初始密码当面给对方,让他登录后自行改密。
+      </p>
+    </section>
+
     <!-- 用户列表 -->
     <section class="card">
       <h3>
         <Users :size="15" :stroke-width="1.8" /> 用户
         <button class="refresh" title="刷新" @click="loadUsers"><RefreshCw :size="13" /></button>
       </h3>
+      <p v-if="isDelegated" class="tip">
+        账号在云端账号中心({{ acct?.authorityUrl }})管理:这里只能改本机角色、停用或移出本机;
+        改密码/邮箱请到账号中心。
+      </p>
       <div v-if="usersLoading" class="dim"><LoaderCircle :size="13" class="spin" /> 加载中…</div>
-      <div v-else-if="!users.length" class="dim">还没有其他用户,先生成票据邀请同事吧</div>
+      <div v-else-if="!users.length" class="dim">还没有其他用户,先建个账号或生成票据邀请同事吧</div>
       <table v-else class="tbl">
         <thead>
           <tr><th>用户名</th><th>昵称</th><th>邮箱</th><th>角色</th><th>状态</th><th></th></tr>
         </thead>
         <tbody>
           <tr v-for="u in users" :key="u.id" :class="{ off: u.disabled }">
-            <td>{{ u.username }}</td>
-            <td>{{ u.display_name || "—" }}</td>
-            <td :title="u.email || '未绑定邮箱,不能自助找回密码'">{{ u.email || "未绑定" }}</td>
-            <td>{{ u.role }}</td>
             <td>
-              <span class="dot" :class="{ ok: !u.disabled }"></span>
-              {{ u.disabled ? "已停用" : "正常" }}
+              {{ u.username }}
+              <span
+                v-if="isAuthority && !u.uid"
+                class="badge-warn"
+                title="没有全局身份,登不了其他主机 —— 点右侧「补签身份」"
+                >本机限定</span
+              >
             </td>
-            <td class="ta-r">
-              <button class="btn ghost sm" @click="resetPassword(u)">重置密码</button>
-              <button class="btn ghost sm" @click="toggleUser(u)">
-                {{ u.disabled ? "启用" : "停用" }}
-              </button>
-            </td>
+            <template v-if="editingId === u.id">
+              <td><input v-model="draft.displayName" class="inp cell" placeholder="昵称" /></td>
+              <td>
+                <input
+                  v-model="draft.email"
+                  class="inp cell"
+                  :disabled="isCloud(u)"
+                  :title="isCloud(u) ? '云端账号的邮箱请到账号中心改' : ''"
+                  placeholder="邮箱(留空=解绑)"
+                />
+              </td>
+              <td>
+                <select v-model="draft.role" class="sel">
+                  <option value="collaborator">collaborator</option>
+                  <option value="visitor">visitor</option>
+                  <option value="owner">owner</option>
+                </select>
+              </td>
+              <td></td>
+              <td class="ta-r">
+                <button class="btn solid sm" :disabled="saving" @click="saveEdit(u)">保存</button>
+                <button class="btn ghost sm" @click="editingId = null">取消</button>
+              </td>
+            </template>
+            <template v-else>
+              <td>{{ u.display_name || "—" }}</td>
+              <td :title="u.email || '未绑定邮箱,不能自助找回密码'">{{ u.email || "未绑定" }}</td>
+              <td>{{ u.role }}</td>
+              <td>
+                <span class="dot" :class="{ ok: !u.disabled }"></span>
+                {{ u.disabled ? "已停用" : "正常" }}
+              </td>
+              <td class="ta-r">
+                <button class="btn ghost sm" @click="startEdit(u)">编辑</button>
+                <button
+                  v-if="isAuthority && !u.uid"
+                  class="btn ghost sm"
+                  @click="backfillUid(u)"
+                >
+                  补签身份
+                </button>
+                <button v-if="!isCloud(u)" class="btn ghost sm" @click="resetPassword(u)">
+                  重置密码
+                </button>
+                <button class="btn ghost sm" @click="toggleUser(u)">
+                  {{ u.disabled ? "启用" : "停用" }}
+                </button>
+                <button class="btn danger sm" @click="removeAccount(u)">
+                  {{ isDelegated ? "移出" : "删除" }}
+                </button>
+              </td>
+            </template>
           </tr>
         </tbody>
       </table>
@@ -293,6 +482,12 @@ onMounted(() => {
 .tk-share {
   margin-top: 8px; font-family: var(--mono); font-size: 11px; line-height: 1.6;
   color: var(--muted); word-break: break-all; user-select: all;
+}
+.inp.cell { min-width: 110px; width: 100%; padding: 5px 8px; font-size: 12px; }
+.badge-warn {
+  font-size: 10px; font-weight: 700; color: var(--vermilion);
+  background: color-mix(in srgb, var(--vermilion) 12%, transparent);
+  border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px;
 }
 .badge-host {
   font-size: 10px; font-weight: 700; color: #b8860b;

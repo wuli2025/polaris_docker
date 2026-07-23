@@ -5815,7 +5815,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-app"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5869,7 +5869,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-cli"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "polaris-app",
  "serde_json",
