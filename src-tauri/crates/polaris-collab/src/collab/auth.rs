@@ -476,6 +476,43 @@ pub fn login(
     ))
 }
 
+/// 邮箱验证码登录：调用方**必须已经核验过验证码**（那是邮箱所有权的证明），
+/// 这里只做「找人 → 查在岗 → 签会话」，全程不碰密码。
+///
+/// 与密码登录同等看待：验证码到达的是账号绑定的那个邮箱，能收到即证明是本人 ——
+/// 这正是「绑定邮箱」的意义。停用的账号一样进不来（与 [`login`] 同一道闸）。
+///
+/// 注意它签的是**本机**会话，故只该在账号权威或本地账号模式下调用；成员主机上
+/// 联邦账号的身份归权威管，调用方须先挡掉（见 http 层的 `reject_if_delegated`）。
+pub fn login_with_verified_email(email: &str, device_id: &str) -> Result<(User, String), String> {
+    let e = validate_email(email)?;
+    let conn = open_db()?;
+    let row: Option<(i64, String, String, String, i64)> = conn
+        .query_row(
+            "SELECT id,username,role,display_name,disabled FROM users WHERE email=?1 LIMIT 1",
+            params![e],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(|err| format!("查账号失败: {err}"))?;
+    let (id, username, role, display_name, disabled) = row.ok_or("该邮箱没有绑定任何账号")?;
+    if disabled != 0 {
+        return Err("账号已停用".into());
+    }
+    let token = issue_session(id, device_id)?;
+    db::audit(&username, "auth.login", device_id, "邮箱验证码");
+    Ok((
+        User {
+            id,
+            username,
+            role,
+            display_name,
+            disabled: false,
+        },
+        token,
+    ))
+}
+
 /// 签一张本机会话 token（不校验密码——调用方必须**已经**证明了身份）。
 /// 密码登录与联邦断言登录共用同一个出口:会话表的形态只有这一处写法,不会各写各的漂掉。
 pub fn issue_session(user_id: i64, device_id: &str) -> Result<String, String> {
@@ -617,6 +654,55 @@ pub fn authority_login(
         User {
             id,
             username: real_name,
+            role,
+            display_name,
+            disabled: false,
+        },
+        uid,
+        email,
+    ))
+}
+
+/// 账号权威侧「凭已验证的邮箱」取全局身份，回 (用户, uid, 邮箱)。
+///
+/// 与 [`authority_login`] 的唯一区别是**凭什么证明是你**：那个凭密码，这个凭邮箱验证码
+/// （调用方必须已核验过）。其余闸门一模一样 —— 停用的进不来，没补签 uid 的也进不来，
+/// 否则会签出一张没有全局身份的断言，成员主机拿到只会一脸茫然。
+pub fn authority_identity_by_email(email: &str) -> Result<(User, String, String), String> {
+    let e = validate_email(email)?;
+    let conn = open_db()?;
+    let row: Option<(i64, String, String, String, i64, String, String)> = conn
+        .query_row(
+            "SELECT id,username,role,display_name,disabled,uid,email \
+             FROM users WHERE email=?1 LIMIT 1",
+            params![e],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| format!("查账号失败: {err}"))?;
+    let (id, username, role, display_name, disabled, uid, email) =
+        row.ok_or("该邮箱没有绑定任何账号")?;
+    if disabled != 0 {
+        return Err("账号已停用".into());
+    }
+    if uid.trim().is_empty() {
+        return Err("该账号还没有全局身份(uid)——请联系管理员为它补签".into());
+    }
+    db::audit(&username, "account.login", &uid, "邮箱验证码");
+    Ok((
+        User {
+            id,
+            username,
             role,
             display_name,
             disabled: false,
@@ -1034,6 +1120,47 @@ mod tests {
         // 没人绑的邮箱登不进(且不能因 email='' 的行被误命中)
         create_user("bob", "s3cret-8", "collaborator", "Bob").unwrap();
         assert!(login("nobody@ex.com", "s3cret-8", "dev4").is_err());
+    }
+
+    /// 验证码登录:验证码已证明邮箱所有权,这里只管找人+查在岗+签会话,不碰密码。
+    /// 停用的账号必须照样进不来 —— 否则「一键停用」对验证码这条路形同虚设。
+    #[test]
+    fn verified_email_login_respects_gates() {
+        let _g = tmp_db();
+        let (u, uid) =
+            create_account_full("alice", "s3cret-8", "Alice", "a@ex.com", "owner", true).unwrap();
+        create_user("bob", "s3cret-8", "collaborator", "Bob").unwrap(); // 没绑邮箱
+
+        // 正常:签出会话,记的是用户名
+        let (got, tok) = login_with_verified_email("A@Ex.com", "dev1").unwrap();
+        assert_eq!(got.username, "alice");
+        assert_eq!(check_session(&tok).unwrap().username, "alice");
+        // 权威侧同一把闸:回全局身份
+        let (_, got_uid, got_mail) = authority_identity_by_email("a@ex.com").unwrap();
+        assert_eq!((got_uid.as_str(), got_mail.as_str()), (uid.as_str(), "a@ex.com"));
+
+        // 没人绑的邮箱进不来
+        assert!(login_with_verified_email("nobody@ex.com", "dev2").is_err());
+        assert!(authority_identity_by_email("nobody@ex.com").is_err());
+
+        // 停用后两条路一起关门
+        create_user("carol", "s3cret-8", "owner", "Carol").unwrap(); // 免触发 last-owner 保护
+        set_user_disabled(u.id, true).unwrap();
+        assert!(login_with_verified_email("a@ex.com", "dev3").is_err());
+        assert!(authority_identity_by_email("a@ex.com").is_err());
+    }
+
+    /// 没补签 uid 的老账号不能靠验证码签出断言 —— 那会签出一张没有全局身份的票,
+    /// 成员主机拿到只会一脸茫然(与 authority_login 同一道闸)。
+    #[test]
+    fn verified_email_login_requires_uid_on_authority() {
+        let _g = tmp_db();
+        create_account_full("alice", "s3cret-8", "Alice", "a@ex.com", "owner", false).unwrap();
+        // 本机会话签得出(本地账号模式本就不需要 uid)
+        assert!(login_with_verified_email("a@ex.com", "dev1").is_ok());
+        // 但权威侧断言签不出
+        let e = authority_identity_by_email("a@ex.com").unwrap_err();
+        assert!(e.contains("全局身份"), "错的理由: {e}");
     }
 
     /// 远程账号管理:建号 → 改资料 → 改角色 → 删号,一条龙。

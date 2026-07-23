@@ -1166,7 +1166,17 @@ async fn collab_email_send_code(Json(v): Json<Value>) -> Response {
                     return Err("该邮箱没有绑定任何账号".into());
                 }
             }
-            _ => return Err("purpose 须为 signup 或 reset".into()),
+            // 验证码登录:不需要密码,能收到这封信就证明是本人。邮箱须已绑定账号 ——
+            // 与 reset 同一口径(都会告知「该邮箱没绑账号」,不额外多泄漏什么)。
+            "login" => {
+                if !crate::collab::mail::configured() {
+                    return Err("邮箱服务未配置,无法用验证码登录,请用密码登录".into());
+                }
+                if crate::collab::auth::find_user_by_email(&email)?.is_none() {
+                    return Err("该邮箱没有绑定任何账号".into());
+                }
+            }
+            _ => return Err("purpose 须为 signup / reset / login".into()),
         }
         crate::collab::mail::issue_code(&email, &purpose)?;
         Ok(json!({"ok": true}))
@@ -1217,8 +1227,53 @@ async fn collab_email_reset(Json(v): Json<Value>) -> Response {
         crate::collab::mail::verify_code(&email, "reset", &s_of(&v, "code"))?;
         let u = crate::collab::auth::find_user_by_email(&email)?
             .ok_or("该邮箱没有绑定任何账号")?;
+        // 联邦账号的密码只有权威说了算:在成员主机上给它写一个本地密码,等于绕开权威
+        // 开了一条本机后门(云端停用了这个人,他仍能凭这个本地密码在断网回落时进来)。
+        // 按**账号**判,故同机的本地应急账号照旧能自助找回。
+        ensure_not_federated(u.id, "改密码")?;
         crate::collab::auth::set_password(u.id, &s_of(&v, "newPassword"))?;
         Ok(json!({"ok": true, "username": u.username}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 邮箱验证码登录(本机会话):验证码 = 邮箱所有权证明,通过即签本机会话,不需要密码。
+///
+/// 成员主机上不开这条路 —— 那里的联邦账号身份归账号中心管,本机凭一份可能过期的
+/// 邮箱副本放人进来,会绕过权威的停用/改密。本地账号模式与账号权威自己照常可用。
+async fn collab_email_login(Json(v): Json<Value>) -> Response {
+    if let Some(r) = reject_if_delegated("验证码登录") {
+        return r;
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let email = s_of(&v, "email");
+        crate::collab::mail::verify_code(&email, "login", &s_of(&v, "code"))?;
+        let (u, token) =
+            crate::collab::auth::login_with_verified_email(&email, &s_of(&v, "deviceId"))?;
+        Ok(json!({"user": u, "token": token}))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 全局验证码登录(账号权威):邮箱 + 验证码 → 身份断言,拿着它能进任意一台成员主机。
+/// 与 `/api/account/login` 的区别只在于「凭什么证明是你」——那个用密码,这个用邮箱验证码。
+async fn account_login_code(Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let email = s_of(&v, "email");
+        crate::collab::mail::verify_code(&email, "login", &s_of(&v, "code"))?;
+        let (u, uid, email) = crate::collab::auth::authority_identity_by_email(&email)?;
+        let assertion =
+            crate::collab::authority::sign_assertion(&uid, &u.username, &email, &u.display_name)?;
+        Ok(json!({
+            "user": {"username": u.username, "displayName": u.display_name, "email": email},
+            "uid": uid,
+            "assertion": assertion,
+        }))
     })
     .await;
     unwrap_api(out)
@@ -3269,6 +3324,8 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
         .route("/api/account/pubkey", get(account_pubkey))
         .route("/api/account/signup", post(account_signup))
         .route("/api/account/login", post(account_login))
+        // 全局验证码登录:邮箱 + 验证码 → 身份断言(免密码,凭邮箱所有权)
+        .route("/api/account/login_code", post(account_login_code))
         .route("/api/account/reset", post(account_reset))
         // 成员侧进门:拿权威签的断言换本机会话。
         .route("/api/collab/login_assertion", post(collab_login_assertion))
@@ -3281,6 +3338,8 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
         .route("/api/collab/email/send_code", post(collab_email_send_code))
         .route("/api/collab/email/signup", post(collab_email_signup))
         .route("/api/collab/email/reset", post(collab_email_reset))
+        // 本机验证码登录(账号权威/本地账号模式;成员主机不开)
+        .route("/api/collab/email/login", post(collab_email_login))
         .route(
             "/api/collab/admin/email_config",
             get(collab_admin_email_config_get).post(collab_admin_email_config_set),

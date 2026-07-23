@@ -163,13 +163,19 @@ fn rate_check(email: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 生成并发送验证码(purpose: signup|reset)。阻塞,须放 spawn_blocking。
+/// 生成并发送验证码(purpose: signup|reset|login)。阻塞,须放 spawn_blocking。
 pub fn issue_code(email: &str, purpose: &str) -> Result<(), String> {
     let email = auth::validate_email(email)?;
     rate_check(&email)?;
     let code = gen_code()?;
     let phc = auth::hash_password(&code)?;
-    let action = if purpose == "signup" { "注册账号" } else { "找回密码" };
+    // 文案要如实说明这封信是干什么用的 —— 收信人据此判断「这是不是我本人在操作」,
+    // 把登录码写成「找回密码」会让人放过一次真正的盗号尝试。
+    let action = match purpose {
+        "signup" => "注册账号",
+        "login" => "登录",
+        _ => "找回密码",
+    };
     let body = format!(
         "你正在 Polaris 设备联盟{action},验证码:\n\n    {code}\n\n10 分钟内有效。如果这不是你本人的操作,请忽略这封邮件。"
     );
