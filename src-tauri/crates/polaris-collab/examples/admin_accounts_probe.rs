@@ -117,7 +117,24 @@ fn probe(base: &str) {
         json!({"email":"bob@example.com","password":"s3cret-88"}),
     );
     assert_eq!(code, 200, "邮箱登录失败");
-    pass("邮箱登录同样放行");
+    pass("邮箱登录同样放行(账号中心全局登录)");
+
+    // ④-b 关键:Web 登录框实际打的是 /api/collab/login。在账号权威自己身上它走**本机密码库**
+    // (upstream_url 为空,不转发),此前那条路只认用户名 —— 于是「在云机绑了邮箱却登不了云机界面」。
+    let (code, v) = post(
+        base,
+        "/api/collab/login",
+        None,
+        json!({"username":"bob@example.com","password":"s3cret-88","deviceId":"probe-mail"}),
+    );
+    assert_eq!(code, 200, "邮箱登不了主机 Web(/api/collab/login): {v}");
+    // 拿邮箱登进来,会话里记的必须仍是用户名
+    assert_eq!(
+        v["user"]["username"].as_str(),
+        Some("bob"),
+        "用邮箱登进来后会话里记成了邮箱"
+    );
+    pass("邮箱能登主机 Web 登录框,且会话记的仍是用户名");
 
     // ⑤ 改资料 + 改角色;缺席的字段不动
     let (code, v) = post(

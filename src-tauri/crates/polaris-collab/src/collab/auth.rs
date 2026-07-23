@@ -404,28 +404,53 @@ pub fn is_bootstrap() -> Result<bool, String> {
 }
 
 /// 登录：校验密码 → 签发会话 token。device_id 关联到会话（供 /ws 与命令做设备核对）。
-pub fn login(username: &str, password: &str, device_id: &str) -> Result<(User, String), String> {
-    let uname = username.trim().to_string();
-    // 暴破节流:同一账号连续失败达阈值后进冷却窗口,冷却期内直接拒(不查库、不比对哈希)。
-    login_cooldown_check(&uname)?;
+///
+/// 标识符**用户名或邮箱都收** —— 给账号绑了邮箱,就该能拿这个邮箱登进来,
+/// 否则「绑定邮箱」只剩找回密码一个用途,绑了跟没绑一样。判别式用 `@`:
+/// 用户名不允许含 `@`(见 [`validate_new_account_credentials`]),与 [`authority_login`] 同一套口径。
+///
+/// 这条路径是**本机密码库**登录:账号权威自己的 Web 登录、老的 local 模式部署、
+/// 以及成员主机在云端连不上时的应急回落,走的都是它 —— 邮箱登录必须在这里也成立,
+/// 只在 `authority_login` 里支持是不够的。
+pub fn login(
+    username_or_email: &str,
+    password: &str,
+    device_id: &str,
+) -> Result<(User, String), String> {
+    let ident = username_or_email.trim().to_string();
+    // 暴破节流:同一标识连续失败达阈值后进冷却窗口,冷却期内直接拒(不查库、不比对哈希)。
+    login_cooldown_check(&ident)?;
     let conn = open_db()?;
-    let row = conn.query_row(
-        "SELECT id,pass_hash,role,display_name,disabled FROM users WHERE username=?1",
-        params![uname],
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        },
-    );
-    let (id, phc, role, display_name, disabled) = match row {
+    // 邮箱按小写比对(建号时 validate_email 已归一化存小写)。ident 含 @ 才走邮箱列,
+    // 故空邮箱的行(email='')永远不会被误命中。
+    let (sql, key) = if ident.contains('@') {
+        (
+            "SELECT id,username,pass_hash,role,display_name,disabled \
+             FROM users WHERE email=?1 LIMIT 1",
+            ident.to_ascii_lowercase(),
+        )
+    } else {
+        (
+            "SELECT id,username,pass_hash,role,display_name,disabled \
+             FROM users WHERE username=?1 LIMIT 1",
+            ident.clone(),
+        )
+    };
+    let row = conn.query_row(sql, params![key], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            // 真用户名:拿邮箱登进来时,会话与审计里记的必须仍是用户名,不能是邮箱。
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    });
+    let (id, real_name, phc, role, display_name, disabled) = match row {
         Ok(v) => v,
         Err(_) => {
-            login_record_fail(&uname);
+            login_record_fail(&ident);
             return Err("用户名或密码错误".into());
         }
     };
@@ -433,16 +458,16 @@ pub fn login(username: &str, password: &str, device_id: &str) -> Result<(User, S
         return Err("账号已停用".into());
     }
     if !verify_password(password, &phc) {
-        login_record_fail(&uname);
+        login_record_fail(&ident);
         return Err("用户名或密码错误".into());
     }
-    login_clear(&uname); // 登录成功清零失败计数
+    login_clear(&ident); // 登录成功清零失败计数
     let token = issue_session(id, device_id)?;
-    db::audit(username, "auth.login", device_id, "");
+    db::audit(&real_name, "auth.login", device_id, "");
     Ok((
         User {
             id,
-            username: username.into(),
+            username: real_name,
             role,
             display_name,
             disabled: false,
@@ -983,6 +1008,32 @@ mod tests {
         assert!(login("alice", "nope", "dev1").is_err());
         logout(&tok).unwrap();
         assert!(check_session(&tok).is_err());
+    }
+
+    /// 绑了邮箱就该能拿邮箱登**本机密码库**(账号权威自己的 Web 登录、local 模式部署、
+    /// 断网回落走的都是这条)。此前只有 `authority_login` 支持邮箱,这条路径只认用户名 ——
+    /// 于是「在云机上给账号绑邮箱,却登不了云机自己的界面」。
+    #[test]
+    fn login_accepts_email_as_identifier() {
+        let _g = tmp_db();
+        let alice =
+            create_account_full("alice", "s3cret-8", "Alice", "A.Lice@Ex.COM", "owner", false)
+                .unwrap()
+                .0;
+
+        // 邮箱登得进,且大小写不敏感(建号时已归一化存小写)
+        let (u, tok) = login("A.LICE@ex.com", "s3cret-8", "dev1").unwrap();
+        assert_eq!(u.id, alice.id);
+        // 关键:拿邮箱登进来,会话里记的仍须是**用户名**,不能变成邮箱
+        assert_eq!(u.username, "alice");
+        assert_eq!(check_session(&tok).unwrap().username, "alice");
+
+        // 用户名照旧能登;密码错一样拒
+        assert!(login("alice", "s3cret-8", "dev2").is_ok());
+        assert!(login("alice@ex.com", "nope", "dev3").is_err());
+        // 没人绑的邮箱登不进(且不能因 email='' 的行被误命中)
+        create_user("bob", "s3cret-8", "collaborator", "Bob").unwrap();
+        assert!(login("nobody@ex.com", "s3cret-8", "dev4").is_err());
     }
 
     /// 远程账号管理:建号 → 改资料 → 改角色 → 删号,一条龙。
