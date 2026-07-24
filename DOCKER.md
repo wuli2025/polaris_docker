@@ -103,8 +103,18 @@ docker compose up -d --build
 - **供应商坞切换**：进入 App 内「供应商」面板切换/新增，会写入 `/root/.claude/settings.json`（持久化）。
 - **OAuth 订阅（Claude Pro / Codex）**：无头容器难走设备码流程。变通：把已登录的
   `~/.claude` 内容拷进 `polaris-claude` 卷复用。本期主推 API Key。
-- **访问口令**：设 `POLARIS_AUTH_TOKEN` 后，`/api/*` 需 `Authorization: Bearer <口令>`，
-  WS 需 `?token=<口令>`。前端用 `http://host:8080/?token=<口令>` 访问会自动记住口令。
+- **访问口令（2026-07-25 起默认不要）**：不设 `POLARIS_AUTH_TOKEN` = **免口令**，
+  谁能连上谁能用，不弹口令框。家用 NAS 挂在路由 NAT 后面公网本来就连不上，
+  而口令忘了没有找回入口 —— 上一版那套「首次访问向导让你设一个」实际效果是把人
+  锁在自己的软件外面，已整条撤掉；**历史落盘的口令也不再生效**（否则升级上来的人
+  照样被几周前随手设的那串挡住）。
+  要上锁只有两条明路，都得是管理员的显式动作：
+  - `POLARIS_AUTH_TOKEN=<口令>` —— 所有来源一律校验；`/api/*` 需
+    `Authorization: Bearer <口令>`，WS 需 `?token=<口令>`，
+    浏览器开 `http://host:8080/?token=<口令>` 会自动记住。
+  - `POLARIS_REQUIRE_LOGIN=1` —— 走账号体系，按人管权限。
+  - （`POLARIS_LAN_ONLY=1` 是折中档：免口令但只放行内网 / Tailscale 来源。）
+  `/api/exec`（远程 shell）不吃免口令这条豁免，没真凭据永远 403。
 
 ---
 
@@ -128,29 +138,51 @@ docker compose up -d --build
 
 ## 七、⭐ 更新
 
-**容器版的「更新」与桌面 Tauri 装包逻辑无关**——桌面 Tauri updater 走 GitHub Releases 装 `.exe` / `.app.tar.gz`，对容器无意义。容器版**永远走** `update.sh` 协议：拉 `ghcr.io/wuli2025/polaris` 的新层 → 重建容器。镜像由 GitHub Actions `image.yml` 在每次打 tag 时自动构建并推 GHCR。
+**容器版的「更新」与桌面 Tauri 装包逻辑无关**——桌面 Tauri updater 走 GitHub Releases 装
+`.exe` / `.app.tar.gz`，对容器无意义。容器版走 `update.sh`，它有两条源：
 
-### 方式 A：Web UI 一键更新（推荐，体验最好）
+| 源 | 何时用 | 怎么走 |
+|---|---|---|
+| **镜像体（默认）** | 纯 `docker run` 起的容器（群晖图形界面、`install-r2.sh` 装的都是） | 逐个**镜像站**拉 `polaris-image-manifest.txt` → 下镜像 tar → `sha256` 校验 → `docker load` → 按老容器配置重建 |
+| **GHCR + compose** | 容器带 compose 标签 | `docker compose pull` + `up -d` |
 
-页面「更新」板块的「立即更新」按钮，**容器内 spawn `update.sh` 拉新镜像并自动重建**。
+镜像站按序尝试，任一条活着就能更新（`POLARIS_UPDATE_MIRRORS` 可自定义，`POLARIS_UPDATE_URL` 把某个源顶到最前）：
 
-**前置两步**（默认关，安全考虑）：
+1. `https://llmwiki.cloud/downloads/docker` —— Cloudflare + R2，分片并行下载
+2. `https://github.com/wuli2025/polaris_docker/releases/latest/download` —— GitHub Release 整包
+3. `https://gh-proxy.com/…` / `https://ghfast.top/…` —— GitHub 国内加速
+
+> 每个源内部先按清单的分片布局取，取不到分片就退回整包；拿完当场 `sha256` 校验，
+> 过不了就换下一个源。**宁可失败也不会装一个残包**。
+
+### 方式 A：Web UI 一键更新（推荐）
+
+「更新」板块 →「检查更新」会去镜像站问版本（这一步**不需要 docker.sock**，所以哪怕
+容器换不了镜像，也照样告诉你「有新版 x.y.z」）；「立即更新」则派一个**替身容器**
+去下载 + 换装（不能在被替换掉的容器里换自己）。新版起不来会自动回滚。
+
+唯一前置：把宿主 `docker.sock` 挂进容器。
 
 ```yaml
-# docker-compose.synology.yml（或 docker-compose.yml）
 services:
   polaris:
-    environment:
-      # 取消下面这行注释 = 启用容器内一键更新
-      POLARIS_DOCKER_SOCKET: "1"
     volumes:
-      # 取消下面这行注释 = 把宿主 docker.sock 挂进容器
-      # - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-`docker compose up -d --no-build` 重建一次容器后，回到 Web 页面「更新」板块，「立即更新」按钮变可点。
+> 旧版还要求额外设 `POLARIS_DOCKER_SOCKET=1`，群晖图形界面装的容器没人会去加它，
+> 结果「立即更新」按钮恒灰 —— 现在**挂了 sock 就认**，这个环境变量只保留
+> 「显式关闭」语义（`=0` 才关）。
 
-**安全提示**：挂 `docker.sock` 进容器 = 容器对宿主 docker daemon 有 root 权限。务必配合 `POLARIS_AUTH_TOKEN`（访问口令）使用，避免未授权用户通过 Web 调用 `docker_update`。
+没挂 sock 也不用进 compose 折腾，SSH 一行等价（数据目录不动）：
+
+```bash
+curl -fsSL https://llmwiki.cloud/docker/install-r2.sh | sudo bash
+```
+
+**安全提示**：挂 `docker.sock` = 容器对宿主 docker daemon 有 root 权限。免口令模式下，
+局域网里任何人都能触发一次「换成官方最新镜像」（内容受 `sha256` 约束，不能借此跑任意代码，
+最坏结果是服务重启）。介意的话设 `POLARIS_AUTH_TOKEN`，或干脆别挂 sock、用上面那行命令更新。
 
 ### 方式 B：终端跑 update.sh（最简，不需 docker.sock）
 

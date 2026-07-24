@@ -21,7 +21,7 @@ use crate::collab::http::{bearer_of, err_resp, ok, role_rank, ws_loop, AuthCtx};
 use crate::host::Event;
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Query, State, WebSocketUpgrade},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Query, State, WebSocketUpgrade},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,6 +29,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -40,6 +41,11 @@ pub struct ApiState {
     pub app: AppHandle,
     pub tx: broadcast::Sender<Event>,
     pub auth_token: Arc<Option<String>>,
+    /// 「免口令」总闸(见 origin_gate)。仅 Docker server 壳在**管理员没显式设**
+    /// POLARIS_AUTH_TOKEN 时置 true —— 家用 NAS 走的就是这一档:任何能连上的来源
+    /// 直接进,不弹口令框(理由见下面「为什么默认免口令」)。桌面 hosting 恒 false:
+    /// 它有自己的分享码口令,隧道对端流量还会被转成 127.0.0.1,不能按来源放行。
+    pub open_no_auth: bool,
 }
 
 impl ApiState {
@@ -53,6 +59,8 @@ impl ApiState {
 /// /api/upload 单挂 512MB body 上限;其余端点由调用方整体 2MB 上限约束。
 pub fn api_router(state: ApiState) -> Router {
     Router::new()
+        .route("/api/auth/state", get(auth_state))
+        .route("/api/auth/setup", post(auth_setup))
         .route("/api/invoke", post(invoke))
         .route(
             "/api/upload",
@@ -78,14 +86,321 @@ fn require_login_env() -> bool {
         .unwrap_or(false)
 }
 
+// ── 为什么默认不要访问口令(2026-07-25 起)──────────────────────────────────
+//
+// 访问口令这套东西在家用 NAS 上是**净负债**:
+//  · NAS 挂在家用路由的 NAT 后面,拿到的是运营商动态分配、还常带 CGNAT 的地址,没做
+//    端口映射时公网压根连不上;真要远程用,走的是 P2P/Tailscale 那条隧道,那条自带身份;
+//  · 口令又最容易忘 —— 网页向导让人随手设一个,几周后没人记得,而且没有找回入口,
+//    结果是用户被自己的软件锁在门外(这已经是第二次栽在口令上:上一次是随机生成的)。
+// 所以现在:**没设 POLARIS_AUTH_TOKEN = 谁都不用口令**,不分内外网;网页里那个「首次
+// 设置口令」向导一并撤掉(见 auth_setup),历史落盘的口令也不再生效 —— 否则老用户升级
+// 上来照样被自己几周前随手设的那串东西挡在门外,这次改动就白做了。
+//
+// 要重新上锁只有一条明路,且必须是管理员的显式动作:
+//  · `POLARIS_AUTH_TOKEN=<口令>` —— 所有来源一律校验;
+//  · `POLARIS_REQUIRE_LOGIN=1`  —— 走账号体系,按人管权限。
+// `/api/exec`(远程 shell)不吃免口令这条豁免,没真凭据永远拒绝 —— 见 exec_ep。
+
+/// 生效口令 = **只认环境变量**。None = 这台机器不设口令(免口令模式)。
+pub(crate) fn effective_token(env_token: &Option<String>) -> Option<String> {
+    env_token.clone()
+}
+
+/// 反代场景下是否信任 X-Forwarded-For。默认不信:见 origin_gate 的取舍。
+fn trust_proxy_env() -> bool {
+    std::env::var("POLARIS_TRUST_PROXY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 私网/回环/本机直连网段 —— 这些地址不可能从公网路由过来。
+/// 100.64.0.0/10 是 CGNAT 段,Tailscale 的 100.x 也落在这里(tailnet 自带设备白名单)。
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private() // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local() // 169.254/16
+                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64/10 CGNAT + Tailscale
+        }
+        IpAddr::V6(v6) => {
+            // IPv4-mapped(::ffff:a.b.c.d)要拆回 v4 判,否则内网 v4 经 v6 套接字进来会被当公网。
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// 免口令模式下**是否还要看来源**。默认 0 = 不看(谁连上谁能用,家用 NAS 的日常)。
+/// 显式 `POLARIS_LAN_ONLY=1` 才退回老行为:只放行内网来源、公网来源一律拒。
+/// 给「机器确实有公网入口、又不想设口令」的部署留的中间档,普通 NAS 用户碰不到。
+fn lan_only_env() -> bool {
+    std::env::var("POLARIS_LAN_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 一次请求的免口令判定。分两半:`enabled` 是本壳允不允许走这条路(见
+/// ApiState::open_no_auth),`origin_ok` 是这一条请求的来源够不够格
+/// —— 默认恒 true,只有 POLARIS_LAN_ONLY=1 时才真去判内外网。
+#[derive(Clone, Copy)]
+pub(crate) struct OriginGate {
+    enabled: bool,
+    origin_ok: bool,
+}
+
+impl OriginGate {
+    /// 关死:显式设过口令的部署、exec 这类高危端点、以及一切拿不准来源的地方走它。
+    pub(crate) fn closed() -> Self {
+        Self {
+            enabled: false,
+            origin_ok: false,
+        }
+    }
+    fn allows(&self) -> bool {
+        self.enabled && self.origin_ok
+    }
+}
+
+/// 判来源。默认直接放行(免口令 = 不分内外网);只有 POLARIS_LAN_ONLY=1 时才按下面
+/// 三条**保守优先**地判内网:
+///  ① 拿不到对端地址(没挂 ConnectInfo / 非 TCP)→ 当公网,要口令。
+///  ② 带了 X-Forwarded-For / X-Real-IP 说明前面有反代,此时对端 IP 恒是反代自己
+///     (常是 127.0.0.1),按它判会把全世界当内网 —— 除非运维显式 POLARIS_TRUST_PROXY=1
+///     声明这层反代可信,否则一律当公网。云机走 install-cloud.sh 必写死 POLARIS_AUTH_TOKEN,
+///     enabled 本就是 false,这条只是再兜一层。
+///  ③ 其余按 TCP 对端地址判私网。
+fn origin_gate(enabled: bool, peer: Option<SocketAddr>, headers: &HeaderMap) -> OriginGate {
+    // 管理员显式要求登录 = 要按人管权限,别在这儿偷偷放行。
+    origin_gate_with(
+        enabled && !require_login_env(),
+        lan_only_env(),
+        peer,
+        headers,
+    )
+}
+
+/// origin_gate 的纯函数内核(两个开关都由调用方传入)。测试直接打这层,免得改进程级
+/// 环境变量跟并行跑的其它用例互踩。
+fn origin_gate_with(
+    enabled: bool,
+    lan_only: bool,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> OriginGate {
+    if !lan_only {
+        return OriginGate {
+            enabled,
+            origin_ok: true,
+        };
+    }
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"));
+    let client_ip: Option<IpAddr> = match (forwarded, trust_proxy_env()) {
+        (Some(v), true) => v
+            .to_str()
+            .ok()
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse().ok()),
+        (Some(_), false) => None, // 有反代但未声明可信 → 判不了,当公网
+        (None, _) => peer.map(|a| a.ip()),
+    };
+    OriginGate {
+        enabled,
+        origin_ok: client_ip.map(is_private_ip).unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod origin_gate_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn 私网段判定() {
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.5",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.78.103.101", // 实测的 Tailscale 地址
+            "100.127.255.254",
+        ] {
+            assert!(is_private_ip(ip(s)), "{s} 应判为内网");
+        }
+        for s in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1",  // 172.16/12 的上界外
+            "100.63.0.1",  // 100.64/10 的下界外
+            "100.128.0.1", // 100.64/10 的上界外
+            "11.0.0.1",
+        ] {
+            assert!(!is_private_ip(ip(s)), "{s} 应判为公网");
+        }
+    }
+
+    #[test]
+    fn ipv6_与_v4_映射() {
+        assert!(is_private_ip(ip("::1")));
+        assert!(is_private_ip(ip("fc00::1")));
+        assert!(is_private_ip(ip("fe80::1")));
+        // v4-mapped 必须拆回 v4 判,否则内网 v4 经 v6 套接字进来会被误判成公网
+        assert!(is_private_ip(ip("::ffff:192.168.1.1")));
+        assert!(!is_private_ip(ip("::ffff:8.8.8.8")));
+        assert!(!is_private_ip(ip("2001:db8::1")));
+    }
+
+    fn gate(
+        enabled: bool,
+        lan_only: bool,
+        peer: Option<&str>,
+        hdrs: &[(&str, &str)],
+    ) -> OriginGate {
+        let mut h = HeaderMap::new();
+        for (k, v) in hdrs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        let addr = peer.map(|s| SocketAddr::new(ip(s), 12345));
+        origin_gate_with(enabled, lan_only, addr, &h)
+    }
+
+    #[test]
+    fn 壳没开就一律不放行() {
+        assert!(!gate(false, false, Some("192.168.1.5"), &[]).allows());
+        assert!(!gate(false, true, Some("192.168.1.5"), &[]).allows());
+    }
+
+    #[test]
+    fn 默认不分内外网一律放行() {
+        // 现行默认:没设 POLARIS_AUTH_TOKEN = 谁都不用口令,来源不再是门槛。
+        assert!(gate(true, false, Some("192.168.1.5"), &[]).allows());
+        assert!(gate(true, false, Some("203.0.113.7"), &[]).allows());
+        // 连「拿不到对端地址 / 反代后面」这些判不出来源的情况也照进,不再吃闭门羹。
+        assert!(gate(true, false, None, &[]).allows());
+        assert!(gate(
+            true,
+            false,
+            Some("127.0.0.1"),
+            &[("x-forwarded-for", "8.8.8.8")]
+        )
+        .allows());
+    }
+
+    #[test]
+    fn lan_only_内网来源放行_公网来源不放行() {
+        assert!(gate(true, true, Some("192.168.1.5"), &[]).allows());
+        assert!(gate(true, true, Some("127.0.0.1"), &[]).allows());
+        assert!(!gate(true, true, Some("203.0.113.7"), &[]).allows());
+    }
+
+    #[test]
+    fn lan_only_拿不到对端地址时保守当公网() {
+        assert!(!gate(true, true, None, &[]).allows());
+    }
+
+    #[test]
+    fn lan_only_有反代且未声明可信时保守当公网() {
+        // 反代场景对端恒是反代自己(127.0.0.1)。若按它判,全世界都成了内网。
+        assert!(!gate(
+            true,
+            true,
+            Some("127.0.0.1"),
+            &[("x-forwarded-for", "8.8.8.8")]
+        )
+        .allows());
+        assert!(!gate(true, true, Some("127.0.0.1"), &[("x-real-ip", "8.8.8.8")]).allows());
+        // 连伪造成内网 IP 也不认(没声明可信就压根不读这个头)
+        assert!(!gate(
+            true,
+            true,
+            Some("127.0.0.1"),
+            &[("x-forwarded-for", "192.168.1.5")]
+        )
+        .allows());
+    }
+
+    #[test]
+    fn 鉴权分支() {
+        // 免口令模式(机器没设 POLARIS_AUTH_TOKEN):默认 origin_ok 恒 true。
+        let open = OriginGate {
+            enabled: true,
+            origin_ok: true,
+        };
+        // 只有 POLARIS_LAN_ONLY=1 且来源判成公网时才会是这个形状。
+        let lan_only_wan = OriginGate {
+            enabled: true,
+            origin_ok: false,
+        };
+
+        // ① 没设口令 → 直接进,不需要任何凭据(NAS 用户的日常,也是这次改动的目的)
+        let ctx = resolve_app_auth_token(&None, None, open).expect("免口令模式应放行");
+        assert_eq!(ctx.role, "owner");
+        assert_eq!(ctx.username, "local");
+
+        // ② POLARIS_LAN_ONLY=1 + 公网来源 → 拒。这里绝不能掉进下面的「开放模式」兜底,
+        //    否则那个开关等于没有。
+        assert!(
+            resolve_app_auth_token(&None, None, lan_only_wan).is_none(),
+            "LAN_ONLY 下公网来源必须拒"
+        );
+
+        // ③ 显式设了口令 → 壳把 enabled 置 false → 任何来源都必须校验,
+        //    否则等于把管理员刻意设的口令静默作废。
+        let explicit = Some("my-secret".to_string());
+        assert!(
+            resolve_app_auth_token(&explicit, None, OriginGate::closed()).is_none(),
+            "显式口令绝不能被来源绕过"
+        );
+        let ctx = resolve_app_auth_token(&explicit, Some("my-secret"), OriginGate::closed())
+            .expect("口令对应放行");
+        assert_eq!(ctx.username, "admin");
+
+        // ④ 桌面 hosting 那种 enabled=false + 无口令 → 维持历史的全放行
+        let ctx = resolve_app_auth_token(&None, None, OriginGate::closed()).expect("开放模式放行");
+        assert_eq!(ctx.role, "owner");
+    }
+
+    #[test]
+    fn 落盘的老口令不再生效() {
+        // 网页向导设过的口令曾经写在 collab.db,忘了就没有找回入口 —— 现在 effective_token
+        // 只认环境变量,老库里那条即使还在也彻底失效,升级上来的用户不会被卡在门外。
+        assert!(effective_token(&None).is_none());
+        assert_eq!(
+            effective_token(&Some("env-token".into())).as_deref(),
+            Some("env-token")
+        );
+    }
+}
+
 /// 基础面鉴权核心:按访问口令 + 传入 token 解析身份。server.rs 的壳专属端点
 /// (/api/status 等)也复用它,故 pub(crate)、且不吃 State(只吃 auth_token 引用)。
 pub(crate) fn resolve_app_auth_token(
     auth_token: &Option<String>,
     token: Option<&str>,
+    gate: OriginGate,
 ) -> Option<AuthCtx> {
-    // 全局口令命中 = owner(单人 Docker 管理员)。
-    if let Some(expected) = auth_token.as_ref() {
+    // 全局口令命中 = owner(单人 Docker 管理员)。口令只来自 POLARIS_AUTH_TOKEN,
+    // 网页里再也设不出第二个来源(见 effective_token 上面那段)。
+    let effective = effective_token(auth_token);
+    if let Some(expected) = effective.as_ref() {
         if token == Some(expected.as_str()) {
             return Some(AuthCtx {
                 user_id: 0,
@@ -104,8 +419,20 @@ pub(crate) fn resolve_app_auth_token(
             });
         }
     }
+    // 免口令模式:gate.enabled 由调用方算出,成立的条件是 —— 本壳是 Docker server 壳、
+    // 没设 POLARIS_AUTH_TOKEN、也没开 POLARIS_REQUIRE_LOGIN。此时任何能连上的来源
+    // 直接是 owner,不弹任何框(家用 NAS 的日常)。
+    // 唯一的例外是管理员显式打开 POLARIS_LAN_ONLY=1:那时 origin_ok 才真去判内外网,
+    // 公网来源在这里 **拒**,绝不能掉到下面的「开放模式」兜底里去 —— 否则那个开关白设。
+    if gate.enabled {
+        return gate.origin_ok.then(|| AuthCtx {
+            user_id: 0,
+            username: "local".into(),
+            role: "owner".into(),
+        });
+    }
     // 是否强制登录:设了全局口令,或显式打开 POLARIS_REQUIRE_LOGIN。
-    let require_login = auth_token.is_some() || require_login_env();
+    let require_login = effective.is_some() || require_login_env();
     if require_login {
         return None; // 上面没拿到有效凭据 → 拒绝
     }
@@ -119,23 +446,105 @@ pub(crate) fn resolve_app_auth_token(
 
 /// 从请求头(Bearer)解析基础面身份。server.rs 壳专属端点复用,故 pub(crate)+同门控。
 #[cfg(feature = "server")]
-pub(crate) fn app_ctx_headers(auth_token: &Option<String>, headers: &HeaderMap) -> Option<AuthCtx> {
-    resolve_app_auth_token(auth_token, bearer_of(headers).as_deref())
+pub(crate) fn app_ctx_headers(
+    auth_token: &Option<String>,
+    headers: &HeaderMap,
+    gate: OriginGate,
+) -> Option<AuthCtx> {
+    resolve_app_auth_token(auth_token, bearer_of(headers).as_deref(), gate)
+}
+
+/// server.rs 壳专属端点用的来源判定(它拿不到 ApiState,只有 AppState)。
+#[cfg(feature = "server")]
+pub(crate) fn server_origin_gate(
+    open_no_auth: bool,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> OriginGate {
+    origin_gate(open_no_auth, peer, headers)
 }
 
 /// resolve_app_auth_token 的异步壳:鉴权含同步 SQLite 查询(check_session),直接跑在
 /// axum async worker 上会钉住 reactor,挪进阻塞线程池。会话短缓存(collab/auth.rs)命中
 /// 时闭包内不落库,这层 spawn_blocking 兜的是未命中/首次。
-async fn resolve_app_auth(state: &ApiState, token: Option<String>) -> Option<AuthCtx> {
+async fn resolve_app_auth(
+    state: &ApiState,
+    token: Option<String>,
+    gate: OriginGate,
+) -> Option<AuthCtx> {
     let auth_token = state.auth_token.clone();
-    tokio::task::spawn_blocking(move || resolve_app_auth_token(&auth_token, token.as_deref()))
+    tokio::task::spawn_blocking(move || resolve_app_auth_token(&auth_token, token.as_deref(), gate))
         .await
         .ok()
         .flatten()
 }
 
-async fn app_ctx(state: &ApiState, headers: &HeaderMap) -> Option<AuthCtx> {
-    resolve_app_auth(state, bearer_of(headers)).await
+/// 端点侧的免口令判定入口:把 ConnectInfo(可能没挂)+ 头 交给 origin_gate。
+/// 「本壳允许」之外再加一条硬条件:**这台机器没设访问口令**。设了就全员校验。
+fn gate_of(
+    state: &ApiState,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> OriginGate {
+    let enabled = state.open_no_auth && effective_token(&state.auth_token).is_none();
+    origin_gate(enabled, peer.map(|c| c.0), headers)
+}
+
+async fn app_ctx(state: &ApiState, headers: &HeaderMap, gate: OriginGate) -> Option<AuthCtx> {
+    resolve_app_auth(state, bearer_of(headers), gate).await
+}
+
+// ── /api/auth/state 与 /api/auth/setup ────────────────────────────────────
+//
+// 两个端点都**不鉴权**(没口令可鉴)。/state 是只读探针,前端据它决定要不要弹口令框;
+// /setup 曾经是「首次访问向导」的落盘入口,现已停用(见上面「为什么默认不要访问口令」),
+// 保留路由只为给老前端一个说得清的错,而不是 404。
+
+#[derive(serde::Serialize)]
+struct AuthState {
+    /// 这台机器是否设了访问口令(即有没有 POLARIS_AUTH_TOKEN)。
+    initialized: bool,
+    /// 口令只可能由 POLARIS_AUTH_TOKEN 管着,网页里改不了。恒等于 initialized。
+    env_managed: bool,
+    /// 网页端能不能设口令。**恒 false**:首次访问向导已停用。
+    can_setup: bool,
+    /// 当前访客是不是靠「免口令」进来的。
+    open_to_me: bool,
+}
+
+async fn auth_state(
+    State(state): State<ApiState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let env_managed = state.auth_token.is_some();
+    let initialized = effective_token(&state.auth_token).is_some();
+    let gate = gate_of(&state, peer, &headers);
+    Json(AuthState {
+        initialized,
+        env_managed,
+        can_setup: false,
+        open_to_me: gate.allows(),
+    })
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct SetupReq {
+    #[allow(dead_code)] // 端点已停用,请求体只为兼容老前端而保留
+    token: String,
+}
+
+async fn auth_setup(Json(_req): Json<SetupReq>) -> Response {
+    // 410 而不是 403:这不是权限不够,是这个功能没了。老前端(缓存的旧 index.html)
+    // 撞上它会直接放弃向导,不会把用户卡在一个永远失败的弹框里。
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "网页端设置访问口令已停用:本机默认免口令。要上锁请给容器设 POLARIS_AUTH_TOKEN"
+        })),
+    )
+        .into_response()
 }
 
 /// 基础 `/api/invoke` 目前操作机器级项目/知识库/供应商配置,没有逐用户资源 ACL;
@@ -186,17 +595,25 @@ async fn exec_ep(
     headers: HeaderMap,
     Json(req): Json<crate::exec::ExecRequest>,
 ) -> Response {
-    // 闸 2:fail-closed。没设访问口令且没强制登录 = 基础面开放模式(合成 owner),
+    let gate = OriginGate::closed();
+    // 闸 2:fail-closed。没设访问口令且没强制登录 = 基础面免口令(合成 owner),
     // 那对 exec 就是**无鉴权 shell**。这里直接拒,且不提供开关绕过。
-    if state.auth_token.is_none() && !require_login_env() {
-        crate::collab::db::audit("anonymous", "exec.denied", &req.cmd, "开放模式(未设访问口令)");
+    // 注:这里刻意**不**走「内网免口令」(OriginGate::closed()),exec 必须拿到真凭据 ——
+    // 内网免口令是为了让家用 NAS 用户能进对话/知识库,不是为了给局域网开一个无鉴权 shell。
+    if effective_token(&state.auth_token).is_none() && !require_login_env() {
+        crate::collab::db::audit(
+            "anonymous",
+            "exec.denied",
+            &req.cmd,
+            "开放模式(未设访问口令)",
+        );
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({"error":"本机未设访问口令,远程执行已禁用。请先设置访问口令(或 POLARIS_REQUIRE_LOGIN=1)再用"})),
+            Json(json!({"error":"本机未设访问口令,远程执行已禁用。请给容器设 POLARIS_AUTH_TOKEN(或 POLARIS_REQUIRE_LOGIN=1)再用"})),
         )
             .into_response();
     }
-    let Some(ctx) = app_ctx(&state, &headers).await else {
+    let Some(ctx) = app_ctx(&state, &headers, gate).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"未授权 (口令错误或会话失效)"})),
@@ -224,7 +641,9 @@ async fn exec_ep(
                 || e.contains("不能带路径")
             {
                 StatusCode::FORBIDDEN
-            } else if e.contains("缺少参数") || e.contains("工作目录不存在") || e.contains("启动失败")
+            } else if e.contains("缺少参数")
+                || e.contains("工作目录不存在")
+                || e.contains("启动失败")
             {
                 StatusCode::BAD_REQUEST
             } else {
@@ -237,10 +656,12 @@ async fn exec_ep(
 
 async fn invoke(
     State(state): State<ApiState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<InvokeRequest>,
 ) -> Response {
-    let Some(ctx) = app_ctx(&state, &headers).await else {
+    let gate = gate_of(&state, peer, &headers);
+    let Some(ctx) = app_ctx(&state, &headers, gate).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"未授权 (口令错误或会话失效)"})),
@@ -271,6 +692,7 @@ async fn invoke(
             Err(e) => invoke_err_resp(format!("chat_send 参数解析失败: {e}")),
         };
     }
+
 
     // 其余命令同步执行，丢到阻塞线程池（内含 ureq 网络/文件 IO，勿阻塞 async worker）。
     // 必须设超时：阻塞池只有 64 线程，慢命令无超时会一条条钉死线程。
@@ -405,7 +827,6 @@ async fn dispatch_desktop(cmd: &str, a: &Args, _app: AppHandle) -> Result<Value,
             a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             a.get("shellMinutes").and_then(|v| v.as_i64()),
         )?),
-
         // ── 对话辅助(chat_send 在 invoke 里单独特判) ──
         "chat_cancel" => ok(chat::chat_cancel(req_str(a, "reqId")?)?),
         "chat_is_running" => ok(chat::chat_is_running(req_str(a, "reqId")?)),
@@ -456,6 +877,20 @@ async fn dispatch_desktop(cmd: &str, a: &Args, _app: AppHandle) -> Result<Value,
             }))
         }
         "list_skills" => ok(skills::list_skills().await),
+
+        // ── 语音输入(手机端按住说话:录 WAV 传回主机,主机拿火山凭据转写)──
+        // 只开放转写这一个口,配置读写仍留在桌面 —— 火山凭据不经手机下发。
+        "voice_transcribe_audio" => {
+            let audio = req_str(a, "audio")?;
+            let fmt = opt_str(a, "format");
+            // 转写是 **同步阻塞** 的 ureq 请求(可跑几十秒)。desktop flavor 下
+            // dispatch_desktop 是直接 await 在 tokio worker 上跑的(不像 server 壳外面
+            // 套了 spawn_blocking),不甩进阻塞池就会钉死一个 worker —— 踩过的坑。
+            let r = tokio::task::spawn_blocking(move || voice::voice_transcribe_audio(audio, fmt))
+                .await
+                .map_err(|e| format!("语音转写任务失败: {e}"))??;
+            ok(r)
+        }
 
         _ => Err(format!(
             "命令 {cmd} 在桌面主机模式暂不支持(手机远程仅开放文件/对话数据面;全部命令请用 Docker/NAS server 版)"
@@ -524,6 +959,75 @@ fn req_vec_str(a: &Args, k: &str) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("参数 `{k}` 无效:数组元素必须是字符串"))
         })
         .collect()
+}
+
+// ───────────────────── 容器自更新（Docker 壳）─────────────────────
+
+/// 容器内更新脚本的固定路径（Dockerfile 把仓库根 update.sh COPY 到这里）。
+/// 整段只在 server 壳编译 —— 桌面壳走 Tauri updater，用不到（否则 dead_code 警告）。
+#[cfg(not(feature = "desktop"))]
+const UPDATE_SCRIPT: &str = "/usr/local/bin/update.sh";
+
+/// 「网页上能不能一键更新」= docker.sock 挂了 + 更新脚本在镜像里。返回
+/// `(enabled, socket_present, script_present)`。
+///
+/// ★ 老版本还额外要求显式 `POLARIS_DOCKER_SOCKET=1` 才放行。群晖 Container Manager
+///   图形界面装的容器根本没人去加这个环境变量 → 「立即更新」按钮恒灰、点不动，
+///   这是「更新点不了/拉不动」的根因之一。现在这个 env 只保留**显式关闭**语义
+///   （`=0` / `=false` 才关），有 sock 就认。
+#[cfg(not(feature = "desktop"))]
+pub(crate) fn docker_updater_bits() -> (bool, bool, bool) {
+    let socket = std::path::Path::new("/var/run/docker.sock").exists();
+    let script = std::path::Path::new(UPDATE_SCRIPT).exists();
+    let disabled = std::env::var("POLARIS_DOCKER_SOCKET")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    (socket && script && !disabled, socket, script)
+}
+
+/// 跑 `update.sh --check`（只查不动），把它吐的 KEY=VALUE 解析成 JSON。
+///
+/// 为什么把「查版本」也交给 shell：更新源是一串镜像站（Cloudflare / GitHub /
+/// 国内加速），逐源回退的逻辑已经在 update.sh 里，Rust 侧再实现一遍必然两边漂移；
+/// 而且 `--check` **不需要 docker.sock** —— 没挂 sock 的容器也能如实告诉用户
+/// 「有新版 x.y.z」，再引导去 SSH 兜底，而不是给一个哑掉的灰按钮。
+#[cfg(not(feature = "desktop"))]
+fn docker_check_update() -> Value {
+    if !std::path::Path::new(UPDATE_SCRIPT).exists() {
+        return json!({
+            "ok": false, "has_update": false,
+            "error": "镜像里没有 /usr/local/bin/update.sh（旧版镜像），请先手动装一次新镜像",
+        });
+    }
+    let out = match std::process::Command::new(UPDATE_SCRIPT).arg("--check").output() {
+        Ok(o) => o,
+        Err(e) => {
+            return json!({"ok": false, "has_update": false, "error": format!("启动 update.sh --check 失败: {e}")})
+        }
+    };
+    let mut map = serde_json::Map::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() {
+                continue;
+            }
+            let val = match k {
+                "ok" | "has_update" => json!(v == "1"),
+                _ => json!(v),
+            };
+            map.insert(k.to_string(), val);
+        }
+    }
+    if map.is_empty() {
+        return json!({
+            "ok": false, "has_update": false,
+            "error": format!("update.sh --check 没有输出：{}", String::from_utf8_lossy(&out.stderr)),
+        });
+    }
+    map.entry("ok").or_insert(json!(false));
+    map.entry("has_update").or_insert(json!(false));
+    Value::Object(map)
 }
 
 /// server 壳全量命令分发(≈200 命令,同步直调各引擎函数)。desktop 下这些引擎命令是
@@ -1110,14 +1614,20 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
         "updater_apply" => Err("容器版请用 docker pull 拉新镜像更新。".to_string()),
 
         // ── 容器自更新(前端 useUpdater.ts 容器线调用)──
-        // docker_status:报「能不能自更新」给 UpdatePanel(POLARIS_DOCKER_SOCKET 开关 + docker.sock 在位
-        //   + 当前镜像 tag + update.sh 是否打进镜像)。
-        "docker_status" => ok(json!({
-            "updater_enabled": std::env::var("POLARIS_DOCKER_SOCKET").map(|v| v == "1").unwrap_or(false),
-            "socket_present": std::path::Path::new("/var/run/docker.sock").exists(),
-            "current_tag": std::env::var("POLARIS_TAG").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "latest".to_string()),
-            "update_script": std::path::Path::new("/usr/local/bin/update.sh").exists(),
-        })),
+        // docker_status:报「能不能自更新」给 UpdatePanel(docker.sock 在位 + update.sh 打进镜像;
+        //   判定口径见 docker_updater_bits)。
+        "docker_status" => {
+            let (enabled, socket, script) = docker_updater_bits();
+            ok(json!({
+                "updater_enabled": enabled,
+                "socket_present": socket,
+                "update_script": script,
+                "current_tag": std::env::var("POLARIS_TAG").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "latest".to_string()),
+            }))
+        }
+        // docker_check_update:只查不动 —— 逐个镜像源拉 manifest,回「当前/最新/有没有新版」。
+        //   不需要 docker.sock,所以没挂 sock 的容器也能看到有新版(再引导 SSH 兜底)。
+        "docker_check_update" => ok(docker_check_update()),
         // docker_update:跑 /usr/local/bin/update.sh(默认模式)——它经 docker.sock 用「自己的镜像」
         //   起一个独立替身容器执行 pull + up -d(不能在被替换的容器里直接 up,compose 会随旧容器被杀)。
         //   脚本起完 detached 替身即返回;真正的替换由替身异步完成(约 1~3 分钟,期间连接断,刷新即可)。
@@ -1125,23 +1635,29 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
             if !bool_def(a, "confirm", false) {
                 return Err("更新需要确认 (confirm: true)".to_string());
             }
-            if !std::env::var("POLARIS_DOCKER_SOCKET")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                return Err("远程更新未启用:请在 compose 设 POLARIS_DOCKER_SOCKET=1 并挂载 /var/run/docker.sock。".to_string());
+            let (enabled, socket, script) = docker_updater_bits();
+            if !script {
+                return Err("/usr/local/bin/update.sh 不存在(镜像未含更新脚本,旧版镜像请先手动装一次新的)。".to_string());
             }
-            if !std::path::Path::new("/var/run/docker.sock").exists() {
-                return Err("/var/run/docker.sock 未挂载,容器无法自更新。".to_string());
+            if !socket {
+                return Err("/var/run/docker.sock 未挂载,容器无法自己换镜像。请在容器设置里加上这个卷映射后重建容器,或在 NAS 上用 SSH 一行命令更新。".to_string());
             }
-            if !std::path::Path::new("/usr/local/bin/update.sh").exists() {
-                return Err("/usr/local/bin/update.sh 不存在(镜像未含更新脚本)。".to_string());
+            if !enabled {
+                return Err(
+                    "远程更新被显式关闭(POLARIS_DOCKER_SOCKET=0),去掉这个环境变量即可。"
+                        .to_string(),
+                );
             }
             let tag = std::env::var("POLARIS_TAG")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "latest".to_string());
-            match std::process::Command::new("/usr/local/bin/update.sh").output() {
+            // force:版本号相同也重装(用户在网页上点了「强制重装」;update.sh 认 POLARIS_FORCE=1)。
+            let mut cmd = std::process::Command::new(UPDATE_SCRIPT);
+            if bool_def(a, "force", false) {
+                cmd.env("POLARIS_FORCE", "1");
+            }
+            match cmd.output() {
                 Ok(out) => ok(json!({
                     "success": out.status.success(),
                     "exit_code": out.status.code(),
@@ -1162,11 +1678,14 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
 
 async fn ws_handler(
     State(state): State<ApiState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     // WS 鉴权走 query token（浏览器 WS 不便带自定义 header）。
-    let Some(ctx) = resolve_app_auth(&state, params.get("token").cloned()).await else {
+    let gate = gate_of(&state, peer, &headers);
+    let Some(ctx) = resolve_app_auth(&state, params.get("token").cloned(), gate).await else {
         return (StatusCode::UNAUTHORIZED, "未授权").into_response();
     };
     if role_rank(&ctx.role) < 3 {
@@ -1181,10 +1700,12 @@ async fn ws_handler(
 /// 浏览器拖拽/选择文件 → 存到服务端临时目录 → 返回服务端绝对路径列表。
 async fn upload(
     State(state): State<ApiState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let Some(ctx) = app_ctx(&state, &headers).await else {
+    let gate = gate_of(&state, peer, &headers);
+    let Some(ctx) = app_ctx(&state, &headers, gate).await else {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"未授权"}))).into_response();
     };
     if role_rank(&ctx.role) < 3 {
@@ -1313,12 +1834,14 @@ struct FileQuery {
 
 async fn serve_file(
     State(state): State<ApiState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Query(q): Query<FileQuery>,
 ) -> Response {
-    let ctx = match app_ctx(&state, &headers).await {
+    let gate = gate_of(&state, peer, &headers);
+    let ctx = match app_ctx(&state, &headers, gate).await {
         Some(c) => Some(c),
-        None => resolve_app_auth(&state, q.token.clone()).await,
+        None => resolve_app_auth(&state, q.token.clone(), gate).await,
     };
     let Some(ctx) = ctx else {
         return (StatusCode::UNAUTHORIZED, "未授权").into_response();
@@ -1328,24 +1851,13 @@ async fn serve_file(
     // ——只有知识库根、~/Polaris/{data/artifacts,projects,uploads-inbox} 和项目绑定的
     // 工作目录能读,整机文件系统读不到。逐用户 ACL 做好前不再往下放。
     if role_rank(&ctx.role) < 2 {
-        return (
-            StatusCode::FORBIDDEN,
-            "文件访问需要协作者及以上权限",
-        )
-            .into_response();
+        return (StatusCode::FORBIDDEN, "文件访问需要协作者及以上权限").into_response();
     }
-    let path = PathBuf::from(&q.path);
     let allowed = allowed_roots();
-    let canon = match std::fs::canonicalize(&path) {
+    let canon = match resolve_readable(&q.path, &allowed) {
         Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "文件不存在").into_response(),
+        Err(resp) => return resp,
     };
-    if !allowed
-        .iter()
-        .any(|root| crate::kb::path_contains(root, &canon))
-    {
-        return (StatusCode::FORBIDDEN, "路径不在允许范围").into_response();
-    }
     let file = match tokio::fs::File::open(&canon).await {
         Ok(f) => f,
         Err(_) => return (StatusCode::NOT_FOUND, "读取失败").into_response(),
@@ -1410,6 +1922,65 @@ fn pct_encode(s: &str) -> String {
     out
 }
 
+/// 把请求里的 `path` 解析成一个**确实在白名单内**的真实文件。
+///
+/// 绝对路径照旧直接 canonicalize;新增的是**相对路径 / `~/` 开头 / 裸文件名**也认 ——
+/// 手机端「点开对话正文里提到的文件」拿到的往往是助手随手写的相对路径
+/// (`docs/报告.md`、`~/Polaris/projects/x/index.html`),按进程 CWD 去解析要么落空、
+/// 要么落到意想不到的目录。这里改成逐个白名单根去拼,第一个命中的算数。
+///
+/// **安全性不变**:无论走哪条,最后一律拿 canonicalize 之后的真实路径复核白名单,
+/// `..` 穿越、符号链接逃逸照旧被 `path_contains` 挡住;白名单本身一个字没放宽。
+///
+fn resolve_readable(raw: &str, allowed: &[PathBuf]) -> Result<PathBuf, Response> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "文件不存在").into_response());
+    }
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        if let Some(u) = directories::UserDirs::new() {
+            cands.push(u.home_dir().join(rest.replace('\\', "/")));
+        }
+    }
+    let p = PathBuf::from(s);
+    if p.is_absolute() {
+        cands.push(p);
+    } else if !s.starts_with('~') {
+        let rel = s
+            .trim_start_matches("./")
+            .trim_start_matches(".\\")
+            .replace('\\', "/");
+        for root in allowed {
+            cands.push(root.join(&rel));
+        }
+    }
+
+    let mut outside = false;
+    for c in cands {
+        let Ok(canon) = std::fs::canonicalize(&c) else {
+            continue;
+        };
+        if !canon.is_file() {
+            continue;
+        }
+        if allowed
+            .iter()
+            .any(|root| crate::kb::path_contains(root, &canon))
+        {
+            return Ok(canon);
+        }
+        outside = true;
+    }
+    if outside {
+        Err((StatusCode::FORBIDDEN, "路径不在允许范围").into_response())
+    } else {
+        Err((StatusCode::NOT_FOUND, "文件不存在").into_response())
+    }
+}
+
+/// 可读根:知识库 + `~/Polaris/{data/artifacts,projects,uploads-inbox}` + 项目绑定工作目录。
+/// (整机文件系统读不到;逐用户 ACL 做好前不再往下放。)
 fn allowed_roots() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
     let kb = PathBuf::from(crate::kb::kb_root());
@@ -1455,6 +2026,141 @@ pub(crate) fn mime_for(p: &Path) -> &'static str {
     }
 }
 
+// ── 「免口令」的 HTTP 层 e2e ────────────────────────────────────────────────
+//
+// 单测只能证明判定函数对,证明不了整条链路上真的没人再拦。故这里起真服务发真请求,
+// 两种挂法(有/无 ConnectInfo)都跑一遍 —— 反代后面、非 TCP 传输等拿不到对端地址的
+// 场景走的正是后者,以前它会被当公网拒掉,那是「打不开」投诉的一大来源。
+#[cfg(all(test, feature = "server", not(feature = "desktop")))]
+mod open_access_e2e_tests {
+    use super::*;
+
+    /// 起真服务。connect_info=true 时按 server.rs 的方式挂 ConnectInfo。
+    async fn serve(
+        auth_token: Option<String>,
+        open_no_auth: bool,
+        connect_info: bool,
+    ) -> (u16, tokio::sync::oneshot::Sender<()>) {
+        let (tx, _rx) = broadcast::channel(64);
+        let state = ApiState {
+            app: AppHandle::new(tx.clone()),
+            tx,
+            auth_token: Arc::new(auth_token),
+            open_no_auth,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stx, srx) = tokio::sync::oneshot::channel::<()>();
+        let router = api_router(state);
+        tokio::spawn(async move {
+            let shutdown = async {
+                let _ = srx.await;
+            };
+            if connect_info {
+                let _ = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown)
+                .await;
+            } else {
+                let _ = axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown)
+                    .await;
+            }
+        });
+        (port, stx)
+    }
+
+    /// 不带任何凭据打一发 /api/invoke,返回状态码。
+    /// 用一条不存在的命令:鉴权过了会走到分发并得 404「未知命令」,鉴权没过则是 401。
+    /// 401 vs 404 正好把「鉴权层」和「分发层」分开,不必依赖任何真命令与数据库。
+    async fn probe(port: u16) -> u16 {
+        tokio::task::spawn_blocking(move || {
+            match ureq::post(&format!("http://127.0.0.1:{port}/api/invoke"))
+                .send_json(json!({"cmd":"__auth_probe","args":{}}))
+            {
+                Ok(r) => r.status(),
+                Err(ureq::Error::Status(c, _)) => c,
+                Err(e) => panic!("请求失败: {e}"),
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 没设 POLARIS_AUTH_TOKEN → 直接进,不能 401。
+    #[tokio::test]
+    async fn 没设口令时直接进得去() {
+        let (port, stop) = serve(None, true, true).await;
+        let code = probe(port).await;
+        let _ = stop.send(());
+        assert_ne!(code, 401, "免口令模式不该被任何口令框挡住");
+        assert_eq!(code, 404, "应已过鉴权、走到分发拿到「未知命令」");
+    }
+
+    /// 管理员显式设了口令 → 一律校验,免口令那条路不生效。
+    #[tokio::test]
+    async fn 显式口令不被绕过() {
+        let (port, stop) = serve(Some("my-secret".into()), true, true).await;
+        let code = probe(port).await;
+        let _ = stop.send(());
+        assert_eq!(code, 401, "显式设的口令不能被静默作废");
+    }
+
+    /// 拿不到对端地址(反代后面 / 没挂 ConnectInfo)也照进 —— 这条以前是 401,
+    /// 群晖反代、隧道转发过来的用户就卡在这儿,现在不再拦。
+    #[tokio::test]
+    async fn 拿不到对端地址也进得去() {
+        let (port, stop) = serve(None, true, false).await;
+        let code = probe(port).await;
+        let _ = stop.send(());
+        assert_eq!(code, 404, "免口令模式下不看来源,应已过鉴权走到分发");
+    }
+
+    /// /api/auth/state:免口令机器要明确告诉前端「别弹框」(can_setup=false + open_to_me=true),
+    /// 否则老前端会照旧弹「设置访问口令」向导,又造出一个没人记得住的口令。
+    #[tokio::test]
+    async fn 未设口令时前端不该弹任何框() {
+        let (port, stop) = serve(None, true, true).await;
+        let body = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("http://127.0.0.1:{port}/api/auth/state"))
+                .call()
+                .unwrap()
+                .into_string()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let _ = stop.send(());
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["initialized"], false);
+        assert_eq!(v["can_setup"], false, "网页端设口令的向导已停用");
+        assert_eq!(v["open_to_me"], true);
+    }
+
+    /// 网页端设口令的入口已停用:不论机器有没有口令,一律 410,不再往库里写任何东西。
+    #[tokio::test]
+    async fn 网页端不再能设口令() {
+        for token in [None, Some("env-token".to_string())] {
+            let (port, stop) = serve(token, true, true).await;
+            let code = tokio::task::spawn_blocking(move || {
+                match ureq::post(&format!("http://127.0.0.1:{port}/api/auth/setup"))
+                    .send_json(json!({"token":"whatever"}))
+                {
+                    Ok(r) => r.status(),
+                    Err(ureq::Error::Status(c, _)) => c,
+                    Err(e) => panic!("请求失败: {e}"),
+                }
+            })
+            .await
+            .unwrap();
+            let _ = stop.send(());
+            assert_eq!(code, 410, "首次访问向导已停用,应直接告知功能没了");
+        }
+    }
+}
+
 // ── /api/exec 的鉴权闸(HTTP 层真起服务测) ──────────────────────────────────
 //
 // exec 是本仓唯一「外部可触发本机任意进程」的入口,它的边界不能只靠编译期保证。
@@ -1471,6 +2177,9 @@ mod exec_gate_tests {
             app: AppHandle::new(tx.clone()),
             tx,
             auth_token: Arc::new(auth_token),
+            // 这组测试盯的是 exec 的 fail-closed:不论壳开不开免口令,没真凭据都得拒。
+            // 置 false 走的是「桌面 hosting / 开放模式」那条兜底,更严格地覆盖到分支。
+            open_no_auth: false,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1523,12 +2232,7 @@ mod exec_gate_tests {
         crate::exec::set_policy(true, None).unwrap(); // 开关开着,也必须拒
 
         let (port, stx) = serve(None).await; // None = 未设访问口令 = 开放模式
-        let (code, body) = post_exec(
-            port,
-            None,
-            json!({"cmd":"cargo","args":["--version"]}),
-        )
-        .await;
+        let (code, body) = post_exec(port, None, json!({"cmd":"cargo","args":["--version"]})).await;
         assert_eq!(code, 403, "开放模式必须拒绝 exec,实际 body={body}");
         assert!(body.contains("未设访问口令"), "body={body}");
 
@@ -1600,7 +2304,8 @@ mod exec_gate_tests {
         );
 
         // 白名单闸仍在:鉴权过了不等于什么都能跑。
-        let (code, b) = post_exec(port, Some("s3cret"), json!({"cmd":"rm","args":["-rf","/"]})).await;
+        let (code, b) =
+            post_exec(port, Some("s3cret"), json!({"cmd":"rm","args":["-rf","/"]})).await;
         assert_eq!(code, 403, "白名单外命令必须 403,body={b}");
 
         let _ = stx.send(());
@@ -1666,10 +2371,44 @@ mod exec_gate_tests {
         assert_eq!(code, 403, "工作目录外的文件必须照旧拒绝,body={body}");
         assert!(body.contains("不在允许范围"), "body={body}");
 
+        // ── 相对路径:手机端点开「对话正文里提到的文件」拿到的往往是助手随手写的
+        //    相对路径(`报告/周报.md`),按进程 CWD 解析必落空 → 得逐个白名单根去拼。
+        let get_s = |raw: String| async move {
+            tokio::task::spawn_blocking(move || {
+                let url = format!("http://127.0.0.1:{port}/api/file?path={}", pct_encode(&raw));
+                match ureq::get(&url).set("Authorization", "Bearer s3cret").call() {
+                    Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+                    Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+                    Err(e) => panic!("请求失败: {e}"),
+                }
+            })
+            .await
+            .unwrap()
+        };
+        std::fs::create_dir_all(inside.join("报告")).unwrap();
+        std::fs::write(inside.join("报告/周报.md"), "# 本周进展").unwrap();
+
+        let (code, body) = get_s("报告/周报.md".to_string()).await;
+        assert_eq!(code, 200, "相对路径应能在白名单根下解析到,body={body}");
+        assert!(body.contains("本周进展"), "body={body}");
+
+        let (code, body) = get_s("./dashboard.html".to_string()).await;
+        assert_eq!(code, 200, "`./` 前缀也要认,body={body}");
+        assert!(body.contains("看板"), "body={body}");
+
+        // 相对路径不等于可以往上爬:`..` 穿越到白名单外仍旧拒绝(canonicalize 后复核白名单)。
+        let (code, body) = get_s("../elsewhere/secret.txt".to_string()).await;
+        assert_ne!(code, 200, "相对路径 `..` 穿越必须挡住,body={body}");
+
+        let (code, body) = get_s("不存在的文件.md".to_string()).await;
+        assert_eq!(
+            code, 404,
+            "解析不到的相对路径应报不存在而非权限,body={body}"
+        );
+
         let _ = stx.send(());
         std::env::remove_var("POLARIS_COLLAB_DB");
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
-

@@ -43,6 +43,19 @@ interface DockerStatus {
   current_tag: string;
   update_script: boolean;
 }
+// ★ DOCKER 分叉:docker_check_update(update.sh --check 的结构化输出)。
+//   不需要 docker.sock —— 所以「有没有新版」和「能不能一键装」是两件独立的事。
+interface DockerCheck {
+  ok: boolean;
+  has_update: boolean;
+  current?: string;
+  latest?: string;
+  image?: string;
+  file?: string;
+  size?: string;
+  source?: string;
+  error?: string;
+}
 interface DockerUpdateResult {
   success?: boolean;
   exit_code?: number | null;
@@ -68,6 +81,13 @@ export const dockerUpdaterEnabled = ref<boolean>(false); // POLARIS_DOCKER_SOCKE
 export const dockerStatus = ref<DockerStatus | null>(null); // 最近一次 docker_status 响应
 export const dockerLastApply = ref<DockerUpdateResult | null>(null); // 最近一次 docker_update 响应
 export const dockerApplying = ref<boolean>(false); // 更新中（按钮转圈 + 禁用）
+export const dockerChecking = ref<boolean>(false); // 检查中（容器线自己的转圈位，桌面的 checking 在容器里恒 false）
+export const dockerCheckInfo = ref<DockerCheck | null>(null); // 最近一次 docker_check_update 响应
+export const dockerHasUpdate = computed(() => !!dockerCheckInfo.value?.has_update);
+export const dockerLatest = computed(() => dockerCheckInfo.value?.latest || "");
+/** 没挂 docker.sock 时给用户的兜底命令：SSH 到 NAS 粘一行，等价于网页上点更新。 */
+export const dockerSshFallback =
+  "curl -fsSL https://llmwiki.cloud/docker/install-r2.sh | sudo bash";
 
 const versionOf = (s: UpdaterState): string | null =>
   "version" in s ? s.version : null;
@@ -156,8 +176,12 @@ export async function checkForUpdate(): Promise<void> {
   autoChecked = true;
   await ensureCurrentVersion();
   // ★ DOCKER 分叉:容器里没有桌面 updater 状态机(updater_check 是 Tauri IPC,必失败)。
-  //   不早返回的话下面的退避循环会白等 5+4+12+30s 重试四次。容器更新走 dockerCheck()。
-  if (isDockerMode.value) return;
+  //   走容器自己的一条线:启动时也真去问一次远端版本,这样「有新版」不用等用户
+  //   主动翻到更新页才知道(老版本这里直接 return,页面永远静默)。
+  if (isDockerMode.value) {
+    await dockerCheck();
+    return;
+  }
   await ensureSubscribed();
   // 首查错峰推迟 5s（避开首帧 IPC 突发——启动检查更新不抢开屏后的第一波命令），
   // 随后 4s/12s/30s 退避重试（覆盖冷启动到网络就绪的常见窗口）。
@@ -202,31 +226,63 @@ export async function applyUpdate(): Promise<void> {
 
 // ── ★ DOCKER 分叉:容器版独有动作(主仓无此段,同步时整体保住)───────────────
 
-/** 容器模式：「检查更新」按钮——调 /api/invoke docker_status,返回 updater_enabled + socket_present。 */
+/** /api/invoke 的薄封装：设了 POLARIS_AUTH_TOKEN 时全量鉴权,裸 fetch 不带 token 必 401。 */
+async function apiInvoke<T>(cmd: string, args: Record<string, unknown> = {}): Promise<T> {
+  const r = await fetch("/api/invoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ cmd, args }),
+  });
+  const j = (await r.json()) as T & { error?: string };
+  if (j && (j as { error?: string }).error) throw new Error((j as { error?: string }).error);
+  return j;
+}
+
+/**
+ * 容器模式：「检查更新」按钮。
+ *
+ * 两件独立的事，一次问清楚：
+ *   · docker_status       —— 这台机器**能不能**在网页上一键换镜像（docker.sock 挂没挂）；
+ *   · docker_check_update —— 远端**有没有**新版（逐个镜像源拉 manifest，不需要 sock）。
+ * ★ 老版本只问前者,于是页面永远说不出「有新版 x.y.z」,用户看到的就是一个没反应的按钮。
+ */
 export async function dockerCheck(): Promise<void> {
+  if (dockerChecking.value) return;
+  dockerChecking.value = true;
   await ensureCurrentVersion();
   dialogDismissed.value = false;
   try {
-    const r = await fetch("/api/invoke", {
-      method: "POST",
-      // 设了 POLARIS_AUTH_TOKEN 时 /api/invoke 全量鉴权,裸 fetch 不带 token 必 401
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ cmd: "docker_status", args: {} }),
-    });
-    const j = (await r.json()) as DockerStatus & { error?: string };
-    if (j.error) throw new Error(j.error);
-    dockerStatus.value = j;
-    dockerUpdaterEnabled.value = !!j.updater_enabled && !!j.socket_present;
+    const st = await apiInvoke<DockerStatus>("docker_status");
+    dockerStatus.value = st;
+    dockerUpdaterEnabled.value = !!st.updater_enabled;
+  } catch (e) {
+    console.warn("[updater] docker_status failed:", e);
+    dockerLastApply.value = { error: `检查失败：${(e as Error).message || e}` };
+  }
+  try {
+    const ck = await apiInvoke<DockerCheck>("docker_check_update");
+    dockerCheckInfo.value = ck;
+    if (ck.current) currentVersion.value = ck.current;
     lastCheckedAt.value = Date.now();
   } catch (e) {
-    console.warn("[updater] docker_check failed:", e);
-    // 状态里塞个 error 提示;UpdatePanel 兜底
-    dockerLastApply.value = { error: `检查失败：${(e as Error).message || e}` };
+    console.warn("[updater] docker_check_update failed:", e);
+    dockerCheckInfo.value = {
+      ok: false,
+      has_update: false,
+      error: `查不到最新版本：${(e as Error).message || e}`,
+    };
+  } finally {
+    dockerChecking.value = false;
   }
 }
 
-/** 容器模式：「立即更新」按钮——调 /api/invoke docker_update。后端 spawn update.sh。 */
-export async function dockerApply(): Promise<void> {
+/**
+ * 容器模式：「立即更新」按钮——调 /api/invoke docker_update。后端 spawn update.sh，
+ * 由它派一个替身容器去下载/校验/换镜像（当前容器会被替换掉，所以这里拿到的只是
+ * 「替身已出发」，不是「已装好」）。
+ * @param force 版本号相同也重装（用于「重装一遍试试」）。
+ */
+export async function dockerApply(force = false): Promise<void> {
   if (dockerApplying.value) return;
   dockerApplying.value = true;
   dockerLastApply.value = null;
@@ -234,7 +290,7 @@ export async function dockerApply(): Promise<void> {
     const r = await fetch("/api/invoke", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ cmd: "docker_update", args: { confirm: true } }),
+      body: JSON.stringify({ cmd: "docker_update", args: { confirm: true, force } }),
     });
     const j = (await r.json()) as DockerUpdateResult;
     dockerLastApply.value = j;

@@ -3,7 +3,7 @@
 // 桌面 Tauri 走 updater.rs 状态机；容器模式走 /api/invoke docker_update（容器内 spawn update.sh）。
 // 与中央对话框(UpdateBanner)共享 useUpdater 的状态——启动自动检测，
 // 这里则给用户一个随时主动检查的入口。
-import { onMounted, computed } from "vue";
+import { onMounted, computed, ref } from "vue";
 import { getVersion } from "@tauri-apps/api/app";
 import {
   RefreshCw,
@@ -32,24 +32,42 @@ import {
   dockerStatus,
   dockerLastApply,
   dockerApplying,
+  dockerChecking,
+  dockerCheckInfo,
+  dockerHasUpdate,
+  dockerLatest,
+  dockerSshFallback,
   dockerCheck,
   dockerApply,
 } from "../composables/useUpdater";
 
 onMounted(async () => {
+  if (isDockerMode.value) {
+    // 容器模式：进页面就真查一次远端版本（顺带拿当前版本 + 能不能一键更新）。
+    await dockerCheck();
+    return;
+  }
   if (!currentVersion.value) {
-    if (isDockerMode.value) {
-      // 容器模式：useUpdater 内部的 ensureCurrentVersion 会调 /api/version
-      await manualCheck();
-    } else {
-      try {
-        currentVersion.value = await getVersion();
-      } catch {
-        /* 浏览器预览态拿不到版本，忽略 */
-      }
+    try {
+      currentVersion.value = await getVersion();
+    } catch {
+      /* 浏览器预览态拿不到版本，忽略 */
     }
   }
 });
+
+// SSH 兜底命令的「已复制」反馈。没挂 docker.sock 的容器（群晖图形界面装的就是）
+// 没法自己换镜像，但这条命令等价于网页上点更新：重下最新镜像重建容器，数据目录不动。
+const copied = ref(false);
+async function copyFallback() {
+  try {
+    await navigator.clipboard.writeText(dockerSshFallback);
+    copied.value = true;
+    setTimeout(() => (copied.value = false), 1800);
+  } catch {
+    /* 非安全上下文没有 clipboard API，用户手动选中复制即可 */
+  }
+}
 
 const lastChecked = computed(() => {
   if (!lastCheckedAt.value) return "";
@@ -64,7 +82,9 @@ async function onCheck() {
   return manualCheck();
 }
 async function onApply() {
-  if (isDockerMode.value) return dockerApply();
+  // 容器线：已是最新时这个按钮是「重新安装当前版本」→ 必须带 force，
+  // 否则 update.sh 的版本比对会直接判「已是最新」原地返回，用户看着像没反应。
+  if (isDockerMode.value) return dockerApply(!dockerHasUpdate.value);
   return applyUpdate();
 }
 </script>
@@ -90,19 +110,17 @@ async function onApply() {
         </div>
         <button
           class="ck-btn"
-          :disabled="checking || dockerApplying"
-          :title="isDockerMode && !dockerUpdaterEnabled
-            ? '请在 docker-compose 取消注释 POLARIS_DOCKER_SOCKET=1 并挂载 /var/run/docker.sock'
-            : ''"
+          :disabled="checking || dockerChecking || dockerApplying"
+          title="去镜像源查一下有没有新版本"
           @click="onCheck"
         >
-          <!-- 主仓 v2.1.0 换用 OrbitSpinner;容器模式下 dockerApplying 也要转圈 -->
+          <!-- 主仓 v2.1.0 换用 OrbitSpinner;容器模式下 dockerChecking/dockerApplying 也要转圈 -->
           <OrbitSpinner
-            v-if="checking || dockerApplying"
+            v-if="checking || dockerChecking || dockerApplying"
             :size="15"
           />
           <RefreshCw v-else :size="15" :stroke-width="2" />
-          <span>{{ checking ? "检查中…" : "检查更新" }}</span>
+          <span>{{ checking || dockerChecking ? "检查中…" : "检查更新" }}</span>
         </button>
       </div>
 
@@ -144,42 +162,61 @@ async function onApply() {
           <span>已是最新版本</span>
         </div>
 
-        <!-- Docker 模式专属面板：一键更新到 GHCR 最新 -->
-        <div v-else-if="isDockerMode" class="docker-panel">
+        <!-- Docker 模式专属面板：查远端版本 + 一键换镜像 -->
+        <div v-else-if="isDockerMode" class="docker-panel" :class="{ hot: dockerHasUpdate }">
           <div class="dp-top">
-            <span class="dp-badge"><Container :size="18" :stroke-width="1.7" /></span>
+            <span class="dp-badge"><Sparkles v-if="dockerHasUpdate" :size="18" :stroke-width="1.7" /><Container v-else :size="18" :stroke-width="1.7" /></span>
             <div>
-              <div class="dp-title">Docker 容器版</div>
+              <div class="dp-title">
+                <template v-if="dockerHasUpdate">发现新版本 <b>v{{ dockerLatest }}</b></template>
+                <template v-else-if="dockerCheckInfo?.ok">已是最新版本</template>
+                <template v-else>Docker 容器版</template>
+              </div>
               <div class="dp-hint">
-                <template v-if="dockerUpdaterEnabled">
-                  点「立即更新」会后台拉取新镜像并自动重建容器（数据卷保留）。
+                <!-- ① 查不到远端版本（多半是容器不通外网） -->
+                <template v-if="dockerCheckInfo && !dockerCheckInfo.ok">
+                  ⚠️ {{ dockerCheckInfo.error || "拉不到更新清单" }}
                 </template>
-                <template v-else>
-                  <b>Web 一键更新未启用</b>。请在 <code>docker-compose.synology.yml</code> 取消注释
-                  <code>POLARIS_DOCKER_SOCKET="1"</code> 与
-                  <code>/var/run/docker.sock</code> 挂载,重建容器后此处变可点。
-                  <br />或者在终端跑 <code>./update.sh</code>(仓库自带) 手动更新。
+                <!-- ② 有新版 + 能一键装 -->
+                <template v-else-if="dockerHasUpdate && dockerUpdaterEnabled">
+                  点「立即更新」后台下载新镜像（Cloudflare / GitHub 多个源自动挑一个能用的）、
+                  校验完整性后重建容器，<b>数据目录不动</b>；失败会自动回滚到现在这版。
                 </template>
+                <!-- ③ 有新版但没挂 docker.sock：给等价的一行命令，别只丢一个灰按钮 -->
+                <template v-else-if="dockerHasUpdate">
+                  这个容器没挂 <code>/var/run/docker.sock</code>，没法自己换镜像。
+                  SSH 到 NAS 粘下面这行即可（等价于点更新，数据目录不动）：
+                </template>
+                <!-- ④ 已最新 -->
+                <template v-else-if="dockerCheckInfo?.ok">
+                  当前 v{{ dockerCheckInfo.current }}，与镜像源上的最新版一致。
+                </template>
+                <template v-else>点右上角「检查更新」看看有没有新版本。</template>
               </div>
             </div>
+          </div>
+
+          <!-- 没挂 sock 的兜底命令（可复制） -->
+          <div v-if="!dockerUpdaterEnabled && dockerStatus" class="dp-fallback">
+            <code>{{ dockerSshFallback }}</code>
+            <button class="cp-btn" @click="copyFallback">{{ copied ? "已复制" : "复制" }}</button>
           </div>
 
           <div v-if="dockerLastApply" class="dp-result" :class="{ ok: dockerLastApply.success, err: !dockerLastApply.success }">
             <div v-if="dockerLastApply.error">❌ {{ dockerLastApply.error }}</div>
             <div v-else-if="dockerLastApply.success">
-              ✅ update.sh 已执行(exit={{ dockerLastApply.exit_code }})。容器马上会被替换,
-              HTTP 短暂断开,稍等几秒刷新即可。
+              ✅ 替身容器已出发(exit={{ dockerLastApply.exit_code }})。下载+校验完成后当前容器会被替换,
+              期间 HTTP 断开,过 1~5 分钟刷新页面即可。
             </div>
             <pre v-if="dockerLastApply.stdout" class="dp-stdout">{{ dockerLastApply.stdout }}</pre>
             <pre v-if="dockerLastApply.stderr" class="dp-stderr">{{ dockerLastApply.stderr }}</pre>
           </div>
 
           <button
+            v-if="dockerUpdaterEnabled"
             class="go-btn"
-            :disabled="!dockerUpdaterEnabled || dockerApplying"
-            :title="!dockerUpdaterEnabled
-              ? '未启用 docker 一键更新'
-              : '拉取新镜像并重建容器'"
+            :disabled="dockerApplying"
+            :title="dockerHasUpdate ? '下载新镜像并重建容器' : '重新装一遍当前版本'"
             @click="onApply"
           >
             <LoaderCircle
@@ -189,7 +226,7 @@ async function onApply() {
               class="spin"
             />
             <Rocket v-else :size="15" :stroke-width="1.9" />
-            <span>{{ dockerApplying ? "更新中…" : "立即更新" }}</span>
+            <span>{{ dockerApplying ? "更新中…" : dockerHasUpdate ? "立即更新" : "重新安装当前版本" }}</span>
           </button>
         </div>
 
@@ -221,11 +258,15 @@ async function onApply() {
           <li>后台静默下载并安装，<b>自动重启</b>到新版 —— 无需手动重装</li>
         </ol>
         <ol v-else>
-          <li>本镜像由 GitHub Actions 自动构建并推送到 <b>ghcr.io/wuli2025/polaris</b></li>
-          <li>启用 docker 一键更新后,点「立即更新」会执行 <code>update.sh</code>:
-              <code>docker compose pull</code> + <code>up -d</code></li>
-          <li>容器重建会保留数据卷(<code>polaris-data/claude/config</code>);HTTP 短暂断开,几秒后刷新即可</li>
-          <li>未启用一键更新?在终端跑 <code>./update.sh</code> 也行,或看 <a href="https://github.com/wuli2025/polaris_docker" target="_blank">仓库说明</a></li>
+          <li>「检查更新」会依次问几个镜像源要版本清单：
+              <b>Cloudflare</b>(llmwiki.cloud) → <b>GitHub Release</b> → 国内加速镜像。
+              任何一条活着就查得到，不依赖 GHCR、不用登录</li>
+          <li>点「立即更新」后，容器会派一个<b>替身容器</b>去干活（不能在被换掉的容器里换自己）：
+              下载镜像体 → <code>sha256</code> 校验 → <code>docker load</code> → 按原配置重建</li>
+          <li>数据目录/卷原样带回，端口、内存、环境变量都按老容器复刻；
+              新版起不来会<b>自动回滚</b>到旧镜像，不会把你晾在宕机状态</li>
+          <li>下载中途断网没关系：分片并行 + 断点续传，重下只补缺的那段；
+              校验不过宁可失败也不会装一个残包</li>
         </ol>
       </div>
     </div>
@@ -507,6 +548,45 @@ async function onApply() {
   padding: 1px 5px;
   border-radius: 4px;
   font-size: 11px;
+}
+/* 有新版时整块提亮，和桌面端「发现新版本」卡片同一个视觉重量 */
+.docker-panel.hot {
+  background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+}
+.docker-panel.hot .dp-title b {
+  color: var(--primary);
+}
+.dp-fallback {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-radius: 8px;
+}
+.dp-fallback code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  color: var(--text-2);
+}
+.cp-btn {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+.cp-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
 }
 .dp-result {
   margin-top: 12px;

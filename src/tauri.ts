@@ -114,6 +114,24 @@ async function tokenRejected(): Promise<boolean> {
   }
 }
 
+/** 后端 /api/auth/state 的形状（不鉴权，任何人都能问）。 */
+type AuthState = {
+  initialized: boolean;
+  env_managed: boolean;
+  can_setup: boolean;
+  open_to_me: boolean;
+};
+
+async function fetchAuthState(): Promise<AuthState | null> {
+  try {
+    const r = await fetch("/api/auth/state", { cache: "no-store" });
+    if (!r.ok) return null;
+    return (await r.json()) as AuthState;
+  } catch {
+    return null;
+  }
+}
+
 let tokenGate: Promise<void> | null = null;
 /** 用户点「稍后」之后的冷静期：期间不再自动弹框，避免连环 401 把弹窗顶回来。 */
 let tokenPromptDismissedAt = 0;
@@ -126,9 +144,27 @@ function requireToken(): Promise<void> {
     return Promise.resolve();
   tokenGate = (async () => {
     try {
+      // 机器压根没设口令却还是 401 → 让他输是无解的，因为根本不存在可输的口令。
+      // 这种组合只可能出自主机侧的显式配置（POLARIS_REQUIRE_LOGIN=1 要求登录账号，
+      // 或 POLARIS_LAN_ONLY=1 只放行内网来源）。直说该怎么办，别把人卡在一个死框里。
+      const st = await fetchAuthState();
+      if (st && !st.initialized) {
+        await askTokenOnce({
+          title: "该主机不接受匿名访问",
+          desc:
+            "这台北极星没有设访问口令，但主机侧要求登录账号（POLARIS_REQUIRE_LOGIN），" +
+            "或只放行局域网 / Tailscale 来源（POLARIS_LAN_ONLY）。请用团队账号登录，" +
+            "或从它的局域网内打开。",
+          okText: "知道了",
+          laterText: "",
+          hideInput: true,
+        });
+        tokenPromptDismissedAt = Date.now();
+        return;
+      }
       let errMsg: string | undefined;
       for (;;) {
-        const t = await askTokenOnce(errMsg);
+        const t = await askTokenOnce({ errMsg });
         if (t === null) {
           tokenPromptDismissedAt = Date.now();
           return;
@@ -152,8 +188,34 @@ function requireToken(): Promise<void> {
   return tokenGate;
 }
 
-/** 弹一次口令输入框（自绘 DOM，不依赖 Vue，双主题下都可读）。resolve(null)=用户点「稍后」。 */
-function askTokenOnce(errMsg?: string): Promise<string | null> {
+type TokenDialogOpts = {
+  title?: string;
+  desc?: string;
+  okText?: string;
+  /** 空串 = 不显示这个次要按钮。 */
+  laterText?: string;
+  placeholder?: string;
+  autocomplete?: string;
+  errMsg?: string;
+  /** 纯告知型弹框（如「该主机不接受匿名访问」），不收输入。 */
+  hideInput?: boolean;
+};
+
+/**
+ * 弹一次口令框（自绘 DOM，不依赖 Vue，双主题下都可读）。
+ * 两种用途共用：① 输入既有口令 ② 纯告知。resolve(null) = 用户点了次要按钮/关闭。
+ */
+function askTokenOnce(opts: TokenDialogOpts = {}): Promise<string | null> {
+  const {
+    title = "输入访问口令",
+    desc = "这台北极星设置了访问口令。输入一次，本浏览器会记住。",
+    okText = "进入",
+    laterText = "稍后",
+    placeholder = "访问口令",
+    autocomplete = "current-password",
+    errMsg,
+    hideInput = false,
+  } = opts;
   return new Promise((resolve) => {
     const wrap = document.createElement("div");
     wrap.style.cssText =
@@ -164,44 +226,63 @@ function askTokenOnce(errMsg?: string): Promise<string | null> {
       "width:min(340px,86vw);padding:26px 24px;border-radius:18px;background:rgba(28,30,38,.94);" +
       "border:1px solid rgba(255,255,255,.1);box-shadow:0 24px 64px rgba(0,0,0,.4);" +
       "font:14px/1.6 system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#f5f6f8";
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     card.innerHTML =
-      '<div style="font-size:17px;font-weight:600;margin-bottom:6px">输入访问口令</div>' +
-      '<div style="opacity:.65;margin-bottom:14px">这台北极星设置了访问口令（POLARIS_AUTH_TOKEN）。输入一次，本浏览器会记住。</div>' +
+      '<div style="font-size:17px;font-weight:600;margin-bottom:6px">' +
+      esc(title) +
+      "</div>" +
+      '<div style="opacity:.65;margin-bottom:14px">' +
+      esc(desc) +
+      "</div>" +
       (errMsg
-        ? '<div style="color:#ff8f8f;margin-bottom:10px">' + errMsg + "</div>"
+        ? '<div style="color:#ff8f8f;margin-bottom:10px">' + esc(errMsg) + "</div>"
         : "") +
-      '<input type="password" placeholder="访问口令" autocomplete="current-password" ' +
-      'style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;' +
-      "border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:inherit;" +
-      'outline:none;font-size:14px" />' +
+      (hideInput
+        ? ""
+        : '<input type="password" placeholder="' +
+          esc(placeholder) +
+          '" autocomplete="' +
+          esc(autocomplete) +
+          '" ' +
+          'style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;' +
+          "border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:inherit;" +
+          'outline:none;font-size:14px" />') +
       '<div style="display:flex;gap:10px;margin-top:16px">' +
       '<button data-act="ok" style="flex:1;padding:10px 0;border:none;border-radius:10px;' +
-      'background:#4c7dff;color:#fff;font-size:14px;font-weight:600;cursor:pointer">进入</button>' +
-      '<button data-act="later" style="padding:10px 14px;border:1px solid rgba(255,255,255,.15);' +
-      'border-radius:10px;background:transparent;color:inherit;opacity:.7;cursor:pointer">稍后</button>' +
+      'background:#4c7dff;color:#fff;font-size:14px;font-weight:600;cursor:pointer">' +
+      esc(okText) +
+      "</button>" +
+      (laterText
+        ? '<button data-act="later" style="padding:10px 14px;border:1px solid rgba(255,255,255,.15);' +
+          'border-radius:10px;background:transparent;color:inherit;opacity:.7;cursor:pointer">' +
+          esc(laterText) +
+          "</button>"
+        : "") +
       "</div>";
     wrap.appendChild(card);
-    const input = card.querySelector("input")!;
+    const input = card.querySelector("input");
     const done = (v: string | null) => {
       wrap.remove();
       resolve(v);
     };
     card.querySelector('[data-act="ok"]')!.addEventListener("click", () => {
+      if (!input) return done(null); // 纯告知型：「知道了」即关闭
       const v = input.value.trim();
       if (v) done(v);
       else input.focus();
     });
     card
-      .querySelector('[data-act="later"]')!
-      .addEventListener("click", () => done(null));
-    input.addEventListener("keydown", (e) => {
+      .querySelector('[data-act="later"]')
+      ?.addEventListener("click", () => done(null));
+    input?.addEventListener("keydown", (e) => {
       if ((e as KeyboardEvent).key === "Enter") {
         const v = input.value.trim();
         if (v) done(v);
       }
     });
     document.body.appendChild(wrap);
-    input.focus();
+    input?.focus();
   });
 }
 

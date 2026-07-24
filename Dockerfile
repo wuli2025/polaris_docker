@@ -183,12 +183,24 @@ RUN echo "${POLARIS_VERSION}" > /app/VERSION.bak \
        fi
 # docker CLI + compose 插件:容器内一键更新(update.sh 替身模式)要真 CLI 操作宿主 daemon。
 # 纯客户端不装 daemon(docker-ce-cli ~50MB + compose-plugin ~60MB)。
-# 源用清华 TUNA 镜像:Windows 构建机(中国网络)和 GitHub Actions 都可达。
+# 源按序试:国内镜像(阿里/中科大/腾讯)优先给中国构建机,官方 download.docker.com 兜底给
+# GitHub Actions。★ 原来写死清华 TUNA,2026-07-25 它对 /docker-ce/ 开始回 403,构建直接挂 ——
+# 单一源就是单点故障,这里改成谁通用谁。
 RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian bookworm stable" \
-        > /etc/apt/sources.list.d/docker.list \
-    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && for M in https://mirrors.aliyun.com/docker-ce \
+                https://mirrors.ustc.edu.cn/docker-ce \
+                https://mirrors.cloud.tencent.com/docker-ce \
+                https://mirrors.tuna.tsinghua.edu.cn/docker-ce \
+                https://download.docker.com ; do \
+         echo "[docker-cli] 试源 $M"; \
+         curl -fsSL --max-time 90 "$M/linux/debian/gpg" -o /etc/apt/keyrings/docker.asc || continue; \
+         echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] $M/linux/debian bookworm stable" \
+             > /etc/apt/sources.list.d/docker.list; \
+         if apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin; then \
+           DOCKER_CLI_OK=1; echo "[docker-cli] 用了 $M"; break; \
+         fi; \
+       done; \
+       [ -n "${DOCKER_CLI_OK:-}" ] || { echo "[docker-cli] ❌ 所有 docker-ce 源都不可用"; exit 1; } \
     && rm -rf /var/lib/apt/lists/*
 
 # update.sh 拷进镜像 → /usr/local/bin/update.sh;容器内 spawn 它派出替身容器完成 pull+重建。

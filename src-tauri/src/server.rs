@@ -32,6 +32,8 @@ pub struct AppState {
     pub app: AppHandle,
     pub tx: broadcast::Sender<Event>,
     pub auth_token: Arc<Option<String>>,
+    /// 与 ApiState 同名字段同义:没设 POLARIS_AUTH_TOKEN → 免口令。见 apihub::origin_gate。
+    pub open_no_auth: bool,
     pub web_dir: PathBuf,
     readiness: Arc<ReadinessState>,
 }
@@ -111,30 +113,36 @@ pub async fn serve() -> anyhow::Result<()> {
     let explicit = std::env::var("POLARIS_AUTH_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
-    let allow_open = std::env::var("POLARIS_ALLOW_OPEN")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    // 安全默认:未设口令且未显式选择开放 → **自动生成本次随机口令并打印**,而不是裸奔对所有
-    // 网络开放(旧默认会合成 owner 全放行,而 /api/invoke 能触到 docker_update/provider_save 等
-    // 高危命令)。要固定口令设 POLARIS_AUTH_TOKEN;要维持旧的「无口令全开放」显式设 POLARIS_ALLOW_OPEN=1。
+    // 默认**不要访问口令**(2026-07-25 起,整段取舍见 apihub.rs「为什么默认不要访问口令」):
+    // NAS 挂在家用路由 NAT 后面、地址还是动态的,公网连不上;而口令没人记得住,忘了又
+    // 没有找回入口,实际效果只是把用户锁在自己的软件外面。要上锁走 POLARIS_AUTH_TOKEN
+    // (所有来源一律校验)或 POLARIS_REQUIRE_LOGIN=1(按账号管权限),两者都是管理员的
+    // 显式动作。POLARIS_ALLOW_OPEN 现在就是默认行为,留着不报错、也不必再设。
+    let mut open_no_auth = false;
     let auth_token = match explicit {
         Some(t) => {
-            println!("[polaris-server] 已启用访问口令 (POLARIS_AUTH_TOKEN)");
+            println!("[polaris-server] 已启用访问口令 (POLARIS_AUTH_TOKEN),所有来源一律校验");
             Some(t)
         }
-        None if allow_open => {
-            println!("[polaris-server] ⚠ POLARIS_ALLOW_OPEN=1:未设口令,服务对所有可达网络开放(请仅在完全可信网络使用)");
-            None
-        }
         None => {
-            let gen = crate::collab::auth::random_token();
-            println!("[polaris-server] 🔐 未设 POLARIS_AUTH_TOKEN,已自动生成本次访问口令:");
-            println!("[polaris-server]     {gen}");
-            println!("[polaris-server]     客户端用此口令连接;固定口令请设 POLARIS_AUTH_TOKEN,");
-            println!(
-                "[polaris-server]     要维持旧的「无口令全开放」请显式设 POLARIS_ALLOW_OPEN=1。"
-            );
-            Some(gen)
+            open_no_auth = true;
+            if std::env::var("POLARIS_REQUIRE_LOGIN")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            {
+                println!(
+                    "[polaris-server] 🔐 POLARIS_REQUIRE_LOGIN=1:未设口令,但所有请求都要登录账号"
+                );
+            } else if std::env::var("POLARIS_LAN_ONLY")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            {
+                println!("[polaris-server] 🔓 免口令模式(POLARIS_LAN_ONLY=1):局域网 / Tailscale 内直接进,公网来源拒绝");
+            } else {
+                println!(
+                    "[polaris-server] 🔓 免口令模式:任何能连上的来源都可直接使用,不弹口令框。"
+                );
+                println!("[polaris-server]     要上锁请设 POLARIS_AUTH_TOKEN=<口令>,或 POLARIS_REQUIRE_LOGIN=1 走账号登录。");
+            }
+            None
         }
     };
 
@@ -146,6 +154,7 @@ pub async fn serve() -> anyhow::Result<()> {
         app: app.clone(),
         tx: tx.clone(),
         auth_token: auth_token.clone(),
+        open_no_auth,
         web_dir: web_dir.clone(),
         readiness: Arc::new(ReadinessState {
             data_root,
@@ -158,6 +167,7 @@ pub async fn serve() -> anyhow::Result<()> {
         app: app.clone(),
         tx: tx.clone(),
         auth_token: auth_token.clone(),
+        open_no_auth,
     };
 
     let port: u16 = std::env::var("POLARIS_PORT")
@@ -211,7 +221,13 @@ pub async fn serve() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut server_task = tokio::spawn(async move {
-        axum::serve(listener, app_router)
+        // into_make_service_with_connect_info:把 TCP 对端地址塞进请求扩展,鉴权层据此
+        // 判「内网免口令」(apihub::origin_gate)。少了它 ConnectInfo 恒 None → 一律按公网
+        // 处理 → 家用 NAS 用户照样被口令挡在门外,这条修复整个失效。
+        axum::serve(
+            listener,
+            app_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
@@ -269,9 +285,14 @@ async fn shutdown_signal() {
 static STATUS_CACHE: Lazy<tokio::sync::Mutex<Option<(Instant, Value)>>> =
     Lazy::new(|| tokio::sync::Mutex::new(None));
 
-async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn status(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     // 鉴权复用 apihub 的基础面解析(与 /api/invoke 同语义);role_rank 在 collab::http。
-    let Some(ctx) = crate::apihub::app_ctx_headers(&state.auth_token, &headers) else {
+    let gate = crate::apihub::server_origin_gate(state.open_no_auth, peer.map(|c| c.0), &headers);
+    let Some(ctx) = crate::apihub::app_ctx_headers(&state.auth_token, &headers, gate) else {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":"未授权"}))).into_response();
     };
     if crate::collab::http::role_rank(&ctx.role) < 3 {
@@ -281,7 +302,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         )
             .into_response();
     }
-    let auth_set = state.auth_token.is_some();
+    // 生效口令只认环境变量(历史落盘的那把已作废),运维水位要如实反映。
+    let auth_set = crate::apihub::effective_token(&state.auth_token).is_some();
     let init_errors = state.readiness.init_errors.clone();
     let mut cache = STATUS_CACHE.lock().await;
     if let Some((at, value)) = cache.as_ref() {
@@ -456,11 +478,15 @@ async fn version_info() -> Response {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    // ★ 与 apihub::docker_updater_bits 同一把尺子:挂了 docker.sock + 镜像里有 update.sh
+    //   就算「能自更新」。以前这里单看 POLARIS_DOCKER_SOCKET==1,而群晖图形界面装的容器
+    //   没人会去加那个环境变量 → 前端拿到 updater_enabled:false → 按钮恒灰。
+    let (updater_enabled, socket_present, _) = crate::apihub::docker_updater_bits();
     Json(json!({
         "version": version,
         "flavor": "docker",
-        "updater_enabled": std::env::var("POLARIS_DOCKER_SOCKET").map(|v| v == "1").unwrap_or(false),
-        "socket_present": std::path::Path::new("/var/run/docker.sock").exists(),
+        "updater_enabled": updater_enabled,
+        "socket_present": socket_present,
     }))
     .into_response()
 }

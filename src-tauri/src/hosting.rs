@@ -180,6 +180,10 @@ pub async fn start_core(
             app,
             tx: tx.clone(),
             auth_token: auth_arc.clone(),
+            // 恒 false:桌面主机的入场券是分享码里那把口令(上面 access_token),它就在
+            // 分享码里、用户复制粘贴即得,不存在「忘了被锁死」的问题,故不走 Docker 那套
+            // 免口令。远端成员还经 iroh 隧道转到本机 127.0.0.1,来源判定也认不出谁是谁。
+            open_no_auth: false,
         };
         router = router.merge(api_router(api_state));
     }
