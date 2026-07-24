@@ -248,6 +248,11 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# 版本标签 —— 容器内 update.sh 靠 `docker inspect .Config.Labels["org.polaris.version"]`
+# 与 R2 清单里的 version 比对做「已是最新就跳过」的幂等判断。此前没打这个标签,
+# 取到的恒为空 → 每次点网页「一键更新」都把整包重下一遍。放在末尾:只失效元数据层。
+LABEL org.polaris.version="${POLARIS_VERSION}"
+
 EXPOSE 8080
 # tini -g 杀进程组(SIGTERM 给整个进程组而非只 tini 直接子进程);
 # sh -c 套 chromiumoxide/chromium 启动时,sh 退出后子进程会变孤儿,-g 一次穿透
