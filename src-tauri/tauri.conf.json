@@ -5,7 +5,7 @@
   "identifier": "com.polaris.app",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build && node scripts/fetch-runtimes.mjs",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://127.0.0.1:1421",
     "frontendDist": "../dist"
   },
@@ -47,8 +47,7 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": [
-      "resources/seed-kb/**/*",
-      "runtime/**/*"
+      "resources/seed-kb/**/*"
     ],
     "icon": [
       "icons/32x32.png",
