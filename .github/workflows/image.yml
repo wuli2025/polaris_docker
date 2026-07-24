@@ -48,6 +48,7 @@ jobs:
           context: .
           build-args: |
             POLARIS_RENDER=0
+            POLARIS_VERSION=${{ steps.ver.outputs.v }}
           push: true
           platforms: linux/amd64
           tags: |
@@ -65,6 +66,7 @@ jobs:
           context: .
           build-args: |
             POLARIS_RENDER=1
+            POLARIS_VERSION=${{ steps.ver.outputs.v }}
           push: true
           platforms: linux/amd64
           tags: |
