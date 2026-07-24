@@ -5815,7 +5815,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-app"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5828,6 +5828,8 @@ dependencies = [
  "enigo",
  "futures-util",
  "getrandom 0.2.17",
+ "hyper",
+ "hyper-util",
  "include_dir",
  "libc",
  "once_cell",
@@ -5869,7 +5871,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-cli"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "polaris-app",
  "serde_json",

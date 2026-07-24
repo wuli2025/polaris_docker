@@ -70,6 +70,12 @@ def list_weixin():
 
 
 def main():
+    # macOS 走内存扫描抓 key 的独立流程（不能注入 DLL）
+    if sys.platform == "darwin":
+        import wx_mac
+        wx_mac.setup()
+        return
+
     cfg = load_config()
     dll_path = os.path.join(cfg["wx_key_dir"], "data", "flutter_assets", "assets", "dll", "wx_key.dll")
     weixin = cfg["weixin_exe"]

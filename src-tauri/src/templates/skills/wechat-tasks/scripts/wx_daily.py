@@ -34,18 +34,29 @@ def load_config():
         return json.load(f)
 
 
-# ───────────────────────── kb_root 解析（写晨报用）─────────────────────────
+# ───────────────────────── kb_root 解析（写晨报用，跨平台）─────────────────────────
+def _settings_candidates():
+    home = os.path.expanduser("~")
+    return [
+        # Windows: %APPDATA%\polaris\polaris-app\config\settings.json
+        os.path.join(os.environ.get("APPDATA", ""), "polaris", "polaris-app", "config", "settings.json"),
+        # macOS: ~/Library/Application Support/com.polaris.polaris-app/settings.json
+        os.path.join(home, "Library", "Application Support", "com.polaris.polaris-app", "settings.json"),
+        # Linux(XDG): ~/.config/polaris-app/settings.json
+        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(home, ".config")), "polaris-app", "settings.json"),
+    ]
+
+
 def resolve_kb_root():
-    appdata = os.environ.get("APPDATA", "")
-    settings = os.path.join(appdata, "polaris", "polaris-app", "config", "settings.json")
-    try:
-        with open(settings, encoding="utf-8") as f:
-            kr = json.load(f).get("kb_root")
-            if kr and os.path.isdir(kr):
-                return kr
-    except Exception:
-        pass
-    return os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Polaris", "PolarisKB")
+    for settings in _settings_candidates():
+        try:
+            with open(settings, encoding="utf-8") as f:
+                kr = json.load(f).get("kb_root")
+                if kr and os.path.isdir(kr):
+                    return kr
+        except Exception:
+            continue
+    return os.path.join(os.path.expanduser("~"), "Polaris", "PolarisKB")
 
 
 # ───────────────────────── master key 有效性校验（纯标准库）─────────────────────────
@@ -278,26 +289,43 @@ def write_briefing(kb_root, sugs):
     return path
 
 
+def _reauth_briefing(reason_how):
+    kb = resolve_kb_root()
+    p = write_briefing(kb, [{
+        "id": "wx-reauth", "title": "微信授权已过期，请重新授权",
+        "kind": "organize", "source": "微信待办",
+        "why": "缓存的微信密钥对当前数据库校验失败（通常是微信重新登录过）。",
+        "how": reason_how,
+        "action": "微信每日待办的密钥失效了，请指导我重新运行 wx_setup.py 完成授权。",
+        "dismissed": False,
+    }])
+    log(f"[!] 密钥失效，已写「重新授权」提醒 → {p}")
+
+
 def main():
     cfg = load_config()
     no_export = "--no-export" in sys.argv
+    is_mac = sys.platform == "darwin"
 
     if not no_export:
-        if not master_still_valid(cfg):
-            # key 失效（多半是重新登录过）——给一条「重新授权」的待办，别静默失败
-            kb = resolve_kb_root()
-            p = write_briefing(kb, [{
-                "id": "wx-reauth", "title": "微信授权已过期，请重新授权",
-                "kind": "organize", "source": "微信待办",
-                "why": "缓存的微信密钥对当前数据库校验失败（通常是微信重新登录过）。",
-                "how": "在技能中心打开「微信聊天 · 每日待办」，或运行 wx_setup.py 重新抓取一次密钥（会重启微信让你扫码登录）。",
-                "action": "微信每日待办的密钥失效了，请指导我重新运行 wx_setup.py 完成授权。",
-                "dismissed": False,
-            }])
-            log(f"[!] master key 失效，已写「重新授权」提醒 → {p}")
-            sys.exit(3)
-        log("[1/3] 密钥有效，开始解密 + 导出当前微信库 …")
-        run_pipeline(cfg)
+        if is_mac:
+            # macOS：per-db key，免 sudo 复用缓存；校验+解密+导出走 wx_mac
+            import wx_mac
+            storage = cfg.get("data_dir") or (wx_mac.find_data_dirs() or [None])[0]
+            if not storage or not wx_mac.keys_still_valid(cfg, storage):
+                _reauth_briefing("在技能中心打开「微信聊天 · 每日待办」，或在终端运行 "
+                                 "`python <技能目录>/scripts/wx_setup.py` 重新抓一次密钥"
+                                 "（会让你在微信登录进主界面后扫内存）。")
+                sys.exit(3)
+            log("[1/3] 密钥有效，开始解密 + 导出当前微信库（免 sudo）…")
+            wx_mac.run_pipeline(cfg)
+        else:
+            if not master_still_valid(cfg):
+                _reauth_briefing("在技能中心打开「微信聊天 · 每日待办」，或运行 wx_setup.py "
+                                 "重新抓取一次密钥（会重启微信让你扫码登录）。")
+                sys.exit(3)
+            log("[1/3] 密钥有效，开始解密 + 导出当前微信库 …")
+            run_pipeline(cfg)
     else:
         log("[1/3] 跳过解密导出（--no-export）")
 

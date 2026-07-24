@@ -368,5 +368,14 @@ fn write_wechat_tasks_files(dest: &Path) -> Result<(), String> {
         WECHAT_TASKS_CONFIG_EXAMPLE,
     )
     .map_err(|e| e.to_string())?;
+    // macOS 专属文件：wx_mac.py 与内存扫描器源码（放 scripts/mac/，首次运行 cc 编译）。
+    fs::write(scripts.join("wx_mac.py"), WECHAT_TASKS_MAC_PY).map_err(|e| e.to_string())?;
+    let mac_dir = scripts.join("mac");
+    fs::create_dir_all(&mac_dir).map_err(|e| e.to_string())?;
+    fs::write(
+        mac_dir.join("find_all_keys_macos.c"),
+        WECHAT_TASKS_MAC_SCANNER_C,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }

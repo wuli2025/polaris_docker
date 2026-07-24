@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "2.5.1"
+version = "2.6.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -42,6 +42,10 @@ axum = { version = "0.7", features = ["ws", "multipart"], optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", features = ["fs", "cors", "trace"], optional = true }
 futures-util = { version = "0.3", optional = true }
+# 应用直投的 WebSocket/Upgrade 透传:要拿 hyper 的 OnUpgrade 扩展 + TokioIo 适配器。
+# 两者本就在 axum 0.7 的依赖树里(hyper 1.x / hyper-util 0.1),显式声明不引入新编译量。
+hyper = { version = "1", optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -175,7 +179,7 @@ custom-protocol = ["tauri?/custom-protocol"]
 # collab-host 提供共用的协作路由(collab/http.rs)与全部 axum 依赖。
 server = ["collab-host", "polaris-fable/server"]
 # 协作路由双壳共用(collab crate 的 http.rs)+ 壳件 apihub/hosting 所需 HTTP 依赖。
-collab-host = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util", "polaris-collab/collab-host"]
+collab-host = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util", "dep:hyper", "dep:hyper-util", "polaris-collab/collab-host"]
 # 语音识别运行时:本地 SenseVoice(sherpa-onnx),**桌面 / Docker server 皆可**。
 # 只拉 sherpa-rs,不含麦克风/热键/注入 → Docker server 可开它跑「浏览器上传音频→服务端识别」。
 # 默认不开(保护 build + 镜像体积),实测/发版显式开 `--features voice-asr`。

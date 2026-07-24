@@ -260,8 +260,9 @@ pub(crate) const BROWSER_USE_RUNNER: &str =
 // + scripts/wx_config.example.json。脚本纯 stdlib，解密导出 shell 到 wechat-decrypt 的 venv。
 // 和其它多文件技能同套路：编译期内嵌、启动确保落到 ~/Polaris/skills（版本号比对覆盖）。
 pub(crate) const WECHAT_TASKS_ID: &str = "wechat-tasks";
-// 改动 SKILL.md / wx_daily.py / wx_setup.py 后必须 +1，让已安装用户下次启动拿到更新。
-pub(crate) const WECHAT_TASKS_VERSION: &str = "1";
+// 改动 SKILL.md / wx_daily.py / wx_setup.py / wx_mac.py / find_all_keys_macos.c 后必须 +1，
+// 让已安装用户下次启动拿到更新。v2：新增 macOS 支持（内存扫描抓 key + 自包含解密导出）。
+pub(crate) const WECHAT_TASKS_VERSION: &str = "2";
 pub(crate) const WECHAT_TASKS_SKILL_MD: &str =
     include_str!("../../../../src/templates/skills/wechat-tasks/SKILL.md");
 pub(crate) const WECHAT_TASKS_DAILY_PY: &str =
@@ -270,6 +271,11 @@ pub(crate) const WECHAT_TASKS_SETUP_PY: &str =
     include_str!("../../../../src/templates/skills/wechat-tasks/scripts/wx_setup.py");
 pub(crate) const WECHAT_TASKS_CONFIG_EXAMPLE: &str =
     include_str!("../../../../src/templates/skills/wechat-tasks/scripts/wx_config.example.json");
+// macOS 专属：自包含解密/导出流程模块 + Mach VM 内存抓 key 扫描器（源码，首次运行 cc 编译）。
+pub(crate) const WECHAT_TASKS_MAC_PY: &str =
+    include_str!("../../../../src/templates/skills/wechat-tasks/scripts/wx_mac.py");
+pub(crate) const WECHAT_TASKS_MAC_SCANNER_C: &str =
+    include_str!("../../../../src/templates/skills/wechat-tasks/scripts/mac/find_all_keys_macos.c");
 
 // ───────── 「项目检测」多文件技能(协作检查闸的默认检查项,编译期内嵌,启动落盘)─────────
 // SKILL.md(声明 check_entry_* / check_timeout_secs 检查协议)+ scripts/check.ps1 + check.sh。
