@@ -200,7 +200,27 @@ pub async fn serve() -> anyhow::Result<()> {
         // /api/collab/* 与 /git/* 全部路由(crate::collab::http,双壳共用)。
         // 三者都是 Router<()>(各自 with_state),merge 在后;layer 在 merge 之后 →
         // 下面的 body 上限与 CORS 同样罩住数据面与协作端点。
-        .merge(crate::collab::http::collab_router(collab_state, false))
+        //
+        // 那层 from_fn:把「本机免口令 + 这条请求的来源够格」算好塞进请求扩展，
+        // 供 collab_bootstrap 读(见 collab::http::OpenGate)。免口令的 NAS 上机器没有
+        // 口令可出示，不给这条闸就永远建不出第一个账号。判定与 /api/invoke 同源，
+        // 所以 POLARIS_LAN_ONLY=1 时公网来源在这里同样进不来。
+        .merge(
+            crate::collab::http::collab_router(collab_state, false).layer(
+                axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    let peer = req
+                        .extensions()
+                        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                        .map(|c| c.0);
+                    let gate =
+                        crate::apihub::server_bootstrap_gate(open_no_auth, peer, req.headers());
+                    let mut req = req;
+                    req.extensions_mut()
+                        .insert(crate::collab::http::OpenGate(gate.is_open()));
+                    next.run(req).await
+                }),
+            ),
+        )
         // 普通 JSON/表单统一 2MB；只有 /api/upload 单独放宽到 512MB。此前把 512MB
         // 套在整棵路由上，未认证登录/bootstrap 也能迫使服务缓冲巨型请求体。
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))

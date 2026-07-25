@@ -157,6 +157,16 @@ pub(crate) struct OriginGate {
 }
 
 impl OriginGate {
+    /// 这一条请求能不能吃「免口令」这条豁免。协作面的 bootstrap 闸复用它，
+    /// 好让两个面用的是同一把尺子（含 POLARIS_LAN_ONLY 的内外网判定）。
+    /// 只有 server 壳(与单测)用得到：桌面壳不走 bootstrap 免口令那条路。
+    #[cfg(any(feature = "server", test))]
+    pub(crate) fn is_open(&self) -> bool {
+        self.enabled && self.origin_ok
+    }
+}
+
+impl OriginGate {
     /// 关死:显式设过口令的部署、exec 这类高危端点、以及一切拿不准来源的地方走它。
     pub(crate) fn closed() -> Self {
         Self {
@@ -225,6 +235,30 @@ mod origin_gate_tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// 协作面 bootstrap 复用 `is_open()` 当闸(见 server.rs 的 from_fn 层)。
+    /// 这里钉死它的两条语义：免口令且来源够格才为真；LAN_ONLY 下公网来源必须为假 ——
+    /// 否则「只放行内网」的部署会被公网来客抢注第一个 owner 账号。
+    #[test]
+    fn is_open_是免口令与来源两个条件的与() {
+        let h = HeaderMap::new();
+        let lan = Some(SocketAddr::new(ip("192.168.1.5"), 5000));
+        let wan = Some(SocketAddr::new(ip("8.8.8.8"), 5000));
+
+        // 没开免口令 → 恒假，来源再内网也不放
+        assert!(!origin_gate_with(false, false, lan, &h).is_open());
+        assert!(!origin_gate_with(false, true, lan, &h).is_open());
+
+        // 免口令 + 不分内外网(默认) → 谁都放
+        assert!(origin_gate_with(true, false, lan, &h).is_open());
+        assert!(origin_gate_with(true, false, wan, &h).is_open());
+        assert!(origin_gate_with(true, false, None, &h).is_open());
+
+        // 免口令 + LAN_ONLY → 只放内网；公网、以及拿不到对端地址的都拒
+        assert!(origin_gate_with(true, true, lan, &h).is_open());
+        assert!(!origin_gate_with(true, true, wan, &h).is_open());
+        assert!(!origin_gate_with(true, true, None, &h).is_open());
     }
 
     #[test]
@@ -462,6 +496,22 @@ pub(crate) fn server_origin_gate(
     headers: &HeaderMap,
 ) -> OriginGate {
     origin_gate(open_no_auth, peer, headers)
+}
+
+/// 协作面 `bootstrap`(建第一个账号)专用的来源闸。
+///
+/// 与 [`server_origin_gate`] 只差一点：**不看 `POLARIS_REQUIRE_LOGIN`**。
+/// 那个开关的意思是「所有请求都要登录账号」，可库里零账号时根本没有账号可登 ——
+/// 若连建号也按它拦掉，`REQUIRE_LOGIN=1` + 没设口令的新机器就永久锁死了
+/// (旧版靠自动生成的随机口令兜住，免口令改动把那条路撤了)。
+/// `POLARIS_LAN_ONLY` 照旧生效：它管的是「谁够得着」，与要不要登录是两回事。
+#[cfg(feature = "server")]
+pub(crate) fn server_bootstrap_gate(
+    open_no_auth: bool,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> OriginGate {
+    origin_gate_with(open_no_auth, lan_only_env(), peer, headers)
 }
 
 /// resolve_app_auth_token 的异步壳:鉴权含同步 SQLite 查询(check_session),直接跑在

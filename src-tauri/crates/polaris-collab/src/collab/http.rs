@@ -127,6 +127,16 @@ pub fn bearer_of(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+/// 「这台机器处于免口令模式，且**这一条请求**的来源够格」——由外壳(server.rs)按它
+/// 自己那套来源判定算好，经请求扩展塞进来。没有这个扩展(桌面内嵌主机 / 老调用方)
+/// 一律当 false。
+///
+/// 只有 [`collab_bootstrap`] 读它：免口令的 NAS 上机器根本没有口令可出示，
+/// 不认这条闸就永远建不出第一个账号 —— 协作/团队整条线直接锁死。
+/// 其余端点照旧只认真会话，`resolve_auth` 也绝不因此合成 owner。
+#[derive(Clone, Copy, Debug)]
+pub struct OpenGate(pub bool);
+
 /// token(header 或 ws query) → AuthCtx。None = 未授权。
 pub fn resolve_auth(auth_token: &Option<String>, token: Option<&str>) -> Option<AuthCtx> {
     // 轨② 全局口令 = owner。
@@ -234,11 +244,12 @@ fn urlencode(s: &str) -> String {
 /// 首启建 owner(仅零账号时放行,防抢注)。
 async fn collab_bootstrap(
     State(state): State<CollabState>,
+    open: Option<axum::Extension<OpenGate>>,
     headers: HeaderMap,
     Json(v): Json<Value>,
 ) -> Response {
     // loopback 不是身份边界：恶意网页可通过跨源请求扫描本机端口，本地普通进程也可直连。
-    // 所有外壳都必须持有机器初始化口令；桌面内嵌主机会生成随机口令并仅经 Tauri IPC
+    // 设了机器口令就必须出示它；桌面内嵌主机会生成随机口令并仅经 Tauri IPC
     // 交给自己的前端，绝不通过 HTTP 状态接口泄露。
     let supplied = bearer_of(&headers);
     let setup_ok = state
@@ -247,7 +258,13 @@ async fn collab_bootstrap(
         .as_ref()
         .map(|expected| supplied.as_deref() == Some(expected.as_str()))
         .unwrap_or(false);
-    if !setup_ok {
+    // ★ 免口令模式(2026-07-25 起是 Docker/NAS 的默认)：机器压根没有口令可出示，
+    //   只认上面那条的话第一个账号永远建不出来 —— 协作/团队/联邦整条线锁死。
+    //   这里认外壳算好的来源闸(它与 /api/invoke 用的是同一套判定，含 POLARIS_LAN_ONLY)。
+    //   放开的边界很窄：bootstrap 本身在 create_initial_owner 里以 IMMEDIATE 事务
+    //   原子限定「库里零账号才可建」，且这台机器的应用面早已把任何够格来源当 owner。
+    let open_ok = open.map(|e| e.0 .0).unwrap_or(false);
+    if !setup_ok && !open_ok {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"首次初始化需要服务器访问口令"})),
