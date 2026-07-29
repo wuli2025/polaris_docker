@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>北极星 · 隔空同屏 + 应用直投(V2)</title>
+<style>
+:root{
+  --bg:#0d0f14; --bg2:#141821; --card:rgba(255,255,255,.045); --line:rgba(255,255,255,.10);
+  --tx:#e9ecf3; --dim:#9aa3b5; --faint:#6a7387;
+  --a:#4c7dff; --a2:#7a5cff; --ok:#3ecf8e; --warn:#ffb454; --bad:#ff7a7a;
+  color-scheme:dark;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#f7f8fb;--bg2:#fff;--card:rgba(10,14,25,.028);--line:rgba(10,14,25,.10);
+        --tx:#161a22;--dim:#5b6478;--faint:#8b93a5;color-scheme:light}
+}
+*{box-sizing:border-box}html,body{margin:0;padding:0}
+body{
+  background:
+    radial-gradient(1100px 620px at 12% -8%, rgba(76,125,255,.20), transparent 62%),
+    radial-gradient(900px 560px at 92% 4%, rgba(122,92,255,.16), transparent 60%),
+    var(--bg);
+  color:var(--tx);
+  font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:44px 20px 90px}
+.kicker{display:inline-flex;align-items:center;gap:8px;font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;color:#fff;background:linear-gradient(135deg,var(--a),var(--a2));
+  padding:5px 12px;border-radius:999px;font-weight:700}
+h1{font-size:clamp(28px,5vw,44px);line-height:1.15;margin:18px 0 12px;font-weight:750;letter-spacing:-.02em}
+.lede{font-size:16.5px;color:var(--dim);max-width:64ch;margin:0}
+.lede b{color:var(--tx)}
+h2{font-size:21px;margin:52px 0 8px;font-weight:700;display:flex;align-items:center;gap:10px}
+h2 .n{width:26px;height:26px;flex:0 0 26px;border-radius:8px;display:grid;place-items:center;
+  font-size:13px;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--a),var(--a2))}
+h3{font-size:15px;margin:22px 0 6px;font-weight:700}
+p{margin:.6em 0}.sub{color:var(--dim);margin:0 0 18px;font-size:14px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em;
+  background:var(--card);border:1px solid var(--line);padding:.1em .4em;border-radius:5px}
+a{color:var(--a);text-decoration:none}a:hover{text-decoration:underline}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px 20px}
+.grid{display:grid;gap:14px}
+@media(min-width:760px){.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}}
+.pill{display:inline-block;font-size:11px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);
+  color:var(--dim);background:var(--card);margin-right:6px}
+.pill.ok{color:var(--ok);border-color:rgba(62,207,142,.35)}
+.pill.warn{color:var(--warn);border-color:rgba(255,180,84,.35)}
+.pill.bad{color:var(--bad);border-color:rgba(255,122,122,.35)}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:14px;margin-top:14px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:640px}
+th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--card);font-weight:700;font-size:12.5px;color:var(--dim);white-space:nowrap}
+tr:last-child td{border-bottom:none}td.k{white-space:nowrap;font-weight:600}
+.note{border-left:3px solid var(--a);padding:10px 0 10px 14px;color:var(--dim);font-size:14px;margin:16px 0;
+  background:linear-gradient(90deg,rgba(76,125,255,.07),transparent)}
+.note.warn{border-left-color:var(--warn);background:linear-gradient(90deg,rgba(255,180,84,.08),transparent)}
+.note b{color:var(--tx)}
+ul{padding-left:1.2em}li{margin:.32em 0}
+.cmp{display:grid;gap:0;border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-top:14px}
+@media(min-width:640px){.cmp{grid-template-columns:1fr 1fr}}
+.cmp>div{padding:16px 18px}
+.cmp>div:first-child{background:rgba(255,122,122,.06)}
+.cmp>div:last-child{background:rgba(62,207,142,.06);border-left:1px solid var(--line)}
+.cmp h4{margin:0 0 8px;font-size:14px}
+.cmp ul{margin:0;font-size:13px;color:var(--dim)}
+footer{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);font-size:12.5px}
+</style>
+</head>
+<body>
+<div id="beam-doc" class="wrap">
+
+<span class="kicker">Polaris · 互联层 V2</span>
+<h1>隔空同屏 + 应用直投</h1>
+<p class="lede">
+  V1 让手机与电脑<b>同看一份文件</b>。V2 再进一步:把电脑当服务器,
+  手机跑一个<b>空壳网页端</b>,直接使用电脑上<b>带后端的真实应用</b> ——
+  比远程桌面清晰、省流、可选可搜、触摸原生。这一页你正在 app 里读,
+  <b>手机横过来就自动切成电脑版式</b>。
+</p>
+
+<h2><span class="n">1</span>两个能力,一条底座</h2>
+<div class="grid g2">
+  <div class="card">
+    <span class="pill">隔空同屏 · Beam</span>
+    <h3>投一个「文件」</h3>
+    <p style="font-size:13.5px;color:var(--dim);margin:6px 0 0">
+      主机把文件打包成一页自包含网页,两端渲染同一份 HTML,滚动/指点/字号实时同步。
+      看报告、过 PPT、一起圈重点用它。<b>横屏即电脑版式。</b>
+    </p>
+  </div>
+  <div class="card" style="border-color:rgba(76,125,255,.4)">
+    <span class="pill ok">应用直投 · V2 新增</span>
+    <h3>投一个「应用」</h3>
+    <p style="font-size:13.5px;color:var(--dim);margin:6px 0 0">
+      主机把它本机在跑的 HTTP 应用反代给手机。手机上操作的是<b>真实应用本体</b>,
+      计算全在电脑。断线重连不丢状态 —— 状态在电脑上的应用里,手机只是视图。
+    </p>
+  </div>
+</div>
+<p class="sub" style="margin-top:14px">
+  两者共用同一条底座:已有的 <code>iroh</code> P2P 隧道(打洞 + relay 兜底 + mDNS)。
+  <b>都不要求同一 WiFi</b>,4G 也能用。
+</p>
+
+<h2><span class="n">2</span>比远程桌面好在哪</h2>
+<div class="cmp">
+  <div>
+    <h4>🖥️ 远程桌面(投像素)</h4>
+    <ul>
+      <li>带宽 Mbps 级,4G 下糊成一团</li>
+      <li>文字不可选、不可搜、不可复制</li>
+      <li>触摸要模拟成鼠标,别扭</li>
+      <li>手机屏比例和电脑对不上,黑边或裁切</li>
+      <li>断线 = 画面卡死,重连从头来</li>
+    </ul>
+  </div>
+  <div>
+    <h4>📡 应用直投(投 HTTP 报文)</h4>
+    <ul>
+      <li>KB 级流量,4G 顺滑</li>
+      <li>原生 DOM,文字可选可搜可复制</li>
+      <li>触摸就是触摸,输入法原生</li>
+      <li>页面按手机屏自适应,横屏即电脑版式</li>
+      <li>断线重连不丢状态(状态在电脑上)</li>
+    </ul>
+  </div>
+</div>
+
+<h2><span class="n">3</span>怎么用应用直投</h2>
+<div class="grid g2">
+  <div class="card">
+    <h3>电脑侧:发布</h3>
+    <ol style="font-size:14px;color:var(--dim);padding-left:1.2em;margin:8px 0 0">
+      <li>互联 → 设备与授权 → <b>应用直投 → 扫描本机应用</b>。</li>
+      <li>在扫到的端口里点<b>发布</b>(自动起短名)。</li>
+      <li>「在本机浏览器打开」可先自己验证通不通。</li>
+    </ol>
+  </div>
+  <div class="card">
+    <h3>手机侧:使用</h3>
+    <ol style="font-size:14px;color:var(--dim);padding-left:1.2em;margin:8px 0 0">
+      <li>抽屉 → <b>应用</b> → 点开已发布的应用。</li>
+      <li>全屏使用;<b>横过来自动进电脑版式 + 沉浸</b>。</li>
+      <li>顶栏细把手唤回工具条,可强制横屏 / 系统浏览器打开。</li>
+    </ol>
+  </div>
+</div>
+
+<div class="note warn">
+  <b>什么能投、什么不能投。</b>
+  只能投<b>开了 TCP HTTP 端口</b>的应用:开发服务器(Vite / Next / Flask / Streamlit…)、
+  带内置 HTTP 后端或 sidecar 的桌面应用。
+  <b>Tauri / Electron 的生产包默认走 <code>tauri://</code> / <code>file://</code> 自定义协议,不开 TCP 端口 —— 投不了。</b>
+  想投那种应用,开它的 dev server(如 <code>npm run dev</code>)再扫端口;
+  否则只能退回画面流,那就是远程桌面。
+</div>
+
+<h2><span class="n">4</span>它是怎么做到的</h2>
+<div class="tw"><table>
+<thead><tr><th>环节</th><th>做法</th></tr></thead>
+<tbody>
+<tr><td class="k">反向代理</td>
+  <td>裸 TCP 说 HTTP/1.1,不引 HTTP 客户端。请求头改写后转发,响应按 <b>chunked / content-length / EOF</b> 三种成帧方式<b>流式</b>回传 —— SSE、大文件、长轮询都不缓死。已有真 HTTP 端到端测试钉住成帧正确性。</td></tr>
+<tr><td class="k">WebSocket / HMR</td>
+  <td>拿 hyper 的 <code>OnUpgrade</code>,握手成 101 后 <code>copy_bidirectional</code> 裸转字节。Vite 热更新、Socket.IO、应用自己的实时推送照常 —— 远程桌面给不了这个。</td></tr>
+<tr><td class="k">凭据(关键)</td>
+  <td>手机壳是 WebView,应用在 iframe 里算<b>第三方</b>,安卓默认拦第三方 cookie。所以真正的凭据是路径里的<b>一次性会话票据</b> <code>/x/{sid}/</code>;绝对路径的子资源(<code>/assets/x.js</code>)靠服务端<b>从 Referer 认回</b>会话。owner 令牌绝不进任何 URL。</td></tr>
+<tr><td class="k">粘性回退</td>
+  <td>应用页面里的绝对路径没有 <code>/app/{slug}</code> 前缀,由 cookie 或 Referer 里的会话票据认回它属于哪个应用。<b>不改应用一行 HTML</b>,零侵入。</td></tr>
+</tbody></table></div>
+
+<h2><span class="n">5</span>安全边界</h2>
+<div class="grid g2">
+  <div class="card"><h3>① 会话票据是能力票</h3>
+    <p style="font-size:13.5px;color:var(--dim);margin:6px 0 0">
+      每个 <code>/x/{sid}/</code> 只对一个应用有效,12 小时过期,主机重启即全部作废(会话只在内存)。
+      owner 令牌只在换票据的一瞬用一次,不出现在 URL / Referer 里。</p></div>
+  <div class="card"><h3>② owner 闸 + 自噬防护</h3>
+    <p style="font-size:13.5px;color:var(--dim);margin:6px 0 0">
+      开会话要 owner 权限;发布清单拒绝端口 0 与「polaris 自己的端口」,
+      避免请求转给自己成环。<code>/api</code> <code>/ws</code> 永远不被代理接管。</p></div>
+  <div class="card"><h3>③ 票据不外泄给应用</h3>
+    <p style="font-size:13.5px;color:var(--dim);margin:6px 0 0">
+      转发给上游前,Cookie 头里 polaris 自己的项被摘掉 —— 被代理的应用看不到会话票据。</p></div>
+  <div class="card"><h3>④ 只发你信得过的</h3>
+    <p style="font-size:13.5px;color:var(--dim);margin:6px 0 0">
+      发布出去的应用与 polaris 同源。它拿不到 <code>/api</code>(那只认 Bearer/?token=,不认 cookie),
+      但仍应只发布自己信任的本机应用。</p></div>
+</div>
+
+<h2><span class="n">6</span>GitHub 调研:为什么不引第三方</h2>
+<div class="tw"><table>
+<thead><tr><th>项目</th><th>取舍</th></tr></thead>
+<tbody>
+<tr><td class="k"><a href="https://github.com/n0-computer/iroh">iroh</a> / <a href="https://www.dumbpipe.dev/">dumbpipe</a></td>
+  <td><span class="pill ok">已在用</span>隧道就是 dumbpipe 式 TCP↔QUIC 双向拷贝,应用直投直接跑在上面,零改动。</td></tr>
+<tr><td class="k"><a href="https://github.com/n0-computer/iroh-examples">iroh-examples</a> 的 http-over-dumbpipe</td>
+  <td><span class="pill">同思路</span>官方示例就是「把 HTTP 转进 dumbpipe 暴露本机服务」,验证了做法正确。我们在应用层做反代以便加鉴权/会话,而非裸转。</td></tr>
+<tr><td class="k"><a href="https://github.com/Le-Maz/iroh-h3">iroh-h3</a> / <a href="https://github.com/n0-computer/web-transport-iroh">web-transport-iroh</a></td>
+  <td><span class="pill warn">没引</span>在 iroh 上跑 HTTP/3 很诱人,但现有数据面已是 axum + 隧道透传、能跑完整 HTTP;换 h3 收益是延迟边角料,代价是重写整条数据面。</td></tr>
+<tr><td class="k">nginx / caddy 反代</td>
+  <td><span class="pill warn">没引</span>要的功能只是「TCP↔TCP + 会话闸」,自己写 ~600 行、零外部进程,还能复用 polaris 的 owner 鉴权。引一个反代进程反而多一个要管的东西。</td></tr>
+<tr><td class="k"><a href="https://github.com/n0-computer/iroh-docs">iroh-docs</a></td>
+  <td><span class="pill warn">留作后手</span>要做「两端同时编辑同一份文档」时用它的 CRDT,别自己写 OT。</td></tr>
+</tbody></table></div>
+<p class="sub" style="margin-top:12px">
+  结论:<b>网络层不用再引任何东西,隧道已经够;反代自己写最省心。</b>
+</p>
+
+<h2><span class="n">7</span>状态 · 边界 · 下一步</h2>
+<ul style="color:var(--dim);font-size:14px">
+  <li><b>验证:</b>Rust <code>cargo check</code> 绿;反代的<b>真 HTTP 端到端测试</b>过(content-length / chunked 解块 / Referer 认票据 / 无票据 404 / 假 sid 401 / <b>CRLF 注入路径 400</b>);beam 15 单测 + 全仓 82 lib 测全绿;桌面/手机壳 <code>vue-tsc + vite build</code> 均绿。<b>尚未在真机上跑过手机↔电脑完整往返</b>,需你点一次确认。</li>
+  <li><b>已过 Fable 5 双审计并修:</b>反代侧修掉 CRLF 请求走私、弱随机会话票据、owner 令牌 Referer 泄漏、chunked 溢出/内存放大;同屏侧修掉 markdown 强调咬坏 URL、指点在两端不同版式下指偏、连投竞态等 12 处。</li>
+  <li><b>Tauri/Electron 生产包投不了</b>(不开端口),这是协议决定的,不是 bug;开 dev server 即可。</li>
+  <li><b>同源信任:</b>发布的应用与 polaris 同源,只发布信得过的本机应用。</li>
+  <li><b>可顺手加:</b>发布时给应用起图标、多设备并发使用、把常用应用「添加到手机主屏幕」当 PWA 用。</li>
+</ul>
+
+<footer>
+  北极星 Polaris · 隔空同屏 + 应用直投(V2)· 本页自包含,可离线打开、可任意转发 ·
+  你正在 app 内阅读它,横屏试试
+</footer>
+</div>
+</body>
+</html>
