@@ -289,6 +289,13 @@ pub(crate) fn claude_candidates() -> Vec<PathBuf> {
                 .join("bin")
                 .join("claude"),
         );
+        // Windows 便携版 Node (后台静默安装装的) 的全局前缀就是它自己的根目录 ——
+        // `npm i -g` 把 claude 直接放这里, 没有 bin/ 这一层。必须显式列出:
+        // 用户的 .npmrc 可能把 `npm prefix -g` 指到别处, 那条路探不到我们装的这份。
+        let portable = h.join(".local").join("polaris-node");
+        v.push(npm_claude_native_exe(&portable));
+        v.push(portable.join("claude.exe"));
+        v.push(portable.join("claude.cmd"));
     }
     // npm 全局 (用户真实前缀): 先原生 exe, 再 shim
     if let Some(prefix) = npm_global_prefix() {
@@ -333,6 +340,7 @@ pub fn harden_child_env(cmd: &mut Command) {
         cmd.env(key, merge_no_proxy(&current));
     }
     cmd.env_remove("DEBUG");
+    inject_bundled_runtime(cmd);
     #[cfg(target_os = "linux")]
     {
         cmd.env_remove("LD_PRELOAD");
@@ -341,6 +349,57 @@ pub fn harden_child_env(cmd: &mut Command) {
             cmd.env("IS_SANDBOX", "1");
         }
     }
+}
+
+/// 把随安装包内置的运行时 (uv / Python / Git Bash) 喂给 **claude 子进程**:
+/// ① `CLAUDE_CODE_GIT_BASH_PATH` 指向可用的 bash (用户自装的优先, 内置兜底);
+/// ② 把 uv / Python 目录 —— 用内置 bash 时再加上 msys 的 `usr/bin`、`mingw64/bin` ——
+///    **前插**进子进程 PATH。
+///
+/// 为什么必须前插 msys 目录 (2026-07-23 实测): 非登录 bash (`bash -c`) 不读 `/etc/profile`,
+/// PATH 里没有 `/usr/bin` → `ls/cat/grep/sed/awk` 全部 command not found; 而 `find`/`sort`
+/// 会**静默命中 System32 的同名 exe**(Windows 的 find 是查字符串、sort 是另一套语义),
+/// 结果错了还不报错。前插之后 unix 工具压过 System32, bash 里的行为才与 mac/Linux 一致。
+///
+/// 只动子进程 env, **不碰本进程 PATH** —— 免得 msys 的同名 exe 污染整个应用。
+fn inject_bundled_runtime(cmd: &mut Command) {
+    // bash: 类 Unix 无此概念, 恒 false。
+    #[allow(unused_mut)]
+    let mut using_bundled_bash = false;
+    #[cfg(windows)]
+    {
+        // ★ 必须**先解析出到底用哪个 bash**, 再判断它是不是内置的 —— 不能写成
+        //   「环境变量没设才处理」: 启动期 prime_path_for_claude 早就把这个变量设好了,
+        //   那样写的话 using_bundled_bash 永远是 false, msys 工具目录永远注入不进去。
+        let bash = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(git_bash_path);
+        if let Some(bash) = bash {
+            using_bundled_bash = super::bundled::is_bundled(&bash);
+            cmd.env("CLAUDE_CODE_GIT_BASH_PATH", &bash);
+        }
+    }
+
+    let prefix = super::bundled::child_path_prefix(using_bundled_bash);
+    if prefix.is_empty() {
+        return;
+    }
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let current = std::env::var("PATH").unwrap_or_default();
+    // 已在 PATH 里的不重复插 (幂等: 同一条 Command 上调两次结果一样)
+    let mut parts: Vec<String> = prefix
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|d| !super::path::path_contains_dir(&current, d))
+        .collect();
+    if parts.is_empty() {
+        return;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    cmd.env("PATH", parts.join(&sep.to_string()));
 }
 
 /// 把回环主机（`127.0.0.1` / `localhost` / `::1`）并进既有 NO_PROXY 值：
@@ -411,10 +470,15 @@ pub(crate) fn pwsh_candidates() -> Vec<PathBuf> {
 pub(crate) fn node_dir_candidates() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        vec![
-            PathBuf::from(r"C:\Program Files\nodejs"),
-            PathBuf::from(r"C:\Program Files (x86)\nodejs"),
-        ]
+        let mut v = Vec::new();
+        // 后台静默安装装的**便携版 Node**(免管理员、不弹 UAC) —— 排在系统安装之前:
+        // 它是本应用自己装的, 版本可控; 见 doctor::autopilot。
+        if let Some(h) = home_dir() {
+            v.push(h.join(".local").join("polaris-node"));
+        }
+        v.push(PathBuf::from(r"C:\Program Files\nodejs"));
+        v.push(PathBuf::from(r"C:\Program Files (x86)\nodejs"));
+        v
     }
     #[cfg(not(windows))]
     {
@@ -458,8 +522,12 @@ fn is_app_exec_alias(p: &std::path::Path) -> bool {
 }
 
 /// 探测可用的 Git Bash (claude 在 Windows 上可接受的另一种 shell)。
-/// 先认 `CLAUDE_CODE_GIT_BASH_PATH` 覆盖, 再扫常见安装位置。
+/// 先认 `CLAUDE_CODE_GIT_BASH_PATH` 覆盖, 再扫常见安装位置, **最后回落到随包内置的那份**。
 /// 仅 Windows 需要 (扫的全是 Windows 路径); 类 Unix 用系统自带 shell, 不走这里。
+///
+/// 内置的排最后: 用户自己装的 Git for Windows 是完整版(工具更全、还带 `which`),
+/// 有就用它; 内置的 MinGit 只保证「没装 Git 的机器也有 bash 可用」, 免得用户被迫去装
+/// PowerShell 7 / Git。
 #[cfg(windows)]
 pub(crate) fn git_bash_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CLAUDE_CODE_GIT_BASH_PATH") {
@@ -476,6 +544,7 @@ pub(crate) fn git_bash_path() -> Option<PathBuf> {
     .iter()
     .map(PathBuf::from)
     .find(|p| p.exists())
+    .or_else(super::bundled::git_bash)
 }
 
 /// 通用工具探测: which 命中 + 已知候选, 取首个可用; on_path = 是否被 PATH 发现。
@@ -521,6 +590,7 @@ pub(crate) fn detect(
         install_hint.to_string()
     };
 
+    let bundled = resolved.as_deref().is_some_and(super::bundled::is_bundled);
     ToolStatus {
         key: key.to_string(),
         name: name.to_string(),
@@ -530,6 +600,7 @@ pub(crate) fn detect(
         on_path,
         required,
         hint,
+        bundled,
     }
 }
 
@@ -557,6 +628,22 @@ pub(crate) fn resolve_uv_exe() -> Option<PathBuf> {
     uv_bin_dir()
         .map(|d| d.join(uv_exe_name()))
         .filter(|p| p.exists())
+        // 用户自己装的都没有 → 用随安装包内置的那份 (免安装、免管理员)
+        .or_else(super::bundled::uv_exe)
+}
+
+/// uv 探测候选 (PATH 落空时按序取首个存在的): 用户自装的 `~/.local/bin` 优先, 内置兜底。
+pub(crate) fn uv_candidates() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = uv_bin_dir()
+        .map(|d| vec![d.join(uv_exe_name())])
+        .unwrap_or_default();
+    v.extend(super::bundled::uv_exe());
+    v
+}
+
+/// Python 探测候选 —— 只有内置那份。系统 Python 由 PATH 命中负责 (见 `detect`)。
+pub(crate) fn python_candidates() -> Vec<PathBuf> {
+    super::bundled::python_exe().into_iter().collect()
 }
 
 /// 探测可用的 Git Bash, 供 chat.rs spawn 时显式喂给子 claude (跨平台签名; 类 Unix 恒 None)。

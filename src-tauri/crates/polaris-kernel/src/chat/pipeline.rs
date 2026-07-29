@@ -1849,16 +1849,10 @@ pub(super) fn spawn_on_host(
         .stdin(Stdio::piped()) // 接 prompt 用, 调用方 spawn 后 write + drop
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Windows: claude 跑 Bash 工具要靠 Git Bash。启动期 prime 通常已设好 CLAUDE_CODE_GIT_BASH_PATH,
-    // 但若 Git Bash 是 app 启动后才装的, 这里兜底显式喂给子进程 —— 免得 claude 扫不到 shell。
-    #[cfg(windows)]
-    if std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").is_none() {
-        if let Some(bash) = crate::doctor::detect_git_bash() {
-            cmd.env("CLAUDE_CODE_GIT_BASH_PATH", bash);
-        }
-    }
     // 子进程环境净化: loopback 强制 NO_PROXY (切 Codex 时 claude 走 127.0.0.1 本地代理,
     // 系统代理会劫持回环 → 连不上) + 清 DEBUG/LD_PRELOAD。见 doctor::harden_child_env。
+    // Windows 的 Git Bash (CLAUDE_CODE_GIT_BASH_PATH) 与随包运行时 (uv/Python/msys 工具目录)
+    // 也一并由它注入 —— 这里曾另有一段 git-bash 兜底, 与之重复且判断更弱, 已并进单一入口。
     crate::doctor::harden_child_env(&mut cmd);
     // 隔离模式跑第三方 → CLAUDE_CONFIG_DIR 指私有目录, 会话账本不进 ~/.claude/projects,
     // cc-switch 等外部监控不再看见 Polaris 自动任务的第三方会话。

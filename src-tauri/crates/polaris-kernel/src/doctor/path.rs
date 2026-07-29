@@ -211,11 +211,22 @@ if ($parts -notcontains $d) {{ \
     }
 }
 
+/// 把 uv (与随包内置的 Python) 目录并进**本进程** PATH。
+/// 内置那份放在用户自装之后 —— 用户装过就用他的, 没装才吃内置的。
+/// 这里只上 uv/python(不会与系统命令重名), msys 的 unix 工具目录**不上进程 PATH**
+/// (它有 find/sort 等与 System32 同名的 exe), 那批只前插进 claude 子进程,
+/// 见 `doctor::probe::inject_bundled_runtime`。
 pub fn ensure_uv_on_process_path() {
     if let Some(dir) = uv_bin_dir() {
         if dir.join(uv_exe_name()).exists() {
             prepend_process_path(&dir.to_string_lossy());
         }
+    }
+    for dir in [super::bundled::uv_dir(), super::bundled::python_dir()]
+        .into_iter()
+        .flatten()
+    {
+        prepend_process_path(&dir.to_string_lossy());
     }
 }
 

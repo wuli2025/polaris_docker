@@ -23,6 +23,9 @@ interface VoiceConfig {
   polish_api_base: string;
   polish_api_key: string;
   polish_model: string;
+  volc_app_key: string;
+  volc_access_key: string;
+  volc_asr_model: string;
 }
 interface PolishResult {
   raw: string;
@@ -348,6 +351,57 @@ async function runLearn() {
             />
             说完 AI 整形（仿 Typeless·去语气词/顺句/自动列表，走下方 API，默认关最快）
           </label>
+        </div>
+      </section>
+
+      <!-- 火山云端识别（手机端语音输入的后端） -->
+      <section class="block">
+        <div class="b-head">
+          <h2>火山语音识别 · 手机端语音输入</h2>
+          <span class="b-desc">
+            手机 App 里「按住说话」时，录音在手机、识别在这台主机。
+            <b>默认什么都不用填</b>——会自动借用「供应商」里配好的
+            <b>火山方舟 Agentplan</b> key，走方舟的音频理解转写。
+            下面两项只在你另外开通了火山「语音技术」的<b>大模型录音文件识别</b>时才填（那是专业 ASR，更准、更快，但和方舟 API Key 不是同一套凭据）。
+          </span>
+        </div>
+        <div class="row">
+          <label class="fl fill">
+            语音技术 AppID
+            <input
+              class="in"
+              :value="cfg.volc_app_key"
+              placeholder="留空 = 借用「火山方舟 Agentplan」的 key 走方舟音频理解"
+              @change="setCfg({ volcAppKey: ($event.target as HTMLInputElement).value })"
+            />
+          </label>
+        </div>
+        <div class="row">
+          <label class="fl fill">
+            语音技术 Access Token
+            <input
+              class="in"
+              type="password"
+              :value="cfg.volc_access_key"
+              placeholder="console.volcengine.com/speech 开通「大模型录音文件识别」后获取"
+              @change="setCfg({ volcAccessKey: ($event.target as HTMLInputElement).value })"
+            />
+          </label>
+        </div>
+        <div class="row">
+          <label class="fl fill">
+            方舟转写模型
+            <input
+              class="in"
+              :value="cfg.volc_asr_model"
+              placeholder="doubao-seed-2-0-lite-260428（留空即用此默认）"
+              @change="setCfg({ volcAsrModel: ($event.target as HTMLInputElement).value })"
+            />
+          </label>
+        </div>
+        <div class="tierhint">
+          只有 <b>doubao-seed-2.0</b> 系模型吃音频输入。若方舟那条报 404/403，多半是
+          Coding Plan 套餐圈定了模型范围——换个模型名，或改走上面的语音技术凭据。
         </div>
       </section>
 

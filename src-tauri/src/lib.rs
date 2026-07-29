@@ -49,6 +49,36 @@ pub mod server;
 pub mod sysstat;
 // 受控远程执行：iroh 互联的对端在本机跑命令（总开关默认关 + 白名单/Shell 两档 + 全审计）。
 pub mod exec;
+pub mod fsshare;
+// 远程盘挂载:把互联对端的共享目录挂成本机系统盘符(Z:/Y:…),Tailscale 式「连上即多一块盘」。
+#[cfg(feature = "collab-host")]
+pub mod fsmount;
+// 同账号设备网:登录一次云端账号中心,此后自己账号的设备自动互连自动挂盘(Tailscale 式)。
+#[cfg(feature = "collab-host")]
+pub mod mesh;
+// 隔空同屏:文件 → 自包含网页 + 同步消息总线(手机与电脑经 iroh P2P 同看一页)。
+// 顺带持有「可读文件白名单」,apihub 的 /api/file 与它共用同一把闸。
+pub mod beam;
+// 应用直投:把本机在跑的 HTTP 应用反代给手机 —— 电脑当服务器,手机只是个视图。
+#[cfg(feature = "collab-host")]
+pub mod appproxy;
+
+/// 本机 polaris 服务端口(桌面 = 内嵌主机实际绑定的口;server 壳 = POLARIS_PORT)。
+/// 应用直投据此挡住「把 polaris 自己发布出去」造成的请求自噬成环。
+#[cfg(feature = "collab-host")]
+pub fn hosting_port() -> Option<u16> {
+    #[cfg(feature = "desktop")]
+    {
+        hosting::current_port()
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        std::env::var("POLARIS_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .or(Some(8080))
+    }
+}
 
 // ── 桌面外壳入口(run + 适配器):`not(test)` 门控 ──
 // 单测二进制永远不会跑 Tauri 事件循环, 却会因编入 run() 把 tauri-plugin-dialog→rfd
@@ -169,6 +199,9 @@ pub fn run() {
             // 环境预热: 后台把 claude / pwsh 目录塞进进程 PATH + 设 Git Bash 路径,
             // 让之后 spawn 的 claude CLI 直接「找得到、有 shell」, 无需重启 (见 doctor.rs)。
             doctor::prime_path_for_claude();
+            // 环境静默托管: 缺 Claude Code 就在后台悄悄装好(全程免 UAC、不打断用户)。
+            // uv/Python/Git Bash 已随包内置, 通常这里什么都不用做、一声不吭。
+            doctor::start_autopilot(h.clone());
             // 自动更新状态机初始化（记录当前版本 + 持久化路径 + 重启续提示）。best-effort。
             let _ = updater::init(h);
             // 飞书网关「开机自动启动」：若用户开了 auto_start 且凭证齐全，后台自动拉起（不阻塞启动）。
@@ -185,6 +218,9 @@ pub fn run() {
             // 云机网关自启重挂:上次挂过牌就重新向云机注册(云机重启后注册表清空需重挂)。
             #[cfg(feature = "collab-net")]
             collab::commands::gateway_auto_reattach();
+            // 同账号设备网:入过网就自动接上自己账号的其它设备(隧道+挂盘全自动)。
+            // 用户只在第一次填过账号,此后每次开机都是「打开就已经连好」。
+            mesh::spawn_if_enrolled();
             // ── 系统托盘（Tailscale 式静默驻留）──
             // 关窗只是藏进托盘, 协作主机/隧道/网关/常驻 claude 池全部继续跑;
             // 左键单击托盘图标唤回主窗口, 右键菜单里才有真正的「退出」。
@@ -323,6 +359,38 @@ pub fn run() {
             // 受控远程执行策略(主机侧总开关 / Shell 临时解锁)
             exec::exec_policy_get,
             exec::exec_policy_set,
+            // 远程盘共享目录(主机侧:开放哪些目录给互联对端访问,逐目录点选放开写)
+            fsshare::fs_share_get,
+            fsshare::fs_share_set,
+            fsshare::fs_share_list,
+            fsshare::fs_share_save,
+            // 同账号设备网(入网一次 → 自己的设备自动互连自动挂盘,不再粘连接码)
+            mesh::mesh_join,
+            mesh::mesh_leave,
+            mesh::mesh_kick,
+            mesh::mesh_sync,
+            mesh::mesh_status,
+            // 远程盘挂载(成员侧:对端共享目录 → 本机系统盘符,自动挑 Z:/Y:…)
+            fsmount::fs_mount,
+            fsmount::fs_unmount,
+            fsmount::fs_mount_status,
+            // 远程大文件下载(流写磁盘 + 断点续传;浏览器 blob 揣不动的都走这)
+            fsmount::fs_fetch,
+            fsmount::fs_fetch_cancel,
+            // 挂载盘大文件解锁(Windows WebClient 默认 50MB → 4GB,一次 UAC)
+            fsmount::fs_webdav_limit,
+            fsmount::fs_webdav_unlock,
+            // 隔空同屏(手机 ↔ 电脑同看一页,经 iroh P2P,不要求同一 WiFi)
+            beam::beam_pack,
+            beam::beam_export,
+            beam::beam_send,
+            beam::beam_focus,
+            beam::beam_doc_path,
+            // 应用直投(把本机在跑的 HTTP 应用反代给手机:电脑当服务器,手机只是视图)
+            appproxy::app_pub_list,
+            appproxy::app_pub_set,
+            appproxy::app_scan_ports,
+            appproxy::app_open,
             // 人格模块 (板块⑫)
             persona::persona_list,
             persona::persona_apply,
@@ -439,6 +507,7 @@ pub fn run() {
             forge::forge_tts,
             // 环境医生 (环境监测 + 配置安装)
             doctor::env_check,
+            doctor::env_autopilot_status,
             doctor::env_fix_path,
             doctor::env_install_claude,
             doctor::env_install_node,
@@ -475,6 +544,7 @@ pub fn run() {
             voice::voice_learn_correction,
             voice::voice_lexicon_learn,
             voice::voice_transcribe_file,
+            voice::voice_transcribe_audio,
             voice::voice_listen_start,
             voice::voice_listen_stop,
             voice::voice_dictate_start,
@@ -552,6 +622,8 @@ pub fn run() {
                 // 退出瞬间可能还有最近半秒的消息只在内存里 —— 这里补一刀(不脏则零开销)。
                 conv::flush();
                 integrations::feishu::shutdown_on_exit(); // 回收飞书 node 桥,防其 autoReconnect 空转成孤儿烧 CPU
+                #[cfg(feature = "collab-host")]
+                fsmount::unmount_all(); // 删远程盘盘符 + 停 WebDAV 桥,别给系统留死映射
                                                           // 释放全局键盘热键监听:置 ENABLED=false,退出时不再处理热键事件
                                                           //(rdev::listen 无法干净中止是已知限制,置闸 + 进程退出即可接受的清理)。
                 #[cfg(feature = "voice-live")]

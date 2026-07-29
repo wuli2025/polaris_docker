@@ -26,6 +26,8 @@
 //! 解压到 `~/.local/polaris-node` 并写 shell 配置。经 `build_install_shell` 选 PowerShell 或 sh。
 //! 持久化 PATH: Windows 写注册表用户 PATH; macOS·Linux 写 `~/.zshrc` 等 shell 配置。
 
+pub mod autopilot;
+pub mod bundled;
 pub mod check;
 pub mod install;
 pub mod path;
@@ -37,6 +39,7 @@ pub mod uv_cache;
 // tauri::command 生成的 __cmd__* / __tauri_command_name_* 隐藏宏项会被 glob 一并带出,
 // 故 lib.rs 的 generate_handler!(doctor::xxx) 路径零改动。原 doctor.rs 的全部对外符号
 // (crate::doctor::xxx) 经下列 glob re-export 保持不变。
+pub use autopilot::*;
 pub use check::*;
 pub use install::*;
 pub use path::*;

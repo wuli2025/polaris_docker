@@ -185,7 +185,13 @@ pub async fn start_core(
             // 免口令。远端成员还经 iroh 隧道转到本机 127.0.0.1,来源判定也认不出谁是谁。
             open_no_auth: false,
         };
-        router = router.merge(api_router(api_state));
+        router = router.merge(api_router(api_state.clone()));
+        // 应用直投的「粘性回退」:被代理应用页面里的绝对路径(/assets/x.js、/socket.io/…)
+        // 不带 /app/{slug} 前缀,靠进门时种的 cookie 认回属于哪个应用。桌面壳根路径本来
+        // 就没挂东西(前端是 tauri webview,不由这里托管),接管它零冲突;
+        // Docker server 壳根上有 SPA(server.rs 已占 fallback),故这条只在桌面挂。
+        let sticky: axum::Router = axum::Router::new().fallback(crate::appproxy::sticky_fallback);
+        router = router.merge(sticky);
     }
     // 分享码探活 + 成员端 REST 都是跨源 → CORS 必开。普通 JSON 限 2MB；/api/upload
     // 在 api_router 内单独放宽到 512MB;git 路由在 collab_router 内单独放宽。
@@ -228,6 +234,28 @@ fn starting_placeholder(app: tauri::AppHandle, gen: u64) -> Running {
         app,
         bus: BusHandle::new(tokio::sync::broadcast::channel(1).0),
         access_token: String::new(),
+    }
+}
+
+/// 内嵌主机当前实际绑定的端口(未跑 / 启动占位期 = None)。
+pub fn current_port() -> Option<u16> {
+    RUNNING.lock().as_ref().map(|r| r.port).filter(|p| *p != 0)
+}
+
+/// 往内嵌主机的广播总线投一条事件(桌面 → 手机/中继的**唯一**出口)。
+///
+/// 返回是否真投出去了:主机没跑(或还在启动占位期)时总线只是个哑频道,投进去无人接 ——
+/// 此时如实返回 false,让调用方能提示「还没设为主机,对端收不到」,而不是假装发出去了。
+/// 注:总线上的事件会被 [`bridge_to_ui`] 回灌本机 tauri 事件系统,故调用方**不必**再本地 emit
+/// 一遍,否则本机 UI 会收到两条一模一样的帧。
+pub fn bus_emit(topic: &str, payload: serde_json::Value) -> bool {
+    let g = RUNNING.lock();
+    match g.as_ref() {
+        Some(r) if r.port != 0 => {
+            r.bus.emit_value(topic, payload);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -334,7 +362,10 @@ pub async fn collab_host_start(
                 // 启动失败 → 回滚**自己那个代次**的占位。占位可能已被 stop 摘走、甚至
                 // 已被更晚的 start 换成新占位(ABA)—— 只认 gen,绝不误删别人的。
                 let mut g = RUNNING.lock();
-                if g.as_ref().map(|r| r.port == 0 && r.gen == my_gen).unwrap_or(false) {
+                if g.as_ref()
+                    .map(|r| r.port == 0 && r.gen == my_gen)
+                    .unwrap_or(false)
+                {
                     *g = None;
                 }
                 return Err(e);
@@ -424,7 +455,11 @@ pub fn collab_host_add_device(name: String, nodeId: String) -> Result<(), String
     if crate::collab::identity::is_node_allowed(nid) {
         return Ok(());
     }
-    let nm = if name.trim().is_empty() { "我的设备" } else { name.trim() };
+    let nm = if name.trim().is_empty() {
+        "我的设备"
+    } else {
+        name.trim()
+    };
     crate::collab::identity::add_device(0, nm, nid).map(|_| ())
 }
 

@@ -26,16 +26,25 @@ fn to_forge_flavor(f: ImageFlavor) -> Flavor {
 
 /// 取当前生图配置并翻成 forge 的入参。没配 / 没 key → None。
 fn current_cfg() -> Option<(ImageCfg, String)> {
-    let c = provider::current_image_config()?;
-    Some((
-        ImageCfg {
-            endpoint: c.endpoint,
-            model: c.model,
-            api_key: c.api_key,
-            flavor: to_forge_flavor(c.flavor),
-        },
-        c.name,
-    ))
+    candidates().into_iter().next()
+}
+
+/// 按优先级排好的候选(火山方舟 → MiniMax);显式配置时只有一个。
+fn candidates() -> Vec<(ImageCfg, String)> {
+    provider::image_config_candidates()
+        .into_iter()
+        .map(|c| {
+            (
+                ImageCfg {
+                    endpoint: c.endpoint,
+                    model: c.model,
+                    api_key: c.api_key,
+                    flavor: to_forge_flavor(c.flavor),
+                },
+                c.name,
+            )
+        })
+        .collect()
 }
 
 /// 生图同步内核。server/apihub 的命令路由本就在阻塞线程池里,直调这里
@@ -45,15 +54,46 @@ pub fn forge_image_sync(
     out: String,
     ratio: Option<String>,
 ) -> Result<Value, String> {
-    let (cfg, name) = current_cfg().ok_or(
-        "还没配生图模型:到「设置 → API 供应商 → 生图模型」加一家并填 Key(MiniMax / OpenAI / 豆包方舟都行)",
-    )?;
-    let mut v = crate::forge::image::generate(&cfg, &prompt, &out, ratio.as_deref())?;
-    // 把「用的哪家」带回去 —— 出了图但风格不对时,用户第一个想知道的就是这个。
-    if let Some(o) = v.as_object_mut() {
-        o.insert("provider".into(), json!(name));
+    let cands = candidates();
+    if cands.is_empty() {
+        return Err(
+            "还没配生图模型:到「设置 → API 供应商 → 生图模型」加一家并填 Key(火山方舟 / MiniMax / OpenAI 都行)"
+                .into(),
+        );
     }
-    Ok(v)
+    // 借用链有多个候选时逐个试:火山方舟排在前面, 但那是**借来的聊天套餐 key**,
+    // 能不能打生图端点未经证实。第一家打不通就顺延, 而不是让原本靠 MiniMax 出图好好的
+    // 用户,因为多配了一个方舟聊天 key 就突然出不了图。
+    // (显式选中的那家只会有一个候选 —— 用户点名了谁就是谁, 失败如实报错, 不偷换。)
+    let last = cands.len() - 1;
+    let mut first_err = String::new();
+    for (i, (cfg, name)) in cands.into_iter().enumerate() {
+        match crate::forge::image::generate(&cfg, &prompt, &out, ratio.as_deref()) {
+            Ok(mut v) => {
+                // 把「用的哪家」带回去 —— 出了图但风格不对时,用户第一个想知道的就是这个。
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("provider".into(), json!(name));
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                if i == 0 {
+                    first_err = format!("{name}: {e}");
+                }
+                if i == last {
+                    // 全试完了才报错, 且把**第一家**的原因也带上 —— 只报最后一家的话,
+                    // 用户会以为问题出在 MiniMax, 而真正没配好的是排在前面的火山。
+                    return Err(if last == 0 {
+                        format!("{name}: {e}")
+                    } else {
+                        format!("{name}: {e}(此前已试过 {first_err})")
+                    });
+                }
+                eprintln!("[imagegen] {name} 生图失败, 顺延下一家: {e}");
+            }
+        }
+    }
+    unreachable!("候选非空且最后一家必定 return")
 }
 
 /// 桌面命令。生图常 20–60s,必须 async + spawn_blocking,否则钉住 Tauri 主线程整个 UI 卡死。

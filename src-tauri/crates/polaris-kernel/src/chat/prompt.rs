@@ -822,29 +822,35 @@ pub(crate) fn longtask_convention() -> &'static str {
 /// 背景(实证): 用户机器上的 `python` / `python3` 常常是 Microsoft Store 的 0 字节执行别名
 /// 占位符(`%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe`), 在无控制台 spawn 的子进程里
 /// 起不来 —— 模型探测到「有 python」便去用, 结果失败或假装成功(截图实证: 做 .pptx 因此只能
-/// 降级成 HTML)。解法不是赌用户机器的解释器, 而是统一走 **uv**: 它一个二进制同时管「装解释器」
-/// 与「按脚本装依赖」, 由环境医生预置、已注入子进程 PATH(`doctor::ensure_uv_on_process_path`),
-/// win/mac/docker 三端同构。本公约把这套规范写死进每轮 system 指令, 从行为层面根治。
+/// 降级成 HTML)。
+///
+/// **2026-07-23 起前提变了**: 应用**随包内置了真解释器**(python-build-standalone 3.13, 自带 pip、
+/// 标准库齐全), 且 `doctor::bundled` 把它的目录**前插**进 claude 子进程 PATH —— 子进程里的
+/// `python` 现在必定命中这份真解释器, 压过 Store 占位符。故公约从「一律走 uv」改为
+/// **「Python 打头阵, uv 是可选加速器」**: uv 不再是必需品(它只是把「建隔离环境+装依赖」
+/// 做得更省事), 没有它照样干活。这样也不必再把「去装个 uv」这种事推给用户。
 pub(crate) fn script_convention() -> &'static str {
     "## 脚本执行公约 (Polaris) —— 必须遵守\n\n\
 你常会写临时脚本来干活。本机的脚本运行时由北极星统一托管, 遵守以下铁律, 否则脚本大概率跑不起来。\n\n\
-**Python —— 一律走 `uv`, 禁止裸调系统 Python / pip**:\n\
-- **执行脚本**: 用 `uv run 脚本.py`(或 `uv run --no-project 脚本.py`)。\
-**禁止** `python 脚本.py` / `python3 脚本.py` —— 用户机器上的 `python` 极可能是 \
-Microsoft Store 的 0 字节占位符, 直接调用会报错或「假装成功」却没真在跑。\n\
-- **管依赖**: 用 `uv pip install` / `uv pip ...`, 或在脚本头写 PEP 723 内联声明(见下)。\
-**禁止** `pip install` / `pip3 install` 等一切系统 pip 命令。\n\
-- **声明依赖**: 脚本要用第三方库时, 在文件**开头**写 PEP 723 内联块并**钉死版本**, 让 uv 自动建临时环境, \
-**不要**外置 requirements.txt:\n\
+**Python —— 直接用 `python`(北极星已内置真解释器)**:\n\
+- **执行脚本**: 直接 `python 脚本.py` 即可。北极星随安装包内置了 Python 3.13(自带 pip、标准库齐全) \
+并已注入本进程 PATH, 你调到的 `python` 就是它 —— **不是** Microsoft Store 那个 0 字节占位符, 放心用。\n\
+- **只用标准库时什么都不用装**: sqlite3 / json / csv / zipfile / urllib / ssl / hashlib / venv 等全都在。\n\
+- **要第三方库时**, 二选一(**优先 ①**):\n\
+  ① **有 `uv` 就用 uv**(最省事, 自动建隔离环境, 不碰用户全局): 在脚本**开头**写 PEP 723 内联块并钉死版本, \
+然后 `uv run 脚本.py`:\n\
 ```python\n\
 # /// script\n\
 # requires-python = \">=3.11\"\n\
 # dependencies = [\"pillow==11.0.0\", \"requests==2.32.3\"]\n\
 # ///\n\
 ```\n\
-写好后直接 `uv run 脚本.py` —— uv 会先把这些依赖装好再跑, 全程无需用户机器预装任何东西。\n\
-- **uv 找不到时**: 提示用户去「环境医生」一键安装 uv, **不要**自己去装 Python / pip。\n\n\
-**Node 脚本**: 先确认 `node` 可用(技能自带的 install-deps 脚本会自检); 不可用就改用 Python(uv) 等价实现, \
+  ② **没有 uv 就用内置 python 自己的 pip**: `python -m pip install --user 包名==版本`, 再 `python 脚本.py`。\n\
+- **`--user` 不能省**: 内置解释器装在应用安装目录(常在 `Program Files`)里, **不带 `--user` 的 \
+`pip install` 会因为写不进去而失败或要管理员权限**; `--user` 装到用户目录, 免提权且内置解释器能直接 import。\n\
+- **禁止**: 裸 `pip install` / `pip3 install`(同上, 且会污染用户全局)、`sudo pip`、去下载安装另一个 Python。\n\
+- **uv 不是必需品**: 找不到 uv 就走 ②, **不要**因此停下来让用户去装 uv。\n\n\
+**Node 脚本**: 先确认 `node` 可用(技能自带的 install-deps 脚本会自检); 不可用就改用 Python 等价实现, \
 或提示用户在环境医生里安装, **禁止** `npm install -g` 全局安装污染用户环境。\n\n\
 **浏览器自动化(操纵网页/抓取/自动填表/截图等)一律用 Playwright**:\n\
 - 新功能**统一用 Playwright**(JS/TS), 不要新写 puppeteer / selenium / 裸 CDP; 存量简单脚本(如 export-pptx)可沿用。\n\

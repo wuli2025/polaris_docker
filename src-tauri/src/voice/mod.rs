@@ -21,6 +21,9 @@ pub mod asr;
 // 实时语音输入(录音+全局热键+注入);桌面专属,默认不编译。
 #[cfg(feature = "voice-live")]
 pub mod live;
+// 火山云端语音识别 —— 手机壳的语音输入后端。零重型依赖(ureq+base64),**默认就编**,
+// 否则手机端按住说话根本没有能落地的转写路径(本地 SenseVoice 那套要 sherpa 动态库)。
+pub mod volc;
 
 use directories::UserDirs;
 use once_cell::sync::Lazy;
@@ -71,6 +74,19 @@ pub struct VoiceConfig {
     /// 整形模型 id;默认便宜快的 MiniMax-M2.7-highspeed。
     #[serde(default = "default_polish_model")]
     pub polish_model: String,
+
+    // ── 火山云端语音识别(手机端语音输入的后端,见 volc.rs)──
+    // 留空是常态:留空就自动借用聊天坞里「火山方舟 Agentplan」的 key 走音频理解那条路,
+    // 用户什么都不用配。填了下面两个才切到语音技术控制台的专业 ASR。
+    /// 火山「语音技术」控制台的 AppID(X-Api-App-Key)。与方舟 API Key **不是**一套凭据。
+    #[serde(default)]
+    pub volc_app_key: String,
+    /// 火山「语音技术」控制台的 Access Token(X-Api-Access-Key)。
+    #[serde(default)]
+    pub volc_access_key: String,
+    /// 走方舟音频理解那条路时用的模型;留空 = volc::DEFAULT_ARK_ASR_MODEL。
+    #[serde(default)]
+    pub volc_asr_model: String,
 }
 
 fn default_polish_base() -> String {
@@ -94,6 +110,9 @@ impl Default for VoiceConfig {
             polish_api_base: default_polish_base(),
             polish_api_key: String::new(),
             polish_model: default_polish_model(),
+            volc_app_key: String::new(),
+            volc_access_key: String::new(),
+            volc_asr_model: String::new(),
         }
     }
 }
@@ -652,6 +671,9 @@ pub fn voice_config_set(
     polish_api_base: Option<String>,
     polish_api_key: Option<String>,
     polish_model: Option<String>,
+    volc_app_key: Option<String>,
+    volc_access_key: Option<String>,
+    volc_asr_model: Option<String>,
 ) -> Result<VoiceConfig, String> {
     {
         let mut s = STORE.write();
@@ -699,6 +721,17 @@ pub fn voice_config_set(
         }
         if let Some(v) = polish_model {
             c.polish_model = v.trim().to_string();
+        }
+        // 火山云端识别(手机端语音输入)。三个都留空 = 走「借聊天坞方舟 key」那条,
+        // 用户零配置即可用;填了 AppID+Token 才切到语音技术控制台的专业 ASR。
+        if let Some(v) = volc_app_key {
+            c.volc_app_key = v.trim().to_string();
+        }
+        if let Some(v) = volc_access_key {
+            c.volc_access_key = v.trim().to_string();
+        }
+        if let Some(v) = volc_asr_model {
+            c.volc_asr_model = v.trim().to_string();
         }
     }
     persist();
@@ -801,6 +834,21 @@ pub fn voice_transcribe_file(path: String) -> Result<TranscribeResult, String> {
                 .into(),
         )
     }
+}
+
+/// 云端识别一段 base64 音频(火山)→ 防污染 → 终稿。**手机端语音输入走的就是这条**:
+/// 手机壳没有本地模型,录完 WAV 传回主机,由主机拿火山凭据去转写。
+/// `format` 形如 "wav"(默认);详见 volc.rs 顶部对两条路与格式限制的说明。
+/// (async):一次网络往返可达数十秒,同步命令会钉死主线程 → 甩到线程池跑。
+#[cfg_attr(feature = "desktop", tauri::command(async))]
+pub fn voice_transcribe_audio(
+    audio: String,
+    format: Option<String>,
+) -> Result<volc::CloudAsrResult, String> {
+    let mut r = volc::transcribe_base64(&audio, format.as_deref().unwrap_or("wav"))?;
+    // 与本地识别同口径:开了 AI 整形就把终稿再过一遍 LLM(默认关 → 零额外延迟)。
+    r.text = polish_if_enabled(&r.text);
+    Ok(r)
 }
 
 /// 启用实时语音输入(按住右 Alt 说话 → 流式上字 → 松手注入)。

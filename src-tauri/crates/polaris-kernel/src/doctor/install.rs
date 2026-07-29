@@ -26,15 +26,23 @@ pub(crate) fn next_req_id() -> String {
     format!("env-{:x}-{:x}", ts, c)
 }
 
-/// 安装 Claude Code。method: "npm" (默认, 经国内镜像) | "native" (官方原生脚本, 兜底)。
+/// 安装 Claude Code。method: `direct`/`npm` (默认, 直抓平台包 tgz, R2 优先多源) |
+/// `native` (官方原生脚本 install.ps1/sh, 境外网络兜底)。
 /// 流式把安装日志通过 `env:stream` 事件推给前端; 成功后自动修 PATH。
-/// 跨平台: Windows 经 PowerShell, macOS/Linux 经 `sh`(npm 方式两端一致; native 各走各的官方脚本)。
+///
+/// 默认路径**不经 npm** —— 见 `CLAUDE_VER` 说明: `npm i -g` 下那个 80MB 的 optional 依赖常卡死。
+/// (为兼容旧前端, method 传 `"npm"` 也走这条直装路径, 不再真的调 npm。)
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn env_install_claude(app: AppHandle, method: Option<String>) -> Result<String, String> {
-    let method = method.unwrap_or_else(|| "npm".to_string());
-    let inner = claude_install_cmd(&method);
+    let method = method.unwrap_or_else(|| "direct".to_string());
     let req_id = next_req_id();
-    let cmd = build_install_shell(&inner);
+    // "native" = 官方原生脚本 (从 claude.ai/GCS 拉, 国内常被墙, 仅境外网络兜底);
+    // 其余一律走「直抓平台包 tgz」: R2 优先、多源回落、不碰 npm。
+    let cmd = if method == "native" {
+        build_install_shell(&claude_native_cmd())
+    } else {
+        claude_install_command()
+    };
     stream_install(app, req_id.clone(), cmd, true, "Claude Code");
     Ok(req_id)
 }
@@ -203,6 +211,8 @@ function Install-PolarisMsi {
 const MSI_MAGIC: &str = "d0cf11e0a1b11ae1";
 /// zip 文件头魔数 (`PK\x03\x04`) —— uv 的 release 包。
 const ZIP_MAGIC: &str = "504b0304";
+/// gzip 文件头魔数 (`\x1f\x8b`) —— npm 平台包 tgz (Claude Code)。
+const GZ_MAGIC: &str = "1f8b";
 
 /// 自家依赖包的分发基址 —— Cloudflare `/downloads/*` 由 `functions/downloads/[[path]].js`
 /// 从 R2 桶 `polaris-downloads` 流式取出 (支持 Range、边缘缓存 24h、出站免费)。
@@ -217,6 +227,13 @@ const DEPS_BASE: &str = "https://llmwiki.cloud/downloads/deps";
 const PWSH_VER: &str = "7.4.6";
 const NODE_VER: &str = "20.18.1";
 const UV_VER: &str = "0.11.29";
+/// Claude Code 版本 —— **直接抓 npm 平台包 (`@anthropic-ai/claude-code-<plat>`) 的 tgz 装**,
+/// 不再走 `npm i -g`(它要下同一个 ~80MB 的 optional 依赖, 却常在解压/链接阶段卡死或半途而废,
+/// 这是用户主诉的「装不下来」根因)。改成「一个 HTTP 下载 + tar 解压」后, 就能复用与 uv/Node
+/// 同一套「R2 优先、多源回落、魔数校验」的下载机制。
+/// 与 uv 同理: 锁版本才能把包镜像进 R2。升级 = 改这里 + 把三平台 tgz 传进 R2 的 `deps/`
+/// (没传则 R2 那跳 404, 自动落到 npmmirror, 仍装得上)。
+const CLAUDE_VER: &str = "2.1.218";
 
 /// 把脚本正文里的占位符换成真值。用占位符而非 `format!` 的 `{}` —— PowerShell 脚本里全是
 /// `${...}`/`{0:N0}` 这类花括号, 走 format! 得把每个都转义成 `{{}}`, 既难读又极易写错。
@@ -225,6 +242,8 @@ fn fill(script: &str) -> String {
         .replace("DEPS_BASE", DEPS_BASE)
         .replace("MSI_MAGIC", MSI_MAGIC)
         .replace("ZIP_MAGIC", ZIP_MAGIC)
+        .replace("GZ_MAGIC", GZ_MAGIC)
+        .replace("CLAUDE_VER", CLAUDE_VER)
         .replace("PWSH_VER", PWSH_VER)
         .replace("NODE_VER", NODE_VER)
         .replace("UV_VER", UV_VER)
@@ -236,6 +255,50 @@ fn node_install_script() -> String {
         "{PS_DOWNLOAD_PRELUDE}\n{PS_MSIEXEC_HELPER}\n{NODE_INSTALL_BODY}"
     ))
 }
+
+/// **便携版** Node.js 安装脚本 (前奏 + 正文) —— 后台静默安装专用, 不弹 UAC。
+pub(crate) fn node_portable_script() -> String {
+    fill(&format!("{PS_DOWNLOAD_PRELUDE}\n{WIN_NODE_PORTABLE_BODY}"))
+}
+
+/// Windows **免管理员**的 Node.js 安装: 下载官方 zip 解压到 `~/.local/polaris-node`。
+///
+/// 为什么不复用上面那套 MSI/winget: 它们都要写 `Program Files` → `Start-Process -Verb RunAs`
+/// **必弹 UAC**。而后台静默安装的前提就是「用户不用点任何东西」, 弹一个没有上下文的
+/// 管理员授权框是最糟的体验(用户根本不知道这是谁弹的)。zip 解压到用户目录全程无提权,
+/// npm 的全局前缀也落在同一个用户目录里, 装 claude 同样不需要管理员。
+const WIN_NODE_PORTABLE_BODY: &str = r#"
+$ver = 'NODE_VER'
+$arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'AMD64' { 'x64' } default { 'x86' } }
+$zip = "node-v$ver-win-$arch.zip"
+$dst = Join-Path $env:TEMP $zip
+$urls = @(
+  "DEPS_BASE/$zip",
+  "https://cdn.npmmirror.com/binaries/node/v$ver/$zip",
+  "https://npmmirror.com/mirrors/node/v$ver/$zip",
+  "https://nodejs.org/dist/v$ver/$zip"
+)
+Get-PolarisFile -Urls $urls -Dest $dst -Magic 'ZIP_MAGIC' -MinBytes 15MB
+if (-not $global:PolarisDlOk) { Write-Output 'Node.js 下载失败 (可检查网络 / 代理后重试)。'; exit 1 }
+$dest = Join-Path $env:USERPROFILE '.local\polaris-node'
+$stage = Join-Path $env:TEMP ('polaris-node-stage-' + [guid]::NewGuid().ToString('N'))
+try {
+  Expand-Archive -Path $dst -DestinationPath $stage -Force
+} catch {
+  Write-Output ('解压失败: ' + $_.Exception.Message); Remove-Item $dst -Force -ErrorAction SilentlyContinue; exit 1
+}
+Remove-Item $dst -Force -ErrorAction SilentlyContinue
+# zip 内是 node-v<ver>-win-<arch>\ 一层, 提出来
+$inner = Get-ChildItem $stage -Directory | Select-Object -First 1
+if (-not $inner) { Write-Output '解压后没找到 Node 目录。'; exit 1 }
+if (Test-Path $dest) { Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
+Move-Item $inner.FullName $dest
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+$node = Join-Path $dest 'node.exe'
+if (-not (Test-Path $node)) { Write-Output '解压后未找到 node.exe。'; exit 1 }
+Write-Output ('Node.js (便携版) 安装完成: ' + (& $node -v) + ' -> ' + $dest)
+"#;
 
 /// PowerShell 7 安装脚本 (前奏 + msiexec 封装 + 正文)。
 fn pwsh_install_script() -> String {
@@ -518,28 +581,210 @@ pub(crate) fn build_install_shell(inner: &str) -> Command {
     }
 }
 
-/// Claude Code 的安装命令串 (按方式选择, 两端默认一致)。
-/// - `npm` (**默认, 两端**): `npm i -g @anthropic-ai/claude-code --registry=npmmirror.com`。
-///   原生二进制 (win32 / darwin-arm64 / darwin-x64 …) 经 `optionalDependencies` 由 npmmirror
-///   **同源镜像**分发, postinstall 只把它拷成 `bin/claude` —— 整个过程**不碰 claude.ai / GCS**,
-///   故国内 (含 macOS) 可装。这是国内最稳的路径, 需要 Node.js (缺则先 `env_install_node`)。
-/// - `native` (**兜底, 境外网络**): 官方原生脚本 —— Windows `install.ps1` / macOS·Linux
-///   `install.sh`。它从 claude.ai/GCS 拉二进制, **国内常被墙 → 默认不走**, 仅给能访问外网的人。
-fn claude_install_cmd(method: &str) -> String {
-    match method {
-        "native" => {
-            #[cfg(windows)]
-            {
-                "irm https://claude.ai/install.ps1 | iex".to_string()
-            }
-            #[cfg(not(windows))]
-            {
-                "curl -fsSL https://claude.ai/install.sh | bash".to_string()
-            }
-        }
-        _ => "npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com"
-            .to_string(),
+/// 官方原生脚本 (境外网络兜底): Windows `install.ps1` / macOS·Linux `install.sh`。
+/// 它从 claude.ai/GCS 拉二进制, **国内常被墙 → 仅给能访问外网的人**。
+fn claude_native_cmd() -> String {
+    #[cfg(windows)]
+    {
+        "irm https://claude.ai/install.ps1 | iex".to_string()
     }
+    #[cfg(not(windows))]
+    {
+        "curl -fsSL https://claude.ai/install.sh | bash".to_string()
+    }
+}
+
+/// Windows **免管理员**装 Claude Code: 直接抓 npm 平台包 tgz, 解压出 `claude.exe` 到
+/// `~/.local/bin`(env_check 的首选探测位, 且已在启动期并进 PATH)。**不经 `npm i -g`** ——
+/// 后者要下同一个 ~80MB 的 optional 依赖却常卡死(用户主诉), 这里退回最不会坏的「一个 HTTP
+/// 下载 + tar 解压」形态, 并复用 R2 优先、多源回落、魔数校验的下载机制。
+///
+/// 源顺序: 自家 R2 打头(不开梯子最快) → npmmirror(阿里, 国内 CDN) → npmjs 官方。
+/// 平台包内结构固定为 `package/claude.exe`(2026-07-24 实测), 故 `tar --strip-components=1`。
+/// `tar.exe`(bsdtar) 是 Windows 10 1803+ 自带(最低支持 1809), 无需另装。
+#[cfg(windows)]
+const WIN_CLAUDE_PORTABLE_BODY: &str = r#"
+$ver = 'CLAUDE_VER'
+$arch = switch ($env:PROCESSOR_ARCHITECTURE) { 'ARM64' { 'arm64' } 'AMD64' { 'x64' } default { 'x64' } }
+$pkg = "claude-code-win32-$arch"
+$tgz = "$pkg-$ver.tgz"
+$bin = Join-Path $env:USERPROFILE '.local\bin'
+New-Item -ItemType Directory -Force -Path $bin | Out-Null
+$exe = Join-Path $bin 'claude.exe'
+# 清掉历次「旧 claude 运行中让路」遗留的 .old-*（那些进程多半早退出了，此刻能删就删）
+Get-ChildItem (Join-Path $bin 'claude.exe.old-*') -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+# 多源, 失败域各不相同: R2(自托管 / CF) → npmmirror(阿里) → yarn(CF 镜像) → npmjs(官方)。
+# 四家不同公司、不同网络路径, 任一活着就能装。R2 打头 = 不开梯子最快。
+$urls = @(
+  "DEPS_BASE/$tgz",
+  "https://registry.npmmirror.com/@anthropic-ai/$pkg/-/$tgz",
+  "https://registry.yarnpkg.com/@anthropic-ai/$pkg/-/$tgz",
+  "https://registry.npmjs.org/@anthropic-ai/$pkg/-/$tgz"
+)
+
+# ── 阶段一: 从任一源拿到一个「下得下来、解得开、还真能跑」的 claude.exe ──
+# 每个源**各自端到端自证**(下载→体积→gzip 魔数→解压→`--version` 真跑一次), 任一步不过就换下
+# 一个源。比只校验哈希更强: 能挡住「下坏但恰好 >30MB 还是 gzip 头」「架构拿错」「包结构变了」,
+# 且零维护(不用每版更新哈希)。下载与落盘分开 —— 占锁不该让人白下 80MB。
+$verified = Join-Path $env:TEMP ('polaris-claude-verified-' + [guid]::NewGuid().ToString('N') + '.exe')
+$ver_out = $null
+$got = $false
+foreach ($round in 1..2) {
+  foreach ($u in $urls) {
+    if ($got) { break }
+    $dst = Join-Path $env:TEMP $tgz
+    $stage = Join-Path $env:TEMP ('polaris-cc-stage-' + [guid]::NewGuid().ToString('N'))
+    try {
+      Write-Output "下载: $u"
+      if (Test-Path $dst) { Remove-Item $dst -Force -ErrorAction SilentlyContinue }
+      Invoke-WebRequest -Uri $u -OutFile $dst -UseBasicParsing -TimeoutSec 600
+      $len = (Get-Item $dst).Length
+      if ($len -lt 30MB) { Write-Output ('  体积不对 {0:N0} 字节 (多半是代理错误页), 换下一个源' -f $len); continue }
+      $fs = [IO.File]::OpenRead($dst); $hb = New-Object byte[] 2; $null = $fs.Read($hb, 0, 2); $fs.Close()
+      $magic = ($hb | ForEach-Object { $_.ToString('x2') }) -join ''
+      if ($magic -ne 'GZ_MAGIC') { Write-Output ('  文件头 {0} 不是 gzip, 换下一个源' -f $magic); continue }
+      # 解压到独立 stage (tar.exe = bsdtar, Win10 1803+ 自带; --strip-components=1 去掉 package\ 一层)
+      New-Item -ItemType Directory -Force -Path $stage | Out-Null
+      & tar.exe -xzf $dst -C $stage --strip-components=1
+      $cand = Join-Path $stage 'claude.exe'
+      if (-not (Test-Path $cand)) { Write-Output '  解压后没有 claude.exe (包坏了 / 结构变了), 换下一个源'; continue }
+      # 真跑一次: 证明是能用的、架构对的二进制, 而不是坏包 / 错架构
+      $out = & $cand --version 2>$null
+      if ($LASTEXITCODE -ne 0 -or -not $out) { Write-Output '  解压出的 claude 跑不起来 (下坏 / 架构不符), 换下一个源'; continue }
+      Copy-Item $cand $verified -Force
+      $ver_out = $out
+      $got = $true
+    } catch {
+      Write-Output ('  下载 / 校验失败: ' + $_.Exception.Message + ', 换下一个源')
+    } finally {
+      Remove-Item $dst -Force -ErrorAction SilentlyContinue
+      Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+  if ($got) { break }
+  if ($round -eq 1) { Write-Output '一轮源都没成, 歇 2 秒再来一轮...'; Start-Sleep -Seconds 2 }
+}
+if (-not $got) { Write-Output 'Claude Code 所有源都失败 (可检查网络 / 代理后重试)。'; exit 1 }
+
+# ── 阶段二: 落盘 (只做一次; 与「重试下载源」分开, 避免因占锁白下 80MB) ──
+$installed = $false
+# 首选直接覆盖（全新装 / 旧文件没被占用都走这条）
+try { Copy-Item $verified $exe -Force -ErrorAction Stop; $installed = $true }
+catch {
+  # 覆盖被拒 = 旧 claude 正在运行、镜像被锁。用**唯一后缀**改名让路（不与遗留 .old 撞）, 再覆盖。
+  # (Windows 允许给「正在运行的镜像」改名, 这正是能原地更新的关键; 改名后 $exe 空出来即可写新的。)
+  $old = "$exe.old-" + [guid]::NewGuid().ToString('N')
+  try {
+    Move-Item $exe $old -Force -ErrorAction Stop
+    Copy-Item $verified $exe -Force -ErrorAction Stop
+    $installed = $true
+    Remove-Item $old -Force -ErrorAction SilentlyContinue  # 进程还活着会删不掉, 无妨, 下次再清
+  } catch {
+    Write-Output ('无法替换正在运行的 claude.exe: ' + $_.Exception.Message + ' — 请结束正在进行的对话后重试。')
+  }
+}
+Remove-Item $verified -Force -ErrorAction SilentlyContinue
+# 关键: 只有真装成功才算成功。绝不在「旧文件还在」时误报(否则用户以为装了新版, 其实是旧版)。
+if (-not $installed) { exit 1 }
+Write-Output ('Claude Code 安装完成: ' + $ver_out)
+"#;
+
+/// Claude Code 直装脚本 (前奏 + 正文) —— 手动按钮与后台静默托管共用。
+#[cfg(windows)]
+fn claude_install_script() -> String {
+    fill(&format!("{PS_DOWNLOAD_PRELUDE}\n{WIN_CLAUDE_PORTABLE_BODY}"))
+}
+
+/// 类 Unix (macOS / Linux) 直装 Claude Code (POSIX sh): 抓 npm 平台包 tgz → 解压
+/// `package/claude` 到 `~/.local/bin`。绕开 `npm i -g` 的卡死, 走 R2 优先多源。免 sudo。
+///
+/// 平台判定覆盖 npm 上全部六个类 Unix 平台包 (2026-07-24 实测均存在):
+/// `darwin-arm64` / `darwin-x64` / `linux-x64` / `linux-arm64` / `linux-x64-musl` /
+/// `linux-arm64-musl`。**musl 与 glibc 是两个不同的包**, Alpine 之类拿错会跑不起来, 故按
+/// `ldd --version` 判。包内结构 `package/claude` 与 Windows 的 `package/claude.exe`
+/// 同一套 npm 打包约定 (三平台均已实测)。
+#[cfg(not(windows))]
+const UNIX_CLAUDE_INSTALL_SCRIPT: &str = r#"
+VER='CLAUDE_VER'
+OS=$(uname -s)
+ARCH=$(uname -m)
+case "$ARCH" in
+  arm64|aarch64) A=arm64 ;;
+  x86_64|amd64)  A=x64 ;;
+  *)             A=x64 ;;
+esac
+case "$OS" in
+  Darwin) PLAT="darwin-${A}" ;;
+  Linux)
+    # musl(Alpine 等) 与 glibc 各有各的包, 拿错了解压出来也跑不起来
+    if ldd --version 2>&1 | grep -qi musl; then PLAT="linux-${A}-musl"; else PLAT="linux-${A}"; fi ;;
+  *) echo "不支持的系统: $OS"; exit 1 ;;
+esac
+PKG="claude-code-${PLAT}"
+TGZ="${PKG}-${VER}.tgz"
+BIN="$HOME/.local/bin"
+mkdir -p "$BIN"
+TMP="$(mktemp -d)"
+# 多源, 失败域各不相同: R2(自托管) → npmmirror(阿里) → yarn(CF 镜像) → npmjs(官方)。
+# 每个源**各自端到端自证**: 下载 → gzip 魔数 → 解压 → `--version` 真跑一次, 任一步不过就换下
+# 一个源 (挡住「下坏但仍是 gzip」「架构不符」「包结构变了」)。下载与落盘分开。
+URLS="DEPS_BASE/$TGZ https://registry.npmmirror.com/@anthropic-ai/${PKG}/-/${TGZ} https://registry.yarnpkg.com/@anthropic-ai/${PKG}/-/${TGZ} https://registry.npmjs.org/@anthropic-ai/${PKG}/-/${TGZ}"
+VERIFIED=""
+for ROUND in 1 2; do
+  [ -n "$VERIFIED" ] && break
+  for U in $URLS; do
+    echo "下载: $U"
+    TARBALL="$TMP/dl.tgz"
+    if ! curl -fsSL --retry 2 --retry-delay 2 "$U" -o "$TARBALL"; then echo "  下载失败, 换下一个源..."; continue; fi
+    if [ ! -s "$TARBALL" ]; then echo "  空文件, 换下一个源..."; continue; fi
+    if [ "$(head -c 2 "$TARBALL" | od -An -tx1 | tr -d ' \n')" != "1f8b" ]; then echo "  非 gzip (多半是错误页), 换下一个源..."; continue; fi
+    ST="$TMP/stage"; rm -rf "$ST"; mkdir -p "$ST"
+    if ! tar -xzf "$TARBALL" -C "$ST" --strip-components=1 2>/dev/null; then echo "  解压失败, 换下一个源..."; continue; fi
+    if [ ! -f "$ST/claude" ]; then echo "  解压后没有 claude, 换下一个源..."; continue; fi
+    chmod +x "$ST/claude" 2>/dev/null || true
+    if ! "$ST/claude" --version >/dev/null 2>&1; then echo "  claude 跑不起来 (下坏 / 架构不符), 换下一个源..."; continue; fi
+    VERIFIED="$TMP/claude.verified"
+    cp -f "$ST/claude" "$VERIFIED"; chmod +x "$VERIFIED"
+    break
+  done
+  if [ -z "$VERIFIED" ] && [ "$ROUND" = "1" ]; then echo "一轮源都没成, 歇 2 秒再来一轮..."; sleep 2; fi
+done
+if [ -z "$VERIFIED" ]; then echo "Claude Code 所有源都失败 (检查网络/代理后重试)。"; rm -rf "$TMP"; exit 1; fi
+# 同目录临时文件 + mv 原子替换 —— cp -f 会 open(O_TRUNC) 就地截断, 会让**正在运行**的旧
+# claude 二进制崩(SIGBUS)。mv 是 unlink+rename, 旧进程照抱着已被 unlink 的 inode 跑完不受影响。
+NEW="$BIN/.claude.new.$$"
+cp -f "$VERIFIED" "$NEW" && chmod +x "$NEW" && mv -f "$NEW" "$BIN/claude" || { echo "落盘失败。"; rm -f "$NEW"; rm -rf "$TMP"; exit 1; }
+rm -rf "$TMP"
+# 把 ~/.local/bin 写进 shell 配置 (与 uv/node 一致), 已存在则不重复
+LINE="export PATH=\"$BIN:\$PATH\""
+for RC in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.profile" ; do
+  touch "$RC" 2>/dev/null || true
+  grep -qF "$BIN" "$RC" 2>/dev/null || printf '\n# Added by Polaris (Claude Code)\n%s\n' "$LINE" >> "$RC"
+done
+echo "Claude Code 安装完成: $("$BIN/claude" --version 2>/dev/null || echo "(已装到 $BIN/claude)")"
+"#;
+
+/// 默认方式安装 Claude Code 的进程命令 (直抓平台包 tgz, R2 优先多源, 不经 npm)。
+/// 供手动安装按钮与后台静默托管 (`autopilot`) 共用, 两端一致。
+pub(crate) fn claude_install_command() -> Command {
+    #[cfg(windows)]
+    {
+        build_powershell(&claude_install_script())
+    }
+    // macOS 与 Linux 共用同一套 POSIX sh 脚本 (脚本内按 uname 自判平台包)。
+    // Linux 以前留的是 `npm i -g` 老路 —— 那正是「下 80MB optional 依赖卡死」的根因,
+    // 一并换掉; Docker 镜像本就预烤 claude(见 Dockerfile), 不经这里。
+    #[cfg(not(windows))]
+    {
+        build_install_shell(&fill(UNIX_CLAUDE_INSTALL_SCRIPT))
+    }
+}
+
+/// macOS 免 sudo 装 Node 的命令 (供后台静默托管复用)。
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_node_install_command() -> Command {
+    build_install_shell(MAC_NODE_INSTALL_SCRIPT)
 }
 
 /// 构造一个跑给定内联命令的 PowerShell 进程 (Bypass 执行策略, 以便 iex 远程脚本)。
@@ -722,16 +967,50 @@ mod tests {
             ("pwsh", pwsh_install_script()),
         ];
         #[cfg(windows)]
-        all.push(("uv", uv_install_script()));
+        {
+            all.push(("uv", uv_install_script()));
+            all.push(("claude", claude_install_script()));
+        }
         #[cfg(target_os = "macos")]
         all.push(("mac-uv", mac_uv_install_script()));
+        #[cfg(not(windows))]
+        all.push(("unix-claude", fill(UNIX_CLAUDE_INSTALL_SCRIPT)));
+        all.push(("node-portable", node_portable_script()));
         for (name, s) in &all {
-            for ph in ["DEPS_BASE", "MSI_MAGIC", "ZIP_MAGIC", "PWSH_VER", "NODE_VER", "UV_VER"] {
+            for ph in [
+                "DEPS_BASE", "MSI_MAGIC", "ZIP_MAGIC", "GZ_MAGIC", "CLAUDE_VER", "PWSH_VER",
+                "NODE_VER", "UV_VER",
+            ] {
                 assert!(!s.contains(ph), "{name} 脚本里还留着未替换的占位符 {ph}");
             }
             assert!(
                 s.contains(DEPS_BASE),
                 "{name} 脚本应把自家 R2 源排进候选 (否则镜像白传)"
+            );
+        }
+    }
+
+    /// Claude 直装脚本必须走「平台包 tgz + tar 解压」而**不是** `npm i -g` —— 后者是被替掉的卡死路径。
+    #[test]
+    fn claude_install_is_direct_tgz_not_npm() {
+        #[cfg(windows)]
+        let s = claude_install_script();
+        #[cfg(not(windows))]
+        let s = fill(UNIX_CLAUDE_INSTALL_SCRIPT);
+        {
+            assert!(s.contains("claude-code-"), "应按平台包名抓 tgz");
+            assert!(s.contains(".tgz"), "应下载 tgz");
+            assert!(!s.contains("npm install"), "默认路径不该再调 npm i -g");
+            // 每个源必须端到端自证: 解压后真跑一次 --version, 而非只校验体积/魔数
+            assert!(s.contains("--version"), "每个源应跑 --version 自证二进制能用");
+            // 四源、失败域各不相同, 且 R2 打头 (不开梯子最快): R2 → npmmirror → yarn → npmjs
+            let r2 = s.find(DEPS_BASE).expect("应含 R2 源");
+            let mirror = s.find("registry.npmmirror.com").expect("应含 npmmirror 源");
+            let yarn = s.find("registry.yarnpkg.com").expect("应含 yarn 镜像源");
+            let npmjs = s.find("registry.npmjs.org").expect("应含 npmjs 兜底源");
+            assert!(
+                r2 < mirror && mirror < yarn && yarn < npmjs,
+                "源顺序应为 R2 → npmmirror → yarn → npmjs"
             );
         }
     }
@@ -756,9 +1035,16 @@ mod tests {
     /// 三个 Windows 脚本一个都不能漏, 故在此锁死。
     #[test]
     fn windows_scripts_disable_progress_bar() {
-        let mut all = vec![node_install_script(), pwsh_install_script()];
+        let mut all = vec![
+            node_install_script(),
+            pwsh_install_script(),
+            node_portable_script(),
+        ];
         #[cfg(windows)]
-        all.push(uv_install_script());
+        {
+            all.push(uv_install_script());
+            all.push(claude_install_script());
+        }
         for s in &all {
             assert!(s.contains("$ProgressPreference = 'SilentlyContinue'"));
         }
@@ -779,6 +1065,7 @@ mod tests {
         all.push(("uv", uv_install_script()));
         #[cfg(target_os = "macos")]
         all.push(("mac-uv", mac_uv_install_script()));
+        all.push(("node-portable", node_portable_script()));
         for (name, src) in &all {
             let ext = if name.starts_with("mac") { "sh" } else { "ps1" };
             let p = dir.join(format!("polaris_{name}_install.{ext}"));
@@ -798,6 +1085,8 @@ mod tests {
             ("node", node_install_script()),
             ("pwsh", pwsh_install_script()),
             ("uv", uv_install_script()),
+            ("claude", claude_install_script()),
+            ("node-portable", node_portable_script()),
         ] {
             let f = std::env::temp_dir().join(format!("polaris_test_{name}_install.ps1"));
             // 必须写 UTF-8 BOM: Windows PowerShell 5.1 读**无 BOM** 的 .ps1 会按 ANSI(GBK) 解,

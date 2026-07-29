@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "polaris-app"
-version = "2.6.0"
+version = "2.7.0"
 description = "Polaris - 本地优先 AI 工作台 (MVP)"
 authors = ["winner3388"]
 edition = "2021"
@@ -97,6 +97,9 @@ polaris-forge-codec = { path = "crates/forge-codec", optional = true }
 # Codex(ChatGPT) OAuth Device Code 流程 —— 同步阻塞 HTTP 客户端 (rustls, 无 tokio)。
 # 只用于授权三步: 取设备码 / 轮询 / code 换 token。比 cc-switch 的 reqwest+tokio 轻得多。
 ureq = { version = "2", features = ["json"] }
+# 远程盘(fsmount)读文件时解开对端的传输压缩。依赖树里本来就有(zip → polaris-kernel),
+# 这里只是显式点名;对端不压时这段代码不经手数据。
+zstd = "0.13"
 # Claude 官方订阅 OAuth(PKCE):code_challenge = base64url(sha256(verifier))。
 # sha2 纯 Rust 哈希、getrandom 取 OS 加密安全随机(verifier/state),两者均无系统依赖、
 # 三平台(Win/mac/Linux musl+gnu)同构编译;桌面与 server feature 都要,故无条件依赖。

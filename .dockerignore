@@ -19,6 +19,11 @@ workspace
 docs
 *.html
 !index.html
+# 例外:beam.rs 用 include_str!("../../docs/beam-guide.html") 把它编进二进制。
+# 上面两条(docs / *.html)会把它挡在构建上下文外 → stage2 直接编译失败
+# (`couldn't read src/../../docs/beam-guide.html`)。**排除规则的例外必须写在被排除项之后**,
+# 否则不生效。以后再有跨出 src-tauri 的 include_*,这里和 Dockerfile 的 COPY 都要跟着加。
+!docs/beam-guide.html
 # 知识库内容运行时由卷挂载/种子提供，不进镜像
 PolarisKB
 # updater 私钥等

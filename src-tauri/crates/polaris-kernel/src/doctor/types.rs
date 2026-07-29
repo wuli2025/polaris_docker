@@ -23,6 +23,9 @@ pub struct ToolStatus {
     pub required: bool,
     /// 一句话状态说明 / 安装建议
     pub hint: String,
+    /// 命中的是不是**随安装包内置**的那份 (见 doctor::bundled)。
+    /// true ⇒ 面板显示「随应用内置」, 不再催用户安装 —— 它本就免安装、免管理员。
+    pub bundled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,11 +46,24 @@ pub struct EnvReport {
     pub claude_dir: Option<String>,
     /// 该目录是否已在「用户 PATH」里 (Windows)。false ⇒ 需要修复
     pub claude_dir_on_user_path: bool,
-    /// 是否有 claude 可用的 shell —— 真身 PowerShell 7 (非 Store 别名) 或 Git Bash。
-    /// false ⇒ 即便装了 claude, 对话里也会报「找不到 PowerShell / bash」。
+    /// 是否有 claude 可用的 shell —— 真身 PowerShell 7 (非 Store 别名) 或 Git Bash
+    /// (含**随安装包内置**的那份)。false ⇒ 即便装了 claude, 对话里也会报「找不到 PowerShell / bash」。
     pub shell_ready: bool,
+    /// 当前这个 shell 是不是随应用内置的 Git Bash。true ⇒ 面板据此说明「无需另装 PowerShell 7」。
+    pub shell_bundled: bool,
     /// 整体是否就绪 (claude 已装 **且** 有可用 shell 才算真能跑起来)
     pub ready: bool,
+    /// **运行环境由镜像托管** (server/容器 flavor) —— claude 等组件随镜像预烤, 升级靠
+    /// `docker pull` 换镜像, 而非在面板里点安装/更新。
+    ///
+    /// 为什么要这个字段: 容器里 `env_claude_update_check` 是放行的(能查出有新版), 但
+    /// `env_install_claude` / `env_update_claude` 在 apihub 层被挡 → 面板会渲染出一个
+    /// 「更新到 x.y.z」按钮而**点了必然报错**。而且镜像把 claude 版本锁死后, 随上游发版
+    /// 这个必失败的按钮只会越来越常出现。前端据此改渲染成一行静态提示。
+    ///
+    /// 判定: 非 desktop feature 即 server flavor(Docker 镜像用 `-p polaris-cli` 构建,
+    /// 不开 desktop) —— 后端权威, 免得前端靠 `isTauri` 之类的迹象猜。
+    pub image_managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

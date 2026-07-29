@@ -64,6 +64,12 @@ RUN mkdir -p /usr/local/cargo/ \
 #   --features local-embed:本地 ONNX 嵌入/重排(经 polaris-cli → polaris-app → polaris-fable
 #     转发);配套 crates/polaris-fable 的 ort-load-dynamic + 运行层 ORT_DYLIB_PATH。
 COPY src-tauri ./src-tauri
+# ★ src-tauri 之外的内嵌资源:beam.rs 用 include_str!("../../docs/beam-guide.html")
+#   把这份说明编进二进制。只 COPY src-tauri 会在这一层直接编译失败
+#   (`couldn't read src/../../docs/beam-guide.html`)。.dockerignore 里也要有对应的
+#   `!docs/beam-guide.html` 例外,否则它压根不在构建上下文里。
+#   新增跨出 src-tauri 的 include_* 时,这两处都要跟着加。
+COPY docs/beam-guide.html ./docs/beam-guide.html
 RUN cargo build --profile release-fast \
         --manifest-path src-tauri/Cargo.toml \
         -p polaris-cli --features collab-net,local-embed \

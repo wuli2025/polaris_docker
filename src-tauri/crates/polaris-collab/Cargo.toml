@@ -42,6 +42,9 @@ tauri = { version = "2.1", features = [], optional = true }
 axum = { version = "0.7", features = ["ws", "multipart"], optional = true }
 # 邮箱验证码(注册/找回密码)发信:阻塞 SMTP + rustls(避开 OpenSSL,QQ 邮箱 465 隐式 TLS)
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "rustls-tls"], optional = true }
+# 远程盘读文件的传输压缩(Accept-Encoding: zstd 时才启用)。这棵依赖本来就在树里
+# (zip → polaris-kernel),这里只是显式点名,不新增编译负担。
+zstd = { version = "0.13", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", features = ["fs", "cors", "trace"], optional = true }
 futures-util = { version = "0.3", optional = true }
@@ -54,5 +57,5 @@ tokio-tungstenite = { version = "0.24", optional = true }
 [features]
 default = []
 desktop = ["dep:tauri"]
-collab-host = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util", "dep:lettre"]
+collab-host = ["dep:axum", "dep:tower", "dep:tower-http", "dep:futures-util", "dep:lettre", "dep:zstd"]
 collab-net = ["dep:iroh", "dep:iroh-mdns-address-lookup", "dep:tokio-tungstenite"]

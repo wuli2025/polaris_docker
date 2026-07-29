@@ -278,6 +278,38 @@ pub fn ensure_pinned() -> Result<(String, String), String> {
     Ok((url, pk))
 }
 
+/// 用**显式给的地址**钉住权威(不看环境变量)。
+///
+/// 为什么需要它:`ensure_pinned` 的地址来自 `POLARIS_ACCOUNT_AUTHORITY_URL`,而桌面 App 是
+/// 双击启动的 —— 那个环境变量根本不存在。于是桌面主机永远钉不上权威,也就**永远不接受
+/// 身份断言**:同账号的另一台设备连过来会吃一句「本机未配置云端账号中心」。设备网入网时
+/// 用户亲手填了地址、输了密码,正是钉住它的合法时机。
+///
+/// 语义与 `ensure_pinned` 一致的那一半:已经钉过**同一个** URL 就直接复用;钉过**别的**
+/// URL 一律拒绝,不静默改钉 —— 静默换钥匙等于把验签这道防线拆了。真要换走 [`repin`]。
+pub fn pin_explicit(url: &str) -> Result<(String, String), String> {
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Err("账号中心地址不能为空".into());
+    }
+    if let Some((pinned_url, pk, _)) = pinned() {
+        if pinned_url == url {
+            return Ok((url, pk));
+        }
+        return Err(format!(
+            "本机已信任账号中心「{pinned_url}」,与这次要用的「{url}」不一致 —— \
+             要换请走「重新信任」并核对公钥指纹"
+        ));
+    }
+    let pk = fetch_public_key(&url)?;
+    let k = kid_of(&pk);
+    db::meta_set("authority_url", &url)?;
+    db::meta_set("authority_pub", &pk)?;
+    db::meta_set("authority_kid", &k)?;
+    db::audit("system", "authority.pin", &url, &k);
+    Ok((url, pk))
+}
+
 /// owner 显式重钉(换云机/轮换密钥)。要求调用方已核过 kid。
 pub fn repin(expect_kid: Option<&str>) -> Result<(String, String), String> {
     let url = upstream_url().ok_or("本机未配置账号权威(POLARIS_ACCOUNT_AUTHORITY_URL)")?;

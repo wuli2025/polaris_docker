@@ -280,6 +280,24 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             registered_at INTEGER NOT NULL
         );
 
+        -- 同账号设备网(Tailscale 式「登录即成网」)的设备目录。**只有账号权威(云机)用这张表**:
+        -- 每台装了 Polaris 的机器登录后把自己的 iroh NodeId 挂上来,同 uid 的其它设备据此
+        -- 自动建隧道、自动挂盘,用户再不必手工粘连接码。
+        -- key_hash = 设备密钥的 sha256(明文只在颁发那一次回给设备,库里不留)——
+        -- 这把密钥能换取身份断言,等同该账号的长期凭据,所以按设备独立颁发、可独立吊销。
+        CREATE TABLE IF NOT EXISTS mesh_nodes(
+            node_id    TEXT PRIMARY KEY,
+            uid        TEXT NOT NULL,
+            name       TEXT NOT NULL DEFAULT '',
+            os         TEXT NOT NULL DEFAULT '',
+            ver        TEXT NOT NULL DEFAULT '',
+            key_hash   TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_seen  INTEGER NOT NULL DEFAULT 0,
+            revoked    INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_mesh_uid ON mesh_nodes(uid, revoked);
+
         CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, state);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_devices_node ON devices(node_id);

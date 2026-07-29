@@ -69,7 +69,9 @@ pub fn api_router(state: ApiState) -> Router {
         .route("/api/file", get(serve_file))
         .route("/api/exec", post(exec_ep))
         .route("/ws", get(ws_handler))
-        .with_state(state)
+        .with_state(state.clone())
+        // 应用直投:/app/{slug}/… 反代到本机在跑的 HTTP 应用(自带鉴权与 owner 闸)。
+        .merge(crate::appproxy::routes(state))
 }
 
 // ───────────────────────── 鉴权 ─────────────────────────
@@ -744,6 +746,61 @@ async fn invoke(
     }
 
 
+    // ── 「隔空同屏」三条命令在这里就地处理,不进 dispatch ──────────────────────
+    // 理由:beam_send 要往 **本次请求所属的广播总线**(state.tx)里投递,而 dispatch_* 只拿得到
+    // AppHandle;桌面壳里 AppHandle 是 tauri 句柄,emit 只到本机 webview,手机永远收不到。
+    // 在这一层处理还有个好处:双壳(desktop/server)共用同一段代码,不用在两个 dispatch 里各写一份。
+    if cmd == "beam_send" {
+        // 允许 {msg:{…}} 与直接把字段摊平两种写法(手机端少一层包装)。
+        let raw = args
+            .get("msg")
+            .cloned()
+            .unwrap_or(Value::Object(args.as_object().cloned().unwrap_or_default()));
+        return match crate::beam::normalize(raw) {
+            Ok(msg) => {
+                let _ = state.tx.send(crate::host::Event::new(
+                    crate::beam::TOPIC.to_string(),
+                    msg.clone(),
+                    None,
+                ));
+                crate::collab::db::audit(
+                    &ctx.username,
+                    "beam.send",
+                    msg.get("act").and_then(|v| v.as_str()).unwrap_or(""),
+                    msg.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                );
+                Json(json!({ "delivered": true, "msg": msg })).into_response()
+            }
+            Err(e) => invoke_err_resp(e),
+        };
+    }
+    if cmd == "beam_pack" || cmd == "beam_export" {
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p.to_string(),
+            None => return invoke_err_resp("缺少字符串参数 `path`".into()),
+        };
+        let out_dir = args
+            .get("outDir")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let want_export = cmd == "beam_export";
+        // 打包要读文件 + base64 整份编码,是纯 CPU/IO 活,必须离开 async worker。
+        let joined = tokio::task::spawn_blocking(move || {
+            if want_export {
+                crate::beam::export(&path, out_dir).map(|p| json!(p))
+            } else {
+                crate::beam::pack(&path)
+                    .and_then(|d| serde_json::to_value(d).map_err(|e| e.to_string()))
+            }
+        })
+        .await;
+        return match joined {
+            Ok(Ok(v)) => Json(v).into_response(),
+            Ok(Err(e)) => invoke_err_resp(e),
+            Err(e) => err_resp(format!("打包任务失败: {e}")),
+        };
+    }
+
     // 其余命令同步执行，丢到阻塞线程池（内含 ureq 网络/文件 IO，勿阻塞 async worker）。
     // 必须设超时：阻塞池只有 64 线程，慢命令无超时会一条条钉死线程。
     let timeout_secs: u64 = std::env::var("POLARIS_INVOKE_TIMEOUT_SECS")
@@ -877,6 +934,15 @@ async fn dispatch_desktop(cmd: &str, a: &Args, _app: AppHandle) -> Result<Value,
             a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             a.get("shellMinutes").and_then(|v| v.as_i64()),
         )?),
+        // ── 远程盘共享目录(主机侧开放哪些目录给对端访问,逐目录点选放开写) ──
+        "fs_share_get" => ok(crate::fsshare::fs_share_get()),
+        "fs_share_set" => ok(crate::fsshare::fs_share_set(vec_str(a, "paths"))?),
+        "fs_share_list" => ok(crate::fsshare::fs_share_list()),
+        "fs_share_save" => ok(crate::fsshare::fs_share_save(vec_val(a, "items"))?),
+        // ── 应用直投:手机要知道主机发布了哪些应用(点开后走 /app/{slug}/) ──
+        "app_pub_list" => ok(crate::appproxy::app_pub_list()),
+        "app_open" => ok(crate::appproxy::app_open(req_str(a, "slug")?)?),
+
         // ── 对话辅助(chat_send 在 invoke 里单独特判) ──
         "chat_cancel" => ok(chat::chat_cancel(req_str(a, "reqId")?)?),
         "chat_is_running" => ok(chat::chat_is_running(req_str(a, "reqId")?)),
@@ -891,13 +957,24 @@ async fn dispatch_desktop(cmd: &str, a: &Args, _app: AppHandle) -> Result<Value,
         )?),
         "chat_build_manifest" => ok(chat::chat_build_manifest(opt_str(a, "conversationId"))),
 
+        // ── 隔空同屏说明页(beam_pack/export/send 在 invoke 上层特判,这里补同步读命令) ──
+        "beam_doc_path" => ok(crate::beam::beam_doc_path()?),
+
         // ── 产物(手机产物 chip 预览走 /api/file;这里给读取/列举备用) ──
         "artifact_read" => ok(chat::artifact_read(req_str(a, "path")?)?),
         "artifact_list" => ok(chat::artifact_list(opt_str(a, "conversationId")).await),
         "artifact_search" => ok(chat::artifact_search(req_str(a, "query")?).await),
 
-        // ── 会话读取(手机历史主要走本地存储,这些为兼容/备用) ──
+        // ── 电脑上的项目(手机说「打开××项目」后,新会话建在该项目下 → claude 的 cwd
+        //     就是这个项目绑定的工作目录, 等同电脑上 `cd <repo> && claude`) ──
+        // 不开放 archive/open_dir:归档是破坏性的、在电脑上弹资源管理器对手机也没意义。
         "conv_list_projects" => ok(conv::conv_list_projects()),
+        "conv_create_project" => ok(conv::conv_create_project(req_str(a, "name")?)?),
+        "conv_set_project_work_dir" => ok(conv::conv_set_project_work_dir(
+            req_str(a, "projectId")?,
+            opt_str(a, "workDir"),
+        )?),
+        // ── 会话读取(手机历史主要走本地存储,这些为兼容/备用) ──
         "conv_list_conversations" => ok(conv::conv_list_conversations(req_str(a, "projectId")?)),
         "conv_get_messages" => ok(conv::conv_get_messages(req_str(a, "conversationId")?)),
         "conv_create_conversation" => {
@@ -984,6 +1061,14 @@ fn opt_u8(a: &Args, k: &str) -> Option<u8> {
 fn bool_def(a: &Args, k: &str, d: bool) -> bool {
     a.get(k).and_then(|v| v.as_bool()).unwrap_or(d)
 }
+/// 可选的对象数组(共享清单 `[{path, write}]` 这类)。缺失/非数组 → 空 vec。
+fn vec_val(a: &Args, k: &str) -> Vec<serde_json::Value> {
+    a.get(k)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.to_vec())
+        .unwrap_or_default()
+}
+
 fn vec_str(a: &Args, k: &str) -> Vec<String> {
     a.get(k)
         .and_then(|v| v.as_array())
@@ -1091,12 +1176,21 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
         "kb_default_root" => ok(kb::kb_default_root()),
         // 设备联盟遥测:云主机/server 壳自采本机资源。
         "sys_stats" => ok(crate::sysstat::sample()),
+        // 应用直投:远端要知道主机发布了哪些本机应用
+        "app_pub_list" => ok(crate::appproxy::app_pub_list()),
+        "app_open" => ok(crate::appproxy::app_open(req_str(a, "slug")?)?),
+        "beam_doc_path" => ok(crate::beam::beam_doc_path()?),
         // 受控远程执行策略(exec 本体走 /api/exec 专用端点,不走 invoke)
         "exec_policy_get" => ok(crate::exec::exec_policy_get()),
         "exec_policy_set" => ok(crate::exec::exec_policy_set(
             a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
             a.get("shellMinutes").and_then(|v| v.as_i64()),
         )?),
+        // 远程盘共享目录(主机侧开放哪些目录给对端访问,逐目录点选放开写)
+        "fs_share_get" => ok(crate::fsshare::fs_share_get()),
+        "fs_share_set" => ok(crate::fsshare::fs_share_set(vec_str(a, "paths"))?),
+        "fs_share_list" => ok(crate::fsshare::fs_share_list()),
+        "fs_share_save" => ok(crate::fsshare::fs_share_save(vec_val(a, "items"))?),
         "kb_set_root" => ok(kb::kb_set_root(req_str(a, "newPath")?)?),
         "kb_scan" => ok(kb::kb_scan_sync()?),
         "kb_compile" => ok(wiki::kb_compile(app)?),
@@ -1160,6 +1254,9 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
             opt_str(a, "polishApiBase"),
             opt_str(a, "polishApiKey"),
             opt_str(a, "polishModel"),
+            opt_str(a, "volcAppKey"),
+            opt_str(a, "volcAccessKey"),
+            opt_str(a, "volcAsrModel"),
         )?),
         "voice_lexicon_get" => ok(voice::voice_lexicon_get()),
         "voice_hotword_add" => ok(voice::voice_hotword_add(req_str(a, "word")?)?),
@@ -1173,6 +1270,11 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
         // AI 整形试跑(设置页「测一下整形」):纯 HTTP 调 LLM,容器内可用
         "voice_polish" => ok(voice::voice_polish(req_str(a, "text")?)?),
         "voice_transcribe_file" => ok(voice::voice_transcribe_file(req_str(a, "path")?)?),
+        // 手机端语音输入:录好的 WAV(base64)传回来,由主机拿火山凭据转写。
+        "voice_transcribe_audio" => ok(voice::voice_transcribe_audio(
+            req_str(a, "audio")?,
+            opt_str(a, "format"),
+        )?),
         "voice_listen_start" => ok(voice::voice_listen_start(app)?),
         "voice_listen_stop" => ok(voice::voice_listen_stop()?),
         "voice_dictate_start" => ok(voice::voice_dictate_start(app)?),
@@ -1583,6 +1685,8 @@ fn dispatch_sync(cmd: &str, a: &Args, app: AppHandle) -> Result<Value, String> {
 
         // ── 环境医生（容器内只读检测；安装类降级为提示）──
         "env_check" => ok(doctor::env_check()),
+        // 静默托管状态: 容器版从不自己装东西(组件随镜像预装), 如实回一个「没跑过」的空状态
+        "env_autopilot_status" => ok(doctor::env_autopilot_status()),
         "env_fix_path" => ok(doctor::env_fix_path()?),
         "env_claude_update_check" => ok(doctor::env_claude_update_check()),
         "env_install_claude" | "env_install_node" | "env_install_pwsh" | "env_update_claude" => {
@@ -1982,81 +2086,19 @@ fn pct_encode(s: &str) -> String {
 /// **安全性不变**:无论走哪条,最后一律拿 canonicalize 之后的真实路径复核白名单,
 /// `..` 穿越、符号链接逃逸照旧被 `path_contains` 挡住;白名单本身一个字没放宽。
 ///
+/// 实现已下沉 [`crate::beam`](crate::beam::resolve_readable_path) —— 「隔空同屏」的打包器
+/// 要用同一把闸,两处各写一份迟早漂移。这里只负责把拒绝原因翻成 HTTP 状态码。
 fn resolve_readable(raw: &str, allowed: &[PathBuf]) -> Result<PathBuf, Response> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "文件不存在").into_response());
-    }
-    let mut cands: Vec<PathBuf> = Vec::new();
-    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-        if let Some(u) = directories::UserDirs::new() {
-            cands.push(u.home_dir().join(rest.replace('\\', "/")));
+    crate::beam::resolve_readable_path(raw, allowed).map_err(|d| match d {
+        crate::beam::PathDenied::NotFound => (StatusCode::NOT_FOUND, "文件不存在").into_response(),
+        crate::beam::PathDenied::Outside => {
+            (StatusCode::FORBIDDEN, "路径不在允许范围").into_response()
         }
-    }
-    let p = PathBuf::from(s);
-    if p.is_absolute() {
-        cands.push(p);
-    } else if !s.starts_with('~') {
-        let rel = s
-            .trim_start_matches("./")
-            .trim_start_matches(".\\")
-            .replace('\\', "/");
-        for root in allowed {
-            cands.push(root.join(&rel));
-        }
-    }
-
-    let mut outside = false;
-    for c in cands {
-        let Ok(canon) = std::fs::canonicalize(&c) else {
-            continue;
-        };
-        if !canon.is_file() {
-            continue;
-        }
-        if allowed
-            .iter()
-            .any(|root| crate::kb::path_contains(root, &canon))
-        {
-            return Ok(canon);
-        }
-        outside = true;
-    }
-    if outside {
-        Err((StatusCode::FORBIDDEN, "路径不在允许范围").into_response())
-    } else {
-        Err((StatusCode::NOT_FOUND, "文件不存在").into_response())
-    }
+    })
 }
 
-/// 可读根:知识库 + `~/Polaris/{data/artifacts,projects,uploads-inbox}` + 项目绑定工作目录。
-/// (整机文件系统读不到;逐用户 ACL 做好前不再往下放。)
 fn allowed_roots() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = Vec::new();
-    let kb = PathBuf::from(crate::kb::kb_root());
-    if let Ok(c) = std::fs::canonicalize(&kb) {
-        v.push(c);
-    }
-    if let Some(u) = directories::UserDirs::new() {
-        let home = u.home_dir().join("Polaris");
-        for root in [
-            home.join("data/artifacts"),
-            home.join("projects"),
-            home.join("uploads-inbox"),
-        ] {
-            if let Ok(c) = std::fs::canonicalize(root) {
-                v.push(c);
-            }
-        }
-    }
-    // 项目绑定的工作目录(Project.work_dir):大项目的产物写在用户自选的仓库目录里,
-    // 不补进白名单的话手机端点开必 403「路径不在允许范围」——功能加了、读口没跟上。
-    for wd in crate::conv::all_project_work_dirs() {
-        if let Ok(c) = std::fs::canonicalize(&wd) {
-            v.push(c);
-        }
-    }
-    v
+    crate::beam::allowed_roots()
 }
 
 pub(crate) fn mime_for(p: &Path) -> &'static str {
@@ -2454,6 +2496,174 @@ mod exec_gate_tests {
         assert_eq!(
             code, 404,
             "解析不到的相对路径应报不存在而非权限,body={body}"
+        );
+
+        let _ = stx.send(());
+        std::env::remove_var("POLARIS_COLLAB_DB");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ── 手机端「说一句就进电脑上的项目」的数据面链路 ────────────────────────────
+//
+// 盯的是一条真踩过的坑:手机原先拿本地生成的 `m-<时间戳>` 当 conversationId,主机不认识
+// 就把它挂到「第一个未归档项目」下(conv::ensure_writable_or_create),而 claude 的 cwd 是
+// 按 conversation→project→work_dir 解析的 —— 于是用户在手机上选哪个项目根本不起作用,
+// 活干在了另一个目录里。修法是:选了项目就走 conv_create_conversation 拿主机发的真会话 id。
+// 这里起真服务、发真 /api/invoke,把手机那套调用顺序原样走一遍,并一路验到 cwd 的落点。
+#[cfg(all(test, feature = "server", not(feature = "desktop")))]
+mod mobile_project_e2e_tests {
+    use super::*;
+
+    async fn serve(auth_token: Option<String>) -> (u16, tokio::sync::oneshot::Sender<()>) {
+        let (tx, _rx) = broadcast::channel(64);
+        let state = ApiState {
+            app: AppHandle::new(tx.clone()),
+            tx,
+            auth_token: Arc::new(auth_token),
+            open_no_auth: false,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stx, srx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, api_router(state))
+                .with_graceful_shutdown(async {
+                    let _ = srx.await;
+                })
+                .await;
+        });
+        (port, stx)
+    }
+
+    /// 学手机端 net.ts 的 invoke():POST /api/invoke {cmd,args} + Bearer。返回 (状态码, 响应体)。
+    async fn invoke(port: u16, cmd: &str, args: Value) -> (u16, Value) {
+        let cmd = cmd.to_string();
+        tokio::task::spawn_blocking(move || {
+            let sent = ureq::post(&format!("http://127.0.0.1:{port}/api/invoke"))
+                .set("Authorization", "Bearer s3cret")
+                .send_json(json!({"cmd": cmd, "args": args}));
+            let (code, text) = match sent {
+                Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+                Err(ureq::Error::Status(c, r)) => (c, r.into_string().unwrap_or_default()),
+                Err(e) => panic!("请求失败: {e}"),
+            };
+            (
+                code,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phone_picks_project_then_cwd_follows_it() {
+        let _g = crate::collab::db::TEST_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join("polaris-mobileproj.db");
+        let _ = std::fs::remove_file(&tmp);
+        std::env::set_var("POLARIS_COLLAB_DB", &tmp);
+        std::env::remove_var("POLARIS_REQUIRE_LOGIN");
+
+        // 电脑上两个真实存在的文件夹(用户的两个大项目仓库)
+        let root = std::env::temp_dir().join("polaris-mobileproj");
+        let alpha = root.join("alpha-repo");
+        let beta = root.join("beta-repo");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+
+        let (port, stx) = serve(Some("s3cret".into())).await;
+
+        // ① 手机在「电脑项目」页建项目并绑文件夹(WorkScreen 的新建 + 绑定工作目录)
+        let (c, pa) = invoke(port, "conv_create_project", json!({"name":"阿尔法"})).await;
+        assert_eq!(c, 200, "建项目应成功,body={pa}");
+        let pa_id = pa["id"].as_str().expect("项目应有 id").to_string();
+        let (c, pb) = invoke(port, "conv_create_project", json!({"name":"贝塔"})).await;
+        assert_eq!(c, 200, "建项目应成功,body={pb}");
+        let pb_id = pb["id"].as_str().unwrap().to_string();
+
+        for (pid, dir) in [(&pa_id, &alpha), (&pb_id, &beta)] {
+            let (c, b) = invoke(
+                port,
+                "conv_set_project_work_dir",
+                json!({"projectId": pid, "workDir": dir.to_string_lossy()}),
+            )
+            .await;
+            assert_eq!(c, 200, "绑定工作目录应成功,body={b}");
+        }
+
+        // 手输路径打错是手机上最常见的失手 —— 必须当场报错,不能默默存下一个无效 cwd
+        let (c, b) = invoke(
+            port,
+            "conv_set_project_work_dir",
+            json!({"projectId": pa_id, "workDir": root.join("并不存在").to_string_lossy()}),
+        )
+        .await;
+        assert_ne!(c, 200, "不存在的目录必须拒绝,body={b}");
+        assert_eq!(
+            crate::conv::project_work_dir(&pa_id).as_deref(),
+            Some(alpha.to_string_lossy().as_ref()),
+            "被拒的绑定不能把原来那个有效目录改掉"
+        );
+
+        // ② 手机拉项目清单(说「打开××项目」时就是在这份清单里匹配名字/文件夹名)
+        let (c, list) = invoke(port, "conv_list_projects", json!({})).await;
+        assert_eq!(c, 200);
+        let arr = list.as_array().expect("应返回数组");
+        let found = arr
+            .iter()
+            .find(|p| p["id"].as_str() == Some(pa_id.as_str()))
+            .expect("清单里应有刚建的项目");
+        assert_eq!(
+            found["work_dir"].as_str(),
+            Some(alpha.to_string_lossy().as_ref()),
+            "清单必须带 work_dir —— 手机端顶栏显示、按文件夹名匹配都靠它"
+        );
+
+        // ③ 选中阿尔法后开新对话:走 conv_create_conversation(projectId),拿主机发的真 id
+        let (c, conv) = invoke(port, "conv_create_conversation", json!({"projectId": pa_id})).await;
+        assert_eq!(c, 200, "在项目下建会话应成功,body={conv}");
+        let cid = conv["id"].as_str().expect("会话应有 id").to_string();
+
+        // ④ 这一跳正是 chat 管线解析 cwd 的路径:conversation → project → work_dir
+        assert_eq!(
+            crate::conv::project_id_of_conversation(&cid).as_deref(),
+            Some(pa_id.as_str()),
+            "会话必须归属于手机上选中的那个项目"
+        );
+        assert_eq!(
+            crate::conv::project_work_dir(&pa_id).as_deref(),
+            Some(alpha.to_string_lossy().as_ref()),
+            "claude 的 cwd 就是这个值 —— 手机上说的活应该落在 alpha-repo 里"
+        );
+
+        // ⑤ 换到贝塔项目再开一条:cwd 必须跟着换,两条会话互不串目录
+        let (c, conv2) = invoke(port, "conv_create_conversation", json!({"projectId": pb_id})).await;
+        assert_eq!(c, 200, "body={conv2}");
+        let cid2 = conv2["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            crate::conv::project_id_of_conversation(&cid2).as_deref(),
+            Some(pb_id.as_str())
+        );
+        assert_ne!(
+            crate::conv::project_work_dir(&pa_id),
+            crate::conv::project_work_dir(&pb_id),
+            "两个项目应各在各的文件夹里"
+        );
+
+        // ⑥ 对照组 = 修复前的老行为:裸 `m-<ts>` 会话被挂到「第一个未归档项目」,
+        //    跟用户选的那个项目毫无关系。这条固化下来,免得哪天回退了没人发现。
+        let bare = format!("m-{}", 1_700_000_000_000u64);
+        crate::conv::ensure_writable_or_create(&bare).unwrap();
+        let default_pid = crate::conv::conv_list_projects()
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap();
+        assert_eq!(
+            crate::conv::project_id_of_conversation(&bare).as_deref(),
+            Some(default_pid.as_str()),
+            "裸会话落到第一个未归档项目 —— 这正是手机端非得显式建会话不可的原因"
         );
 
         let _ = stx.send(());

@@ -3,6 +3,10 @@ use super::*;
 const DEFAULT_TOKEN_FIELD: &str = "ANTHROPIC_AUTH_TOKEN";
 const API_KEY_FIELD: &str = "ANTHROPIC_API_KEY";
 
+/// 本地路由模式下写进供应商配置的**占位** token(路由不看它, 真 key 由路由实时注入)。
+/// 借 key 的路径必须认得它 —— 把占位串当成真 key 借出去, 拿去打上游必 401。
+const LOCAL_ROUTE_TOKEN: &str = "polaris-local-router";
+
 /// 切换时先从 live env 清掉这些受管键, 再套用供应商配置 → 切换结果确定。
 const MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
@@ -368,6 +372,97 @@ pub fn minimax_borrow_key_for_image() -> Option<(String, bool)> {
     pick(&st)
 }
 
+/// **火山方舟**系聊天供应商的 id, 按优先级排 —— 「火山方舟 Agentplan」摆第一位,
+/// 它就是用户口里的「我们火山的 agentplan」。BytePlus 是同一套方舟的海外站。
+const VOLC_ARK_IDS: &[&str] = &["agentplan", "doubaoseed", "byteplus"];
+
+/// **生图**专用借 key(火山方舟):借用户已在聊天坞里配好的方舟 key, 拼出方舟的生图端点。
+///
+/// 与 MiniMax 那条借用同一个理由 —— 用户已经为方舟付过费/配过 key, 没道理再让他去生图坞
+/// 重填一遍。回 `(key, endpoint)`: endpoint 由该家 base_url 的**主机名**推出, 因为方舟
+/// 国内站(ark.cn-beijing.volces.com)与海外站(ark.ap-southeast.bytepluses.com)是两套域名,
+/// 拿错域名必 401;而 base_url 的路径部分(`/api/coding` 之类)是聊天套餐专用前缀,
+/// **生图要走 `/api/v3`**, 不能照抄。
+pub fn volc_ark_borrow_key_for_image() -> Option<(String, String)> {
+    let (key, host) = volc_ark_borrow()?;
+    Some((key, format!("https://{host}/api/v3/images/generations")))
+}
+
+/// 借用聊天坞里配好的**火山方舟** key, 回 `(key, 主机名)`。
+///
+/// 生图(images/generations)与语音识别(chat/completions 的 input_audio)都用它 ——
+/// 用户已经为方舟付过费/配过 key, 没道理再让他去别处重填一遍。
+/// 只回主机名不回完整地址, 因为方舟国内站(ark.cn-beijing.volces.com)与海外站
+/// (ark.ap-southeast.bytepluses.com)是两套域名(拿错必 401), 而 base_url 的路径部分
+/// (`/api/coding` 之类)是**聊天套餐专用前缀**, 生图/转写都得走 `/api/v3`, 不能照抄。
+pub fn volc_ark_borrow() -> Option<(String, String)> {
+    fn pick(st: &Store) -> Option<(String, String)> {
+        for id in VOLC_ARK_IDS {
+            let Some(it) = st.items.iter().find(|i| &i.id == id) else {
+                continue;
+            };
+            let mut key = String::new();
+            for field in [DEFAULT_TOKEN_FIELD, API_KEY_FIELD] {
+                let tok = cfg_env_str(&it.settings_config, field);
+                if !tok.trim().is_empty() {
+                    key = tok.trim().to_string();
+                    break;
+                }
+            }
+            // 「本地路由」模式下这家的 base_url 会被改写成 127.0.0.1 的 /p/{id}, token 是
+            // 占位串 —— 拿它去打方舟必失败, 而且一旦返回 Some 就把整条借用链堵死
+            // (火山优先 → MiniMax 也轮不到)。开关关掉后旧配置也可能残留, 所以按内容判而非按开关判。
+            if key.is_empty() || key == LOCAL_ROUTE_TOKEN {
+                continue;
+            }
+            let host = ark_host(&cfg_env_str(&it.settings_config, "ANTHROPIC_BASE_URL"), id);
+            return Some((key, host));
+        }
+        None
+    }
+    // 与 minimax_borrow_key_for_image 同款双路读取:壳内读内存 STORE, 生图子进程
+    // (polaris-forge image, 没有 AppHandle 不走 init, STORE 恒空)则直接读磁盘,
+    // 否则「对话里出图」这条最常用的链路借不到 key。
+    if !STORE_PATH.read().as_os_str().is_empty() {
+        return pick(&STORE.read());
+    }
+    let user = UserDirs::new()?;
+    let path = user
+        .home_dir()
+        .join("Polaris")
+        .join("data")
+        .join("providers.json");
+    let txt = fs::read_to_string(path).ok()?;
+    let st: Store = serde_json::from_str(&txt).ok()?;
+    pick(&st)
+}
+
+/// 从已配的 base_url 里取方舟主机名; 取不到就按 id 回默认站点。
+///
+/// 「取不到」包括三种:清空过 / 含 `${}` 变量 / **指向本地路由的回环地址** ——
+/// 最后这种最阴:本地路由开关开过(或旧配置残留)时 base_url 是
+/// `http://127.0.0.1:{port}/p/agentplan`, 照抄主机名就会拼出 `https://127.0.0.1:{port}/api/v3/...`
+/// (在 http 端口上说 TLS), 生图与语音转写双双打空炮。一律回落到该家的真站点。
+fn ark_host(base_url: &str, id: &str) -> String {
+    let b = base_url.trim();
+    if let Some(rest) = b
+        .strip_prefix("https://")
+        .or_else(|| b.strip_prefix("http://"))
+    {
+        let host = rest.split('/').next().unwrap_or("").trim();
+        let bare = host.split(':').next().unwrap_or(host);
+        let loopback = matches!(bare, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
+        if !host.is_empty() && !host.contains('$') && !loopback {
+            return host.to_string();
+        }
+    }
+    if id == "byteplus" {
+        "ark.ap-southeast.bytepluses.com".to_string()
+    } else {
+        "ark.cn-beijing.volces.com".to_string()
+    }
+}
+
 /// 还原构建期注入的「免费额度赠送」Kimi For Coding token(XOR 混淆, 见 build.rs)。
 /// 与 MiniMax 同 —— 仅从环境变量注入(CI secret POLARIS_GIFT_KIMI_KEY);未注入
 /// (本地 dev / 无 secret 构建)时返回空串, seed_gift_kimi 见空即跳过, 不种子。
@@ -498,7 +593,7 @@ fn local_route_config(port: u16, id: &str, model: &str) -> Value {
     );
     env.insert(
         "ANTHROPIC_AUTH_TOKEN".into(),
-        Value::String("polaris-local-router".into()),
+        Value::String(LOCAL_ROUTE_TOKEN.into()),
     );
     for k in MODEL_ENV_KEYS {
         env.insert((*k).into(), Value::String(model.into()));
@@ -1243,7 +1338,7 @@ fn cfg_for_view(v: &ProviderView, route_all: bool) -> Result<Value, String> {
         } else {
             v.token_field.as_str()
         };
-        env.insert(field.into(), Value::String("polaris-local-router".into()));
+        env.insert(field.into(), Value::String(LOCAL_ROUTE_TOKEN.into()));
         return Ok(cfg);
     }
     Ok(v.settings_config.clone())
@@ -1579,6 +1674,66 @@ pub fn provider_delete(id: String) -> Result<(), String> {
     drop(store);
     persist();
     Ok(())
+}
+
+#[cfg(test)]
+mod volc_ark_tests {
+    use super::*;
+
+    #[test]
+    fn ark_host_takes_configured_host_but_never_the_local_router() {
+        // 正常:照抄用户配的主机名(国内 / 海外两套站点都要认)
+        assert_eq!(
+            ark_host("https://ark.cn-beijing.volces.com/api/coding", "agentplan"),
+            "ark.cn-beijing.volces.com"
+        );
+        assert_eq!(
+            ark_host("https://ark.ap-southeast.bytepluses.com/api/coding", "byteplus"),
+            "ark.ap-southeast.bytepluses.com"
+        );
+        // 开过「本地路由」(或旧配置残留)时 base_url 指向回环 —— 照抄会拼出
+        // https://127.0.0.1:port/api/v3/...(在 http 端口上说 TLS), 生图/转写双双打空炮。
+        for b in [
+            "http://127.0.0.1:8791/p/agentplan",
+            "http://localhost:8791/p/agentplan",
+            "http://0.0.0.0:8791/p/agentplan",
+        ] {
+            assert_eq!(
+                ark_host(b, "agentplan"),
+                "ark.cn-beijing.volces.com",
+                "回环地址必须回落到真站点: {b}"
+            );
+        }
+        // 空 / 含变量 → 按 id 回默认站点
+        assert_eq!(ark_host("", "agentplan"), "ark.cn-beijing.volces.com");
+        assert_eq!(ark_host("", "byteplus"), "ark.ap-southeast.bytepluses.com");
+        assert_eq!(
+            ark_host("https://${ARK_HOST}/api", "agentplan"),
+            "ark.cn-beijing.volces.com"
+        );
+    }
+
+    #[test]
+    fn image_endpoint_uses_v3_not_the_chat_plan_prefix() {
+        // base_url 的 `/api/coding` 是**聊天套餐**前缀, 生图必须走 /api/v3 —— 照抄就是 404。
+        let host = ark_host("https://ark.cn-beijing.volces.com/api/coding", "agentplan");
+        let ep = format!("https://{host}/api/v3/images/generations");
+        assert!(!ep.contains("/api/coding"), "不该把聊天套餐前缀带进生图地址: {ep}");
+        assert!(ep.ends_with("/api/v3/images/generations"), "{ep}");
+    }
+
+    #[test]
+    fn local_route_placeholder_token_is_not_a_real_key() {
+        // 占位串被当成真 key 借出去的话, 打上游必 401, 而且会把整条借用链堵死
+        // (火山优先 → MiniMax 永远轮不到)。这里钉住常量, 防它跟 local_route_config 走散。
+        assert_eq!(LOCAL_ROUTE_TOKEN, "polaris-local-router");
+        let cfg = local_route_config(8791, "agentplan", "m");
+        assert_eq!(
+            cfg_env_str(&cfg, DEFAULT_TOKEN_FIELD),
+            LOCAL_ROUTE_TOKEN,
+            "本地路由写进去的占位串必须与借 key 侧判定的常量是同一个"
+        );
+    }
 }
 
 #[cfg(test)]

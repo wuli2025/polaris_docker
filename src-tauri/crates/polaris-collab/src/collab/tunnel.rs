@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use iroh::endpoint::presets;
-use iroh::endpoint::{Connection, IdleTimeout, PathId, QuicTransportConfig};
+use iroh::endpoint::{Connection, IdleTimeout, PathId, QuicTransportConfig, VarInt};
 use iroh::{Endpoint, EndpointId, RelayMode, RelayUrl, SecretKey};
 use once_cell::sync::Lazy;
 
@@ -35,6 +35,47 @@ const ALPN: &[u8] = b"polaris/1";
 /// 60s 无响应判死(close_reason 变 Some,健康巡检据此重连)。
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 单向转发缓冲(KB)。tokio `copy_bidirectional` 默认 8KB —— 一块 8KB 就要一次
+/// 唤醒 + 一次系统调用,内网千兆/本地环回上这是纯开销。加大到 256KB 换更少的往返,
+/// 代价是每条活跃流两个方向各占这么多内存(空闲流不占,缓冲随流创建随流释放)。
+/// `POLARIS_TUNNEL_BUF_KB` 可调;小内存主机(NAS)想省内存就调回 32。
+const DEFAULT_COPY_BUF_KB: usize = 256;
+
+/// 转发缓冲字节数,夹在 [8KB, 4MB]:太小退化成默认,太大是拿内存换不到速度。
+fn copy_buf_bytes() -> usize {
+    let kb = std::env::var("POLARIS_TUNNEL_BUF_KB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_COPY_BUF_KB);
+    kb.clamp(8, 4096) * 1024
+}
+
+/// 隧道 runtime 的 worker 数:默认按机器核数来(旧版写死 2,4 核以上的机器白闲着,
+/// 而 QUIC 的收发/加解密是实打实吃 CPU 的)。夹在 [2, 8]:1 核机也留 2 个免得
+/// accept 与转发互相饿死,超过 8 个对这种 IO 型负载没有收益。`POLARIS_TUNNEL_WORKERS` 可调。
+fn tunnel_workers() -> usize {
+    std::env::var("POLARIS_TUNNEL_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+        })
+        .clamp(2, 8)
+}
+
+/// TCP 段禁用 Nagle。隧道两端跑的是「一问一答」的 HTTP:Nagle 会把小的请求头/
+/// 响应头攒着等下一段,与对端的延迟 ACK 撞上就是白等几十毫秒。挂载盘那种
+/// 「一次 PROPFIND 一次往返」的用法对这个尤其敏感。失败只记不致命(链路照常能用)。
+fn nodelay(s: &tokio::net::TcpStream, who: &str) {
+    if let Err(e) = s.set_nodelay(true) {
+        eprintln!("[tunnel] {who} 设置 TCP_NODELAY 失败(忽略): {e}");
+    }
+}
 
 /// hosting.rs 内嵌服务实际绑定的端口(8484-8494 扫描结果),启动成功后写入。
 /// 0 = 未设置。修「隧道默认打 8080 而内嵌服务在 8484」的不一致。
@@ -85,6 +126,11 @@ static HOST_SHUTDOWN: Lazy<tokio::sync::Notify> = Lazy::new(tokio::sync::Notify:
 struct ClientTunnel {
     host_str: String,
     host_id: EndpointId,
+    /// 主机的**已知直连地址**(`NodeId@1.2.3.4:41641` 形式给进来的那部分)。
+    /// 非空 = 拨号时直接把这个地址喂给 iroh,不必等 n0 DNS 发现/中继中转 ——
+    /// 对「公网固定 IP + 固定 UDP 口」的云主机能省掉整条中继绕路(实测 370ms → 直连)。
+    /// 空 = 老行为:只凭 NodeId,由发现与中继找路。
+    direct_addrs: Vec<std::net::SocketAddr>,
     port: u16,
     /// 隧道任务存活(创建即 true,任务退出置 false;状态细节看 state)。
     alive: AtomicBool,
@@ -108,11 +154,12 @@ impl ClientTunnel {
 static CLIENTS: Lazy<Mutex<BTreeMap<u16, Arc<ClientTunnel>>>> =
     Lazy::new(|| Mutex::new(BTreeMap::new()));
 
-/// 隧道专用共享 runtime:所有客户端隧道任务跑在这 2 个 worker 上
+/// 隧道专用共享 runtime:所有客户端隧道任务跑在这几个 worker 上
 /// (旧版每盘一线程一 runtime,N 盘 = 2N 线程)。主机侧仍独享一线程(见下)。
+/// worker 数按机器核数走,见 [`tunnel_workers`]。
 static TUNNEL_RT: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(tunnel_workers())
         .thread_name("polaris-tunnel")
         .enable_all()
         .build()
@@ -229,16 +276,56 @@ pub fn apply_relay_config(json: &str) -> Result<(), String> {
 /// 有自定义 relay 则覆盖 relay_mode。
 async fn build_endpoint(seed: [u8; 32]) -> Result<Endpoint, String> {
     // 保活 + 判死超时:没有它,NAT/relay 会静默回收空闲连接,直到下次请求才暴露断线。
+    //
+    // 流量窗口:QUIC 的默认值按「100ms RTT × 100Mbps」调,单流 1.25MB、连接级不设上限。
+    // 两头都不合适 ——
+    //  · 单流 1.25MB 在**高延迟长肥管**(比如跨境 200ms)上会把单流封在 6MB/s 左右,
+    //    而这正是「拷一个大文件」的形态;放到 4MB 才够喂满。
+    //  · 连接级不设上限意味着最坏情况是 `并发流数 × 单流窗口`,没有硬约束 —— 对
+    //    1.6G 内存的小云机是个隐患。这里显式钉一个连接级总量(默认 32MB)作为**内存上限**,
+    //    既拿到单流的速度,又不会因为对端猛开流把内存吃穿。
+    // 两个都可用 env 覆盖(单位 KB):内存紧张的 NAS 调小,专线大带宽调大。
+    let stream_rwnd = env_kb("POLARIS_QUIC_STREAM_WINDOW_KB", 4 * 1024).clamp(64 * 1024, 64 << 20);
+    let conn_rwnd = env_kb("POLARIS_QUIC_CONN_WINDOW_KB", 32 * 1024)
+        .clamp(stream_rwnd, 512 << 20);
     let transport = QuicTransportConfig::builder()
         .keep_alive_interval(KEEP_ALIVE)
         .max_idle_timeout(Some(
             IdleTimeout::try_from(IDLE_TIMEOUT).expect("idle timeout 常量合法"),
         ))
+        .stream_receive_window(VarInt::from_u64(stream_rwnd).expect("窗口值已夹在合法区间"))
+        .receive_window(VarInt::from_u64(conn_rwnd).expect("窗口值已夹在合法区间"))
+        // 发送侧同样放到连接级上限,否则收端给了窗口发端也吐不出来。
+        .send_window(conn_rwnd)
         .build();
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from_bytes(&seed))
         .transport_config(transport)
         .alpns(vec![ALPN.to_vec()]);
+    // 固定 UDP 端口(`POLARIS_IROH_PORT`)。默认是随机口,这对**跑在容器/NAT 后面的主机**
+    // 是致命的:端口每次重启都变,docker 没法发布、防火墙没法放行 → 外面永远打不进来,
+    // 打洞必失败、只能落中继(实测绕到 n0 德国中继,每跳往返 370ms)。钉死端口后
+    // `-p 41641:41641/udp` + 云防火墙放行这一个口,成员端即可直连。0 = 保持随机。
+    if let Some(p) = env_u16("POLARIS_IROH_PORT") {
+        builder = builder
+            .bind_addr((std::net::Ipv4Addr::UNSPECIFIED, p))
+            .map_err(|e| format!("POLARIS_IROH_PORT={p} 绑定失败: {e}"))?;
+    }
+    // 自建中继也允许 env 配(容器重启即生效),不必每次重启后再 POST 一次
+    // /api/collab/tunnel/relays —— 服务端进程重启后 RELAYS 是空的,靠人工补那一刀
+    // 迟早会漏。env 只在 RELAYS 还没被 API 设过时兜底。
+    if RELAYS.lock().unwrap().is_empty() {
+        if let Ok(s) = std::env::var("POLARIS_RELAYS") {
+            let list: Vec<String> = s
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if !list.is_empty() {
+                *RELAYS.lock().unwrap() = list;
+            }
+        }
+    }
     let relays = RELAYS.lock().unwrap().clone();
     if !relays.is_empty() {
         let mut urls: Vec<RelayUrl> = Vec::new();
@@ -358,8 +445,12 @@ pub async fn host_listen() -> Result<(), String> {
                             return;
                         }
                     };
+                    nodelay(&tcp, "主机→上游");
                     let mut stream = tokio::io::join(recv, send);
-                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+                    let buf = copy_buf_bytes();
+                    let _ =
+                        tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut stream, buf, buf)
+                            .await;
                 });
             }
         });
@@ -375,6 +466,40 @@ pub async fn host_listen() -> Result<(), String> {
 // ── 成员侧 ──────────────────────────────────────────────────────────────────
 
 /// 取一条到该隧道主机的健康连接:缓存里已死(close_reason=Some)的直接丢弃重建。
+/// 读一个「以 KB 为单位」的环境变量,返回字节数;缺失/写错/为 0 用 `default_kb`。
+/// 配置写错不拒绝启动 —— 隧道断了比慢一点严重得多。
+fn env_kb(key: &str, default_kb: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_kb)
+        * 1024
+}
+
+/// 读一个非零的 u16 环境变量;缺失/写错/为 0 都当没设(不为一个配置错误拒绝启动)。
+fn env_u16(key: &str) -> Option<u16> {
+    std::env::var(key).ok()?.trim().parse::<u16>().ok().filter(|p| *p != 0)
+}
+
+/// 拆 `NodeId` 与可选的已知直连地址:`<nodeid>` 或 `<nodeid>@1.2.3.4:41641[,5.6.7.8:41641]`。
+/// 地址写错一律报错而不是静默丢弃 —— 悄悄退回中继绕路,现象是「能用但慢 30 倍」,
+/// 那种故障没人查得出来。
+fn split_node_and_addrs(s: &str) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+    let s = s.trim();
+    let Some((id, rest)) = s.split_once('@') else {
+        return Ok((s.to_string(), Vec::new()));
+    };
+    let mut addrs = Vec::new();
+    for part in rest.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        addrs.push(
+            part.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("直连地址 {part} 非法(要 IP:端口): {e}"))?,
+        );
+    }
+    Ok((id.trim().to_string(), addrs))
+}
+
 async fn healthy_conn(t: &ClientTunnel, ep: &Endpoint) -> Result<Connection, String> {
     let cached = t.conn.lock().unwrap().clone();
     if let Some(c) = cached {
@@ -385,8 +510,14 @@ async fn healthy_conn(t: &ClientTunnel, ep: &Endpoint) -> Result<Connection, Str
         *t.conn.lock().unwrap() = None;
     }
     t.set_state("connecting");
+    // 有已知直连地址就连地址(iroh 仍会并行试中继,谁先通用谁,通了之后择优走直连路径);
+    // 没有就退回只凭 NodeId,由 n0 DNS 发现 + 中继找路。
+    let mut target = iroh::EndpointAddr::new(t.host_id);
+    for a in &t.direct_addrs {
+        target = target.with_ip_addr(*a);
+    }
     let c = ep
-        .connect(t.host_id, ALPN)
+        .connect(target, ALPN)
         .await
         .map_err(|e| format!("连主机失败: {e}"))?;
     *t.conn.lock().unwrap() = Some(c.clone());
@@ -400,7 +531,7 @@ async fn healthy_conn(t: &ClientTunnel, ep: &Endpoint) -> Result<Connection, Str
 /// 同端口同主机且任务还活着 = 直接返回 Ok;同端口不同主机且活着 = 报错;
 /// 死任务(启动失败/已停)= 拆掉重建。坏 NodeId 在这里同步报错,不再吞进后台线程。
 pub fn connect_client(host_node_id: &str, listen_port: u16) -> Result<(), String> {
-    let host_str = host_node_id.trim().to_string();
+    let (host_str, direct_addrs) = split_node_and_addrs(host_node_id)?;
     let host_id: EndpointId = host_str
         .parse()
         .map_err(|e| format!("主机 NodeId 非法: {e}"))?;
@@ -418,6 +549,7 @@ pub fn connect_client(host_node_id: &str, listen_port: u16) -> Result<(), String
         let t = Arc::new(ClientTunnel {
             host_str,
             host_id,
+            direct_addrs,
             port: listen_port,
             alive: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
@@ -570,10 +702,13 @@ async fn run_client(t: Arc<ClientTunnel>) {
             }
         };
         let Some((send, recv)) = bi else { continue };
+        nodelay(&tcp, "成员←本地");
         tokio::spawn(async move {
             let _guard = ConnGuard::new();
             let mut stream = tokio::io::join(recv, send);
-            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+            let buf = copy_buf_bytes();
+            let _ =
+                tokio::io::copy_bidirectional_with_sizes(&mut tcp, &mut stream, buf, buf).await;
         });
     }
 
@@ -701,7 +836,7 @@ pub fn start_host_blocking_thread() -> Option<std::thread::JoinHandle<Result<(),
         .name("polaris-tunnel-host".into())
         .spawn(|| {
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(tunnel_workers())
                 .enable_all()
                 .build()
                 .map_err(|e| format!("tokio runtime 创建失败: {e}"))?;
@@ -735,6 +870,24 @@ mod tests {
 
         std::env::remove_var("POLARIS_DEVICE_KEY");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `NodeId@地址` 拆分:无 @ 保持老行为;有 @ 拆出地址;地址写错必须报错
+    /// (静默丢弃会退回中继绕路,表现是「能用但慢 30 倍」,查不出来)。
+    #[test]
+    fn node_and_addrs_split() {
+        let (id, a) = split_node_and_addrs("  abc123  ").expect("纯 NodeId");
+        assert_eq!(id, "abc123");
+        assert!(a.is_empty());
+
+        let (id, a) =
+            split_node_and_addrs("abc123@1.2.3.4:41641, 5.6.7.8:41641").expect("带两个地址");
+        assert_eq!(id, "abc123");
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].port(), 41641);
+
+        assert!(split_node_and_addrs("abc123@1.2.3.4").is_err()); // 缺端口
+        assert!(split_node_and_addrs("abc123@不是地址:41641").is_err());
     }
 
     /// relay 配置解析:合法进、坏 URL 拒。

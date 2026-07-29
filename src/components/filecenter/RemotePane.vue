@@ -4,11 +4,12 @@
  * 自 FileCenter.vue 原样搬出;浏览态(当前路径/条目)是纯局部状态,下沉到本组件。
  * 父层点远程 chip → source/openTick 变化 → 本组件从根目录重新打开(与旧 pickRemote 行为一致)。
  */
-import { ref, computed, watch } from "vue";
-import { Server, ChevronRight, ChevronLeft, RefreshCw, Folder, ArrowDownWideNarrow, WifiOff } from "@lucide/vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { Server, ChevronRight, ChevronLeft, RefreshCw, Folder, ArrowDownWideNarrow, WifiOff, X } from "@lucide/vue";
 import OrbitSpinner from "../icons/OrbitSpinner.vue";
 import type { RemoteSource } from "../../features/interconnect/remoteSources";
 import { fsList, fsDownload, joinPath, type FsEntry } from "../../features/collab/fsapi";
+import { isTauri, fsfetch, listen, type FetchProgress } from "../../tauri";
 
 const props = defineProps<{
   source: RemoteSource;
@@ -45,10 +46,57 @@ function remoteUp() {
 function remoteCrumbTo(i: number) {
   openRemote(rcrumbs.value.slice(0, i + 1).join("/"));
 }
+// ── 下载:桌面走 Rust 流写磁盘(任意大小 + 断点续传 + 进度);浏览器端保留 blob 老路 ──
+/** 在飞下载:文件名 → { dest(取消/进度键), pct(-1=未知总长) } */
+const dl = ref<Record<string, { dest: string; pct: number }>>({});
+let unProgress: (() => void) | null = null;
+
+onMounted(async () => {
+  if (!isTauri) return;
+  unProgress = await listen<FetchProgress>("fsfetch:progress", (p) => {
+    for (const [name, st] of Object.entries(dl.value)) {
+      if (st.dest !== p.dest) continue;
+      if (p.done) {
+        const next = { ...dl.value };
+        delete next[name];
+        dl.value = next;
+      } else {
+        dl.value = {
+          ...dl.value,
+          [name]: { dest: st.dest, pct: p.total ? Math.floor((p.got / p.total) * 100) : -1 },
+        };
+      }
+    }
+  });
+});
+onUnmounted(() => unProgress?.());
+
 async function downloadRemote(e: FsEntry) {
   if (e.is_dir) return;
+  const rel = joinPath(rcwd.value, e.name);
+  if (isTauri) {
+    if (dl.value[e.name]) {
+      // 再点一下 = 取消(保留断点,下次接着拉)。
+      fsfetch.cancel(dl.value[e.name].dest).catch(() => {});
+      return;
+    }
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const dest = await save({ defaultPath: e.name, title: `保存「${e.name}」到…` });
+    if (!dest) return;
+    dl.value = { ...dl.value, [e.name]: { dest, pct: 0 } };
+    try {
+      await fsfetch.start({ port: props.source.port, token: props.source.token, rel, dest, size: e.size });
+    } catch (err) {
+      rerr.value = (err as Error).message;
+    } finally {
+      const next = { ...dl.value };
+      delete next[e.name];
+      dl.value = next;
+    }
+    return;
+  }
   try {
-    const blob = await fsDownload(props.source, joinPath(rcwd.value, e.name));
+    const blob = await fsDownload(props.source, rel);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -103,7 +151,10 @@ watch(
         <span class="rm-ic"><Folder v-if="e.is_dir" :size="16" :stroke-width="1.8" /><Server v-else :size="15" :stroke-width="1.7" /></span>
         <span class="rm-name" @click="enterRemote(e)">{{ e.name }}</span>
         <span class="rm-sz">{{ e.is_dir ? "" : fmtRemoteSize(e.size) }}</span>
-        <button v-if="!e.is_dir" class="rm-dl" @click.stop="downloadRemote(e)"><ArrowDownWideNarrow :size="13" /> 下载</button>
+        <button v-if="!e.is_dir && dl[e.name]" class="rm-dl busy" title="点一下取消(断点保留,可续传)" @click.stop="downloadRemote(e)">
+          <X :size="13" /> {{ dl[e.name].pct >= 0 ? dl[e.name].pct + "%" : "下载中…" }}
+        </button>
+        <button v-else-if="!e.is_dir" class="rm-dl" @click.stop="downloadRemote(e)"><ArrowDownWideNarrow :size="13" /> 下载</button>
         <button v-else class="rm-dl ghost" @click.stop="enterRemote(e)"><ChevronRight :size="13" /> 进入</button>
       </div>
     </div>
@@ -144,5 +195,8 @@ watch(
 .rm-sz { flex: none; font-family: var(--mono); font-size: 11.5px; color: var(--muted); min-width: 68px; text-align: right; }
 .rm-dl { flex: none; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 11.5px; padding: 4px 9px; border-radius: 7px; }
 .rm-dl:hover { border-color: var(--primary); color: var(--primary); }
+/* 在飞下载:进度即按钮文本;hover 变红提示「点了会取消」 */
+.rm-dl.busy { border-color: var(--primary); color: var(--primary); font-variant-numeric: tabular-nums; }
+.rm-dl.busy:hover { border-color: #f87171; color: #f87171; }
 .rm-dl.ghost { color: var(--muted); }
 </style>

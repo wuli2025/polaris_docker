@@ -48,7 +48,8 @@ Container Manager → 项目 → 新增：
 - 项目名 `polaris`
 - 路径选 `/volume1/docker/polaris`
 - 来源选「上传 `docker-compose.yml`」→ 传 `docker-compose.synology.yml`
-- 按需在「环境」里填 `ANTHROPIC_API_KEY`、`POLARIS_AUTH_TOKEN`（公网必填）、`PUID/PGID`
+- 按需在「环境」里填 `ANTHROPIC_API_KEY`、`PUID/PGID`；
+  `POLARIS_AUTH_TOKEN` **不用填**（默认免口令，内网直接进），只有真做了公网映射/反代域名才填
 - 构建并启动
 
 启动后容器内会以非 root 运行，`/api/health` 返回 `ok`，`/api/status` 可看内存/磁盘水位。
@@ -80,6 +81,7 @@ Container Manager → 项目 → 新增：
 证书：控制面板 → 安全性 → 证书，给这个反代域名签/绑 Let's Encrypt。
 
 公网访问形如 `https://polaris.你的域名/?token=<POLARIS_AUTH_TOKEN>`。
+（既然要开公网入口，这一步就把 `POLARIS_AUTH_TOKEN` 设上——默认的免口令是给纯内网的 NAS 用的。）
 
 ---
 

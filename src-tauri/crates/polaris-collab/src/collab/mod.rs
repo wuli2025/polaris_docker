@@ -23,6 +23,9 @@ pub mod fsface;
 #[cfg(feature = "collab-host")]
 pub mod http;
 pub mod identity;
+/// 同账号设备网的设备目录(「登录即成网」)。权威侧的表与判定;不挂 feature ——
+/// 云机要发号,桌面/NAS 侧的客户端循环也要复用这里的类型。
+pub mod mesh;
 /// 邮箱验证码(注册/找回密码)与 SMTP 发信。随协作路由走,仅 collab-host。
 #[cfg(feature = "collab-host")]
 pub mod mail;

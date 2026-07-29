@@ -233,6 +233,20 @@ pub async fn serve() -> anyhow::Result<()> {
     // 隧道上游对齐:服务器壳的真实端口告知 tunnel(与 hosting.rs 同理)。
     #[cfg(feature = "collab-net")]
     crate::collab::tunnel::set_upstream_port(port);
+    // 主机隧道自启:没有它,容器每次 recreate 之后都得有人手动 POST 一次
+    // /api/collab/tunnel/start,否则远程盘一侧只见「隧道已建」却永远等不到应答
+    //(一天踩过两次,而且现象是「盘挂不上」,根本不像是少了一条启动指令)。
+    // 默认关(桌面壳自有启停 UI,云端服务器才需要开机就在线),`POLARIS_TUNNEL_AUTOSTART=1` 开。
+    #[cfg(feature = "collab-net")]
+    if std::env::var("POLARIS_TUNNEL_AUTOSTART")
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        match crate::collab::tunnel::start_host_blocking_thread() {
+            Some(_) => println!("[polaris-server] iroh 主机隧道已随进程自启"),
+            None => println!("[polaris-server] iroh 主机隧道已在运行,跳过自启"),
+        }
+    }
     println!(
         "[polaris-server] 监听 http://0.0.0.0:{port} (前端目录: {})",
         web_dir.display()

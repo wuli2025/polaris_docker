@@ -35,6 +35,8 @@ import {
   LogOut,
   Mail,
   Terminal,
+  Pencil,
+  Eye,
 } from "@lucide/vue";
 import RemoteTerminal from "./RemoteTerminal.vue";
 import { invoke, isTauri } from "../../tauri";
@@ -48,6 +50,8 @@ import {
   type EmailStatus,
 } from "../collab/api";
 import { toast } from "../../composables/useToast";
+import { requestBeamOpen } from "../../lib/beamBus";
+import { apps as appsApi, fsmount, openUrl, type MountStatus, type PubApp, type PortHit } from "../../tauri";
 import {
   loadRemoteSources,
   upsertRemoteSource,
@@ -697,6 +701,358 @@ function browseDisk(s: RemoteSource) {
   app.setView("file_center");
 }
 
+// ── 远程盘挂载:连上对端后自动把它挂成本机系统盘符(Z:/Y:…),Tailscale 式「连上即多一块盘」──
+// 后端看门狗每 15s 保隧道 + 保盘符,断线自愈;这里只负责发起与展示。
+const mountMap = ref<Record<string, MountStatus>>({});
+
+async function loadMounts() {
+  if (!isTauri) return;
+  try {
+    const list = await fsmount.status();
+    const m: Record<string, MountStatus> = {};
+    for (const st of list) m[st.sourceId] = st;
+    mountMap.value = m;
+  } catch {
+    /* 老版本/非主机构建:无此命令,不打扰 */
+  }
+}
+
+// Windows WebClient 单文件上限(挂载盘读大文件的系统闸,默认 50MB,可一次 UAC 解到 4GB)。
+const webdavUnlocked = ref(true); // 默认 true:非 Windows / 老后端不弹横幅
+const webdavBusy = ref(false);
+const isWindows = navigator.userAgent.includes("Windows");
+
+async function loadWebdavLimit() {
+  if (!isTauri || !isWindows) return;
+  try {
+    webdavUnlocked.value = (await fsmount.webdavLimit()).unlocked;
+  } catch {
+    /* 老版本无此命令 */
+  }
+}
+
+async function unlockWebdav() {
+  webdavBusy.value = true;
+  try {
+    const r = await fsmount.webdavUnlock();
+    webdavUnlocked.value = r.unlocked;
+    toast.info(r.unlocked ? "已解锁:挂载盘单文件上限 4GB(更大的走文件中心下载)" : "解锁没生效,可重试");
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    webdavBusy.value = false;
+  }
+}
+
+/** 挂载一个远程源(幂等)。quiet = 启动自动恢复时静默,别一开机弹一串 toast。 */
+async function mountRemote(s: RemoteSource, quiet = false) {
+  if (!isTauri) return;
+  try {
+    const st = await fsmount.mount(s);
+    mountMap.value = { ...mountMap.value, [s.id]: st };
+    if (quiet) return;
+    if (st.drive) {
+      const rw = st.writable ? "可读写" : "只读";
+      const desk = st.shortcut ? ",桌面已放一个盘图标" : "";
+      toast.info(`「${s.name}」已挂载为 ${st.drive} 盘(${rw})${desk}`);
+    } else {
+      toast.info(`「${s.name}」隧道握手中,通了会自动挂上盘符,无需再操作`);
+    }
+  } catch (e) {
+    if (!quiet) toast.error(`挂盘失败:${(e as Error).message}`);
+  }
+}
+
+// ── 同账号设备网:入网一次,自己账号的设备此后自动互连自动挂盘 ──
+// 与「手工粘连接码」并存(不替代):粘码仍是接别人 NAS / 临时设备的路子,
+// 设备网只管**自己账号**的机器。
+interface MeshPeer {
+  nodeId: string;
+  name: string;
+  port: number;
+  connected: boolean;
+  error: string;
+  /** 对端本机会话 token(远程终端/浏览盘用)。由设备密钥自助换来,不是云端给的。 */
+  token: string;
+  drive: string;
+  writable: boolean;
+  ok: boolean;
+}
+interface MeshStatus {
+  enrolled: boolean;
+  url: string;
+  uid: string;
+  nodeId: string;
+  name: string;
+  peers: MeshPeer[];
+}
+const mesh = ref<MeshStatus>({ enrolled: false, url: "", uid: "", nodeId: "", name: "", peers: [] });
+const meshForm = reactive({ open: false, url: "", username: "", password: "" });
+const meshBusy = ref(false);
+const meshMounted = computed(() => mesh.value.peers.filter((p) => !!p.drive).length);
+
+async function loadMesh() {
+  if (!isTauri) return;
+  try {
+    mesh.value = await invoke<MeshStatus>("mesh_status");
+    // 已入网的机器不必再看那张表单(退网后会自己回来)。
+    if (mesh.value.enrolled) meshForm.open = false;
+  } catch {
+    /* 老版本/非主机构建:整张卡不出现 */
+  }
+}
+
+async function meshJoin() {
+  if (meshBusy.value) return;
+  if (!meshForm.url.trim() || !meshForm.username.trim() || !meshForm.password) {
+    toast.error("云端账号中心地址、账号、密码都要填");
+    return;
+  }
+  meshBusy.value = true;
+  try {
+    await invoke("mesh_join", {
+      url: meshForm.url.trim(),
+      username: meshForm.username.trim(),
+      password: meshForm.password,
+    });
+    meshForm.password = ""; // 用完即弃,不留在内存里等着被截图
+    toast.info("已入网 —— 正在后台自动连上同账号的其它设备");
+    await loadMesh();
+  } catch (e) {
+    toast.error(`入网失败:${(e as Error).message}`);
+  } finally {
+    meshBusy.value = false;
+  }
+}
+
+async function meshLeave() {
+  if (meshBusy.value) return;
+  if (!confirm("退出设备网?本机自动挂上的远程盘会一并卸掉(手工添加的远程源不受影响)。")) return;
+  meshBusy.value = true;
+  try {
+    await invoke("mesh_leave");
+    toast.info("已退网");
+    await loadMesh();
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    meshBusy.value = false;
+  }
+}
+
+/** 立刻对一次账(不等 60s 心跳)。 */
+async function meshRefresh() {
+  if (meshBusy.value) return;
+  meshBusy.value = true;
+  try {
+    await invoke("mesh_sync");
+    await loadMesh();
+  } catch (e) {
+    toast.error(`对账失败:${(e as Error).message}`);
+  } finally {
+    meshBusy.value = false;
+  }
+}
+
+/** 把一台设备移出设备网(丢了电脑时用)。它需要重新登录账号才能再进来。 */
+async function meshKick(p: MeshPeer) {
+  if (meshBusy.value) return;
+  if (!confirm(`把「${p.name}」移出设备网?\n\n它将无法再自动连入你的设备(重新登录账号可恢复)。`)) return;
+  meshBusy.value = true;
+  try {
+    await invoke("mesh_kick", { nodeId: p.nodeId });
+    toast.info("已移出设备网");
+    await loadMesh();
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    meshBusy.value = false;
+  }
+}
+
+// ── 我共享出去的盘:本机开放哪些目录给互联对端,以及**哪些允许写**(落库,桌面双击也生效) ──
+/** 一个共享目录:路径 + 是否允许对端写入。写权限默认关,由用户逐个点开。 */
+interface ShareItem {
+  path: string;
+  write: boolean;
+}
+const shareItems = ref<ShareItem[]>([]);
+const shareBusy = ref(false);
+const writableCount = computed(() => shareItems.value.filter((d) => d.write).length);
+
+async function loadShareRoots() {
+  if (!isTauri) return;
+  try {
+    shareItems.value = (await invoke<ShareItem[]>("fs_share_list")) ?? [];
+  } catch {
+    // 老后端只有 fs_share_get(纯路径 = 只读):退化读一次,别让页面空着。
+    try {
+      const paths = (await invoke<string[]>("fs_share_get")) ?? [];
+      shareItems.value = paths.map((p) => ({ path: p, write: false }));
+    } catch {
+      /* 非主机构建:不显示,不打扰 */
+    }
+  }
+}
+
+/** 覆盖式保存;后端会校验每条都是已存在目录,失败整体不落。 */
+async function saveShareItems(next: ShareItem[], note?: string) {
+  shareBusy.value = true;
+  try {
+    shareItems.value = (await invoke<ShareItem[]>("fs_share_save", { items: next })) ?? [];
+    toast.info(note ?? (shareItems.value.length ? "已更新共享目录" : "已停止共享(清单为空)"));
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    shareBusy.value = false;
+  }
+}
+
+/** 弹目录选择器,追加一个共享目录(新加的一律先只读)。 */
+async function addShareRoot() {
+  if (shareBusy.value) return;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({
+    directory: true,
+    multiple: false,
+    title: "选择要共享给互联设备的目录",
+  });
+  if (typeof picked !== "string" || !picked) return;
+  if (shareItems.value.some((d) => d.path === picked)) {
+    toast.info("这个目录已在共享清单里");
+    return;
+  }
+  await saveShareItems([...shareItems.value, { path: picked, write: false }]);
+}
+
+/** 切换某个目录的写权限。开写是有后果的动作,故明确二次确认一次。 */
+async function toggleShareWrite(item: ShareItem) {
+  if (shareBusy.value) return;
+  const next = !item.write;
+  if (next && !confirm(`允许互联设备写入「${item.path}」?\n\n对端将能在这个目录里新建、修改和删除文件。`)) {
+    return;
+  }
+  await saveShareItems(
+    shareItems.value.map((d) => (d.path === item.path ? { ...d, write: next } : d)),
+    next ? "已允许对端写入该目录" : "已改回只读",
+  );
+}
+
+/** 从清单里移掉某个目录并保存。 */
+async function removeShareRoot(dir: string) {
+  if (shareBusy.value) return;
+  await saveShareItems(shareItems.value.filter((d) => d.path !== dir));
+}
+
+// ── 应用直投:把本机在跑的 HTTP 应用发布给手机(电脑当服务器,手机只是视图) ──
+const pubApps = ref<PubApp[]>([]);
+const portHits = ref<PortHit[]>([]);
+const appsBusy = ref(false);
+const scanning = ref(false);
+
+async function loadApps() {
+  if (!isTauri) return;
+  try {
+    pubApps.value = (await appsApi.list()) ?? [];
+  } catch {
+    /* 老版本主机没这命令:不显示,不打扰 */
+  }
+}
+
+/** 扫本机在说 HTTP 的端口。Tauri/Electron 生产包不开端口,扫不到很正常。 */
+async function scanPorts() {
+  if (scanning.value) return;
+  scanning.value = true;
+  try {
+    portHits.value = (await appsApi.scan()) ?? [];
+    if (!portHits.value.length) {
+      toast.info("本机没扫到在说 HTTP 的端口 —— Tauri/Electron 生产包默认不开端口,投不了");
+    }
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    scanning.value = false;
+  }
+}
+
+async function saveApps(next: PubApp[]) {
+  appsBusy.value = true;
+  try {
+    pubApps.value = (await appsApi.set(next)) ?? [];
+    portHits.value = portHits.value.map((h) => ({
+      ...h,
+      published: pubApps.value.some((a) => a.port === h.port),
+    }));
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    appsBusy.value = false;
+  }
+}
+
+/** 把一个扫到的端口发布出去。短名按端口自动起,重名自动加序号。 */
+async function publishPort(h: PortHit) {
+  const base = (h.title || h.server || `app${h.port}`)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 20);
+  let slug = base || `app${h.port}`;
+  let i = 2;
+  while (pubApps.value.some((a) => a.slug === slug)) slug = `${base}-${i++}`;
+  await saveApps([
+    ...pubApps.value,
+    { slug, name: h.title || `本机 ${h.port} 端口`, port: h.port, path: "/", note: h.server },
+  ]);
+  toast.info(`已发布「${slug}」—— 手机端「应用」页即可打开`);
+}
+
+async function unpublishApp(slug: string) {
+  await saveApps(pubApps.value.filter((a) => a.slug !== slug));
+}
+
+/** 在本机系统浏览器里打开(验证代理确实通了,也方便自己在电脑上用第二个窗口)。 */
+async function openAppLocally(a: PubApp) {
+  const port = collab.hostInfo?.port;
+  if (!port) {
+    toast.error("本机主机没在跑,无法打开");
+    return;
+  }
+  try {
+    const { url } = await appsApi.open(a.slug);
+    await openUrl(`http://127.0.0.1:${port}${url}`);
+  } catch (e) {
+    toast.error((e as Error).message);
+  }
+}
+
+// ── 隔空同屏:本机挑一个文件,包装成网页推给手机,两端同看一页(走 iroh,不要求同一 WiFi) ──
+
+/** 在 app 内直接读方案说明:后端把随包分发的说明页拷进白名单目录并返回路径,再走同屏舞台打开。 */
+async function openBeamDoc() {
+  try {
+    const p = await invoke<string>("beam_doc_path");
+    requestBeamOpen(p);
+  } catch (e) {
+    toast.error((e as Error).message);
+  }
+}
+
+async function beamPick() {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({
+    multiple: false,
+    title: "选择要与手机同屏的文件",
+    filters: [
+      { name: "可同屏的文件", extensions: ["md", "html", "htm", "svg", "txt", "pdf", "png", "jpg", "jpeg", "webp", "gif", "mp4", "mp3", "json", "csv", "log"] },
+      { name: "所有文件", extensions: ["*"] },
+    ],
+  });
+  if (typeof picked !== "string" || !picked) return;
+  // 真正的打包/广播在 BeamStage 里做(它同时是接收端,状态与工具条都在那儿)。
+  requestBeamOpen(picked);
+}
+
 // ── 远程盘(我能用的)实况:经 iroh 隧道调对端 sys_stats,真数据;对端老版本无此命令→缺项 ──
 const remoteStats = ref<Record<string, Partial<DeviceStats>>>({});
 /** 每块盘最近一次成功拉到实况的时间:决定「新鲜/标灰」,失败不清值只变灰。 */
@@ -951,7 +1307,8 @@ async function connectRemote() {
     addForm.open = false;
     addForm.nodeId = "";
     addForm.token = "";
-    toast.info(`已发起 iroh P2P 连接「${src.name}」—— 到「文件中心 · 远程源」浏览它的盘`);
+    // 连上即自动挂盘:它的共享目录变成本机一块新盘符(结果由 mountRemote 弹 toast)。
+    await mountRemote(src);
   } catch (e) {
     toast.error(`连接失败:${(e as Error).message}`);
   } finally {
@@ -960,8 +1317,11 @@ async function connectRemote() {
 }
 function forgetRemote(s: RemoteSource) {
   if (!confirm(`断开并移除「${s.name}」?`)) return;
+  // 先卸盘(删盘符 + 拆 WebDAV 桥),再断隧道:不然资源管理器里留一块死盘。
+  if (isTauri) fsmount.unmount(s.id).catch(() => {});
   // 真断隧道:不然孤儿隧道在后台对着已移除的主机永远重连(占端口+空耗流量)。
   if (isTauri) invoke("collab_tunnel_disconnect", { listenPort: s.port }).catch(() => {});
+  delete mountMap.value[s.id];
   remotes.value = removeRemoteSource(s.id);
   toast.info("已断开并移除远程源");
 }
@@ -982,6 +1342,8 @@ async function autoReconnectRemotes() {
     } catch {
       /* 单台失败不阻断其它;拓扑里仍显示,浏览时按需重连 */
     }
+    // 盘符自动恢复:挂载命令幂等,后端看门狗接力等隧道通(静默,别一开机弹一串 toast)。
+    mountRemote(s, true);
   }
 }
 
@@ -994,6 +1356,11 @@ onMounted(async () => {
   await autoReconnectRemotes();
   await sampleLocal();
   loadExecPolicy(); // 远程执行开关档位(主机侧)
+  loadShareRoots(); // 我共享出去的盘目录(主机侧)
+  loadApps(); // 已发布给手机的本机应用
+  loadMounts(); // 已挂载的远程盘盘符(徽标)
+  loadWebdavLimit(); // 挂载盘大文件解锁横幅要不要出现
+  loadMesh(); // 同账号设备网现状(入网了吗、名册上有谁、挂了哪些盘)
   pollRemoteStats(); // 首屏就拉一次 NAS/远程盘实况(它们在「我的设备」里)
   pollTunnelPaths(); // 首屏也拉一次隧道链路,星图别先画个写死的 P2P
   // 本机仪表每 4s 跳一帧。盘实况:启动后前 ~40s 每 4s 密集试(iroh 握手要几秒,
@@ -1011,6 +1378,8 @@ onMounted(async () => {
     if (due && (tab.value === "devices" || tab.value === "topo")) {
       pollRemoteStats(); // 盘实况(任何分区都拉:mine 默认显示它们)
       pollTunnelPaths(); // 隧道真实链路(直连/中继),卡片与星图共用
+      loadMounts(); // 盘符徽标(本地查注册表,零网络开销)
+      loadMesh(); // 设备网名册(纯本地读进程内状态,不打云端)
       if (tick % 3 === 0) {
         if (devFilter.value === "mine") loadDevices(true);
         else if (devFilter.value === "activity") loadAudit(true); // 停在活动页也持续刷新(codex #7)
@@ -1161,6 +1530,123 @@ onUnmounted(() => {
               </span>
             </div>
 
+            <!-- 我共享出去的盘:开放哪些目录给互联对端,逐目录点选是否允许写入 -->
+            <div v-if="isTauri" class="fs-share" :class="{ busy: shareBusy }">
+              <div class="fss-head">
+                <div class="lt-txt">
+                  <span class="lt-title">共享给互联设备的目录</span>
+                  <span class="lt-sub">{{ shareItems.length
+                    ? `已开放 ${shareItems.length} 个目录(${writableCount} 个可写) · 对端连上即挂成一块盘`
+                    : "未开放任何目录 · 对端挂上的盘是空的" }}</span>
+                </div>
+                <button class="pill" :disabled="shareBusy" @click="addShareRoot">
+                  <FolderInput :size="13" /> 添加目录
+                </button>
+              </div>
+              <ul v-if="shareItems.length" class="fss-list">
+                <li v-for="d in shareItems" :key="d.path">
+                  <HardDrive :size="13" class="fss-ic" />
+                  <span class="fss-path" :title="d.path">{{ d.path }}</span>
+                  <!-- 点选放开写:默认关。开了对端就能在这块盘里直接改/删/拖入 -->
+                  <label class="fss-w" :class="{ on: d.write }"
+                    :title="d.write
+                      ? '对端可在此目录内新建/修改/删除文件 —— 点一下改回只读'
+                      : '当前只读。点一下允许对端写入此目录'">
+                    <input type="checkbox" :checked="d.write" :disabled="shareBusy"
+                      @change="toggleShareWrite(d)" />
+                    <component :is="d.write ? Pencil : Eye" :size="12" />
+                    {{ d.write ? "可写" : "只读" }}
+                  </label>
+                  <button class="fss-x" title="停止共享此目录" :disabled="shareBusy" @click="removeShareRoot(d.path)">
+                    <ShieldOff :size="13" />
+                  </button>
+                </li>
+              </ul>
+              <span class="ex-note">
+                路径关押在所选目录内(拒 <code>..</code> 与符号链接逃逸),仅同账号/持 owner 令牌的设备可见。
+                <b>写权限默认关</b> —— 打开后对端能删这个目录里的东西,只开你真需要共享编辑的目录。
+              </span>
+            </div>
+
+            <!-- 隔空同屏:把一个文件包装成网页,两端同看一页(手机侧在预览页点投屏钮也能发起) -->
+            <div v-if="isTauri" class="fs-share">
+              <div class="fss-head">
+                <div class="lt-txt">
+                  <span class="lt-title">隔空同屏</span>
+                  <span class="lt-sub">
+                    把文件包装成一页自包含网页,手机与电脑同时打开<b>同一页</b>,滚动与指点实时互传 ——
+                    走 iroh 打洞/中继,<b>不要求同一 WiFi</b>。
+                  </span>
+                </div>
+                <button class="pill ghost" title="在应用内直接读这套方案说明" @click="openBeamDoc">
+                  <GraduationCap :size="13" /> 看说明
+                </button>
+                <button class="pill" @click="beamPick">
+                  <MonitorSmartphone :size="13" /> 选文件投屏
+                </button>
+              </div>
+              <span class="ex-note">
+                手机侧:文件预览页右上角的投屏钮。可同屏的文件与「文件预览」同一把白名单闸
+                (知识库 / ~/Polaris 产物 / 项目工作目录)。<b>手机横过来即自动切电脑版式。</b>
+              </span>
+            </div>
+
+            <!-- 应用直投:把本机在跑的 HTTP 应用发布给手机 —— 电脑当服务器,手机只跑视图 -->
+            <div v-if="isTauri" class="fs-share" :class="{ busy: appsBusy }">
+              <div class="fss-head">
+                <div class="lt-txt">
+                  <span class="lt-title">应用直投(把电脑当服务器)</span>
+                  <span class="lt-sub">
+                    发布本机在跑的应用,手机上操作的是<b>真实应用本体</b>,计算全在电脑跑 ——
+                    传的是 HTTP 报文不是画面,比远程桌面清晰、省流、可选可搜、触摸原生。
+                  </span>
+                </div>
+                <button class="pill" :disabled="scanning" @click="scanPorts">
+                  <Radio :size="13" /> {{ scanning ? "扫描中…" : "扫描本机应用" }}
+                </button>
+              </div>
+
+              <ul v-if="pubApps.length" class="fss-list">
+                <li v-for="a in pubApps" :key="a.slug">
+                  <Cpu :size="13" class="fss-ic" />
+                  <span class="fss-path" :title="`127.0.0.1:${a.port}${a.path}`">
+                    {{ a.name }} · <code>/{{ a.slug }}</code> → :{{ a.port }}
+                  </span>
+                  <button class="fss-x" title="在本机浏览器打开" :disabled="appsBusy" @click="openAppLocally(a)">
+                    <Globe :size="13" />
+                  </button>
+                  <button class="fss-x" title="下架" :disabled="appsBusy" @click="unpublishApp(a.slug)">
+                    <ShieldOff :size="13" />
+                  </button>
+                </li>
+              </ul>
+
+              <ul v-if="portHits.length" class="fss-list">
+                <li v-for="h in portHits" :key="h.port">
+                  <Zap :size="13" class="fss-ic" />
+                  <span class="fss-path">
+                    :{{ h.port }} · {{ h.title || h.server || "HTTP 服务" }}
+                    <span class="faint">(HTTP {{ h.status }})</span>
+                  </span>
+                  <button
+                    v-if="!h.published"
+                    class="pill"
+                    :disabled="appsBusy"
+                    @click="publishPort(h)"
+                  >
+                    <Plus :size="12" /> 发布
+                  </button>
+                  <span v-else class="faint" style="font-size: 11px">已发布</span>
+                </li>
+              </ul>
+
+              <span class="ex-note">
+                只能投<b>开了 TCP HTTP 端口</b>的应用(开发服务器、带内置 HTTP 后端或 sidecar 的桌面应用)。
+                <b>Tauri / Electron 生产包默认走 <code>tauri://</code> / <code>file://</code>,不开端口 → 投不了</b>,
+                需要时开它的 dev server 再扫。发布出去的应用与 polaris 同源,只发布你自己信得过的。
+              </span>
+            </div>
+
             <p class="foot-note">
               仅供你<b>自己的设备</b>用。想让<b>别人(不同账号)</b>加入?到「协作」生成邀请码(collaborator/visitor)。
               要手机从外网(不同 WiFi)连,需走中继/隧道。
@@ -1237,6 +1723,78 @@ onUnmounted(() => {
         <div class="dev-content">
         <!-- 我的设备:本机 + 已登记设备 + 已连接 NAS/远程盘,统一状态卡 + 接入卡 -->
         <template v-if="devFilter === 'mine'">
+          <!-- 同账号设备网:登录一次云端账号中心,自己的设备此后自动互连自动挂盘 -->
+          <section v-if="isTauri" class="glass mesh-card" :class="{ busy: meshBusy }">
+            <div class="mesh-head">
+              <span class="mesh-ic" :class="{ on: mesh.enrolled }"><Network :size="16" :stroke-width="2" /></span>
+              <div class="lt-txt">
+                <span class="lt-title">同账号设备网{{ mesh.enrolled ? "" : "(推荐)" }}</span>
+                <span class="lt-sub">
+                  <template v-if="mesh.enrolled">
+                    已入网 · 账号 <code>{{ mesh.uid || "—" }}</code> ·
+                    名册 {{ mesh.peers.length }} 台,已挂 {{ meshMounted }} 块盘 —— 开机自动接,不用再粘连接码
+                  </template>
+                  <template v-else>
+                    填一次云端账号中心 + 账号密码,<b>此后同一账号的电脑/NAS 自己就成网</b>:
+                    自动打洞、自动把对方共享目录挂成本机盘符。密码不落盘,换的是一把可单独吊销的设备密钥。
+                  </template>
+                </span>
+              </div>
+              <button v-if="mesh.enrolled" class="pill ghost" :disabled="meshBusy" @click="meshRefresh">
+                <RefreshCw :size="13" /> 立即对账
+              </button>
+              <button v-if="mesh.enrolled" class="pill ghost" :disabled="meshBusy" @click="meshLeave">退网</button>
+              <button v-else class="pill" :disabled="meshBusy" @click="meshForm.open = !meshForm.open">
+                <Plus :size="13" /> 入网
+              </button>
+            </div>
+
+            <!-- 入网表单:只在没入网时出现,填完就再也不用看见它 -->
+            <div v-if="meshForm.open && !mesh.enrolled" class="mesh-form">
+              <div class="add-fields">
+                <input v-model="meshForm.url" class="af-inp" placeholder="云端账号中心地址(如 http://43.139.209.127:8080)" />
+                <input v-model="meshForm.username" class="af-inp" placeholder="账号(用户名或邮箱)" />
+                <input v-model="meshForm.password" class="af-inp" type="password" placeholder="密码" />
+              </div>
+              <button class="cta" style="margin-top:8px" :disabled="meshBusy" @click="meshJoin">
+                <LoaderCircle v-if="meshBusy" :size="15" class="spin" /><Zap v-else :size="15" /> 入网并自动连上我的设备
+              </button>
+              <p class="foot-note" style="margin-top:6px">
+                需要本机已「设为主机」(要有 P2P 身份)。对端也得用同一账号入网,且已把这个账号加成它的成员 ——
+                云端只证明「你是谁」,进不进得去仍由每台机器自己说了算。
+              </p>
+            </div>
+
+            <!-- 名册:每台设备连上没、挂成哪块盘、读写档位 -->
+            <ul v-if="mesh.enrolled && mesh.peers.length" class="fss-list">
+              <li v-for="p in mesh.peers" :key="p.nodeId">
+                <component :is="p.connected ? HardDrive : LoaderCircle" :size="13" class="fss-ic"
+                  :class="{ spin: !p.connected }" />
+                <span class="fss-path" :title="p.nodeId">{{ p.name }}</span>
+                <span v-if="p.drive" class="host-badge drive-badge" :class="{ dim: !p.ok }">{{ p.drive }} 盘</span>
+                <span v-if="p.drive" class="host-badge rw-badge" :class="{ rw: p.writable }">
+                  {{ p.writable ? "读写" : "只读" }}
+                </span>
+                <span v-else-if="p.error" class="mesh-err" :title="p.error">接入未成</span>
+                <!-- 远程终端:在这台设备上跑命令(受对端自己的执行策略约束) -->
+                <button
+                  v-if="p.connected"
+                  class="fss-x"
+                  title="在这台设备上跑命令(受它自己的远程执行策略约束)"
+                  @click="termTarget = { id: p.nodeId, name: p.name, nodeId: p.nodeId, port: p.port, token: p.token, createdAt: 0 }"
+                >
+                  <Terminal :size="13" />
+                </button>
+                <button class="fss-x" title="把这台设备移出设备网" :disabled="meshBusy" @click="meshKick(p)">
+                  <ShieldOff :size="13" />
+                </button>
+              </li>
+            </ul>
+            <p v-if="mesh.enrolled && !mesh.peers.length" class="foot-note">
+              名册里还只有本机。在你的另一台电脑 / NAS 上用<b>同一个账号</b>入网,这里就会自动出现它,并挂上它的盘。
+            </p>
+          </section>
+
           <!-- 接入面板(展开式):① 分享本机连接码 ② 接入对方 —— 一步到位,不用去教程 -->
           <section v-if="addForm.open" class="glass add-panel">
             <div class="ap-cols">
@@ -1271,6 +1829,26 @@ onUnmounted(() => {
             <button class="ap-close pill ghost" @click="addForm.open = false">收起</button>
           </section>
 
+          <!-- 挂载盘大文件解锁:Windows WebClient 默认单文件 50MB,一次 UAC 解到 4GB -->
+          <div
+            v-if="isTauri && isWindows && !webdavUnlocked && Object.keys(mountMap).length"
+            class="fs-share"
+            style="margin: 0 0 10px"
+          >
+            <div class="fss-head">
+              <div class="lt-txt">
+                <span class="lt-title">挂载盘大文件解锁</span>
+                <span class="lt-sub">
+                  远程盘符走 Windows 自带 WebDAV,单文件默认限 <b>50MB</b>。解锁到 4GB 只需一次管理员授权;
+                  超过 4GB 的文件请在「文件中心 · 远程源」下载(无上限、断点续传)。
+                </span>
+              </div>
+              <button class="pill" :disabled="webdavBusy" @click="unlockWebdav">
+                <HardDrive :size="13" /> {{ webdavBusy ? "等待授权…" : "解锁到 4GB" }}
+              </button>
+            </div>
+          </div>
+
           <div class="dev-grid">
             <article
               v-for="c in mineItems"
@@ -1284,6 +1862,21 @@ onUnmounted(() => {
                   <div class="dev-name">
                     {{ c.name }}
                     <span v-if="c.kind === 'host'" class="host-badge">本机</span>
+                    <span
+                      v-if="c.kind === 'disk' && c.src && mountMap[c.src.id]?.drive"
+                      class="host-badge drive-badge"
+                      :class="{ dim: !mountMap[c.src.id].ok }"
+                      :title="mountMap[c.src.id].ok ? '已挂载为本机盘,资源管理器直接用' : '盘符还在,对端暂时失联,看门狗重连中'"
+                    >{{ mountMap[c.src.id].drive }} 盘</span>
+                    <!-- 读写档位:对端把目录改成可写后 15s 内这里会自己变 -->
+                    <span
+                      v-if="c.kind === 'disk' && c.src && mountMap[c.src.id]?.drive"
+                      class="host-badge rw-badge"
+                      :class="{ rw: mountMap[c.src.id].writable }"
+                      :title="mountMap[c.src.id].writable
+                        ? '这块盘可读写:直接在资源管理器里改/删/拖入'
+                        : '这块盘只读 —— 让对端在「我共享的盘」里给目录打开写权限'"
+                    >{{ mountMap[c.src.id].writable ? "读写" : "只读" }}</span>
                   </div>
                   <div class="dev-owner">{{ c.sub }}</div>
                 </div>
@@ -1314,6 +1907,12 @@ onUnmounted(() => {
               <div class="dev-btns">
                 <template v-if="c.kind === 'host'"><span class="b flat">本机 · 全权</span></template>
                 <template v-else-if="c.kind === 'disk'">
+                  <button
+                    v-if="!mountMap[c.src!.id]?.drive"
+                    class="b"
+                    title="把它的共享目录挂成本机盘符(Z:/Y:…)"
+                    @click="mountRemote(c.src!)"
+                  ><HardDrive :size="13" /> 挂成盘符</button>
                   <button class="b" @click="browseDisk(c.src!)"><FolderInput :size="13" /> 浏览盘</button>
                   <button class="b" title="在它上面跑命令(受对端策略约束)" @click="termTarget = c.src!">
                     <Terminal :size="13" /> 终端
@@ -1765,6 +2364,28 @@ onUnmounted(() => {
 .exec-shell .pill.hot { color: #fb923c; border-color: rgba(251,146,60,.45); background: rgba(251,146,60,.12); }
 .exec-shell .ex-note { flex: 1; min-width: 220px; font-size: 11px; line-height: 1.6; color: var(--dim); opacity: .85; }
 
+/* 共享出去的盘目录 */
+.fs-share { margin-top: 11px; padding: 11px 12px; border: 1px solid var(--glass-brd); border-radius: 12px; background: color-mix(in srgb, var(--panel) 55%, transparent); }
+.fs-share.busy { opacity: .6; pointer-events: none; }
+.fss-head { display: flex; align-items: center; gap: 12px; }
+.fss-head .lt-txt { flex: 1; min-width: 0; }
+.fss-list { list-style: none; margin: 9px 0 6px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.fss-list li { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 8px; background: rgba(0,0,0,.16); }
+.fss-ic { flex: none; color: var(--dim); }
+.fss-path { flex: 1; min-width: 0; font-size: 12px; font-family: ui-monospace, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fss-x { flex: none; background: none; border: 0; color: var(--dim); cursor: pointer; padding: 3px; border-radius: 6px; display: grid; place-items: center; }
+.fss-x:hover:not(:disabled) { color: #f87171; background: rgba(239,68,68,.12); }
+.fss-x:disabled { opacity: .4; cursor: default; }
+/* 写权限开关:只读是安静的灰,可写是显眼的琥珀 —— 一眼看出哪个目录别人能改 */
+.fss-w { flex: none; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none;
+  font-size: 11px; padding: 3px 7px; border-radius: 999px; color: var(--dim);
+  border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.04); }
+.fss-w input { position: absolute; opacity: 0; width: 0; height: 0; }
+.fss-w:hover { border-color: rgba(255,255,255,.28); }
+.fss-w.on { color: #fbbf24; border-color: rgba(251,191,36,.45); background: rgba(251,191,36,.13); }
+.fs-share .ex-note { display: block; font-size: 11px; line-height: 1.6; color: var(--dim); opacity: .85; margin-top: 4px; }
+.fs-share .ex-note code { font-family: ui-monospace, Consolas, monospace; }
+
 /* ── 设备联盟 ── */
 .fed-head { display: flex; align-items: center; gap: 12px; padding: 13px 18px; }
 .fh-av { width: 34px; height: 34px; border-radius: 50%; flex: none; background: linear-gradient(135deg, #0d99ff, #7c4dff); box-shadow: 0 4px 12px rgba(124, 77, 255, .3); }
@@ -1908,6 +2529,23 @@ onUnmounted(() => {
 .dev-name { font-weight: 700; font-size: 16px; display: flex; align-items: center; gap: 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dev-owner { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
 .host-badge { font-size: 10px; font-weight: 700; color: #b8860b; background: color-mix(in srgb, #b8860b 14%, transparent); border-radius: 4px; padding: 1px 6px; flex: none; }
+/* 已挂为本机盘符的远程盘:绿 = 在线可用;dim = 盘符还在但对端暂时失联(看门狗重连中) */
+.drive-badge { color: #22c07a; background: color-mix(in srgb, #22c07a 14%, transparent); font-family: ui-monospace, Consolas, monospace; }
+.drive-badge.dim { color: var(--dim); background: color-mix(in srgb, var(--dim) 12%, transparent); }
+.rw-badge { color: var(--dim); background: color-mix(in srgb, var(--dim) 12%, transparent); }
+/* ── 同账号设备网卡 ── */
+.mesh-card { padding: 14px 16px; margin-bottom: 12px; }
+.mesh-card.busy { opacity: .7; pointer-events: none; }
+.mesh-head { display: flex; align-items: flex-start; gap: 10px; }
+.mesh-head .lt-txt { flex: 1; min-width: 0; }
+.mesh-ic { flex: none; width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+  color: var(--dim); background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); }
+.mesh-ic.on { color: #22c07a; background: color-mix(in srgb, #22c07a 14%, transparent); border-color: color-mix(in srgb, #22c07a 40%, transparent); }
+.mesh-card .lt-sub code { font-family: ui-monospace, Consolas, monospace; font-size: .92em; opacity: .8; }
+.mesh-form { margin-top: 10px; }
+.mesh-err { flex: none; font-size: 11px; color: #f87171; padding: 2px 7px; border-radius: 999px;
+  background: color-mix(in srgb, #f87171 13%, transparent); }
+.rw-badge.rw { color: #fbbf24; background: color-mix(in srgb, #fbbf24 15%, transparent); }
 .dev-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .dev-dot.on { background: #16a34a; box-shadow: 0 0 0 3px color-mix(in srgb, #16a34a 20%, transparent); }
 .dev-line { display: flex; align-items: center; gap: 8px; margin: 13px 0 8px; }

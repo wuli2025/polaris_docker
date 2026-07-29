@@ -66,7 +66,19 @@ pub struct ImagePreset {
     pub note: &'static str,
 }
 
+/// 火山方舟生图的默认模型 —— 借用聊天坞方舟 key 时按这个跑, 用户想换在生图坞里显式建一档。
+pub const VOLC_IMAGE_MODEL: &str = "doubao-seedream-4-0-250828";
+
+/// 预设顺序即推荐顺序:**火山方舟排第一**(用户指定生图优先走火山)。
 pub const IMAGE_PRESETS: &[ImagePreset] = &[
+    ImagePreset {
+        id: "doubao-image",
+        name: "豆包 Seedream(火山方舟)",
+        flavor: ImageFlavor::Openai,
+        endpoint: "https://ark.cn-beijing.volces.com/api/v3/images/generations",
+        model: VOLC_IMAGE_MODEL,
+        note: "首选;说 OpenAI 形状,模型名需在方舟控制台确认",
+    },
     ImagePreset {
         id: "minimax-image",
         name: "MiniMax 图像",
@@ -82,14 +94,6 @@ pub const IMAGE_PRESETS: &[ImagePreset] = &[
         endpoint: "https://api.openai.com/v1/images/generations",
         model: "gpt-image-1",
         note: "官方或任何兼容网关;画幅走 size(1024x1024 等)",
-    },
-    ImagePreset {
-        id: "doubao-image",
-        name: "豆包 Seedream(方舟)",
-        flavor: ImageFlavor::Openai,
-        endpoint: "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-        model: "doubao-seedream-4-0-250828",
-        note: "火山方舟;说 OpenAI 形状,模型名需在方舟控制台确认",
     },
 ];
 
@@ -196,18 +200,26 @@ pub struct ImageGenConfig {
     pub name: String,
 }
 
-/// 生图坞里当前启用条目的配置(不含借用回落)。配了但缺 key/地址/模型 → None。
+/// 一条生图档是否「能用」= key/地址/模型三样齐全。
+fn usable(it: &StoredImageProvider) -> bool {
+    !it.api_key.trim().is_empty()
+        && !it.endpoint.trim().is_empty()
+        && !it.model.trim().is_empty()
+}
+
+/// 生图坞里当前生效条目的配置(不含借用回落)。配了但缺 key/地址/模型 → None。
+///
+/// **刻意只认用户显式选中的那一家**, 缺什么就掉进借用链, 不在坞里另挑一家顶上:
+/// 「新建了一档、key 还没填完」的中间态很常见, 这时候悄悄换别家跑, 账单和模型
+/// 都不是用户以为的那家, 而 UI 上一点提示都没有。火山优先只体现在预设排序与
+/// 借用链(见 `current_image_config`), 不越过用户的显式选择。
 fn stored_image_config() -> Option<ImageGenConfig> {
     let st = load_store();
-    let it = st.items.iter().find(|x| x.id == st.current_id)?;
-    let key = it.api_key.trim();
-    if key.is_empty() || it.endpoint.trim().is_empty() || it.model.trim().is_empty() {
-        return None;
-    }
+    let it = st.items.iter().find(|x| x.id == st.current_id && usable(x))?;
     Some(ImageGenConfig {
         endpoint: it.endpoint.trim().to_string(),
         model: it.model.trim().to_string(),
-        api_key: key.to_string(),
+        api_key: it.api_key.trim().to_string(),
         flavor: it.flavor,
         name: it.name.clone(),
     })
@@ -222,7 +234,7 @@ fn minimax_image_endpoint(intl: bool) -> &'static str {
         "https://api.minimaxi.com/v1/image_generation"
     }
 }
-fn borrowed_image_config() -> Option<ImageGenConfig> {
+fn borrowed_minimax_config() -> Option<ImageGenConfig> {
     let (key, intl) = minimax_borrow_key_for_image()?;
     Some(ImageGenConfig {
         endpoint: minimax_image_endpoint(intl).to_string(),
@@ -233,12 +245,57 @@ fn borrowed_image_config() -> Option<ImageGenConfig> {
     })
 }
 
+/// 借用聊天坞里的**火山方舟**(Agentplan / 豆包 Seed / BytePlus)key 生图。
+/// 方舟说 OpenAI 形状, endpoint 由 store 侧按该家 base_url 的主机名推出(国内/海外两套域名)。
+fn borrowed_volc_config() -> Option<ImageGenConfig> {
+    let (key, endpoint) = volc_ark_borrow_key_for_image()?;
+    Some(ImageGenConfig {
+        endpoint,
+        model: VOLC_IMAGE_MODEL.to_string(),
+        api_key: key,
+        flavor: ImageFlavor::Openai,
+        name: "火山方舟 Seedream(借用方舟 Key)".to_string(),
+    })
+}
+
+/// 借用链:**火山优先**, 借不到才轮到 MiniMax。
+fn borrowed_image_config() -> Option<ImageGenConfig> {
+    borrowed_volc_config().or_else(borrowed_minimax_config)
+}
+
 /// 当前生效的生图配置。这是壳(lib.rs 的 forge_image / apihub / polaris-cli)取配置的**唯一入口**。
-/// 优先级: 生图坞里显式配的那家 → 借用聊天坞的 MiniMax(Coding Plan)key 开箱即用
-/// (实测 `sk-cp-` key 可直接调 image_generation) → None(= 生图能力关闭)。
-/// 显式配置永远压过借用 —— 用户配了别家就是不想用 MiniMax, 别自作聪明换回去。
+///
+/// 优先级(**火山优先**是用户明确要求的默认取向):
+///   ① 生图坞里显式选中且配全的那家(显式选择最大);
+///   ② 借用聊天坞的**火山方舟**(Agentplan/豆包 Seed/BytePlus)key;
+///   ③ 借用聊天坞的 MiniMax(Coding Plan)key(实测 `sk-cp-` key 可直调 image_generation);
+///   ④ None = 生图能力关闭。
+/// 显式配置永远压过借用 —— 用户配了别家就是不想用默认那家, 别自作聪明换回去。
+///
+/// ②③ 之间还有一层**运行时**回落: 见 `image_config_candidates` —— 借用的方舟 key
+/// 未必真能打生图端点(Coding Plan 套餐可能圈定了模型范围), 打不通要退回 MiniMax,
+/// 而不是让「昨天还能出图」的用户今天直接报错。
 pub fn current_image_config() -> Option<ImageGenConfig> {
-    stored_image_config().or_else(borrowed_image_config)
+    image_config_candidates().into_iter().next()
+}
+
+/// 按优先级排好的**全部**可用生图配置, 供调用方逐个试。
+///
+/// 为什么需要「逐个试」而不是只给第一个:把火山排到 MiniMax 前面是配置层的取舍,
+/// 但借来的方舟 key 是**聊天套餐**的 key(`/api/coding`), 能不能打 `/api/v3/images/generations`
+/// 未经证实。只给第一个的话, 原本借 MiniMax 出图好好的用户会因为多配了一个方舟聊天 key
+/// 而突然出不了图 —— 用一个没验证的路径顶掉一个实测可用的路径, 是纯粹的退步。
+/// 所以配置层照旧火山优先, 请求层失败即顺延下一个(见壳里的 imagegen.rs)。
+///
+/// 显式选中的那家**不参与顺延**: 用户点名了谁就用谁, 失败就要如实报错, 不能偷偷换家烧别人的额度。
+pub fn image_config_candidates() -> Vec<ImageGenConfig> {
+    if let Some(c) = stored_image_config() {
+        return vec![c];
+    }
+    [borrowed_volc_config(), borrowed_minimax_config()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 // ───────────────────────── 命令 ─────────────────────────
@@ -412,6 +469,36 @@ mod tests {
             minimax_image_endpoint(true),
             "https://api.minimax.io/v1/image_generation"
         );
+    }
+
+    fn item(id: &str, endpoint: &str, key: &str) -> StoredImageProvider {
+        StoredImageProvider {
+            id: id.into(),
+            name: id.into(),
+            flavor: ImageFlavor::Openai,
+            endpoint: endpoint.into(),
+            model: "m".into(),
+            api_key: key.into(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn usable_needs_all_three_fields() {
+        assert!(usable(&item("a", "https://x/y", "k")));
+        assert!(!usable(&item("a", "https://x/y", "")), "缺 key 不算能用");
+        assert!(!usable(&item("a", "", "k")), "缺地址不算能用");
+        let mut no_model = item("a", "https://x/y", "k");
+        no_model.model = String::new();
+        assert!(!usable(&no_model), "缺模型不算能用");
+    }
+
+    #[test]
+    fn volc_preset_ranks_first() {
+        // 预设顺序即前端「新建」时的推荐顺序 —— 火山必须排头一个(用户要求生图优先走火山)
+        assert_eq!(IMAGE_PRESETS[0].id, "doubao-image");
+        assert!(IMAGE_PRESETS[0].endpoint.contains("volces.com"));
+        assert_eq!(IMAGE_PRESETS[0].model, VOLC_IMAGE_MODEL);
     }
 
     #[test]

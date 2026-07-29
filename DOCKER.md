@@ -14,13 +14,14 @@ cp .env.example .env
 #   编辑 .env，至少填一种鉴权：
 #   - ANTHROPIC_API_KEY=sk-ant-...           （Claude 官方）
 #   - 或 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN（智谱/Kimi/DeepSeek/聚合站）
-#   - 公网部署务必设 POLARIS_AUTH_TOKEN=<一串口令>
+#   访问口令默认不要（家用 NAS 直接用）；只有真把 8080 暴露到公网时才设
+#   POLARIS_AUTH_TOKEN=<一串口令>
 
 # 2) 一键构建 + 拉起
 docker compose up -d --build
 
 # 3) 浏览器打开
-#   http://localhost:8080
+#   http://localhost:8080          ← 默认免口令，直接进
 #   若设了口令：http://localhost:8080/?token=<你的口令>
 ```
 

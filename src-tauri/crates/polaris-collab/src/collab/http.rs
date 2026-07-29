@@ -3298,7 +3298,67 @@ async fn fs_list_api(
     }
 }
 
-/// GET /api/fs/read?path=<rel> → 原始字节(前端按 mime 预览/下载)。
+/// 解析单区间 `Range: bytes=a-b` / `bytes=a-` / `bytes=-n`(后缀 n 字节)。
+/// 返回 (start, end)(闭区间);None = 头缺失/看不懂(按整文件 200 处理);
+/// start 越界由调用方判 416。多区间只取第一段(挂载盘/下载器都只发单段)。
+fn parse_byte_range(h: Option<&str>, len: u64) -> Option<(u64, u64)> {
+    let spec = h?.trim().strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    let last = len.saturating_sub(1);
+    if a.is_empty() {
+        // 后缀区间:最后 n 字节。
+        let n: u64 = b.trim().parse().ok()?;
+        if n == 0 || len == 0 {
+            return None;
+        }
+        return Some((len - n.min(len), last));
+    }
+    let start: u64 = a.trim().parse().ok()?;
+    let end = if b.trim().is_empty() {
+        last
+    } else {
+        b.trim().parse::<u64>().ok()?.min(last)
+    };
+    if start > end {
+        return None; // 倒置区间 = 无效,按整文件 200 处理(end 越界钳制后也可能落到这)
+    }
+    Some((start, end))
+}
+
+/// 把已 seek 好的文件句柄泵成流式 body:spawn_blocking 分块读 → mpsc → Stream。
+/// 内存占用恒定(256KB 块 × 通道容量),文件多大都一样。
+fn stream_file_body(mut file: std::fs::File, mut remaining: u64) -> axum::body::Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut buf = vec![0u8; 256 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            match file.read(&mut buf[..want]) {
+                Ok(0) => break, // 文件被并发截短:如实提前收流
+                Ok(n) => {
+                    remaining -= n as u64;
+                    if tx
+                        .blocking_send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break; // 客户端断开
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    axum::body::Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+/// GET /api/fs/read?path=<rel> → 文件字节,**流式 + Range**。
+/// 任意大小(不整读进内存);支持断点续传/播放器 seek(206 + Content-Range)。
 async fn fs_read_api(
     State(state): State<CollabState>,
     headers: HeaderMap,
@@ -3311,14 +3371,456 @@ async fn fs_read_api(
         return forbid();
     }
     let rel = q.get("path").cloned().unwrap_or_default();
-    let out = tokio::task::spawn_blocking(move || crate::collab::fsface::read_bytes(&rel)).await;
-    match out {
-        Ok(Ok(bytes)) => (
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
+    let rel_for_ext = rel.clone(); // 判「要不要压缩」看扩展名,而 rel 要被搬进阻塞任务
+    let opened = tokio::task::spawn_blocking(move || crate::collab::fsface::open_jailed(&rel)).await;
+    let (mut file, len, mtime) = match opened {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
+        Err(e) => return err_resp(format!("内部任务失败: {e}")),
+    };
+    let range_hdr = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    // 解析成功即保证 start ≤ end < len;不可满足/看不懂的区间一律回整文件 200
+    //(宁可多传不传错;fs_fetch 端会先比对总长,已完整就不发请求)。
+    let range = parse_byte_range(range_hdr.as_deref(), len);
+    let (start, end) = range.unwrap_or((0, len.saturating_sub(1)));
+    let remaining = if len == 0 { 0 } else { end - start + 1 };
+    if start > 0 {
+        use std::io::Seek;
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
+            return err_resp(format!("seek 失败: {e}"));
+        }
+    }
+    // 压缩靠一个**私有标记头**开启,而不是标准的 Accept-Encoding —— 这不是洁癖:
+    // Chrome 如今默认就发 `Accept-Encoding: ..., zstd`,而「压缩 + Range」对通用客户端
+    // 是个坏组合(区间头说的是原文字节,body 却是压缩流,浏览器拿它做 seek 必错)。
+    // 只有我们自己的挂载桥懂这套记账,就只让它点名。别的客户端(浏览器/curl/老版本)
+    // 看到的行为与从前一字不差。
+    //
+    // 这台云机 2 核常年 0% 占用,而管子只有 3MB/s:拿闲着的 CPU 换带宽,文本/代码/日志
+    // 这类能压掉几倍 —— 实测一份 30MB 日志 10.2s → 0.1s。
+    let zstd_on = zstd_level() > 0
+        && !is_precompressed(&rel_for_ext)
+        && headers
+            .get("x-polaris-zstd")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+    let mut b = Response::builder()
+        .status(if range.is_some() && len > 0 {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::ACCEPT_RANGES, "bytes");
+    // 压缩后长度事先不知道 → 不发 Content-Length,走分块编码。区间头照发**未压缩**的
+    // 语义(起止/总长都按原文件算),对端据此记账;它拿到的解压流正好是这段字节。
+    if !zstd_on {
+        b = b.header(header::CONTENT_LENGTH, remaining);
+    }
+    if mtime > 0 {
+        b = b.header(header::LAST_MODIFIED, httpdate_from_secs(mtime));
+    }
+    if range.is_some() && len > 0 {
+        b = b.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+    }
+    if zstd_on {
+        b = b.header(header::CONTENT_ENCODING, "zstd");
+        return b.body(stream_file_body_zstd(file, remaining)).unwrap();
+    }
+    b.body(stream_file_body(file, remaining)).unwrap()
+}
+
+/// zstd 压缩级别:0 = 关掉压缩(`POLARIS_FS_ZSTD_LEVEL=0`)。默认 3 —— 在这类机器上
+/// 单核也有一百多 MB/s,相对 3MB/s 的管子等于免费,而压缩率比 1 级明显好。
+fn zstd_level() -> i32 {
+    std::env::var("POLARIS_FS_ZSTD_LEVEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(3)
+        .clamp(0, 19)
+}
+
+/// 已经是压缩格式的文件再压一遍纯属浪费 CPU(还会让本就吃紧的小机器多一份负担)。
+/// 判不准也不致命:zstd 对不可压数据是原样存储,顶多白花几个百分点的 CPU。
+fn is_precompressed(rel: &str) -> bool {
+    const EXTS: &[&str] = &[
+        "zip", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "jpg", "jpeg", "png", "gif", "webp",
+        "avif", "heic", "mp3", "aac", "flac", "ogg", "opus", "mp4", "mkv", "mov", "avi", "webm",
+        "pdf", "docx", "xlsx", "pptx", "apk", "jar", "whl", "iso", "dmg", "exe", "wasm",
+    ];
+    let ext = rel
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    EXTS.contains(&ext.as_str())
+}
+
+/// 同 [`stream_file_body`],但边读边 zstd 压缩。压缩在阻塞池的线程里做,不占 async worker。
+fn stream_file_body_zstd(file: std::fs::File, remaining: u64) -> axum::body::Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    let level = zstd_level();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        /// 把 zstd 写出来的每一块直接推进通道。通道容量有界 = 天然背压:
+        /// 客户端读得慢,压缩线程就在 send 上停下来,内存不会涨。
+        struct ChanWriter(tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>);
+        impl Write for ChanWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .blocking_send(Ok(axum::body::Bytes::copy_from_slice(buf)))
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "客户端已断开")
+                    })?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut enc = match zstd::stream::Encoder::new(ChanWriter(tx), level) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        // 只压区间内的那些字节;copy 自带 8KB 缓冲,压缩器内部另有自己的窗口。
+        let mut src = file.take(remaining);
+        if std::io::copy(&mut src, &mut enc).is_ok() {
+            let _ = enc.finish(); // 收尾帧:少了这一步对端解不出最后一块
+        }
+    });
+    axum::body::Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+/// unix 秒 → RFC1123(Last-Modified 用)。Hinnant civil-from-days,无额外依赖。
+fn httpdate_from_secs(secs: u64) -> String {
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let wd = ((days + 4).rem_euclid(7)) as usize;
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as usize;
+    let y = yoe as i64 + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WD[wd],
+        d,
+        MO[m - 1],
+        y,
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+// ───────────────────────── 同账号设备网 /api/mesh/*(权威侧)─────────────────────────
+//
+// 「登录同一个账号 → 设备自己成网」的目录服务。只有账号权威(云机)提供;成员主机上这些
+// 路由一律 400,与 /api/account/* 同口径。
+//
+// 鉴权是**设备密钥**(不是会话):Bearer mk_… 由 /api/mesh/enroll 颁发。理由是设备网的
+// 心跳跑在后台、跨天跨重启,不该依赖某个会话的寿命;而它能做的事只有三样(报到、取本账号
+// 设备清单、换一张 5 分钟身份断言),换不到任何一台设备的访问权。
+
+/// 设备密钥入口闸。密钥无效/被吊销 → 403 并带上原因(客户端据此决定「重新入网」)。
+fn mesh_key_of(headers: &HeaderMap) -> Result<String, Response> {
+    bearer_of(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"缺设备密钥(Bearer mk_…)"})),
         )
-            .into_response(),
-        Ok(Err(e)) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
+            .into_response()
+    })
+}
+
+/// 设备入网:拿一张身份断言换一把长期设备密钥。
+///
+/// 断言由本机(权威)自己签的,所以这里用**自己的公钥**验 —— 等于确认「这张断言真是我签的、
+/// 没过期」。客户端的断言来自 `/api/account/login`,即用户刚亲自输过密码。
+async fn mesh_enroll(Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        use crate::collab::authority as A;
+        let claims = A::verify_assertion_with(&s_of(&v, "assertion"), &A::public_key_b64()?)?;
+        let key = crate::collab::mesh::enroll(
+            &claims.uid,
+            &s_of(&v, "nodeId"),
+            &s_of(&v, "name"),
+            &s_of(&v, "os"),
+            &s_of(&v, "ver"),
+        )?;
+        Ok(json!({ "meshKey": key, "uid": claims.uid, "username": claims.username }))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 心跳 + 取同账号设备清单(一次往返办两件事)。
+async fn mesh_announce(headers: HeaderMap, Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let key = match mesh_key_of(&headers) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (uid, peers) = crate::collab::mesh::announce(
+            &key,
+            &s_of(&v, "name"),
+            &s_of(&v, "os"),
+            &s_of(&v, "ver"),
+        )?;
+        Ok(json!({ "uid": uid, "peers": peers }))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 设备密钥 → 一张新的 5 分钟身份断言。设备拿它去**对端主机**换本机会话。
+///
+/// 这是设备网唯一的「凭据升级」点,也是它必须只能自助的原因:签出来的断言只说
+/// 「我是 uid X」,进不进得去某台机器仍由那台机器自己的成员资格决定。
+async fn mesh_assert(headers: HeaderMap) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let key = match mesh_key_of(&headers) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (uid, _) = crate::collab::mesh::resolve_key(&key)?;
+        let (username, email, display) = crate::collab::mesh::account_of(&uid)?;
+        let assertion =
+            crate::collab::authority::sign_assertion(&uid, &username, &email, &display)?;
+        Ok(json!({ "assertion": assertion, "uid": uid, "username": username }))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+/// 把自己账号名下的一台设备移出设备网(丢了电脑的应急操作)。
+async fn mesh_revoke(headers: HeaderMap, Json(v): Json<Value>) -> Response {
+    if !crate::collab::authority::is_authority() {
+        return not_authority();
+    }
+    let key = match mesh_key_of(&headers) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let out = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let (uid, _) = crate::collab::mesh::resolve_key(&key)?;
+        crate::collab::mesh::revoke(&uid, &s_of(&v, "nodeId"))?;
+        Ok(json!({ "ok": true }))
+    })
+    .await;
+    unwrap_api(out)
+}
+
+// ───────────────────────── 远程文件写入(挂载盘的读写面)─────────────────────────
+//
+// 写比读危险一个量级 —— 远端能删你的文件。所以这批端点有**两道**独立的闸:
+//  ① 角色闸:与读同一条线(owner 级)。挂载端拿的是同账号断言换来的本机会话。
+//  ② 目录闸:fsface 逐根的写位。角色够了但目录没开写 → 一律拒。
+// 两道都得过。少任何一道,「同账号自动组网」就变成「谁进得来谁就能删盘」。
+
+/// 写端点共用的入口闸:角色不够直接 None。
+async fn fs_write_guard(state: &CollabState, headers: &HeaderMap) -> Option<AuthCtx> {
+    let ctx = auth_ctx(state, headers).await?;
+    if role_rank(&ctx.role) < 3 {
+        return None;
+    }
+    Some(ctx)
+}
+
+/// fsface 的错误 → 403 + 原文。写失败的原因(只读/不在根内/父目录不存在)必须如实回给
+/// 挂载端,资源管理器会把它显示成失败原因;糊成 500 就只剩一句「未指定的错误」。
+fn fs_deny(e: String) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response()
+}
+
+/// 单个条目属性。挂载盘的 PROPFIND(文件)与 HEAD 走这条,省掉「列父目录再找一遍」。
+async fn fs_stat_api(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    let rel = q.get("path").cloned().unwrap_or_default();
+    match tokio::task::spawn_blocking(move || crate::collab::fsface::stat(&rel)).await {
+        Ok(Ok(e)) => Json(json!({ "entry": e })).into_response(),
+        Ok(Err(e)) => fs_deny(e),
+        Err(e) => err_resp(format!("内部任务失败: {e}")),
+    }
+}
+
+/// 本机对远端开放了什么能力。挂载端据此决定盘挂成读写还是只读 ——
+/// 不问就盲挂读写,用户会在资源管理器里拖进文件、等半天、再收一个「拒绝访问」。
+async fn fs_caps_api(State(state): State<CollabState>, headers: HeaderMap) -> Response {
+    let Some(ctx) = auth_ctx(&state, &headers).await else {
+        return forbid();
+    };
+    if role_rank(&ctx.role) < 3 {
+        return forbid();
+    }
+    let out = tokio::task::spawn_blocking(|| {
+        let (read, write) = crate::collab::fsface::caps();
+        json!({ "read": read, "write": write })
+    })
+    .await;
+    match out {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_resp(format!("内部任务失败: {e}")),
+    }
+}
+
+/// 写一个文件(整体覆盖)。请求体**流式**落到临时文件再原子改名:
+/// 4GB 的文件不会在内存里过一遍,半途断线也不会留下一个截断的正式文件。
+async fn fs_write_api(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    body: Body,
+) -> Response {
+    let Some(ctx) = fs_write_guard(&state, &headers).await else {
+        return forbid();
+    };
+    let rel = q.get("path").cloned().unwrap_or_default();
+    // 开写(建临时文件)在阻塞线程池;拿到句柄后由 mpsc 把 async 流喂给同步写线程。
+    let opened = tokio::task::spawn_blocking({
+        let rel = rel.clone();
+        move || crate::collab::fsface::begin_write(&rel)
+    })
+    .await;
+    let (file, target) = match opened {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return fs_deny(e),
+        Err(e) => return err_resp(format!("内部任务失败: {e}")),
+    };
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    // 同步写线程:收一块写一块。返回写入字节数;写盘出错立刻停,错误带回调用侧。
+    let writer = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        use std::io::Write;
+        let mut file = file;
+        let mut total: u64 = 0;
+        while let Ok(chunk) = rx.recv() {
+            file.write_all(&chunk).map_err(|e| format!("写盘失败: {e}"))?;
+            total += chunk.len() as u64;
+        }
+        file.flush().map_err(|e| format!("落盘失败: {e}"))?;
+        Ok(total)
+    });
+
+    let mut stream = body.into_data_stream();
+    let mut recv_err: Option<String> = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => {
+                if tx.send(b.to_vec()).is_err() {
+                    break; // 写线程已经出错退出,别再灌了
+                }
+            }
+            Err(e) => {
+                recv_err = Some(format!("接收请求体中断: {e}"));
+                break;
+            }
+        }
+    }
+    drop(tx); // 关通道 = 通知写线程收尾
+    let written = writer.await;
+
+    // 任一环出错都不落定:临时文件删掉,正式文件保持原样。
+    let cleanup = |t: crate::collab::fsface::WriteTarget| {
+        tokio::task::spawn_blocking(move || crate::collab::fsface::abort_write(&t));
+    };
+    if let Some(e) = recv_err {
+        cleanup(target);
+        return err_resp(e);
+    }
+    let total = match written {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            cleanup(target);
+            return err_resp(e);
+        }
+        Err(e) => {
+            cleanup(target);
+            return err_resp(format!("写任务失败: {e}"));
+        }
+    };
+    let committed = tokio::task::spawn_blocking(move || {
+        crate::collab::fsface::commit_write(&target).map_err(|e| {
+            crate::collab::fsface::abort_write(&target);
+            e
+        })
+    })
+    .await;
+    match committed {
+        Ok(Ok(())) => {
+            crate::collab::db::audit(&ctx.username, "fs.write", &rel, &total.to_string());
+            Json(json!({ "ok": true, "bytes": total })).into_response()
+        }
+        Ok(Err(e)) => err_resp(e),
+        Err(e) => err_resp(format!("落定任务失败: {e}")),
+    }
+}
+
+/// 建目录 / 删除 / 改名 / 复制。都是短活,统一走一个 handler 少四份样板。
+async fn fs_op_api(
+    State(state): State<CollabState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    axum::extract::Path(op): axum::extract::Path<String>,
+) -> Response {
+    let Some(ctx) = fs_write_guard(&state, &headers).await else {
+        return forbid();
+    };
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let dest = q.get("dest").cloned().unwrap_or_default();
+    let op2 = op.clone();
+    let rel2 = rel.clone();
+    let dest2 = dest.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use crate::collab::fsface as F;
+        match op2.as_str() {
+            "mkdir" => F::mkdir(&rel2),
+            "delete" => F::remove(&rel2),
+            "move" => F::rename(&rel2, &dest2),
+            "copy" => F::copy(&rel2, &dest2),
+            other => Err(format!("不认识的文件操作「{other}」")),
+        }
+    })
+    .await;
+    match out {
+        Ok(Ok(())) => {
+            crate::collab::db::audit(&ctx.username, &format!("fs.{op}"), &rel, &dest);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Ok(Err(e)) => fs_deny(e),
         Err(e) => err_resp(format!("内部任务失败: {e}")),
     }
 }
@@ -3346,6 +3848,11 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
         .route("/api/account/reset", post(account_reset))
         // 成员侧进门:拿权威签的断言换本机会话。
         .route("/api/collab/login_assertion", post(collab_login_assertion))
+        // ── 同账号设备网(权威侧目录:登录即成网,不必再粘连接码)──
+        .route("/api/mesh/enroll", post(mesh_enroll))
+        .route("/api/mesh/announce", post(mesh_announce))
+        .route("/api/mesh/assert", post(mesh_assert))
+        .route("/api/mesh/revoke", post(mesh_revoke))
         .route("/api/collab/join", post(collab_join))
         .route("/api/collab/authority/repin", post(collab_authority_repin))
         // GitHub 式:开放注册 + 用户名搜索 + 团队(一人多团队,团队下挂项目)
@@ -3476,7 +3983,17 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
         .route("/api/collab/tunnel/relays", post(tunnel_relays_api))
         // 远程文件浏览(fsface):owner 鉴权 + 路径关押,随隧道透传到对端的盘。
         .route("/api/fs/list", get(fs_list_api))
-        .route("/api/fs/read", get(fs_read_api));
+        .route("/api/fs/read", get(fs_read_api))
+        .route("/api/fs/stat", get(fs_stat_api))
+        .route("/api/fs/caps", get(fs_caps_api))
+        // 写面:逐根写位 + 角色闸双闸。挂载盘的 PUT/MKCOL/DELETE/MOVE/COPY 落到这里。
+        // 4GB 是 Windows WebDAV 重定向器的协议顶格,body limit 对齐它。
+        .route(
+            "/api/fs/write",
+            axum::routing::put(fs_write_api)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)),
+        )
+        .route("/api/fs/op/:op", post(fs_op_api));
     // 云机中继网关(collab-net 才有):主机挂牌 + /h/:id 反代到该主机(经 iroh 到桌面 apihub)。
     #[cfg(feature = "collab-net")]
     {
@@ -3495,6 +4012,50 @@ pub fn collab_router(state: CollabState, with_ws: bool) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Range 解析:标准/开区间/后缀/越界钳制/看不懂回 None(整文件)。
+    #[test]
+    fn byte_range_parsing() {
+        assert_eq!(parse_byte_range(Some("bytes=0-99"), 1000), Some((0, 99)));
+        assert_eq!(parse_byte_range(Some("bytes=200-"), 1000), Some((200, 999)));
+        assert_eq!(parse_byte_range(Some("bytes=-100"), 1000), Some((900, 999)));
+        assert_eq!(parse_byte_range(Some("bytes=0-9999"), 1000), Some((0, 999)), "end 越界须钳到 len-1");
+        assert_eq!(parse_byte_range(Some("bytes=500-100"), 1000), None, "倒置区间无效,按整文件");
+        assert_eq!(parse_byte_range(Some("bytes=2000-"), 1000), None, "起点越界不可满足,按整文件");
+        assert_eq!(parse_byte_range(None, 1000), None);
+        assert_eq!(parse_byte_range(Some("items=0-1"), 1000), None);
+        assert_eq!(parse_byte_range(Some("bytes=-0"), 1000), None, "-0 无意义按整文件");
+        assert_eq!(parse_byte_range(Some("bytes=-100"), 0), None, "空文件后缀区间按整文件");
+        // 多区间只取第一段。
+        assert_eq!(parse_byte_range(Some("bytes=0-1,5-9"), 1000), Some((0, 1)));
+        assert_eq!(httpdate_from_secs(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    /// 已压缩格式不再二次压缩(白烧 CPU),其余一律可压。判不准不致命 —— zstd 对
+    /// 不可压数据是原样存储 —— 但这份名单直接决定小机器上的 CPU 账单。
+    #[test]
+    fn precompressed_ext_detection() {
+        for p in ["a/b/photo.JPG", "x.zip", "dir/pkg.tar.gz", "v.mp4", "s.pdf", "app.exe"] {
+            assert!(is_precompressed(p), "{p} 应判为已压缩");
+        }
+        for p in ["notes.md", "src/main.rs", "a.txt", "data.json", "server.log", "无扩展名"] {
+            assert!(!is_precompressed(p), "{p} 应判为可压缩");
+        }
+        // 目录名里的点不能误当扩展名。
+        assert!(!is_precompressed("v1.2.3/README"), "只看最后一段的扩展名");
+    }
+
+    /// 压缩级别的钳制与关闭开关。0 = 彻底不压(链路是千兆内网时该关)。
+    #[test]
+    fn zstd_level_clamped() {
+        std::env::set_var("POLARIS_FS_ZSTD_LEVEL", "0");
+        assert_eq!(zstd_level(), 0, "0 = 关闭压缩");
+        std::env::set_var("POLARIS_FS_ZSTD_LEVEL", "99");
+        assert_eq!(zstd_level(), 19, "超出上限须钳住,不能把 CPU 烧穿");
+        std::env::set_var("POLARIS_FS_ZSTD_LEVEL", "不是数字");
+        assert_eq!(zstd_level(), 3, "写错按默认,不因配置错误退化成不可用");
+        std::env::remove_var("POLARIS_FS_ZSTD_LEVEL");
+    }
 
     /// 自动探测与 env 覆写合在一个测试里跑:环境变量是进程级的,拆成两个测试
     /// 会因并行执行互相污染(一个设着 POLARIS_ADVERTISE_URL,另一个恰好读到)。

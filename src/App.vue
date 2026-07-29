@@ -13,10 +13,12 @@ import ViewLoader from "./components/ViewLoader.vue";
 import RightDrawer from "./components/RightDrawer.vue";
 import SplashScreen from "./components/SplashScreen.vue";
 import Onboarding from "./components/Onboarding.vue";
-import EnvDoctor from "./components/EnvDoctor.vue"; // 既是视图也是启动 env 网关，留静态
+// 环境页：启动网关已取消（环境改为后台静默托管），这里只作侧栏「环境」视图用
+import EnvDoctor from "./components/EnvDoctor.vue";
 import UpdateBanner from "./components/UpdateBanner.vue";
 import ToastHost from "./components/ToastHost.vue";
 import VoiceOverlay from "./components/VoiceOverlay.vue";
+import BeamStage from "./components/BeamStage.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import TaskCenter from "./components/TaskCenter.vue";
 import FaultBoundary from "./components/FaultBoundary.vue";
@@ -181,6 +183,19 @@ onMounted(() => {
   void listen<{ message?: string }>("provider://failover", (p) => {
     if (p?.message) toast.info(p.message);
   });
+  // 环境静默托管(后端 doctor::autopilot):缺 Claude Code 时后台自己装,用户**不用点任何东西**。
+  // 这里只做**被动播报**——装的时候说一声、装完/失败给个结果,绝不弹窗、不要求操作。
+  // 绝大多数启动什么都不缺 → 后端根本不发事件,这里全程静默。
+  void listen<{ running?: boolean; finished?: boolean; ok?: boolean; step?: string; message?: string }>(
+    "env:autopilot",
+    (s) => {
+      if (s?.running && s.step) toast.info(s.step);
+      else if (s?.finished && s.message) {
+        if (s.ok) toast.success(s.message);
+        else toast.error(s.message);
+      }
+    }
+  );
   // 向量索引「默认不开机自启」(见 autoBuildIndexOnStartup 注释):后台嵌入持写锁会让主线程
   // 读命令卡 busy 锁 → 窗口无响应被强杀。建索引改纯手动(文件中心点「建索引」)。这里仅在
   // 用户显式开了 polaris.indexAutoResume 开关时才走旧的开机续建,默认是个立即返回的空操作。
@@ -264,9 +279,14 @@ useHotkeys();
 
 const wsDown = ref(false);
 
-// 启动流程：splash(每次) → onboarding(仅首次) → env(环境检测,健康则无感放行) → ready
+// 启动流程：splash(每次) → onboarding(仅首次) → ready
+//
+// 这里曾有一道 env 关卡(全屏「环境检测与配置」)，会把「你缺 uv / 缺 PowerShell 7 / 缺
+// Claude Code」摊给用户看、还要他自己点安装。已彻底去掉：uv/Python/Git Bash 随安装包内置，
+// 唯一要联网装的 Claude Code 由后端 doctor::autopilot 在**后台静默**装好(全程免 UAC)。
+// 用户什么都不用点；想看环境仍可去侧栏「环境」页。
 const ONBOARDED_KEY = "polaris.onboarded.v1";
-const phase = ref<"splash" | "onboarding" | "env" | "ready">("splash");
+const phase = ref<"splash" | "onboarding" | "ready">("splash");
 // 新用户(本次刚走完初始引导)首开:ready 后直接落地「文件中心」并拉起智能向导(可跳过)。
 // onOnboardingDone 只在 polaris.onboarded.v1 缺失时触发,正是「全新用户」的精确信号 ——
 // 老用户(已 onboarded)走 splash→env→ready,routeFcWizard 始终 false,不打扰、不改落地视图。
@@ -278,13 +298,14 @@ const splashReady = ref(false);
 
 function onSplashDone() {
   const done = localStorage.getItem(ONBOARDED_KEY);
-  phase.value = done ? "env" : "onboarding";
+  if (done) enterReady();
+  else phase.value = "onboarding";
 }
 function onOnboardingDone() {
   routeFcWizard.value = true;
-  phase.value = "env";
+  enterReady();
 }
-function onEnvDone() {
+function enterReady() {
   phase.value = "ready";
   // 全新用户:进文件中心 + 自动开「让 AI 更懂你」向导(向导自带「跳过」)。
   if (routeFcWizard.value) {
@@ -292,7 +313,7 @@ function onEnvDone() {
     app.setView("file_center");
     wiz.openWizard();
   }
-  // splash → onboarding → env 全部完成后，再检查更新（避免弹窗被盖住）
+  // splash → onboarding 走完后再检查更新（避免弹窗被盖住）
   checkForUpdate();
 }
 
@@ -430,6 +451,9 @@ function startSbDrag(e: MouseEvent) {
     <VoiceOverlay />
     <CommandPalette />
 
+    <!-- 隔空同屏:手机投过来一个文件 → 电脑自动打开同一页并实时跟随(iroh P2P,不用同一 WiFi) -->
+    <BeamStage />
+
     <!-- 全局任务中心:盘点/建索引/智能归类等后台任务,无论切到哪个视图都常驻可见、可点回去 -->
     <TaskCenter />
 
@@ -454,9 +478,6 @@ function startSbDrag(e: MouseEvent) {
     </Transition>
     <Transition name="onboard-fade">
       <Onboarding v-if="phase === 'onboarding'" @done="onOnboardingDone" />
-    </Transition>
-    <Transition name="onboard-fade">
-      <EnvDoctor v-if="phase === 'env'" gate @done="onEnvDone" />
     </Transition>
   </div>
 </template>

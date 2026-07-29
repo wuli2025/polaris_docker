@@ -30,7 +30,7 @@ const report = ref<EnvReport | null>(null);
 
 // 安装 / 修复 / 更新 的进行态
 const busyKind = ref<
-  "" | "claude" | "claude-npm" | "claude-update" | "node" | "pwsh" | "uv" | "path"
+  "" | "claude" | "claude-update" | "node" | "pwsh" | "uv" | "path"
 >("");
 const installReqId = ref<string | null>(null);
 const logs = ref<string[]>([]);
@@ -47,33 +47,15 @@ const cleaningCache = ref(false);
 
 const busy = computed(() => busyKind.value !== "");
 
-// 本次会话只自动装一次 shell, 避免失败时每次复检都反复弹 UAC
-let autoPwshTried = false;
-// 想装 Claude 但缺 npm 时: 先自动装 Node.js, 装完链式继续装 Claude (一次点击装齐)
-let chainClaudeAfterNode = false;
-
 async function runCheck() {
   report.value = await envDoctor.check();
   return report.value;
 }
 
-/**
- * claude 已装但缺可用 shell (真身 PowerShell 7 / Git Bash) → 自动装 PowerShell 7。
- * 否则用户进去对话时 claude 会报「找不到 PowerShell / bash」。仅启动关 (gate) 自动触发,
- * 每次会话最多一次。返回是否已发起安装 (true ⇒ 调用方应让出, 进入流式日志)。
- */
-function maybeAutoInstallShell(r: EnvReport): boolean {
-  if (!props.gate || !isTauri) return false;
-  if (!r.claude.found || r.shellReady || autoPwshTried || busy.value) return false;
-  autoPwshTried = true;
-  phase.value = "panel";
-  installPwsh();
-  banner.value = {
-    kind: "info",
-    text: "检测到缺少 Claude Code 可用的 Shell（PowerShell 7），正在自动为你安装——装好后即可正常对话，无需重启。",
-  };
-  return true;
-}
+// 注:这里曾有个 maybeAutoInstallShell() —— 启动关一发现缺 shell 就**自动替用户装
+// PowerShell 7**(弹 UAC、走 winget/MSI、国内常拉不动)。现已删除:应用改为**随安装包内置
+// Git Bash**(见 src-tauri/crates/polaris-kernel/src/doctor/bundled.rs), 干净 Windows
+// 开箱就有 shell, 不需要装任何东西。PowerShell 7 降级为纯可选, 只留手动按钮。
 
 onMounted(async () => {
   // 浏览器预览 / 非 Tauri: 启动关直接放行, 不打扰
@@ -110,8 +92,6 @@ onMounted(async () => {
     return;
   }
   if (r.ready) localStorage.setItem(READY_FLAG, "1");
-  // claude 在但缺 shell → 自动补装 PowerShell 7 (进入流式日志), 不再放任用户进去后对话报错
-  if (maybeAutoInstallShell(r)) return;
   phase.value = r.ready && props.gate ? "ready-skip" : "panel";
 });
 
@@ -153,41 +133,23 @@ async function finishInstall(ok: boolean, message: string) {
   if (r.claude.found) checkClaudeUpdate();
   // 刚装完 uv → 刷新缓存信息卡
   if (justFinished === "uv") loadUvCache();
-
-  // 链式①: 刚装完 Node.js 且本意是装 Claude → npm 就绪后自动继续装 Claude (一次点击装齐)
-  if (justFinished === "node" && chainClaudeAfterNode) {
-    chainClaudeAfterNode = false;
-    if (ok && r.npm.found && !r.claude.found) {
-      banner.value = { kind: "info", text: "Node.js 就绪，正在自动继续安装 Claude Code…" };
-      installClaude("npm");
-      return;
-    }
-  }
-
-  // 链式②: 刚装完 claude 但还缺 shell → 自动补上 PowerShell 7 (启动关, 仅 Windows)
-  maybeAutoInstallShell(r);
 }
 
-async function installClaude(method: "native" | "npm") {
+// 装 Claude Code。默认 "direct"：直抓平台包 tgz (R2 优先 → npmmirror → npmjs) 解压到
+// ~/.local/bin，**不经 npm**（后者下 80MB optional 依赖常卡死）。"native" = 官方脚本兜底。
+async function installClaude(method: "native" | "direct" = "direct") {
   if (busyKind.value) return; // 防双发:已有安装流程在跑
-  // npm 方式但缺 Node/npm → 先自动装 Node, 装完由 finishInstall 链式继续装 Claude。
-  // 这样用户一次点击即「Node.js + npm + Claude Code」一起装齐 (两端通用)。
-  if (method === "npm" && !npmReady.value) {
-    chainClaudeAfterNode = true;
-    await installNode();
-    return;
-  }
   banner.value = null;
   logs.value = [];
-  busyKind.value = method === "npm" ? "claude-npm" : "claude";
+  busyKind.value = "claude";
   try {
     installReqId.value = await envDoctor.installClaude(method);
     logs.value.push(
-      method === "npm"
-        ? "$ npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com"
-        : isWin.value
+      method === "native"
+        ? isWin.value
           ? "$ irm https://claude.ai/install.ps1 | iex"
           : "$ curl -fsSL https://claude.ai/install.sh | bash"
+        : "$ 下载 Claude Code 平台包 (R2 → npmmirror → yarn → npmjs，逐源自证) → 解压到 ~/.local/bin"
     );
   } catch (e) {
     busyKind.value = "";
@@ -196,7 +158,7 @@ async function installClaude(method: "native" | "npm") {
 }
 
 async function installNode() {
-  if (busyKind.value && busyKind.value !== "claude-npm") return; // 防双发
+  if (busyKind.value) return; // 防双发
   banner.value = null;
   logs.value = [];
   busyKind.value = "node";
@@ -340,16 +302,21 @@ function enter() {
 
 // 工具状态 → 状态点级别
 function level(t: ToolStatus): "ok" | "warn" | "bad" {
-  // Python 由 uv 按需托管: 装了 uv(或本机已有真 Python)即视作就绪, 否则提示装 uv
-  if (t.key === "python") return report.value?.uv.found || t.found ? "ok" : "warn";
+  // PowerShell 7 是纯可选的: 只要有可用 shell(应用已内置 Git Bash)就算就绪, 不再标黄催装
+  if (t.key === "pwsh" && !t.found) return report.value?.shellReady ? "ok" : "warn";
+  // uv 是纯可选的加速器: 跑 Python 脚本由内置解释器打头阵, 没有 uv 也不算问题, 不标黄
+  if (t.key === "uv" && !t.found) return "ok";
   if (t.found) return "ok";
   return t.required ? "bad" : "warn";
 }
 function statusText(t: ToolStatus): string {
-  if (t.key === "python") {
-    if (t.found) return "可用";
-    return report.value?.uv.found ? "由 uv 托管" : "建议装 uv 托管";
+  // 随安装包内置的那份: 免安装、免管理员, 如实说明来源, 不显示成「用户装好了」
+  if (t.found && t.bundled) return "已就绪 · 随应用内置";
+  if (t.key === "pwsh" && !t.found) {
+    return report.value?.shellReady ? "可选 · 已内置 Git Bash" : "未安装 · 建议";
   }
+  // uv 缺席不是缺陷: Python 走内置解释器 + pip --user 即可, uv 只是更省事
+  if (t.key === "uv" && !t.found) return "可选 · 未安装（不影响使用）";
   if (t.found) return t.onPath ? "已就绪" : "已安装 (不在 PATH)";
   return t.required ? "未安装 · 必需" : "未安装 · 建议";
 }
@@ -371,8 +338,19 @@ const pathNeedsFix = computed(
     report.value.claude.found &&
     !report.value.claudeDirOnUserPath
 );
-// npm 安装方式需要 Node.js 带来的 npm; 没有则先引导装 Node
-const npmReady = computed(() => !!report.value?.npm.found);
+
+// 运行环境由镜像托管(server/容器 flavor)。后端权威字段，不靠前端猜形态。
+// 容器里 env_claude_update_check 是放行的(查得出新版)，但 env_install_* / env_update_claude
+// 在 apihub 层被挡 → 必须据此不渲染那些按钮，否则就是一个点了必报错的入口。
+const imageManaged = computed(() => !!report.value?.imageManaged);
+const dockerUpdateHint = computed(() => {
+  const cur = report.value?.claude.version || updateInfo.value?.current;
+  const latest = updateInfo.value?.updateAvailable ? updateInfo.value.latest : null;
+  const head = cur ? `镜像内置 Claude Code ${cur}` : "Claude Code 随镜像预装";
+  return latest
+    ? `${head}；上游已有 ${latest}，升级请拉新镜像：docker pull`
+    : `${head}；升级请拉新镜像：docker pull`;
+});
 </script>
 
 <template>
@@ -382,8 +360,9 @@ const npmReady = computed(() => !!report.value?.npm.found);
       <div class="badge"><span class="star"></span></div>
       <h1 class="title">环境检测与配置</h1>
       <p class="lead">
-        北极星依托 <strong>Claude Code</strong> 在你本机干活。先帮你把运行环境安顿好——
-        缺什么一键补上，<strong>环境变量</strong>也会一并配好。
+        北极星依托 <strong>Claude Code</strong> 在你本机干活。跑 Python 脚本与命令所需的
+        <strong>Python、Git Bash 已随应用内置</strong>——免安装、免管理员权限，装好即用（uv 只是可选加速器，
+        不装也不影响）。Claude Code 会在<strong>后台自动装好</strong>，你不用点任何东西。
       </p>
 
       <!-- 检测中 -->
@@ -409,32 +388,24 @@ const npmReady = computed(() => !!report.value?.npm.found);
             </div>
             <!-- 行内动作 -->
             <div class="t-act">
-              <template v-if="t.key === 'claude' && !t.found">
-                <!-- 有 npm: 默认 npm(国内镜像)装 —— 两端一致, 国内可达, 不碰 claude.ai -->
+              <!-- ① 镜像托管(容器/server 版) 优先于一切: 所有「安装 / 更新」在 apihub 层就被
+                   挡下(见 apihub.rs 的 env_install_* / env_update_claude 分支), 给按钮等于给
+                   一个点了必然报错的入口。这里只陈述事实, 升级指向 docker pull。
+                   必须排在最前 —— 否则容器里万一 claude 没探到, 会先命中下面的「一键安装」。 -->
+              <template v-if="imageManaged">
+                <span v-if="t.key === 'claude'" class="t-managed" :title="dockerUpdateHint">
+                  镜像内置
+                </span>
+              </template>
+              <template v-else-if="t.key === 'claude' && !t.found">
+                <!-- 直抓平台包 tgz (R2 → npmmirror → yarn → npmjs) 解压到 ~/.local/bin, 不经 npm -->
                 <button
-                  v-if="npmReady"
                   class="btn primary"
                   :disabled="busy"
-                  @click="installClaude('npm')"
+                  title="下载 Claude Code 平台包（R2 → 国内镜像 → yarn → 官方，逐源自证），解压到 ~/.local/bin，不经 npm（避免卡死）"
+                  @click="installClaude('direct')"
                 >
-                  {{ busyKind === "claude-npm" ? "安装中…" : "一键安装" }}
-                </button>
-                <!-- 无 npm: 一次点击「Node.js + npm + Claude Code」一起装齐 —— 先自动装
-                     Node (Windows winget/MSI, macOS 走 npmmirror tar.gz), 装完链式继续装 Claude -->
-                <button
-                  v-else
-                  class="btn primary"
-                  :disabled="busy"
-                  title="缺 Node.js：自动先装 Node/npm，再继续用 npm(国内镜像)装 Claude Code"
-                  @click="installClaude('npm')"
-                >
-                  {{
-                    busyKind === "node"
-                      ? "装 Node.js 中…"
-                      : busyKind === "claude-npm"
-                        ? "装 Claude 中…"
-                        : "一键安装（含 Node.js）"
-                  }}
+                  {{ busyKind === "claude" ? "安装中…" : "一键安装" }}
                 </button>
               </template>
               <!-- 已装 Claude Code: 检查 / 一键更新 (走国内镜像) -->
@@ -469,30 +440,47 @@ const npmReady = computed(() => !!report.value?.npm.found);
                   {{ busyKind === "node" ? "安装中…" : "安装" }}
                 </button>
               </template>
+              <!-- PowerShell 7: 纯可选。已有可用 shell(内置 Git Bash)时不再催装,
+                   只留一个弱化入口给「就是想用 pwsh」的用户 -->
               <template v-else-if="t.key === 'pwsh' && !t.found">
-                <button class="btn" :disabled="busy" @click="installPwsh">
-                  {{ busyKind === "pwsh" ? "安装中…" : "安装" }}
-                </button>
-              </template>
-              <template v-else-if="t.key === 'uv' && !t.found">
                 <button
                   class="btn"
+                  :class="{ text: report?.shellReady }"
                   :disabled="busy"
-                  title="装 uv 后, Claude 写的 Python 脚本一律 uv run（自动管解释器+依赖），不再依赖系统 Python"
+                  title="可选：Claude 已可用内置 Git Bash，装 PowerShell 7 只是多一种 shell 选择"
+                  @click="installPwsh"
+                >
+                  {{ busyKind === "pwsh" ? "安装中…" : report?.shellReady ? "可选安装" : "安装" }}
+                </button>
+              </template>
+              <!-- uv: 纯可选加速器。Python 脚本已由内置解释器顶着，这里只留一个弱化入口 -->
+              <template v-else-if="t.key === 'uv' && !t.found">
+                <button
+                  class="btn text"
+                  :disabled="busy"
+                  title="可选：不装也能跑 Python 脚本（内置解释器 + pip --user）。装了 uv 则多一种自动隔离环境、按脚本装依赖的省事方式"
                   @click="installUv"
                 >
-                  {{ busyKind === "uv" ? "安装中…" : "安装" }}
+                  {{ busyKind === "uv" ? "安装中…" : "可选安装" }}
                 </button>
               </template>
             </div>
           </li>
         </ul>
 
-        <!-- 安装 Claude 的方式说明 + 兜底 (两端默认 npm 国内镜像; 官方脚本仅境外网络兜底) -->
-        <p v-if="report && !report.claude.found" class="alt">
-          默认经<strong>国内镜像</strong>用 npm 安装
-          <code>npm i -g @anthropic-ai/claude-code --registry=npmmirror.com</code>（含平台原生二进制，国内可装、不碰 claude.ai）。
-          <span v-if="!npmReady">需先安装 <strong>Node.js</strong>（{{ isWin ? "随 npm 一起来" : "免 sudo 装到 ~/.local" }}）。</span>
+        <!-- 镜像托管(容器/server 版): 说清「怎么升级」，取代那个点了必报错的更新按钮 -->
+        <p v-if="imageManaged" class="alt">
+          运行组件随<strong>镜像预装</strong>，面板内不做安装/更新。
+          <span v-if="updateInfo?.updateAvailable">
+            上游已发布 <strong>{{ updateInfo.latest }}</strong>（当前 {{ updateInfo.current }}）——
+          </span>
+          升级请拉新镜像：<code>docker pull</code> 后重建容器。
+        </p>
+
+        <!-- 安装 Claude 的方式说明 + 兜底 (默认直抓平台包 tgz, R2 优先多源; 官方脚本仅境外网络兜底) -->
+        <p v-else-if="report && !report.claude.found" class="alt">
+          默认<strong>直接下载</strong>官方平台包（<code>@anthropic-ai/claude-code</code> 原生二进制），
+          四源逐个自证 <strong>R2 → npmmirror(阿里) → yarn → npmjs</strong>（各源下载+解压+试跑一次），解压到 <code>~/.local/bin</code> 即用、<strong>不经 npm</strong>（避免下载卡死）。
           <button class="link" :disabled="busy" @click="installClaude('native')">
             或改用官方脚本（境外网络{{ isWin ? "" : " · install.sh" }}）
           </button>
@@ -711,6 +699,16 @@ const npmReady = computed(() => !!report.value?.npm.found);
   white-space: nowrap;
 }
 .t-act { flex-shrink: 0; }
+/* 镜像托管标记：容器版没有可点的安装/更新，只标明来源（不做成按钮样式，免得像能点） */
+.t-managed {
+  font-size: 12px;
+  color: var(--dim);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  cursor: default;
+}
 
 .alt {
   font-size: 11.5px;

@@ -15,6 +15,11 @@ services:
     # tini 已由镜像 ENTRYPOINT 自带（不再依赖此处 init），回收 claude 子进程僵尸。
     ports:
       - "8080:8080"
+      # iroh 打洞用的 UDP 口。**必须发布**,而且必须是固定口:iroh 默认随机绑,
+      # 容器里随机口等于外面永远打不进来 → 打洞必失败 → 全部流量绕公共中继。
+      # 这个故障不报任何错,只表现为"能用但很慢"(实测往返 12ms 变 370ms、远程盘慢 30 倍)。
+      # 与下面的 POLARIS_IROH_PORT 必须同值;路由器/群晖防火墙也要放行这个 UDP 口。
+      - "${POLARIS_IROH_PORT:-41641}:${POLARIS_IROH_PORT:-41641}/udp"
     environment:
       # ── 鉴权（任选其一接入 LLM）──
       # 1) Claude 官方 / 第三方 Anthropic 兼容端点：API Key 模式
@@ -61,6 +66,22 @@ services:
       POLARIS_ACCOUNT_AUTHORITY_URL: "${POLARIS_ACCOUNT_AUTHORITY_URL:-}"
       # 自助注册默认关(邀请制) —— 放开等于任何人都能拿到本机 collaborator 会话
       POLARIS_ACCOUNT_OPEN_SIGNUP: "${POLARIS_ACCOUNT_OPEN_SIGNUP:-}"
+      # ── 互联（iroh 隧道 / 远程盘）──
+      # 9) 固定 UDP 口:要与上面 ports 里发布的那个一致(理由见 ports 处注释)。
+      POLARIS_IROH_PORT: "${POLARIS_IROH_PORT:-41641}"
+      # 10) 中继(逗号分隔,可选)。打洞成功时用不上,打洞失败时它是唯一兜底 ——
+      #     不设就会落到 n0 的公共中继(可能在欧洲,每跳往返几百毫秒)。
+      POLARIS_RELAYS: "${POLARIS_RELAYS:-}"
+      # 11) 主机隧道开机自启。不设的话每次容器重建都得手动 POST 一次
+      #     /api/collab/tunnel/start,否则对端一直等不到应答(现象是"远程盘挂不上",
+      #     完全看不出是少了一条启动指令)。
+      POLARIS_TUNNEL_AUTOSTART: "${POLARIS_TUNNEL_AUTOSTART:-1}"
+      # 12) 性能旋钮(留空=按机器自适应):隧道 worker 数默认取 CPU 核数、转发缓冲默认
+      #     256KB(内存紧张的 NAS 可调到 32)、远程盘传输压缩级别默认 3(设 0 关闭)。
+      #     压缩是拿 CPU 换带宽:文本/代码/日志能压掉几倍,小带宽出口收益最大。
+      POLARIS_TUNNEL_WORKERS: "${POLARIS_TUNNEL_WORKERS:-}"
+      POLARIS_TUNNEL_BUF_KB: "${POLARIS_TUNNEL_BUF_KB:-}"
+      POLARIS_FS_ZSTD_LEVEL: "${POLARIS_FS_ZSTD_LEVEL:-}"
     volumes:
       # 数据持久化（KB / 对话历史 / 项目 / 产物 / 技能）：容器重建不丢
       - polaris-data:/root/Polaris
