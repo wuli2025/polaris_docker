@@ -95,7 +95,11 @@ async function ensureBackend(): Promise<void> {
   // 而不是让页面各处功能各自 401 报错（此前唯一入口是 URL ?token=，没人教就全线报错）。
   // 注：probePromise 里改写了 backendMode，TS 的窄化跨 await 看不见这次赋值，故显式放宽。
   const mode = backendMode as BackendMode | null;
-  if (mode === "http" && (await tokenRejected())) await requireToken();
+  if (mode !== "http") return;
+  // 只剩一条路：401 了才弹「输入口令」。「引导用户自己设一个口令」的首次访问向导已撤
+  // （2026-07-25）—— 随手设的口令过几周没人记得、又没有找回入口，反倒把人锁在门外。
+  // 现在默认不设口令，要上锁只能由管理员在容器上设 POLARIS_AUTH_TOKEN。
+  if (await tokenRejected()) await requireToken();
 }
 
 // ── 访问口令引导：探测 401 → 弹输入框 → 校验通过才落盘 ──
@@ -197,13 +201,14 @@ type TokenDialogOpts = {
   placeholder?: string;
   autocomplete?: string;
   errMsg?: string;
-  /** 纯告知型弹框（如「该主机不接受匿名访问」），不收输入。 */
+  /** 纯告知型弹框（如「该主机尚未设置口令」），不收输入。 */
   hideInput?: boolean;
 };
 
 /**
  * 弹一次口令框（自绘 DOM，不依赖 Vue，双主题下都可读）。
- * 两种用途共用：① 输入既有口令 ② 纯告知。resolve(null) = 用户点了次要按钮/关闭。
+ * 三种用途共用：① 输入既有口令 ② 首次设置口令 ③ 纯告知。
+ * resolve(null) = 用户点了次要按钮/关闭。
  */
 function askTokenOnce(opts: TokenDialogOpts = {}): Promise<string | null> {
   const {
@@ -1215,6 +1220,160 @@ export const artifacts = {
     invoke<{ ok: boolean; slides: number; warnings: string[] }>("forge_spec_to_pptx", { spec, out }),
 };
 
+// ──────────────────────────────────────────────────────────────
+// Beam — 隔空同屏:文件包装成自包含网页，手机与电脑同看一页
+// 传输走已有的 iroh P2P 隧道 + 主机广播总线（beam:sync 事件），不要求同一 WiFi。
+// ──────────────────────────────────────────────────────────────
+export interface BeamDoc {
+  /** 打包时解析到的真实绝对路径 */
+  path: string;
+  name: string;
+  /** md | text | code | image | audio | video | html | svg | pdf | other */
+  kind: string;
+  /** 完整的一页 HTML（自包含，可直接落盘双击打开） */
+  html: string;
+  bytes: number;
+  htmlBytes: number;
+  inlined: number;
+  skipped: number;
+  truncated: boolean;
+}
+
+/** 一条同屏同步消息。两端跑同一份协议，谁发谁收是对称的。 */
+export interface BeamMsg {
+  /** open=打开同屏 close=结束 scroll=滚动比例 mark=指点 zoom=字号 ping/pong=探活 */
+  act: "open" | "close" | "scroll" | "mark" | "zoom" | "ping" | "pong";
+  /** 发起方标识（设备名/随机 id）——两端据此忽略自己发的回声 */
+  from?: string;
+  path?: string;
+  name?: string;
+  /** scroll: 0..1 的滚动比例（像素对不齐，只能传比例） */
+  r?: number;
+  /** mark: rx=视口宽度比例, ry=内容高度比例（两端版式不同也指同一段内容） */
+  rx?: number;
+  ry?: number;
+  /** zoom: 字号倍率 */
+  z?: number;
+  /** 后端补的服务器时间戳（毫秒） */
+  ts?: number;
+}
+
+export const beam = {
+  /** 把主机上的文件包装成一页自包含网页（图片/样式内联成 data URI） */
+  pack: (path: string) => invoke<BeamDoc>("beam_pack", { path }),
+  /** 导出成独立 .html 文件（默认落 ~/Polaris/data/beam/），返回绝对路径 */
+  export: (path: string, outDir?: string) =>
+    invoke<string>("beam_export", { path, outDir: outDir ?? null }),
+  /** 发一条同步消息。返回 delivered=false 表示本机还没设为主机，对端收不到 */
+  send: (msg: BeamMsg) =>
+    invoke<{ delivered: boolean; msg: BeamMsg }>("beam_send", {
+      msg: msg as unknown as Record<string, unknown>,
+    }),
+  /** 订阅同屏消息（手机投过来的 open/scroll/… 都从这里到） */
+  on: (cb: (m: BeamMsg) => void) => listen<BeamMsg>("beam:sync", cb),
+  /** 把主窗口从托盘/最小化唤到前台（手机投过来时电脑要自己弹出来） */
+  focus: () => (isTauri ? invoke<void>("beam_focus") : Promise.resolve()),
+};
+
+// ──────────────────────────────────────────────────────────────
+// 应用直投 — 把本机在跑的 HTTP 应用反代给手机：电脑当服务器，手机只是视图
+// ──────────────────────────────────────────────────────────────
+export interface PubApp {
+  /** URL 短名，`/app/{slug}` 即直链入口 */
+  slug: string;
+  name: string;
+  /** 本机监听端口（127.0.0.1） */
+  port: number;
+  /** 打开时的初始路径，默认 "/" */
+  path: string;
+  note: string;
+}
+
+/** 端口探测命中：确实在说 HTTP 的本机端口 */
+export interface PortHit {
+  port: number;
+  server: string;
+  title: string;
+  status: number;
+  published: boolean;
+}
+
+export const apps = {
+  /** 已发布清单 */
+  list: () => invoke<PubApp[]>("app_pub_list"),
+  /** 整体覆盖清单（空数组 = 全部下架） */
+  set: (list: PubApp[]) =>
+    invoke<PubApp[]>("app_pub_set", { apps: list as unknown as Record<string, unknown>[] }),
+  /** 扫本机在说 HTTP 的端口（并发探测常见端口，约 1~2 秒） */
+  scan: () => invoke<PortHit[]>("app_scan_ports"),
+  /** 开一张只对该应用有效的会话票据，返回可直接加载的相对地址 `/x/{sid}/` */
+  open: (slug: string) => invoke<{ sid: string; url: string }>("app_open", { slug }),
+};
+
+// ──────────────────────────────────────────────────────────────
+// 远程盘挂载 — 对端共享目录 → 本机系统盘符（Z:/Y:…），连上即多一块盘
+// ──────────────────────────────────────────────────────────────
+export interface MountStatus {
+  sourceId: string;
+  name: string;
+  /** 已挂的盘符（"Z:"）或 mac 挂载点；空 = 还没挂上（后台看门狗在追） */
+  drive: string;
+  davPort: number;
+  /** 对端最近 45s 内探活成功 */
+  ok: boolean;
+  lastOkAt: number;
+  error: string;
+  /** 对端至少开放了一个可写目录 → 这块盘挂成读写（否则只读）。看门狗每 15s 复核 */
+  writable: boolean;
+  /** 桌面快捷方式路径；空 = 没建成（盘符仍可用） */
+  shortcut: string;
+}
+
+export const fsmount = {
+  /** 挂载（幂等）。对端未就绪不算失败：登记后由看门狗接力，通了自动挂上。 */
+  mount: (s: { id: string; name: string; nodeId: string; port: number; token: string }) =>
+    invoke<MountStatus>("fs_mount", {
+      sourceId: s.id,
+      name: s.name,
+      nodeId: s.nodeId,
+      upstreamPort: s.port,
+      token: s.token,
+    }),
+  /** 卸载（删盘符 + 拆桥）。幂等。 */
+  unmount: (sourceId: string) => invoke<void>("fs_unmount", { sourceId }),
+  /** 全部挂载现状（徽标轮询用） */
+  status: () => invoke<MountStatus[]>("fs_mount_status"),
+  /** Windows WebClient 单文件上限现状（挂载盘读大文件的系统闸） */
+  webdavLimit: () => invoke<{ limit: number; unlocked: boolean }>("fs_webdav_limit"),
+  /** 一次 UAC 把上限解到 4GB 并重启 WebClient（>4GB 走文件中心下载，无上限） */
+  webdavUnlock: () => invoke<{ limit: number; unlocked: boolean }>("fs_webdav_unlock"),
+};
+
+/** fsfetch:progress 事件载荷（大文件下载进度，300ms 一跳） */
+export interface FetchProgress {
+  dest: string;
+  got: number;
+  total: number | null;
+  done: boolean;
+}
+
+export const fsfetch = {
+  /**
+   * 从对端流式下载文件到本机磁盘（任意大小，断点续传）。
+   * 浏览器 blob 会把整个文件揣进 webview 内存，大文件必死 —— 桌面一律走这。
+   */
+  start: (a: { port: number; token: string; rel: string; dest: string; size?: number }) =>
+    invoke<{ path: string; bytes: number; resumed: boolean }>("fs_fetch", {
+      upstreamPort: a.port,
+      token: a.token,
+      rel: a.rel,
+      destPath: a.dest,
+      expectedSize: a.size ?? null,
+    }),
+  /** 取消在飞下载（保留 .part 断点，下次接着拉）。 */
+  cancel: (dest: string) => invoke<void>("fs_fetch_cancel", { destPath: dest }),
+};
+
 /** 跨对话产物搜索命中 */
 export interface ArtifactSearchHit {
   path: string;
@@ -1849,6 +2008,8 @@ export interface ToolStatus {
   onPath: boolean;
   required: boolean;
   hint: string;
+  /** 命中的是随安装包内置的那份(uv / Python / Git Bash)——免安装免管理员，不必再催装 */
+  bundled: boolean;
 }
 export interface EnvReport {
   os: string;
@@ -1862,9 +2023,14 @@ export interface EnvReport {
   python: ToolStatus;
   claudeDir: string | null;
   claudeDirOnUserPath: boolean;
-  /** 是否有 claude 可用的 shell (真身 PowerShell 7 / Git Bash)；false ⇒ 对话会报缺 shell */
+  /** 是否有 claude 可用的 shell (真身 PowerShell 7 / Git Bash，含随包内置那份)；false ⇒ 对话会报缺 shell */
   shellReady: boolean;
+  /** 当前 shell 是随应用内置的 Git Bash ⇒ 用户无需另装 PowerShell 7 */
+  shellBundled: boolean;
   ready: boolean;
+  /** 运行环境由镜像托管（server/容器 flavor）：claude 等随镜像预烤，升级靠 `docker pull`。
+   *  面板据此不渲染「安装 / 更新」按钮（那些在 apihub 层被挡，点了必报错），只给静态提示。 */
+  imageManaged: boolean;
 }
 export interface PathFixResult {
   ok: boolean;
@@ -1899,8 +2065,9 @@ export interface UvCacheInfo {
 export const envDoctor = {
   check: () => invoke<EnvReport>("env_check"),
   fixPath: () => invoke<PathFixResult>("env_fix_path"),
-  /** 安装 Claude Code。method: "npm"(经国内镜像, 默认) | "native"(官方原生脚本, 兜底) */
-  installClaude: (method: "npm" | "native" = "npm") =>
+  /** 安装 Claude Code。method: "direct"(直抓平台包 tgz, R2 优先多源, 不经 npm; 默认) |
+   *  "native"(官方原生脚本 install.ps1/sh, 境外网络兜底) */
+  installClaude: (method: "direct" | "native" = "direct") =>
     invoke<string>("env_install_claude", { method }),
   /** 安装 Node.js LTS (winget) —— npm 安装方式的前置依赖 */
   installNode: () => invoke<string>("env_install_node"),
@@ -2272,6 +2439,7 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         onPath: found,
         required,
         hint: found ? "(browser stub) 已安装" : "未安装 —— 浏览器预览无法真实检测",
+        bundled: false, // 浏览器预览没有随包运行时
       });
       return {
         os: "browser",
@@ -2284,7 +2452,9 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         claudeDir: null,
         claudeDirOnUserPath: true,
         shellReady: false,
+        shellBundled: false,
         ready: false,
+        imageManaged: false,
       };
     }
     case "env_uv_cache_info":
