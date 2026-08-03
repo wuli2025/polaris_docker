@@ -647,6 +647,14 @@ pub fn build_index(
     if !dead_read_roots.is_empty() && stopped == "全部完成" {
         stopped = "部分存储无响应(NAS 掉线?),其上文件已跳过 —— 恢复连接后再点继续".into();
     }
+    // 没有嵌入服务商时这一趟只建了认字腿,一个向量都没加 —— 必须说清楚,
+    // 否则用户点「构建向量索引」看到的是秒回「全部完成」而待嵌入数纹丝不动,
+    // 只会以为软件坏了(2026-07-29 压测实测:8094 待嵌入,点完 1.5s 返回「全部完成」)。
+    if !embed_ok && stopped == "全部完成" {
+        stopped =
+            "未配置嵌入服务商:本轮只建了关键词倒排,向量未建 —— 去「寓言计划 API」配一个(硅基流动免费)后再点"
+                .into();
+    }
     Ok(IndexSummary {
         files_done,
         chunks_added,

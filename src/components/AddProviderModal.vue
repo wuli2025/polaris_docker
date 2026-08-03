@@ -161,6 +161,21 @@ function setEnv(key: string, val: string) {
   writeCfg(cfg);
 }
 
+// ── 密钥掩码 ──
+// 后端 provider_list 出口把已存的 key 打成 `••••••••尾4`(免口令的 NAS/Docker 壳一问
+// 就能把明文全取走, 见 store.rs 的 mask_secret 大注释)。回填框里拿到的就是这串圆点:
+//   · 原样回传 → provider_save 认出掩码, 从库里把原值取回来(编辑别的字段不会误伤 key);
+//   · 用户重填 → 圆点被整串替换成新 key, 照常覆盖;
+//   · 用户清空 → 前端删掉该 env 字段, 后端不回填 → key 真的被清掉。
+// 圆点是 U+2022, 真 key 不可能含它, 所以「含圆点」= 掩码。
+const KEY_MASK_CHAR = "•";
+const keyIsMasked = computed(() => form.apiKey.includes(KEY_MASK_CHAR));
+
+/** 聚焦时把掩码整串选中 —— 否则光标落在圆点后面, 一敲键就拼出「圆点+新key」的四不像。 */
+function onKeyFocus(e: FocusEvent) {
+  if (keyIsMasked.value) (e.target as HTMLInputElement)?.select();
+}
+
 function onApiKey() {
   setEnv(form.tokenField, form.apiKey.trim());
 }
@@ -369,12 +384,17 @@ function dotColor(p: ProviderView) {
                   :type="revealKey ? 'text' : 'password'"
                   placeholder="只需要填这里，下方配置会自动填充"
                   autocomplete="off"
+                  @focus="onKeyFocus"
                   @input="onApiKey"
                 />
                 <button class="icon-btn sm" @click="revealKey = !revealKey">
                   <component :is="revealKey ? EyeOff : Eye" :size="15" :stroke-width="1.8" />
                 </button>
               </div>
+              <p v-if="keyIsMasked" class="hint">
+                🔒 已保存的 Key 只回显尾 4 位（明文不再下发到界面）。不动它就保持原样；要换就直接输入新
+                Key 覆盖；要清掉就把输入框清空。
+              </p>
               <div class="field-toggle">
                 <button :class="{ sel: form.tokenField === 'ANTHROPIC_AUTH_TOKEN' }" @click="onTokenFieldSwitch('ANTHROPIC_AUTH_TOKEN')">AUTH_TOKEN</button>
                 <button :class="{ sel: form.tokenField === 'ANTHROPIC_API_KEY' }" @click="onTokenFieldSwitch('ANTHROPIC_API_KEY')">API_KEY</button>

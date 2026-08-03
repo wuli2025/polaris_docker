@@ -692,7 +692,9 @@ function statusDot(p: SenseProviderView): string {
           <span class="fb-stat"><b>{{ fable.text_files.toLocaleString() }}</b> 文本文件</span>
           <span class="fb-stat"><b>{{ fable.chunks_total.toLocaleString() }}</b> 向量 chunk</span>
           <span class="fb-stat" v-if="fable.pending_files > 0">
-            <b>{{ fable.pending_files.toLocaleString() }}</b> 待嵌入
+            <b>{{ fable.pending_files.toLocaleString() }}</b> 待嵌入{{
+              fable.embed_provider ? "" : "(未配嵌入服务商,暂建不了)"
+            }}
           </span>
           <span class="muted-txt">
             嵌入:{{ fable.embed_provider ?? "未配置(去上面给硅基流动填 key)" }}
@@ -713,8 +715,23 @@ function statusDot(p: SenseProviderView): string {
           <button class="btn sm primary" :disabled="fable.scanning" @click="startInventory">
             {{ fable.scanning ? "盘点中…" : "开始盘点" }}
           </button>
-          <button class="btn sm" :disabled="fable.indexing || fable.pending_files === 0" @click="startIndex">
-            {{ fable.indexing ? "构建中…" : "构建向量索引" }}
+          <!-- 没配嵌入服务商时必须禁掉:后端 build_index 此时只建认字腿(FTS),
+               认意思腿一个 chunk 都不会加。而 pending_files 数的是 chunked=0,
+               永远大于 0 → 旧写法按钮恒可点,点下去 1.5s 就「完成」、待嵌入纹丝不动,
+               用户只会觉得"这软件坏了"(2026-07-29 压测实测:8094 待嵌入,点了毫无变化)。 -->
+          <button
+            class="btn sm"
+            :disabled="fable.indexing || fable.pending_files === 0 || !fable.embed_provider"
+            :title="fable.embed_provider ? '' : '需先在上面的「寓言计划 API」里配一个嵌入服务商(硅基流动免费)'"
+            @click="startIndex"
+          >
+            {{
+              fable.indexing
+                ? "构建中…"
+                : fable.embed_provider
+                  ? "构建向量索引"
+                  : "构建向量索引(需先配嵌入服务商)"
+            }}
           </button>
           <button v-if="fable.scanning || fable.indexing" class="btn sm" @click="cancelFable">取消</button>
         </div>

@@ -103,27 +103,44 @@ pub fn build_lexical_index(progress: &dyn Fn(u64, u64)) -> Result<LexSummary, St
             /// 瞬断 / 权限 / 读超时:不写不标,下轮重试。
             Skip,
         }
-        let mut bodies: Vec<(i64, i64, Body)> = Vec::with_capacity(batch.len());
-        for (file_id, root, rel, mtime) in &batch {
-            if cancelled() {
-                break;
-            }
+        // ── 整批并行读(替代逐文件 with_deadline_bg)──
+        // 旧写法每个文件起一条一次性线程 + 降一次后台档 + 走一趟通道,而且全程串行。
+        // 本机实测(8098 个 md / 167MB / 本地 SSD):那条路整轮 147s(55 文件/s),
+        // 同一批文件 8 路并行裸读只要 2.4s(70MB/s)—— 墙在线程与系统调用开销,不在磁盘。
+        // read_batch_bg 里 worker 只降一次档、并发宽度按核数(POLARIS_INDEX_READ_PAR 可调),
+        // 死线改为「停滞死线」:连续 20s 一条结果都没回才判存储僵死(见其文档注释)。
+        let mut slot_of: Vec<usize> = Vec::with_capacity(batch.len()); // paths[i] → batch 下标
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(batch.len());
+        for (i, (_id, root, rel, _mtime)) in batch.iter().enumerate() {
             if dead_read_roots.contains(root) {
-                bodies.push((*file_id, *mtime, Body::Skip));
-                continue;
+                continue; // 死根:零 IO 跳过(下面按 None 落到 Body::Skip)
             }
             // 显示路径 → 真实字节路径(GBK 名文件在 Unix 上直接 read 恒失败,会被
             // 当「已消失」空文本标记完成,变成永久检索盲区)。
-            let abs = super::reencode_fs_path(
+            slot_of.push(i);
+            paths.push(super::reencode_fs_path(
                 &std::path::Path::new(root).join(rel).to_string_lossy(),
-            );
-            let read = {
-                let p = abs.clone();
-                // _bg:读在旁路线程上发生,优先级不继承 → 旁路自己降后台档,IO 让路前台。
-                crate::fable::sched::with_deadline_bg(20, move || {
-                    std::fs::read(&p).map_err(|e| e.kind())
-                })
-            };
+            ));
+        }
+        if cancelled() {
+            stopped = "已取消".into();
+            break;
+        }
+        let mut reads: Vec<Option<Result<Vec<u8>, std::io::ErrorKind>>> =
+            vec![None; batch.len()];
+        for (k, r) in crate::fable::sched::read_batch_bg(paths, 20)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(&i) = slot_of.get(k) {
+                reads[i] = r;
+            }
+        }
+
+        let mut bodies: Vec<(i64, i64, Body)> = Vec::with_capacity(batch.len());
+        for (i, (file_id, root, _rel, mtime)) in batch.iter().enumerate() {
+            // 死根跳过者与超时者都是 None;对死根重复 insert 是幂等的,无副作用。
+            let read = reads[i].take();
             let body = match read {
                 None => {
                     dead_read_roots.insert(root.clone());

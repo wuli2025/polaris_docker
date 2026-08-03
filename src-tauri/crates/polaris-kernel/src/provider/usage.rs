@@ -131,6 +131,13 @@ pub fn usage_summary() -> Result<UsageSummary, String> {
     let mut year = TokenBucket::default();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // ── 先列文件,再多线程分头解析 ──────────────────────────────────────────
+    // 这份账本会越滚越大:本机 2026-07-29 已是 **3,658 个 jsonl / 2.57GB**,
+    // 原来的「单线程 WalkDir + 逐行 serde_json」实测每次要 5.4~7.4s(压测四次复测都 >5s),
+    // 而看板一进页面就调、切回来还调 —— 用户感知就是「用量页每次都卡好几秒」。
+    // 解析本身是纯 CPU + 顺序读,天然可并行:各线程只吐自己那份「候选记录」,
+    // 汇总(含跨文件的 msg_id 去重)仍在主线程串行做 —— 结果与单线程逐字节一致。
+    let mut files: Vec<PathBuf> = Vec::new();
     for entry in dirs
         .iter()
         .flat_map(|d| WalkDir::new(d).into_iter().flatten())
@@ -141,10 +148,90 @@ pub fn usage_summary() -> Result<UsageSummary, String> {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(file) = fs::File::open(entry.path()) else {
-            continue;
-        };
-        let reader = BufReader::new(file);
+        files.push(entry.path().to_path_buf());
+    }
+
+    /// 一行有效用量记录(解析阶段的中间产物;去重与分桶留给主线程)。
+    struct Rec {
+        msg_id: Option<String>,
+        date: String,
+        usage: Usage,
+        cost: f64,
+        line_tokens: u64,
+    }
+
+    // 并发宽度:默认按核数取(2~8)。`POLARIS_USAGE_SCAN_PAR=1` 可退回单线程 ——
+    // 排查「看板数字对不对」时用它做 A/B,两档结果必须完全一致。
+    let workers = std::env::var("POLARIS_USAGE_SCAN_PAR")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 8)
+        })
+        .min(files.len().max(1));
+    let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let files = std::sync::Arc::new(files);
+    let year_cut_shared = std::sync::Arc::new(year_cut.clone());
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let files = std::sync::Arc::clone(&files);
+        let cursor = std::sync::Arc::clone(&cursor);
+        let year_cut = std::sync::Arc::clone(&year_cut_shared);
+        handles.push(std::thread::spawn(move || {
+            let mut out: Vec<Rec> = Vec::new();
+            loop {
+                let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(path) = files.get(i) else { break };
+                let Ok(file) = fs::File::open(path) else {
+                    continue;
+                };
+                let reader = BufReader::new(file);
+                parse_lines(reader, &year_cut, &mut out);
+            }
+            out
+        }));
+    }
+    let mut records: Vec<Rec> = Vec::new();
+    for h in handles {
+        if let Ok(mut v) = h.join() {
+            records.append(&mut v);
+        }
+    }
+
+    for r in records {
+        if let Some(mid) = r.msg_id {
+            if !seen.insert(mid) {
+                continue;
+            }
+        }
+        let (u, cost, date, line_tokens) = (r.usage, r.cost, r.date, r.line_tokens);
+        if date.as_str() >= year_cut.as_str() {
+            year.add(&u, cost);
+            if date.as_str() >= month_cut.as_str() {
+                month.add(&u, cost);
+                if date.as_str() >= week_cut.as_str() {
+                    week.add(&u, cost);
+                    if date == today_str {
+                        today.add(&u, cost);
+                    }
+                }
+            }
+        }
+        if trend_set.contains(&date) {
+            let e = by_day.entry(date).or_insert((0, 0.0));
+            e.0 += line_tokens;
+            e.1 += cost;
+        }
+    }
+
+    // 逐行解析(从原地内联的循环原样搬出,判定顺序与取值一字未改)。
+    // `year_cut`:一年窗口之外的行对四个桶和 14 天趋势都无贡献,直接在解析阶段丢掉,
+    // 省下把它们搬进汇总阶段的内存与去重成本(旧实现是一路带到最后才被条件过滤掉)。
+    fn parse_lines<R: BufRead>(reader: R, year_cut: &str, out: &mut Vec<Rec>) {
         for line in reader.lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() || !line.contains("\"usage\"") {
@@ -162,11 +249,9 @@ pub fn usage_summary() -> Result<UsageSummary, String> {
             let Some(usage_v) = msg.get("usage") else {
                 continue;
             };
-            if let Some(mid) = msg.get("id").and_then(|x| x.as_str()) {
-                if !seen.insert(mid.to_string()) {
-                    continue;
-                }
-            }
+            // msg_id 去重挪到汇总阶段做:重复消息可能横跨两个文件(会话续写/镜像),
+            // 只有在主线程汇总时才看得见全局,分线程各自去重会漏。重复行的 usage 值相同,
+            // 谁先谁后不影响结果 —— 与旧的单线程「先到先得」等价。
             let u = Usage {
                 input: usage_v
                     .get("input_tokens")
@@ -200,24 +285,21 @@ pub fn usage_summary() -> Result<UsageSummary, String> {
             if date.is_empty() {
                 continue;
             }
+            // 一年窗口之外的行对任何一个桶都无贡献 —— 提前丢,别搬进汇总阶段。
+            if date.as_str() < year_cut {
+                continue;
+            }
 
-            if date.as_str() >= year_cut.as_str() {
-                year.add(&u, cost);
-                if date.as_str() >= month_cut.as_str() {
-                    month.add(&u, cost);
-                    if date.as_str() >= week_cut.as_str() {
-                        week.add(&u, cost);
-                        if date == today_str {
-                            today.add(&u, cost);
-                        }
-                    }
-                }
-            }
-            if trend_set.contains(&date) {
-                let e = by_day.entry(date).or_insert((0, 0.0));
-                e.0 += line_tokens;
-                e.1 += cost;
-            }
+            out.push(Rec {
+                msg_id: msg
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string()),
+                date,
+                usage: u,
+                cost,
+                line_tokens,
+            });
         }
     }
 

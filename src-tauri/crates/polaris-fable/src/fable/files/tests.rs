@@ -11,9 +11,8 @@ fn b64_roundtrip_basic() {
 // 用一个空库(overview 在空 fable.db 上仍返回结构),验证第二次调用走缓存(远快)且结果相等。
 #[test]
 fn overview_ttl_cache_coalesces() {
-    // 隔离到临时 fable.db,避免碰真实库。
-    let tmp = std::env::temp_dir().join(format!("fable-ovcache-{}.db", std::process::id()));
-    std::env::set_var("POLARIS_FABLE_DB", &tmp);
+    // 隔离到临时 fable.db,避免碰真实库(fresh_db 顺带串行化 + 建表)。
+    let (tmp, _g) = fresh_db("ovcache");
     std::env::set_var("POLARIS_FABLE_OVERVIEW_TTL_MS", "5000");
     let a = overview(None).expect("overview 1");
     let b = overview(None).expect("overview 2 (应命中缓存)");
@@ -699,6 +698,98 @@ fn cluster_eval_run() {
     let _ = std::fs::remove_file(&dbp);
     let _ = std::fs::remove_file(dbp.with_extension("db-wal"));
     let _ = std::fs::remove_file(dbp.with_extension("db-shm"));
+}
+
+// ── 文件中心路径闸(回归钉子)──
+//
+// 2026-07-29 压测实测:file_gist / file_thumb 只判 `is_file()`,没有任何根目录校验。
+// 而这两条命令都挂在 apihub 的「手机数据面」白名单上(dispatch_desktop),经 iroh 隧道
+// 与 Docker/NAS server 壳可被远端调用 —— 当时经 127.0.0.1:8485/api/invoke 实测:
+// 桌面上的探针文件被 file_gist 原文取回,系统壁纸被 file_thumb 编成 base64 取回,
+// 而同一个文件走 artifact_read 被正确拒绝(它早有 ensure_artifact_path 那道闸)。
+// 这两条测试把闸钉死,防回归。
+/// POLARIS_FABLE_DB 是进程级 env,多个用例并行改它会互相串库 → 这些用例串行跑。
+static DB_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 换一个干净的临时 fable.db 并把表建好;返回 (库路径, 串行锁守卫)。
+/// 守卫必须持有到用例结束。显式 migrate 的原因:`MIGRATED` 是**进程级**闸,
+/// 同进程里只要有别的用例先开过库,后面换了 DB 路径也不会再自动建表
+/// (生产里库路径一辈子不变,所以只有测试会撞上)。
+fn fresh_db(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+    let g = DB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let p = std::env::temp_dir().join(format!("fable-{tag}-{}.db", std::process::id()));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
+    }
+    std::env::set_var("POLARIS_FABLE_DB", &p);
+    let conn = open_db().expect("open temp db");
+    crate::fable::migrate(&conn).expect("migrate temp db");
+    (p, g)
+}
+
+#[test]
+fn 文件中心路径闸_库外文件一律拒绝() {
+    let (tmp, _g) = fresh_db("pathgate");
+
+    // 造一个「已盘点的根」,里面放一个合法文件;根外另放一个「机密」文件。
+    let base = std::env::temp_dir().join(format!("fable-pathgate-{}", std::process::id()));
+    let inside_root = base.join("库内");
+    std::fs::create_dir_all(&inside_root).unwrap();
+    let inside = inside_root.join("正常文档.md");
+    std::fs::write(&inside, "# 库内文档").unwrap();
+    let outside = base.join("库外机密.txt");
+    std::fs::write(&outside, "SECRET").unwrap();
+
+    {
+        let conn = open_db().expect("open temp db");
+        // MIGRATED 是进程级闸:同进程里已有别的用例开过库就会跳过建表,
+        // 而我们刚把 DB 路径换成一个空文件 → 这里显式补一次建表。
+        crate::fable::migrate(&conn).expect("migrate temp db");
+        conn.execute(
+            "INSERT INTO roots(path, files, bytes, scanned_at) VALUES(?1, 0, 0, 0)",
+            [inside_root.canonicalize().unwrap().to_string_lossy().to_string()],
+        )
+        .expect("insert root");
+    }
+    let ok = super::ensure_file_center_path(&inside.to_string_lossy())
+        .expect("库内文件必须放行");
+    assert!(ok.is_some(), "库内文件应解析出真实路径");
+
+    let err = super::ensure_file_center_path(&outside.to_string_lossy());
+    assert!(err.is_err(), "库外文件必须拒绝,实际={err:?}");
+    assert!(err.unwrap_err().contains("越界"));
+
+    // 相对路径穿越同样打不穿(canonicalize 会先把 .. 折叠掉再比对)。
+    let traversal = inside_root.join("..").join("库外机密.txt");
+    assert!(
+        super::ensure_file_center_path(&traversal.to_string_lossy()).is_err(),
+        "`..` 穿越必须拒绝"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn file_grid_kind_参数不再拼得出_sql() {
+    // kind 来自调用方且曾被原样拼进 SQL(同函数的 query/lang 都转义了,唯独它漏了)。
+    // 实测 `nope') OR 1=1--` 能绕过全部过滤条件。现在非 [a-z0-9_] 字符一律被剔除,
+    // 拼出来的只能是一个普通字符串字面量 → 匹配不到任何 kind,返回空结果而非全量。
+    let (tmp, _g) = fresh_db("kindinj");
+    for evil in [
+        "nope') OR 1=1--",
+        "x' UNION SELECT 1,2,3,4,5,6,7,8,9,10 FROM files--",
+        "text' OR '1'='1",
+    ] {
+        let page = grid(None, None, Some(evil.to_string()), None, None, None, 0, 12)
+            .expect("注入串不该让查询报错(应被消毒成普通字面量)");
+        assert_eq!(
+            page.total, 0,
+            "注入串 {evil:?} 不该匹配到任何行,实际 total={}",
+            page.total
+        );
+    }
+    let _ = std::fs::remove_file(&tmp);
 }
 
 #[test]

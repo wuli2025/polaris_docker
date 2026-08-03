@@ -266,6 +266,99 @@ where
     })
 }
 
+/// 索引读盘并发宽度。默认按核数取一半(2~8),`POLARIS_INDEX_READ_PAR` 可覆盖(1=退回串行)。
+/// 上限压在 8:再宽对本地盘收益已平,而 NAS 上过宽反而互相抢带宽。
+fn read_parallelism() -> usize {
+    if let Some(n) = std::env::var("POLARIS_INDEX_READ_PAR")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+    {
+        return n;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    ((cores + 1) / 2).clamp(2, 8)
+}
+
+/// 批量后台读:一批文件**并行**读,worker 线程各自只降一次后台档。返回值与入参一一对应,
+/// `None` = 该项没在死线内读完(调用方据此把对应根判为僵死存储)。
+///
+/// 为什么不是逐文件 [`with_deadline_bg`]:那等于「N 个文件 = N 次线程创建 + N 次优先级切换 +
+/// N 次通道往返」,而且全程串行。本机实测(2026-07-29,8098 个 md / 167MB / 本地 SSD):
+/// 逐文件走那条路,词法索引整轮 **147s**(55 文件/s);同一批文件 8 路并行裸读只要 **2.4s**
+/// (3371 文件/s、70MB/s)—— 墙根本不在磁盘,在线程与系统调用开销上。
+///
+/// **但整轮不一定跟着快**(2026-08-03 发版前复测,11104 个文件 / 246MB / 本地 SSD):
+/// 读阶段确实 8.0s → 1.7s(4.7×),整轮却是 107.1s → 105.9s(**持平**)—— 这份语料上
+/// 墙已经挪到分词与 FTS 写入,读盘再快也顶不动总时长。所以本函数的收益要按场景说:
+/// **高延迟存储(NAS/远程盘)上读占大头时是实打实的提速,本地 SSD 上主要是省线程开销**,
+/// 别拿纯读的倍数当整轮的倍数用。
+///
+/// 死线语义是「**停滞**死线」而非总死线:只要还有结果在陆续回来就继续等,连续 `secs` 秒
+/// 一条都没回才判存储僵死。既保住了原来「20s 内认出死挂载」的响应速度,又不会因为一批
+/// 文件多而误杀慢但活着的 NAS(原实现是逐文件 20s,整批容忍度其实是 N×secs)。
+/// 超时后 worker 被 detach(与 [`with_deadline`] 同策略):它们只会往一个已断开的通道 send,
+/// 失败即退,不泄漏、不影响调用方。
+/// 入参用 `PathBuf` 而非 `String`:Unix 下 GBK 名文件的真实路径是**非 UTF-8 字节**
+/// (见 `fable::reencode_fs_path`),中途过一趟 String 会被有损替换,那些文件就永远读不到。
+pub fn read_batch_bg(
+    paths: Vec<std::path::PathBuf>,
+    secs: u64,
+) -> Vec<Option<Result<Vec<u8>, std::io::ErrorKind>>> {
+    let n = paths.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // 单文件不值得铺线程:退回单发路径,语义与旧实现完全一致。
+    if n == 1 {
+        let p = paths.into_iter().next().unwrap_or_default();
+        return vec![with_deadline_bg(secs, move || {
+            std::fs::read(&p).map_err(|e| e.kind())
+        })];
+    }
+    let width = read_parallelism().min(n);
+    let paths = std::sync::Arc::new(paths);
+    let cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<u8>, std::io::ErrorKind>)>();
+    for _ in 0..width {
+        let paths = std::sync::Arc::clone(&paths);
+        let cursor = std::sync::Arc::clone(&cursor);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            // 每条 worker 只降一次(旧实现是每个文件降一次)。
+            demote_current_thread_to_background();
+            loop {
+                let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(p) = paths.get(i) else { break };
+                let r = std::fs::read(p).map_err(|e| e.kind());
+                // send 失败 = 调用方已判超时走人,worker 立即收工。
+                if tx.send((i, r)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx); // 本线程这份必须丢掉,否则 worker 全退了 rx 也不会断开
+    let mut out: Vec<Option<Result<Vec<u8>, std::io::ErrorKind>>> = vec![None; n];
+    let stall = std::time::Duration::from_secs(secs.max(1));
+    let mut got = 0usize;
+    while got < n {
+        match rx.recv_timeout(stall) {
+            Ok((i, r)) => {
+                if let Some(slot) = out.get_mut(i) {
+                    *slot = Some(r);
+                }
+                got += 1;
+            }
+            // 停滞超时,或 worker 全部退出 —— 剩下的保持 None 交给调用方处置。
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 /// 有界 `is_dir`:对挂载点探测可达性,挂载掉线最多卡 `secs` 秒即判不可达(返回 false),
 /// 而非让 `Path::is_dir()` 在死 NAS 上 stat 几十秒吊死请求。
 pub fn dir_reachable(path: &std::path::Path, secs: u64) -> bool {
@@ -308,6 +401,62 @@ mod tests {
         );
         let fast: Option<u32> = with_deadline(5, || 7);
         assert_eq!(fast, Some(7), "正常活儿照常返回结果");
+    }
+
+    /// 批量并行读:结果**逐项对齐入参顺序**、内容与逐文件读完全一致,
+    /// 不存在的文件如实带回 NotFound(而不是被顺序错位成别人的结果)。
+    /// 顺带打印两条路径的耗时 —— 这就是把词法索引从 147s 拉下来的那一处。
+    #[test]
+    fn read_batch_bg_对齐且与逐文件读等价() {
+        let dir = std::env::temp_dir().join(format!("fable-readbatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 400usize;
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let p = dir.join(format!("f{i}.md"));
+            // 每份内容各不相同:顺序一旦串位,断言立刻炸。
+            std::fs::write(&p, format!("# 文件 {i}\n").repeat(40)).unwrap();
+            paths.push(p);
+        }
+        // 混一个不存在的进去,验证错误也按位置对齐。
+        paths.push(dir.join("这个不存在.md"));
+
+        let t0 = std::time::Instant::now();
+        let got = read_batch_bg(paths.clone(), 20);
+        let par = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let want: Vec<Option<Result<Vec<u8>, std::io::ErrorKind>>> = paths
+            .iter()
+            .map(|p| {
+                let p = p.clone();
+                with_deadline_bg(20, move || std::fs::read(&p).map_err(|e| e.kind()))
+            })
+            .collect();
+        let seq = t1.elapsed();
+        println!("read_batch_bg: 并行 {par:?} vs 逐文件 {seq:?}({} 个文件)", paths.len());
+
+        assert_eq!(got.len(), paths.len(), "返回项数必须与入参一致");
+        assert_eq!(got, want, "并行结果必须与逐文件读逐项等价(含顺序与错误)");
+        assert_eq!(
+            got.last().unwrap().as_ref().unwrap().as_ref().unwrap_err(),
+            &std::io::ErrorKind::NotFound,
+            "不存在的文件应在它自己的位置上带回 NotFound"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空批次与单文件批次都不能出岔子(单文件走的是不铺线程的快路)。
+    #[test]
+    fn read_batch_bg_边界批次() {
+        assert!(read_batch_bg(Vec::new(), 5).is_empty());
+        let p = std::env::temp_dir().join(format!("fable-readbatch-one-{}.md", std::process::id()));
+        std::fs::write(&p, "单文件").unwrap();
+        let got = read_batch_bg(vec![p.clone()], 5);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref().unwrap().as_ref().unwrap(), "单文件".as_bytes());
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 全树扫完:N worker 并发取件,子节点动态入队,最终所有节点恰好处理一次、无死锁。

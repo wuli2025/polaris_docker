@@ -27,8 +27,11 @@ pub(crate) fn jpeg_data_url(rgb: &image::DynamicImage) -> Result<String, String>
 
 /// 生成(或读缓存)缩略图,统一返回 data URL;无法出图返回 None(前端落类型图标)。
 pub fn thumb(abspath: String, max: u32) -> Result<Option<String>, String> {
-    // 显示路径可能是 GBK 名解码出的 UTF-8;还原成磁盘真实路径再读(否则 GBK 图片出不了图)。
-    let real = crate::fable::reencode_fs_path(&abspath);
+    // 路径闸(见 files/mod.rs 的大注释):这条命令挂在手机数据面白名单上,远端可调,
+    // 没有它就是「给个绝对路径 = 取走本机任意图片」。闸内含 GBK 名还原(reencode_fs_path)。
+    let Some(real) = super::ensure_file_center_path(&abspath)? else {
+        return Ok(None);
+    };
     let p = real.as_path();
     if !p.is_file() {
         return Ok(None);

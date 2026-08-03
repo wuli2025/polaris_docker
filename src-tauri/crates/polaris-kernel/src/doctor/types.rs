@@ -66,6 +66,67 @@ pub struct EnvReport {
     pub image_managed: bool,
 }
 
+// ───────────────────────── 深度校验 (冲突扫描 + 实跑验证) ─────────────────────────
+
+/// 一条**安装冲突 / 环境风险**。`env_check` 只回答「有没有」, 这里回答「有没有装重、
+/// 会不会打架」—— 多份并存、版本不一致、终端与应用解析到不同的那份、Store 别名遮挡、
+/// 外部 ANTHROPIC_* 覆盖、配置文件损坏……全是「面板全绿但一跑就废」的真凶。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvConflict {
+    /// 稳定标识: claude-multi | claude-version-mismatch | claude-app-vs-terminal |
+    /// claude-store-alias | node-multi | node-too-old | npm-prefix-off-path |
+    /// external-anthropic-env | claude-config-broken
+    pub key: String,
+    /// "high"(必然出问题) | "medium"(会出问题) | "low"(值得知道)
+    pub severity: String,
+    pub title: String,
+    /// 展开说明 + 建议怎么处理
+    pub detail: String,
+    /// 相关路径 / 变量名 (正斜杠; 敏感值已掩码)
+    pub paths: Vec<String>,
+    /// 能否用面板现有的「修复 PATH」按钮解决
+    pub fixable: bool,
+}
+
+/// 一条**实跑验证**的结果 —— 每条都是真的起了子进程, 不是查文件在不在。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyStep {
+    /// 稳定标识: exec | terminal | shell | config | auth | smoke
+    pub key: String,
+    pub name: String,
+    /// "ok" | "fail" | "warn" | "skip"
+    pub status: String,
+    pub detail: String,
+    /// 实际执行的命令行 (展示用)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// 实际输出 (截断; 失败时含 stderr)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// 耗时 (毫秒)
+    pub ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyReport {
+    pub os: String,
+    /// 全部关键项通过 (应用内可跑 + shell 可用 + 无 high 冲突; deep 时还要冒烟通过)
+    pub ok: bool,
+    /// **应用内**能真的把 claude 跑起来 (按解析出的绝对路径执行)
+    pub app_runnable: bool,
+    /// **电脑终端里**裸敲 `claude` 能跑起来 (按新开终端的 PATH 语义解析)
+    pub terminal_runnable: bool,
+    /// 本次是否做了「真发一次请求」的端到端冒烟
+    pub deep: bool,
+    pub steps: Vec<VerifyStep>,
+    pub conflicts: Vec<EnvConflict>,
+    /// 一句话结论
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathFixResult {

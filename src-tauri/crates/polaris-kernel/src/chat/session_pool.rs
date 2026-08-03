@@ -563,6 +563,10 @@ pub(super) fn run_persistent_turn(p: TurnParams) -> Result<(), String> {
             if let Some((cur_fp, sp)) = g.get_mut(&p.conv_id) {
                 if *cur_fp == fp && sp.shared.alive.load(Ordering::SeqCst) {
                     reusable = true;
+                    // 就在锁内把本轮登记上(见下方 insert 处的大注释):否则从这里放锁
+                    // 到第 5 步真正注册之间,这个会话在 session_busy 眼里是「空闲」,
+                    // 会被另一条并发对话的 trim_over_cap/insert 当 LRU 牺牲品逐掉。
+                    *sp.shared.active_req.lock() = Some(p.req_id.clone());
                 } else {
                     // 指纹变了(权限/供应商/模型/创作切换)或进程已死 → 杀旧重建
                     to_reap.extend(g.remove(&p.conv_id));
@@ -582,6 +586,21 @@ pub(super) fn run_persistent_turn(p: TurnParams) -> Result<(), String> {
                     continue;
                 }
             };
+            // ⚠ 本轮登记必须**先于入池**。
+            //
+            // session_busy = alive && active_req.is_some(),而新 spawn 出来的会话
+            // active_req 还是 None —— 旧写法要等到第 5 步才登记。于是「入池 → 检出」
+            // 这段窗口里,它在所有逐出谓词眼里都是一个「空闲会话」:
+            //   · 另一条并发对话第 1 步的 trim_over_cap 会挑中它(它 last_used 最老);
+            //   · 另一条并发对话第 2 步的 insert 也会挑中它(insert 只护自己那一个新条目)。
+            // MAX_SESSIONS=2,所以只要同时新建 3 条以上对话,落后的那些必被抢先者收割,
+            // 到第 3 步就报「会话条目在检出后消失(并发收割)」——2 次重试打光后用户直接
+            // 看到发送失败。2026-07-29 压测实测:4 路并发新建对话 3/4 失败,9 路 8/9 失败。
+            //
+            // 登记提前后它一入池就是「忙碌」,谁也逐不走;所有失败路径(stdin 写失败 /
+            // reader 已退出 / 条目消失)本来就会 remove+reap,reap 置 alive=false,
+            // 而 session_busy 要求 alive —— 不会留下逐不掉的僵尸条目。
+            *proc.shared.active_req.lock() = Some(p.req_id.clone());
             let evicted =
                 POOL.lock()
                     .insert(p.conv_id.clone(), fp.clone(), proc, now_ms(), session_busy);
@@ -1062,6 +1081,43 @@ mod tests {
         assert!(evicted.is_empty(), "其余全员忙碌时宁可超上限也不杀活轮");
         assert!(core.get_mut("a").is_some() && core.get_mut("c").is_some());
         assert!(core.get_mut("d").is_some(), "新插入者不可被自己逐出");
+    }
+
+    /// 并发新建对话不得互相收割(2026-07-29 压测实测的 P0 回归钉子)。
+    ///
+    /// 旧行为:新 spawn 的会话要到「写完 stdin、派发 job」那步才登记 active_req,
+    /// 在此之前 session_busy 判它空闲 → 另一条并发新对话的 trim_over_cap/insert
+    /// 顺手就把它逐掉,受害者回头检出时报「会话条目在检出后消失(并发收割)」,
+    /// 重试打光后用户看到发送失败(4 路并发 3/4 失败,9 路 8/9 失败)。
+    /// 修法是把本轮登记提前到入池之前 —— 这里用「入池即忙碌」来复现那个不变量。
+    #[test]
+    fn 并发新建的会话入池即忙碌_不会被彼此逐出() {
+        let mut core: PoolCore<u32> = PoolCore::new();
+        // 三条对话几乎同时新建;每条一入池就算「忙碌」(= 已登记本轮)。
+        let all_busy = |_: &u32| true;
+        for (i, c) in ["c1", "c2", "c3"].iter().enumerate() {
+            let evicted = core.insert((*c).into(), fp("p", ""), i as u32, i as u64, all_busy);
+            assert!(
+                evicted.is_empty(),
+                "{c} 入池不该逐掉任何一条已登记的并发新对话,实际逐出 {evicted:?}"
+            );
+        }
+        for c in ["c1", "c2", "c3"] {
+            assert!(core.get_mut(c).is_some(), "{c} 必须还在池里(否则检出会落空)");
+        }
+        // 另一条对话的检出路径也不能把它们收走。
+        assert!(
+            core.trim_over_cap("c3", all_busy).is_empty(),
+            "全员忙碌时 trim_over_cap 必须原地等待"
+        );
+        assert_eq!(core.entries.len(), 3, "宁可暂时超编,也不能杀掉在飞的轮次");
+
+        // 反证:若登记没提前(入池时仍判空闲),第三条就会把第一条挤掉 —— 那正是旧 bug。
+        let mut old: PoolCore<u32> = PoolCore::new();
+        old.insert("c1".into(), fp("p", ""), 1, 0, idle_only);
+        old.insert("c2".into(), fp("p", ""), 2, 1, idle_only);
+        let evicted = old.insert("c3".into(), fp("p", ""), 3, 2, idle_only);
+        assert_eq!(evicted, vec![1], "复现旧行为:未登记的新会话会被后来者收割");
     }
 
     /// 超编收敛闭环: 全员忙碌导致超上限后, 轮次结束(不再忙)的下一次检出必须把编制

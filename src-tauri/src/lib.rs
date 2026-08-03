@@ -507,6 +507,7 @@ pub fn run() {
             forge::forge_tts,
             // 环境医生 (环境监测 + 配置安装)
             doctor::env_check,
+            doctor::env_verify,
             doctor::env_autopilot_status,
             doctor::env_fix_path,
             doctor::env_install_claude,

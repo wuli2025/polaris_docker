@@ -70,7 +70,11 @@ pub(crate) fn extract_gist(text: &str) -> String {
 
 /// 按需速览:文本/文档抽取式总结(缓存);其余类型给「类型 · 大小」简述。
 pub fn gist(abspath: String) -> Result<String, String> {
-    let real = crate::fable::reencode_fs_path(&abspath);
+    // 路径闸(见 files/mod.rs 的大注释):这条命令挂在手机数据面白名单上,远端可调,
+    // 没有它就是「给个绝对路径 = 读走本机任意文本文件的前 8000 字」。
+    let Some(real) = super::ensure_file_center_path(&abspath)? else {
+        return Err("文件不存在".into());
+    };
     let p = real.as_path();
     if !p.is_file() {
         return Err("文件不存在".into());

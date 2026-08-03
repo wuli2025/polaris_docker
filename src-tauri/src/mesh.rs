@@ -35,6 +35,19 @@ const PORT_BASE: u16 = 18800;
 /// 与云端账号中心通信的超时。连不上要快失败:后台循环下一拍再试,不能把线程吊死。
 const CLOUD_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// 默认的云端账号中心 —— 官方云机。桌面用户不填地址时用它,自建账号中心的人
+/// 照旧在表单里覆盖(前端 `InterconnectView.vue` 的 DEFAULT_AUTHORITY_URL 与此同值)。
+const DEFAULT_AUTHORITY: &str = "http://43.139.209.127:8080";
+
+/// 入网地址:用户填了就用用户的;没填先看环境变量(server 形态),最后落到官方云机。
+fn default_authority() -> String {
+    std::env::var("POLARIS_ACCOUNT_AUTHORITY_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_AUTHORITY.to_string())
+}
+
 // meta 键(都落在 collab.db,桌面双击启动也能读到 —— 环境变量在这个场景根本不存在)
 const K_URL: &str = "mesh_url";
 const K_KEY: &str = "mesh_key";
@@ -399,7 +412,7 @@ pub fn spawn_if_enrolled() {
 
 // ────────────────────────────── 命令 ──────────────────────────────
 
-/// 入网:一次填云端账号中心 + 账号密码,换一把长期设备密钥落本机。
+/// 入网:一次填账号密码(地址可留空,默认官方云端账号中心),换一把长期设备密钥落本机。
 ///
 /// 之后再不需要密码 —— 后台用设备密钥自助换断言。密码不落盘、不进日志。
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -413,7 +426,9 @@ pub async fn mesh_join(
     if node_id.is_empty() {
         return Err("本机 P2P 身份还没就绪 —— 请先在互联页把本机设为主机,再入网".into());
     }
-    let url = norm_url(&url);
+    // 地址留空 = 用官方云端账号中心。自建的人填自己的地址覆盖掉它。
+    let raw = if url.trim().is_empty() { default_authority() } else { url };
+    let url = norm_url(&raw);
     let out = tokio::task::spawn_blocking({
         let url = url.clone();
         let node_id = node_id.clone();

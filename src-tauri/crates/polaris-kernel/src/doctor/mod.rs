@@ -35,6 +35,7 @@ pub mod probe;
 pub mod types;
 pub mod update;
 pub mod uv_cache;
+pub mod verify;
 
 // tauri::command 生成的 __cmd__* / __tauri_command_name_* 隐藏宏项会被 glob 一并带出,
 // 故 lib.rs 的 generate_handler!(doctor::xxx) 路径零改动。原 doctor.rs 的全部对外符号
@@ -47,3 +48,4 @@ pub use probe::*;
 pub use types::*;
 pub use update::*;
 pub use uv_cache::*;
+pub use verify::*;

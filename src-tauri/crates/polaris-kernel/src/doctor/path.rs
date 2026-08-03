@@ -34,6 +34,27 @@ pub(crate) fn read_user_path() -> Option<String> {
     None
 }
 
+/// 读「机器级 PATH」(注册表 HKLM\...\Environment)。新开终端拿到的 PATH ≈ 机器级 + 用户级,
+/// 深度校验要用它复现「用户在 CMD/PowerShell 里敲 claude」的真实解析环境 —— 本进程 PATH
+/// 早被启动预热 (prime_path_for_claude) 改过, 拿它去测终端等于自欺。
+#[cfg(windows)]
+pub(crate) fn read_machine_path() -> Option<String> {
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Environment]::GetEnvironmentVariable('Path','Machine')",
+    ]);
+    cmd.stdin(Stdio::null());
+    no_window(&mut cmd);
+    let out = output_with_timeout(cmd, Duration::from_secs(20))?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// dir 是否(忽略大小写/尾斜杠)出现在分号分隔的 PATH 串里。
 pub(crate) fn path_contains_dir(path_str: &str, dir: &str) -> bool {
     let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_lowercase();

@@ -500,7 +500,7 @@ pub(crate) fn node_dir_candidates() -> Vec<PathBuf> {
 /// 但**本应用是 GUI 进程、以 CREATE_NO_WINDOW 无控制台方式 spawn claude**, claude 再去拉这个
 /// 别名时在该上下文下起不来 → 报「找不到 PowerShell」。故探测时把它当「没装」, 引导装
 /// Program Files 里的真身 (普通 exe, 任何子进程都能稳定 spawn) 替代。
-fn is_app_exec_alias(p: &std::path::Path) -> bool {
+pub(crate) fn is_app_exec_alias(p: &std::path::Path) -> bool {
     #[cfg(windows)]
     {
         let in_windows_apps = p.components().any(|c| {

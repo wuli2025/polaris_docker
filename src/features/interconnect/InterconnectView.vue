@@ -787,7 +787,9 @@ interface MeshStatus {
   peers: MeshPeer[];
 }
 const mesh = ref<MeshStatus>({ enrolled: false, url: "", uid: "", nodeId: "", name: "", peers: [] });
-const meshForm = reactive({ open: false, url: "", username: "", password: "" });
+/** 默认账号中心 = 官方云机。留空提交时后端也落到同一地址(见 src-tauri/src/mesh.rs 的 DEFAULT_AUTHORITY)。 */
+const DEFAULT_AUTHORITY_URL = "http://43.139.209.127:8080";
+const meshForm = reactive({ open: false, url: DEFAULT_AUTHORITY_URL, username: "", password: "" });
 const meshBusy = ref(false);
 const meshMounted = computed(() => mesh.value.peers.filter((p) => !!p.drive).length);
 
@@ -804,8 +806,8 @@ async function loadMesh() {
 
 async function meshJoin() {
   if (meshBusy.value) return;
-  if (!meshForm.url.trim() || !meshForm.username.trim() || !meshForm.password) {
-    toast.error("云端账号中心地址、账号、密码都要填");
+  if (!meshForm.username.trim() || !meshForm.password) {
+    toast.error("账号、密码要填");
     return;
   }
   meshBusy.value = true;
@@ -1752,7 +1754,12 @@ onUnmounted(() => {
             <!-- 入网表单:只在没入网时出现,填完就再也不用看见它 -->
             <div v-if="meshForm.open && !mesh.enrolled" class="mesh-form">
               <div class="add-fields">
-                <input v-model="meshForm.url" class="af-inp" placeholder="云端账号中心地址(如 http://43.139.209.127:8080)" />
+                <input
+                  v-model="meshForm.url"
+                  class="af-inp"
+                  placeholder="云端账号中心地址(留空 = 默认云端账号中心)"
+                  title="默认就是官方云端账号中心,自建了才需要改"
+                />
                 <input v-model="meshForm.username" class="af-inp" placeholder="账号(用户名或邮箱)" />
                 <input v-model="meshForm.password" class="af-inp" type="password" placeholder="密码" />
               </div>
@@ -1760,6 +1767,7 @@ onUnmounted(() => {
                 <LoaderCircle v-if="meshBusy" :size="15" class="spin" /><Zap v-else :size="15" /> 入网并自动连上我的设备
               </button>
               <p class="foot-note" style="margin-top:6px">
+                地址已默认填好官方云端账号中心,<b>只要填账号密码</b> —— 自建了账号中心才需要改它。
                 需要本机已「设为主机」(要有 P2P 身份)。对端也得用同一账号入网,且已把这个账号加成它的成员 ——
                 云端只证明「你是谁」,进不进得去仍由每台机器自己说了算。
               </p>

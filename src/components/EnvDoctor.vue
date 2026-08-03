@@ -9,6 +9,7 @@ import {
   type EnvStreamEvent,
   type ToolStatus,
   type UvCacheInfo,
+  type VerifyReport,
 } from "../tauri";
 // 懒加载:EnvDoctor 是常驻组件,这里若静态 import 会把 McpConfigModal 拽回主包,
 // 把 App.vue:49 的 defineAsyncComponent 架空。模板处已有 v-if 条件,异步化零行为差异。
@@ -44,6 +45,12 @@ const checkingUpdate = ref(false);
 // uv 缓存信息 (装了 uv 才查; 用于展示占用 + 一键清理)
 const uvCache = ref<UvCacheInfo | null>(null);
 const cleaningCache = ref(false);
+
+// 深度校验: 安装冲突 + 实跑验证。
+// 与上面那张工具清单的分工: 清单答「装没装」(查得到文件即绿), 这里答「真能不能跑、会不会打架」——
+// 装重了两份、终端里其实跑的是另一份、Store 别名遮挡、配置文件损坏……都只有实跑才看得见。
+const verify = ref<VerifyReport | null>(null);
+const verifying = ref<"" | "quick" | "deep">("");
 
 const busy = computed(() => busyKind.value !== "");
 
@@ -108,8 +115,28 @@ watch(phase, (p) => {
     if (report.value?.uv.found && !uvCache.value) {
       loadUvCache();
     }
+    // 快速校验 (不发请求, ~1-3s) 在侧栏「环境」页自动跑一次。
+    // 启动关 (gate) 不自动跑: 那里要的是尽快放行, 不该为了一份诊断多等几秒。
+    if (!props.gate && p === "panel" && !verify.value && !verifying.value) {
+      runVerify(false);
+    }
   }
 });
+
+/** 深度校验。deep=true 会真发一次最小请求 (消耗极少量额度), 故只由用户显式点。 */
+async function runVerify(deep = false) {
+  // 不挡浏览器预览: 那边有 stub, 点了会如实说「预览模式无法深度校验」——
+  // 挡掉的话按钮就是个死键, 比给出诚实的否定回答更糟。
+  if (verifying.value) return;
+  verifying.value = deep ? "deep" : "quick";
+  try {
+    verify.value = await envDoctor.verify(deep);
+  } catch (e) {
+    banner.value = { kind: "err", text: `深度校验失败：${String(e)}` };
+  } finally {
+    verifying.value = "";
+  }
+}
 
 function onStream(ev: EnvStreamEvent) {
   if (installReqId.value && ev.reqId !== installReqId.value) return;
@@ -133,6 +160,11 @@ async function finishInstall(ok: boolean, message: string) {
   if (r.claude.found) checkClaudeUpdate();
   // 刚装完 uv → 刷新缓存信息卡
   if (justFinished === "uv") loadUvCache();
+  // 装/更新过之后旧的校验结论就作废了 (最典型: 刚装完那份可能与老的那份并存) → 重跑快速校验
+  if (verify.value) {
+    verify.value = null;
+    runVerify(false);
+  }
 }
 
 // 装 Claude Code。默认 "direct"：直抓平台包 tgz (R2 优先 → npmmirror → npmjs) 解压到
@@ -270,6 +302,11 @@ async function fixPath() {
     const res = await envDoctor.fixPath();
     banner.value = { kind: res.ok ? "ok" : "err", text: res.message };
     await runCheck();
+    // 修 PATH 直接改变「终端里能不能跑」这一结论 → 立刻重验, 让用户当场看到翻绿
+    if (res.ok && verify.value) {
+      verify.value = null;
+      await runVerify(false);
+    }
   } catch (e) {
     banner.value = { kind: "err", text: String(e) };
   } finally {
@@ -286,6 +323,7 @@ async function cancelInstall() {
 async function recheck() {
   banner.value = null;
   phase.value = "checking";
+  verify.value = null; // 旧结论作废; 回到 panel 后 watch 会自动重跑快速校验
   try {
     const r = await runCheck();
     if (r.ready) localStorage.setItem(READY_FLAG, "1");
@@ -320,6 +358,27 @@ function statusText(t: ToolStatus): string {
   if (t.found) return t.onPath ? "已就绪" : "已安装 (不在 PATH)";
   return t.required ? "未安装 · 必需" : "未安装 · 建议";
 }
+
+// 校验步骤 / 冲突 → 状态点级别 (复用工具清单那三档配色)
+function stepLevel(s: VerifyReport["steps"][number]): "ok" | "warn" | "bad" {
+  if (s.status === "ok") return "ok";
+  if (s.status === "fail") return "bad";
+  return "warn"; // warn / skip
+}
+function severityLevel(sev: string): "ok" | "warn" | "bad" {
+  return sev === "high" ? "bad" : sev === "medium" ? "warn" : "ok";
+}
+function severityText(sev: string): string {
+  return sev === "high" ? "必须处理" : sev === "medium" ? "建议处理" : "留意";
+}
+const conflictCount = computed(() => verify.value?.conflicts.length ?? 0);
+const highConflictCount = computed(
+  () => verify.value?.conflicts.filter((c) => c.severity === "high").length ?? 0
+);
+// 有冲突能靠「修复 PATH」解决时，冲突卡里直接给按钮，省得用户找上面那块
+const hasFixableConflict = computed(
+  () => !!verify.value?.conflicts.some((c) => c.fixable)
+);
 
 // 当前系统 (后端 env_check 回传): "windows" | "macos" | "linux" | "browser"
 const osName = computed(() => report.value?.os ?? "");
@@ -496,6 +555,98 @@ const dockerUpdateHint = computed(() => {
           <button class="btn primary" :disabled="busy" @click="fixPath">
             {{ busyKind === "path" ? "修复中…" : "修复 PATH" }}
           </button>
+        </div>
+
+        <!-- ══ 深度校验: 安装冲突 + 实跑验证 ══
+             上面那张清单只答「装没装」; 这一块答「真能不能跑、会不会打架」——
+             每一条都真的起了子进程去验, 且「电脑终端里可运行」是用**新开终端的 PATH 语义**测的
+             (Windows 从注册表重建机器级+用户级 PATH), 所以它跟应用内那条是两个独立结论。 -->
+        <div v-if="!props.gate" class="verify">
+          <div class="v-head">
+            <span class="v-title">深度校验</span>
+            <span v-if="verifying" class="v-sub">
+              <span class="spinner sm"></span>
+              {{ verifying === "deep" ? "正在真发一次请求…" : "正在实跑验证…" }}
+            </span>
+            <span v-else-if="verify" class="v-sub" :class="verify.ok ? 'ok' : 'warn'">
+              {{ verify.summary }}
+            </span>
+            <span v-else class="v-sub">检测安装冲突，并实测 Claude Code 是否真能跑起来</span>
+            <div class="spacer"></div>
+            <button class="btn sm" :disabled="busy || !!verifying" @click="runVerify(false)">
+              {{ verify ? "重新校验" : "开始校验" }}
+            </button>
+            <button
+              class="btn sm primary"
+              :disabled="busy || !!verifying || !verify?.appRunnable"
+              title="真的发一次最小请求（几十 token），确证「装好了 + 能连上 + 有凭据」整条链路通"
+              @click="runVerify(true)"
+            >
+              深度检测
+            </button>
+          </div>
+
+          <template v-if="verify">
+            <!-- ① 安装冲突。零冲突要明说 (否则用户以为没检测), 但**只在真验成功时才敢说**——
+                 claude 都没跑起来时冲突数当然是 0, 那时说「只有一份、两边一致」是在撒谎。 -->
+            <div v-if="conflictCount === 0 && verify.appRunnable" class="v-clean">
+              未发现安装冲突 —— 本机只有一份 Claude Code，终端与应用跑的是同一份。
+            </div>
+            <ul v-else class="conflicts">
+              <li v-for="c in verify.conflicts" :key="c.key" class="cf">
+                <span class="dot" :class="severityLevel(c.severity)"></span>
+                <div class="cf-main">
+                  <div class="cf-row">
+                    <span class="cf-title">{{ c.title }}</span>
+                    <span class="cf-sev" :class="severityLevel(c.severity)">
+                      {{ severityText(c.severity) }}
+                    </span>
+                  </div>
+                  <div class="cf-detail">{{ c.detail }}</div>
+                  <div v-for="(p, i) in c.paths" :key="i" class="cf-path" :title="p">{{ p }}</div>
+                </div>
+                <button
+                  v-if="c.fixable"
+                  class="btn sm"
+                  :disabled="busy || !!verifying"
+                  @click="fixPath"
+                >
+                  {{ busyKind === "path" ? "修复中…" : "修复 PATH" }}
+                </button>
+              </li>
+            </ul>
+
+            <!-- ② 实跑验证逐项 -->
+            <ul class="vsteps">
+              <li v-for="s in verify.steps" :key="s.key" class="vs">
+                <span class="dot" :class="stepLevel(s)"></span>
+                <div class="vs-main">
+                  <div class="vs-row">
+                    <span class="vs-name">{{ s.name }}</span>
+                    <span class="vs-ms">{{ s.ms }} ms</span>
+                  </div>
+                  <div class="vs-detail">{{ s.detail }}</div>
+                  <div v-if="s.command" class="vs-cmd" :title="s.command">$ {{ s.command }}</div>
+                  <pre v-if="s.output && s.status !== 'ok'" class="vs-out">{{ s.output }}</pre>
+                </div>
+              </li>
+            </ul>
+
+            <p
+              v-if="!verify.deep || highConflictCount > 0 || hasFixableConflict"
+              class="v-foot"
+            >
+              <template v-if="!verify.deep">
+                「深度检测」会真发一次最小请求，是确认<strong>真正可用</strong>（凭据、网络、上游全通）的唯一硬证据。
+              </template>
+              <template v-else-if="highConflictCount > 0">
+                建议先清理上面标红的冲突，再重新校验。
+              </template>
+              <template v-else-if="hasFixableConflict">
+                标了「修复 PATH」的那条点一下即可，新开终端后生效。
+              </template>
+            </p>
+          </template>
         </div>
 
         <!-- uv 缓存治理: 装了 uv 才显示。uv 缓存放任会涨到数 GB, 给一键清理 -->
@@ -775,6 +926,121 @@ const dockerUpdateHint = computed(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── 深度校验 ── */
+.verify {
+  margin-top: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.v-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+.v-title {
+  font-family: var(--serif);
+  font-size: 12.5px;
+  letter-spacing: 1px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.v-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.6;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.v-sub.ok { color: #4a8f6d; }
+.v-sub.warn { color: #c08a3e; }
+.spinner.sm { width: 11px; height: 11px; border-width: 1.5px; }
+.btn.sm { padding: 5px 11px; font-size: 11.5px; }
+
+.v-clean {
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #4a8f6d;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.conflicts,
+.vsteps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cf,
+.vs {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.vsteps .vs:last-child { border-bottom: none; }
+.cf .dot,
+.vs .dot { margin-top: 4px; }
+.cf-main,
+.vs-main { flex: 1; min-width: 0; }
+.cf-row,
+.vs-row { display: flex; align-items: baseline; gap: 10px; }
+.cf-title { font-size: 13px; color: var(--ink); font-weight: 500; }
+.cf-sev { font-size: 11px; letter-spacing: 0.5px; }
+.cf-sev.ok { color: #4a8f6d; }
+.cf-sev.warn { color: #c08a3e; }
+.cf-sev.bad { color: var(--vermilion); }
+.cf-detail,
+.vs-detail {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: var(--text-2);
+}
+.cf-path,
+.vs-cmd {
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vs-name { font-size: 13px; color: var(--ink); font-weight: 500; }
+.vs-ms { font-size: 10.5px; color: var(--dim); font-family: var(--mono); }
+.vs-out {
+  margin: 6px 0 0;
+  padding: 7px 9px;
+  border-radius: 3px;
+  background: #0c1320;
+  color: #c8d4e6;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.6;
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.v-foot {
+  margin: 0;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg-soft);
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--muted);
+}
+.v-foot strong { color: var(--ink); }
 
 .logwrap {
   margin-top: 16px;

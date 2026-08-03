@@ -1789,8 +1789,13 @@ export interface ProviderView {
   protocol: string;
   isPreset: boolean;
   hasKey: boolean;
+  /**
+   * **掩码值**(`••••••••尾4`)——后端 provider_list 出口不再下发明文 key。
+   * 原样回传给 provider_save 即表示「保持原 key 不变」；换 key 直接填新值覆盖；
+   * 清空该 env 字段才是真的删掉 key。
+   */
   authToken: string;
-  /** 完整 settings_config（env + includeCoAuthoredBy/attribution 等） */
+  /** 完整 settings_config（env + includeCoAuthoredBy/attribution 等）；env 里的密钥字段同样是掩码 */
   settingsConfig: any;
 }
 export interface ProviderListResult {
@@ -2061,9 +2066,46 @@ export interface UvCacheInfo {
   bytes: number;
   human: string;
 }
+/** 一条安装冲突 / 环境风险（env_check 只答「有没有」，这里答「会不会打架」） */
+export interface EnvConflict {
+  key: string;
+  severity: "high" | "medium" | "low";
+  title: string;
+  detail: string;
+  /** 相关路径 / 变量（敏感值后端已掩码） */
+  paths: string[];
+  /** 能否用面板的「修复 PATH」按钮解决 */
+  fixable: boolean;
+}
+/** 一条实跑验证的结果 —— 每条都真的起了子进程 */
+export interface VerifyStep {
+  key: "exec" | "terminal" | "shell" | "config" | "auth" | "smoke";
+  name: string;
+  status: "ok" | "fail" | "warn" | "skip";
+  detail: string;
+  command?: string;
+  output?: string;
+  ms: number;
+}
+export interface VerifyReport {
+  os: string;
+  ok: boolean;
+  /** 应用内能真把 claude 跑起来 */
+  appRunnable: boolean;
+  /** 电脑终端里裸敲 `claude` 能跑起来（按新开终端的 PATH 语义实测） */
+  terminalRunnable: boolean;
+  /** 本次是否做了「真发一次请求」的端到端冒烟 */
+  deep: boolean;
+  steps: VerifyStep[];
+  conflicts: EnvConflict[];
+  summary: string;
+}
 
 export const envDoctor = {
   check: () => invoke<EnvReport>("env_check"),
+  /** 深度校验：安装冲突扫描 + 实跑验证（应用内 / 电脑终端）。
+   *  deep=true 额外真发一次最小请求做端到端冒烟（走网络、消耗极少量额度）。 */
+  verify: (deep = false) => invoke<VerifyReport>("env_verify", { deep }),
   fixPath: () => invoke<PathFixResult>("env_fix_path"),
   /** 安装 Claude Code。method: "direct"(直抓平台包 tgz, R2 优先多源, 不经 npm; 默认) |
    *  "native"(官方原生脚本 install.ps1/sh, 境外网络兜底) */
@@ -2457,6 +2499,27 @@ function browserStub(cmd: string, _args?: Record<string, unknown>): unknown {
         imageManaged: false,
       };
     }
+    case "env_verify":
+      // 浏览器预览起不了子进程，如实说明是「没检测」而不是「检测通过」——
+      // 否则预览里会显示一片绿，看起来像真验过。
+      return {
+        os: "browser",
+        ok: false,
+        appRunnable: false,
+        terminalRunnable: false,
+        deep: false,
+        steps: [
+          {
+            key: "exec",
+            name: "应用内可执行",
+            status: "skip",
+            detail: "浏览器预览模式无法启动本机进程，深度校验需在桌面版 / 服务端运行。",
+            ms: 0,
+          },
+        ],
+        conflicts: [],
+        summary: "浏览器预览模式无法做深度校验。",
+      };
     case "env_uv_cache_info":
       return { available: false, dir: null, bytes: 0, human: "0 B" };
     case "env_uv_cache_clean":

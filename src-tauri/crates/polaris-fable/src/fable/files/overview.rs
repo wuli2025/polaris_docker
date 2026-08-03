@@ -568,7 +568,22 @@ pub fn grid(
         _ => vec![],
     };
     if !kinds.is_empty() {
-        let list: Vec<String> = kinds.iter().map(|k| format!("'{k}'")).collect();
+        // kind 来自调用方(file_grid 挂在手机数据面白名单上,远端可调),必须转义 ——
+        // 同函数里 query/lang 都做了 `''` 转义、sort 走固定枚举,唯独这里漏了:
+        // 2026-07-29 压测实测 kind="nope') OR 1=1--" 能绕过全部过滤条件,
+        // 拼 UNION SELECT 更能把 fable.db 里的 lex 表(= 全库文档正文)读出来。
+        // 除转义外再压一道保守字符集:kind 本就是 text/doc/image/video 这类小写词,
+        // 非 [a-z0-9_] 一律剔除,拼不出任何 SQL 结构。
+        let list: Vec<String> = kinds
+            .iter()
+            .map(|k| {
+                let safe: String = k
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                format!("'{}'", safe.replace('\'', "''"))
+            })
+            .collect();
         where_sql.push_str(&format!(" AND f.kind IN ({})", list.join(",")));
     }
     // 按语言过滤:代码/标记语言按扩展名集合(不依赖回填)、媒体按 kind、自然语言按回填好的 lang 列。
